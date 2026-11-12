@@ -11,7 +11,9 @@
 //!   the operation, possibly on another connection?
 //! * `fatal` — a property of the *occurrence*: must the caller tear the
 //!   connection down right now? Replay, generation rollback and AEAD failure
-//!   are always fatal because the receive nonce has already moved.
+//!   are fatal by policy: the session state is not safe to continue. (E3: in
+//!   snow 0.10 a failed AEAD open does not move the receive nonce; the fatal
+//!   policy is defensive, not a consequence of nonce advance.)
 
 use std::fmt;
 
@@ -223,7 +225,7 @@ impl ProtocolError {
     }
 
     /// Fatal error: the caller MUST drop the connection. There is no "resume"
-    /// after a replay or an AEAD failure — the receive nonce already moved.
+    /// after a replay or an AEAD failure (defensive policy; see frames.md E3).
     #[must_use]
     pub fn fatal(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {

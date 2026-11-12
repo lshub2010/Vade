@@ -26,8 +26,9 @@
 //! 1. `snow` owns all cryptography. This crate never implements a primitive.
 //! 2. Direction separation comes from the two Noise `Split` keys, not from the
 //!    nonce; the frame `counter` only drives replay detection.
-//! 3. Authentication failure is fatal: the receive nonce has already advanced
-//!    (C0a finding 3), so the caller must drop the connection.
+//! 3. Authentication failure is fatal by policy: the session state after a
+//!    failed AEAD open is not safe to continue. (snow 0.10 does NOT advance the
+//!    receive nonce on failure — see `frames.md` E3; the policy is defensive.)
 //! 4. The IK responder verifies the initiator's static key itself — `snow` does
 //!    not compare it against `remote_public_key` (C0a finding 2).
 

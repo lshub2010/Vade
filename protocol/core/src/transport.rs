@@ -405,7 +405,7 @@ impl Transport {
             ));
         }
         if counter > MAX_COUNTER {
-            return Err(pfatal(
+            return Err(perr(
                 ErrorCode::Unsupported,
                 format!("counter {counter} past {MAX_COUNTER}; re-handshake required"),
             ));

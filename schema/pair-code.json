@@ -1,14 +1,19 @@
 {
   "id": "C-15",
   "version": "v1",
-  "status": "frozen",
+  "status": "frozen-partial",
   "frozen_at": "2026-11-12",
   "source_of_truth": "protocol/v1/frames.md §6",
   "code": {
     "length": 8,
     "shape": "2 汉字 + 6 位 base32",
     "base32_alphabet": "ABCDEFGHJKLMNPQRSTUVWXYZ23456789",
-    "base32_excluded": ["I", "O", "0", "1"],
+    "base32_excluded": [
+      "I",
+      "O",
+      "0",
+      "1"
+    ],
     "hanzi_table": null,
     "hanzi_table_note": "256 字表尚未入库；当前实现只校验长度与后 6 位在 base32 表内（见 protocol/v1/RESULT.md §五）"
   },
@@ -19,7 +24,14 @@
       "逐字符 to_uppercase（与 locale 无关）",
       "结果必须是 8 个字符"
     ],
-    "separators": ["-", " ", "\u3000", "\t", "\u00b7", "\u30fb"]
+    "separators": [
+      "-",
+      " ",
+      "　",
+      "\t",
+      "·",
+      "・"
+    ]
   },
   "psk": {
     "kdf": "HKDF-SHA256",
@@ -60,5 +72,6 @@
       "psk": "7ad55a3f3fa7ff29f841ab3066467607caa3c7bb5765414c867b523c511501fe"
     }
   ],
-  "vectors_note": "完整向量（含 4 组等价输入的同一 PSK）见 protocol/v1/kat.json 的 normalize / hkdf 段；本文件只登记规则与 1 组样例。"
+  "vectors_note": "完整向量（含 4 组等价输入的同一 PSK）见 protocol/v1/kat.json 的 normalize / hkdf 段；本文件只登记规则与 1 组样例。",
+  "completeness_note": "除 256 汉字表外均已冻结；汉字表入库前 normalize() 只校验长度与 base32 字符集"
 }

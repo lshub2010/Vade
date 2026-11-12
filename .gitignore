@@ -13,3 +13,11 @@ target/
 data/
 .env
 .DS_Store
+
+# spike build artifacts
+.gradle/
+*.whl
+*.so
+spike/wasm/protocol-wasm/pkg/
+spike/wasm/kotlin-wasm/build/
+spike/uniffi/kotlin/build/

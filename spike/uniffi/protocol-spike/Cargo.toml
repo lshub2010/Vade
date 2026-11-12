@@ -1,0 +1,40 @@
+[package]
+name = "protocol-spike"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "Vade W0 C0a spike: UniFFI surface over a real Noise IK handshake"
+
+[lib]
+name = "protocol_spike"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+# Pinned: the spike must be reproducible; C1 will re-decide versions.
+uniffi = { version = "=0.32.2", features = ["cli"] }
+snow = { version = "=0.10.0" }
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+thiserror = "2"
+serde_json = "1"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[[bin]]
+name = "spike-server"
+path = "src/bin/spike-server.rs"
+
+[[bin]]
+name = "spike-fixture"
+path = "src/bin/spike-fixture.rs"
+
+[[bin]]
+name = "spike-bench"
+path = "src/bin/spike-bench.rs"
+
+[profile.release]
+# Small cdylib is the point of the size measurement; keep it honest.
+codegen-units = 1
+lto = true

@@ -1,0 +1,9 @@
+{
+  "name": "vade-wasm-spike",
+  "private": true,
+  "type": "module",
+  "description": "C0b spike: Rust protocol core -> wasm32 -> Node + WebSocket",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

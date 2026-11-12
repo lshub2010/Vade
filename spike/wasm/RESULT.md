@@ -4,7 +4,7 @@
 |---|---|
 | T1 编译可行性 | ✅ 通（`cargo build --target wasm32-unknown-unknown` + `wasm-bindgen --target web`） |
 | T2 Rust ↔ JS（真实 WebSocket 握手 + AEAD 往返 + 回调） | ✅ 通，`node test.mjs` **8 PASS / 0 FAIL / exit 0**，连续 3 次 |
-| T3 Kotlin/Wasm 调用 | ✅ 通（`gradle wasmJsNodeDevelopmentRun` → `KOTLIN_WASM_OK`；payload 未回显，见 §九） |
+| T3 Kotlin/Wasm 调用 | ✅ 通（`BRIDGE_ENTER` + `KOTLIN_WASM_OK {"ok":true,...,"handshake_bytes":144}`，见 §九） |
 | T4 体积与时延 | ⚠️ 体积已测；时延数字噪声过大，只能给量级（§五） |
 | T5 ADR-001 | ✅ 已写：`docs/adr/ADR-001-web-protocol-binding.md` |
 
@@ -193,8 +193,8 @@ responder.decrypt            -> THREW not established
 
 ## 八、未验证 / 风险（逐条）
 
-1. **T3 Kotlin/Wasm 已实测通过**（见 §九）：`BUILD SUCCESSFUL` + `KOTLIN_WASM_OK`。
-   这是任务书认定的真正风险点，现已不再是阻塞项；遗留一个小缺口（payload 未回显）。
+1. **T3 Kotlin/Wasm 已实测通过**（见 §九）：`BRIDGE_ENTER` + 非空 payload（`ok:true`，
+   `handshake_bytes:144`）。这是任务书认定的真正风险点，现已关闭。
 2. **T4 时延数字不可信**：抖动 14×，只能在目标设备上重测。
 3. **浏览器未验证**：只在 Node/V8 跑过。`WebSocket`/`atob`/`crypto.getRandomValues` 的
    浏览器行为未实测；`pkg/wasm-b64.js` 是 spike 权宜（生产应走 streaming instantiate）。
@@ -206,30 +206,35 @@ responder.decrypt            -> THREW not established
 命令（无 wrapper，用系统 Gradle 8.10.2）：
 
 ```bash
-cd spike/wasm/kotlin-wasm && /opt/gradle/gradle-8.10.2/bin/gradle wasmJsNodeDevelopmentRun
+cd spike/wasm/kotlin-wasm && /opt/gradle/gradle-8.10.2/bin/gradle kotlinWasmUpgradePackageLock wasmJsNodeDevelopmentRun
 ```
 
 结果（2026-11-12）：
 
 ```
-> Task :wasmJsNodeDevelopmentRun
 KOTLIN_WASM_START
-KOTLIN_WASM_OK
+BRIDGE_ENTER
+BRIDGE_HANDSHAKE_DONE hello from kotlin/wasm hello from kotlin/wasm
+KOTLIN_WASM_OK {"ok":true,"echo":"hello from kotlin/wasm","handshake_bytes":144,"pattern":"IKpsk2"}
 
-BUILD SUCCESSFUL in 9m 13s
+BUILD SUCCESSFUL in 13m 31s
 ```
 
-**结论：Kotlin/Wasm 能调用返回 Promise 的 JS 模块并观察到 resolve**，W-A 的最后一环成立。
+**结论：Kotlin/Wasm 能调用 JS 的 default 导出函数、等待其 Promise、并按属性取回对象**，
+且这条链路上真实跑完了 Noise `IKpsk2` 握手（144 B）与一轮 AEAD 往返。
 
-已知缺口（不掩盖）：
+### 关键教训：第一版是假绿
 
-- `KOTLIN_WASM_OK` 后面的 payload 为空：`asText(value)` 没有把 bridge 返回的 JSON 串出来。
-  这不影响「Promise 调用成立」，但 C-10 落地前必须查清（U1 用同一段代码复现即可）。
-- 为了让 Gradle 真正跑起来，本次改了三处工程配置（都是可复用修复，不是临时绕过）：
-  1. 本地 npm 包改用**绝对路径**声明 —— Kotlin 会把 `file:` 原样拷进 build 目录，
-     相对路径在那里会变成断链；
-  2. 给 `vade-bridge` 补自己的 `node_modules` 链接 —— Node 按软链的真实路径解析依赖；
-  3. bridge 的 default 导出改成**返回 API 的 async 工厂** —— Kotlin/Wasm 的 ESM 互操作
-     会调用 `module.default()` 并等待它返回的 Promise。
+- 早期版本把 bridge 的 default 做成「返回 API 对象的 async 工厂」。Kotlin 生成的 glue 是
+  `_ref.default(p0)` —— 外部函数**只会调用 default 本身**，不会去读具名导出。工厂忽略参数、
+  立即 resolve，于是 `KOTLIN_WASM_OK` 打印出来了，但**握手一行没跑**。
+- 现在 default 就是执行握手的函数，并加了 `BRIDGE_ENTER` 作为「函数真的被调用」的入口证据；
+  payload 里带 `ok:true` 与 `handshake_bytes:144`，空 payload 无法再伪装成通过。
+- 工程侧同步收敛：bridge 自带 `vendor/protocol-wasm` 副本，不再依赖 `node_modules` 与 `ws`；
+  传输改为内存（WebSocket 传输已由 T2 单独证明）。
 
-任务书 §六 的「禁止用 Node 代替 Kotlin/Wasm」已满足：本次结论来自 Kotlin/Wasm 真实运行。
+### 对 C-10 的约束
+
+- 一个 `@JsModule` 只能绑一个 default 导出函数；需要多个入口时，用「单入口 + 操作码」或拆模块，
+  不要假设具名导出可用。
+- JS → Kotlin 的返回值走对象属性（`val text: String`），比再调一个外部函数可靠。

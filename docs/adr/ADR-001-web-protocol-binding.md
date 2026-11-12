@@ -18,7 +18,7 @@
 
 - `cargo build --target wasm32-unknown-unknown --release` + `wasm-bindgen --target web` 成功；
 - `node test.mjs`：**8 PASS / 0 FAIL / exit 0**，含真实 WebSocket（loopback）上的 `IKpsk2` 握手 144 B、AEAD 加密往返、JS 回调；
-- `gradle wasmJsNodeDevelopmentRun`（Kotlin/Wasm）：**BUILD SUCCESSFUL**，输出 `KOTLIN_WASM_START` → `KOTLIN_WASM_OK`，证明 Kotlin/Wasm 能调用返回 Promise 的 JS 模块；
+- `gradle wasmJsNodeDevelopmentRun`（Kotlin/Wasm）：**BUILD SUCCESSFUL**，输出 `BRIDGE_ENTER` 与 `KOTLIN_WASM_OK {"ok":true,"handshake_bytes":144}`，证明 Kotlin/Wasm 能调用 JS 的 default 导出函数并取回结果；
 - 产物：wasm 207,148 B（gzip 95,008 B），glue 30,900 B；
 - 关键边界成立：**Rust 侧不含任何 socket 代码**，`handshake(transport, psk)` 只调用宿主 `send()` 并 `await` 宿主 `recv()`。
 

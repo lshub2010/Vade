@@ -1,9 +1,9 @@
 // C0b T3: Kotlin/Wasm -> JS interop proof.
 //
-// For C-10 the only surface that matters is: Kotlin/Wasm calls a JS module that
-// returns a Promise and observes the resolved value. The full Noise handshake +
-// one AEAD round-trip lives behind `runHandshake()` in the bridge, so this file
-// is a single interop hop rather than a dozen.
+// Kotlin/Wasm `@JsModule` external functions compile to `module.default(args)`,
+// so the bridge's default export is a single async function returning an object.
+// Kotlin reads the result through a property (`text`), which is the same shape
+// C-10 will need for JS -> Kotlin return values.
 
 @file:OptIn(kotlin.js.ExperimentalWasmJsInterop::class)
 
@@ -14,12 +14,13 @@ import kotlin.js.unsafeCast
 @JsModule("vade-bridge")
 external fun runHandshake(psk: String?): JsAny
 
-@JsModule("vade-bridge")
-external fun asText(value: JsAny): String
+private external interface BridgeResult : JsAny {
+    val text: String
+}
 
 private external interface JsPromise : JsAny {
     fun then(onFulfilled: (JsAny?) -> Unit): JsPromise
-    fun `catch`(onRejected: (JsAny?) -> Unit): JsAny
+    fun `catch`(onRejected: (JsAny?) -> Unit): JsPromise
 }
 
 fun main() {
@@ -27,11 +28,12 @@ fun main() {
     runHandshake(null)
         .unsafeCast<JsPromise>()
         .then { value ->
-            println("KOTLIN_WASM_OK " + asText(value ?: error("resolved to undefined")))
+            val result = value!!.unsafeCast<BridgeResult>()
+            println("KOTLIN_WASM_OK " + result.text)
             null
         }
         .`catch` { err ->
-            println("KOTLIN_WASM_FAIL " + asText(err!!))
+            println("KOTLIN_WASM_FAIL " + (err?.toString() ?: "rejected"))
             null
         }
 }

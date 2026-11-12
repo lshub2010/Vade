@@ -134,7 +134,7 @@ responder.decrypt            -> THREW not established
 | `protocol_wasm_bg.wasm` | 207 148 B (202 KB) | 95 008 B (93 KB) |
 | `protocol_wasm.js`（glue） | 30 900 B | — |
 | 合计（首屏需传输） | 238 048 B | ~126 KB |
-| `wasm-b64.js`（spike 专用 base64 内联，**不要**带进生产） | 275 663 B | — |
+| `wasm-b64.js`（bridge 的 base64 内联载体，C0b 用它绕开 fetch） | 276 231 B | — |
 
 对比 Miuix 的 ~900 KB 预算：协议核心 gzip 后约 **93 KB**，占 10% 左右，可接受。
 

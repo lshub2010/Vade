@@ -24,3 +24,6 @@ spike/uniffi/kotlin/build/
 
 # spike secrets
 *.sk.hex
+
+# C1 python binding cdylib (rebuild with uniffi feature)
+protocol/core/python/*.so

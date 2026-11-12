@@ -21,3 +21,6 @@ data/
 spike/wasm/protocol-wasm/pkg/
 spike/wasm/kotlin-wasm/build/
 spike/uniffi/kotlin/build/
+
+# spike secrets
+*.sk.hex

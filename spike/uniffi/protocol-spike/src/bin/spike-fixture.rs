@@ -11,8 +11,14 @@ use protocol_spike::{client, keys, server};
 use std::path::PathBuf;
 
 fn main() {
-    let dir = std::env::args()
-        .nth(1)
+    let raw = std::env::args().nth(1);
+    if let Some(a) = raw.as_deref() {
+        if a.starts_with('-') {
+            eprintln!("usage: spike-fixture [KEY_DIR]");
+            std::process::exit(2);
+        }
+    }
+    let dir = raw
         .or_else(|| std::env::var("VADE_SPIKE_KEY_DIR").ok())
         .unwrap_or_else(|| "/tmp/vade-spike-keys".to_string());
     let dir = PathBuf::from(dir);

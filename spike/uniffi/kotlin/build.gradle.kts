@@ -46,7 +46,7 @@ application {
 val cargoBuild by tasks.registering(Exec::class) {
     description = "Build the Rust cdylib + demo binaries (debug)."
     workingDir = crateDir
-    commandLine(cargoBin, "build", "--bin", "spike-server", "--bin", "spike-fixture")
+    commandLine(cargoBin, "build", "--lib", "--bin", "spike-server", "--bin", "spike-fixture")
     inputs.files(fileTree(crateDir.resolve("src")))
     inputs.files(crateDir.resolve("Cargo.toml"), crateDir.resolve("Cargo.lock"))
     outputs.files(

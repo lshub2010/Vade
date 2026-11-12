@@ -20,10 +20,14 @@ cd spike/uniffi/protocol-spike && cargo test --lib
   12 passed; 0 failed
 
 cargo run --bin spike-bench
-  handshake_ms_median = 38.75      (NFR-3 要求 < 50ms)
-  roundtrip_ms_median = 0.86       (NFR-2 要求 < 2ms)
-  lib_bytes           = 86512104   (debug cdylib)
-  arc_mutex_copy_ns_per_op = 606
+  handshake_ms_median = 38.75      （同次 max 1195ms；本机 load 9–42，不能据此判 NFR-3）
+  roundtrip_ms_median = 0.86       （同次 p95 1.01ms）
+  lib_bytes           = 86512104   ← 这是 spike-bench 可执行文件，不是 cdylib
+  cdylib              = 86312128   （target/debug/libprotocol_spike.so）
+  arc_mutex_copy_ns_per_op = 606   （单次采样；复跑 5293，实际区间 0.6–5.3 µs）
+```
+
+> NFR-3（本机握手 < 50ms）**未判定**：中位数 38.75ms，但同一次运行 max 1195ms，且宿主为共享 8 核 / 5GB、load 9–42。需要在低负载机器上重测后才能给结论。
 
 Python wheel:
   protocol_spike-0.1.0-py3-none-linux_aarch64.whl  14,639,659 B
@@ -48,7 +52,7 @@ Python wheel:
 | 项 | 原因 | 最小复现 |
 |---|---|---|
 | T3 `gradlew run` → HANDSHAKE_OK | 本机为共享 8 核 / 5GB，load 9–42；Gradle 依赖解析在 `SSLSocketInputRecord.read` 长时间阻塞，`net.java.dev.jna` 未下完 | `cd spike/uniffi/kotlin && ./gradlew run`（需网络与低负载） |
-| T4 Swift | 无 macOS/Xcode | 仅生成绑定，未在 Apple 平台编译 |
+| T4 Swift | 无 macOS/Xcode | **完全未做**：0 个 Swift / 头文件 / `run_swift.sh`；任务书允许标注未验证 |
 | | | |
 
 > 另注：spike 早期用过一个 13:38 的 `spike-server` 旧二进制（早于 13:46 的 `server.rs` 改动），导致 Python 握手报 `io: failed to fill whole buffer`；`cargo build --bins` 重建后即通。C1 起禁止用旧产物做验收。

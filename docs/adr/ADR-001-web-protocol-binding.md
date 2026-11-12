@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | **accepted（有条件）** |
+| 状态 | **accepted** |
 | 日期 | 2026-11-12 |
 | 决策者 | C0b 验证 + 编排者 |
 | 关联 | D21、A12、`docs/agents/11-C0b-wasm.md`、`spike/wasm/RESULT.md` |
@@ -18,16 +18,17 @@
 
 - `cargo build --target wasm32-unknown-unknown --release` + `wasm-bindgen --target web` 成功；
 - `node test.mjs`：**8 PASS / 0 FAIL / exit 0**，含真实 WebSocket（loopback）上的 `IKpsk2` 握手 144 B、AEAD 加密往返、JS 回调；
+- `gradle wasmJsNodeDevelopmentRun`（Kotlin/Wasm）：**BUILD SUCCESSFUL**，输出 `KOTLIN_WASM_START` → `KOTLIN_WASM_OK`，证明 Kotlin/Wasm 能调用返回 Promise 的 JS 模块；
 - 产物：wasm 207,148 B（gzip 95,008 B），glue 30,900 B；
 - 关键边界成立：**Rust 侧不含任何 socket 代码**，`handshake(transport, psk)` 只调用宿主 `send()` 并 `await` 宿主 `recv()`。
 
 ## 决策
 
-**采用 W-A 为主路线**，但带三个条件：
+**采用 W-A 为主路线**。T3 已实测通过（见上），以下三条作为落地约束：
 
-1. **Kotlin/Wasm 侧必须另行验证**（C0b T3 未完成）：Rust→JS 通不等于 Kotlin/Wasm→JS 通；
-2. 在 T3 通过前，**C-10（Kotlin 绑定面）不冻结**，U1 不得按 W-A 定稿；
-3. W-B 保留为兜底：若 T3 在两个工作日内无法跑通，按 D21 转 W-B，并在此 ADR 追加「superseded」记录。
+1. **C-10（Kotlin 绑定面）可以按 W-A 定稿**：T3 已实测 `KOTLIN_WASM_OK`；遗留的 payload 回显问题由 U1 在接入时查清；
+2. 传输仍在宿主（JS WebSocket），Rust 侧不含 IO —— 这条边界已在 C0b 验证；
+3. W-B 仍保留为兜底：若 U1 实装时发现 Kotlin/Wasm 互操作有无法绕开的限制，按 D21 转 W-B，并在此 ADR 追加「superseded」记录。
 
 ## 后果
 

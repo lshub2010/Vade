@@ -139,3 +139,51 @@ export async function startEchoServer(pskHex) {
     close: () => wss.close(),
   };
 }
+
+
+// ---- one-shot acceptance entry: the whole T3 flow behind a single Promise ----
+
+export async function runHandshake(pskHex) {
+  const psk =
+    pskHex ??
+    Array.from({ length: 32 }, (_, i) => i.toString(16).padStart(2, '0')).join('');
+  const server = await startEchoServer(psk);
+  try {
+    const transport = await makeTransport(server.url, server.responderPub);
+    const info = await handshake(transport, psk);
+    const ciphertext = await encrypt(textEncode('hello from kotlin/wasm'));
+    transport.send(ciphertext);
+    const reply = await transport.recv();
+    const plaintext = textDecode(await decrypt(reply));
+    return JSON.stringify({ ok: true, info, echo: plaintext });
+  } finally {
+    server.close();
+  }
+}
+
+
+// Kotlin/Wasm's ESM interop calls `module.default()` to obtain the namespace,
+// then reads the external functions off the returned object. So the default
+// export is a callable that returns the same API surface (and also carries the
+// properties directly, for named-import style consumers).
+const api = {
+  load,
+  handshake,
+  encrypt,
+  decrypt,
+  onEvent,
+  textEncode,
+  textDecode,
+  asText,
+  makeTransport,
+  exchange,
+  startEchoServer,
+  runHandshake,
+};
+
+async function bridgeNamespace() {
+  return api;
+}
+Object.assign(bridgeNamespace, api);
+
+export default bridgeNamespace;

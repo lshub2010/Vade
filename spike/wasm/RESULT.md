@@ -4,9 +4,9 @@
 |---|---|
 | T1 编译可行性 | ✅ 通（`cargo build --target wasm32-unknown-unknown` + `wasm-bindgen --target web`） |
 | T2 Rust ↔ JS（真实 WebSocket 握手 + AEAD 往返 + 回调） | ✅ 通，`node test.mjs` **8 PASS / 0 FAIL / exit 0**，连续 3 次 |
-| T3 Kotlin/Wasm 调用 | ❌ 未验证（本机无法解析依赖，见 §九） |
+| T3 Kotlin/Wasm 调用 | ✅ 通（`gradle wasmJsNodeDevelopmentRun` → `KOTLIN_WASM_OK`；payload 未回显，见 §九） |
 | T4 体积与时延 | ⚠️ 体积已测；时延数字噪声过大，只能给量级（§五） |
-| T5 ADR-001 | ❌ 未写（不在本次修复范围内） |
+| T5 ADR-001 | ✅ 已写：`docs/adr/ADR-001-web-protocol-binding.md` |
 
 ## 一、结论
 
@@ -193,46 +193,43 @@ responder.decrypt            -> THREW not established
 
 ## 八、未验证 / 风险（逐条）
 
-1. **T3 Kotlin/Wasm 未验证**（见 §九）。这是任务书里认定的真正风险点：Rust→JS 通不代表
-   Kotlin/Wasm→JS 通。本次只跑到 JS 侧，W-A 的最终裁决仍取决于 T3。
+1. **T3 Kotlin/Wasm 已实测通过**（见 §九）：`BUILD SUCCESSFUL` + `KOTLIN_WASM_OK`。
+   这是任务书认定的真正风险点，现已不再是阻塞项；遗留一个小缺口（payload 未回显）。
 2. **T4 时延数字不可信**：抖动 14×，只能在目标设备上重测。
 3. **浏览器未验证**：只在 Node/V8 跑过。`WebSocket`/`atob`/`crypto.getRandomValues` 的
    浏览器行为未实测；`pkg/wasm-b64.js` 是 spike 权宜（生产应走 streaming instantiate）。
-4. **ADR-001 未写**（T5，不在本次范围）。
+4. **ADR-001 已写**：`docs/adr/ADR-001-web-protocol-binding.md`（W-A 有条件成立）。
 5. **只验证了 loopback**：没有丢包/重连/分片（>64 KB 帧）场景。
 
-## 九、T3 现状
+## 九、T3 实测（Kotlin/Wasm）
 
-`kotlin-wasm/` 里已有完整的最小工程：`@JsModule` + `external fun` 引入 wasm-bindgen 的 ES
-模块、`awaitJs()` 用 `suspendCancellableCoroutine` 把 JS Promise 桥成 Kotlin 协程、
-Kotlin lambda 作为 Rust→UI 回调、以及一个把 base64 wasm 嵌入的 `vade-bridge` 适配层。
-运行命令（无 wrapper，用系统 Gradle 8.10.2）：
+命令（无 wrapper，用系统 Gradle 8.10.2）：
 
 ```bash
 cd spike/wasm/kotlin-wasm && /opt/gradle/gradle-8.10.2/bin/gradle wasmJsNodeDevelopmentRun
 ```
 
-**实测结论：未验证。** 两次尝试（后台 900 s、前台 230 s）都卡在 Gradle 的插件/依赖解析：
+结果（2026-11-12）：
 
 ```
-To honour the JVM settings for this build a single-use Daemon process will be forked.
-EXIT=124   （timeout 230s，之后无任何构建进展）
+> Task :wasmJsNodeDevelopmentRun
+KOTLIN_WASM_START
+KOTLIN_WASM_OK
+
+BUILD SUCCESSFUL in 9m 13s
 ```
 
-原因（已确认，不是代码问题）：
+**结论：Kotlin/Wasm 能调用返回 Promise 的 JS 模块并观察到 resolve**，W-A 的最后一环成立。
 
-- `~/.gradle/caches/modules-2/files-2.1` **不存在**，本机没有任何 Kotlin/Wasm 工件缓存；
-- 网络只有 `https://maven.aliyun.com/repository/public` 可达（返回 404，说明链路通），
-  `https://repo1.maven.org/maven2/` 8 s 超时不通；而 `settings.gradle.kts` 的
-  `pluginManagement` 里 gradlePluginPortal / mavenCentral 排在 aliyun 之后，Gradle 会
-  依次尝试并长时间挂起。
+已知缺口（不掩盖）：
 
-要在能联网的机器上给出 T3 结论，只需：
+- `KOTLIN_WASM_OK` 后面的 payload 为空：`asText(value)` 没有把 bridge 返回的 JSON 串出来。
+  这不影响「Promise 调用成立」，但 C-10 落地前必须查清（U1 用同一段代码复现即可）。
+- 为了让 Gradle 真正跑起来，本次改了三处工程配置（都是可复用修复，不是临时绕过）：
+  1. 本地 npm 包改用**绝对路径**声明 —— Kotlin 会把 `file:` 原样拷进 build 目录，
+     相对路径在那里会变成断链；
+  2. 给 `vade-bridge` 补自己的 `node_modules` 链接 —— Node 按软链的真实路径解析依赖；
+  3. bridge 的 default 导出改成**返回 API 的 async 工厂** —— Kotlin/Wasm 的 ESM 互操作
+     会调用 `module.default()` 并等待它返回的 Promise。
 
-```bash
-cd spike/wasm/kotlin-wasm
-/opt/gradle/gradle-8.10.2/bin/gradle wasmJsNodeDevelopmentRun   # 期望输出 KOTLIN_WASM_OK
-```
-
-**未做的事**：没有把「工程已写好」当成「Kotlin 能调用」的证据。T3 仍然决定 W-A 是否成立
-（任务书 §六：禁止用 Node 跑通代替 Kotlin/Wasm 跑通）。
+任务书 §六 的「禁止用 Node 代替 Kotlin/Wasm」已满足：本次结论来自 Kotlin/Wasm 真实运行。

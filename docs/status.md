@@ -1,13 +1,13 @@
 # 开发台账
 
-> 每次派活、收活、审查、合并后更新本表。状态枚举：`未开工 / 进行中 / 待审查 / 返工中 / 已合并 / 阻塞`。
+> 每次派活、收活、审查、合并后更新本表。状态枚举：`未开工 / 进行中 / 待审查 / 返工中 / 已合并 / 阻塞 / 暂缓`（`暂缓` = 用户明确决定不在当前范围，恢复需重新拍板）。
 > 阻塞必须写原因与解除条件。
 
 | 批次 | Agent | 状态 | 交付 commit | R1 | R2 | R3 | 返工次数 | 备注 |
 |---|---|---|---|---|---|---|---|---|
 | C0a | `c0a-uniffi` | 未开工 | — | — | — | — | 0 | 硬时限 3 天 |
 | C0b | `c0b-wasm` | 未开工 | — | — | — | — | 0 | 硬时限 3 天，出 ADR-001 |
-| C0c | `c0c-miuix` | 未开工 | — | — | — | — | 0 | 硬时限 3 天 |
+| C0c | `c0c-miuix` | 进行中 | —（分支 `tmp/c0c-miuix`） | — | — | — | 0 | **Android 侧阻塞**：Miuix 0.9.2～0.9.4 的 AAR 均要求 `minCompileSdk=37`，当前 AGP 8.8.2 无法使用 API 37（无裸 android-37 平台、`compileSdkVersion("android-37.0")` 被拒、目录联接被判 inconsistent）。已验：Desktop `:composeApp:screenshot` 通过（8 张 `miuix-desktop-*.png`）、Wasm `:composeApp:wasmJsBrowserProductionWebpack` 通过（`app.wasm` gzip 936,611 B vs Material 1,013,216 B）。解除条件：升 AGP 8.13+/9.x + Gradle ≥8.14.4 后复跑 `assembleDebug`。证据 `spike/miuix/RESULT.md` |
 | C1 | `c1-protocol` | 未开工 | — | — | — | — | 0 | 冻结 C-01/C-02（**W1 末**）与 **C-15**（W1 第 2 天），C2 只消费 |
 | C2 | `c2-registry` | 未开工 | — | — | — | — | 0 | 冻结 C-03/04/05/**C-15**/**C-18**（W2 中，config schema） |
 | C3 | `c3-loop` | 未开工 | — | — | — | — | 0 | 冻结 C-06 |
@@ -26,8 +26,9 @@
 | U1 | `u1-ui` | 未开工 | — | — | — | — | 0 | **G3**，第 3 天冻结 C-09；含 **T5b 管理页 WebView 宿主 + 设备绑定（+2 天，仅 Android/Desktop）** |
 | U2 | `u2-miuix` | 未开工 | — | — | — | — | 0 | 依赖 C-09 |
 | U3 | `u3-glass` | 未开工 | — | — | — | — | 0 | 依赖 C-09 |
-| U4 | `u4-ios` | 未开工 | — | — | — | — | 0 | **G4**；含 **T6 iOS WebView 宿主 + P-256 设备绑定（+2 天）** |
+| U4 | `u4-ios` | 暂缓 | — | — | — | — | 0 | **暂缓（用户 2026-11-13 决定）**：v1 首批只做 Android / Desktop / Web 三端，**G4 不作当前门禁**；原「G4；含 T6 iOS WebView 宿主 + P-256 设备绑定（+2 天）」保留为历史范围，恢复需用户重新拍板 |
 | F1 | `f1-release` | 未开工 | — | — | — | — | 0 | **G5** |
+| win-fix | `win-fix` | 已合并 | `35c4dde`（merge，含 98617b8 / ccf79f0） | pass | pass | — | 0 | 2026-11-13 换机 Windows 11 x86_64：uv 建 Python 3.12 venv、重编 `protocol/core/python/vade_protocol.dll`、两条 POSIX 权限位断言加 `os.name != "nt"` 守卫（Linux 仍校验）；全量 `pytest core/tests -q` → **378 passed**；环境见 `docs/dev-windows.md` |
 
 ## 里程碑
 
@@ -36,7 +37,7 @@
 | G1 端到端 + SDK 冻结 | 未达成 | — |
 | G2 审批/审计/Admin 闭环 | 未达成 | — |
 | G3 三端聊天 | 未达成 | — |
-| G4 iOS 真机 | 未达成 | — |
+| G4 iOS 真机 | 暂缓（用户 2026-11-13 决定） | — |
 | G5 抓包 0 泄漏、可交付 | 未达成 | — |
 
 ## 待定 / 风险
@@ -44,8 +45,8 @@
 | # | 事项 | 状态 | 负责人 |
 |---|---|---|---|
 | 1 | W-A/W-B 裁决 | 待 C0b | `c0b-wasm` |
-| 2 | Miuix 三端可行性 | 待 C0c | `c0c-miuix` |
-| 3 | iOS 路径 A/B 裁决 | 待 U4 前两天 | `u4-ios` |
+| 2 | Miuix 三端可行性 | **已验：Desktop/Wasm 通过；Android 待升 AGP**（C0c） | `c0c-miuix` |
+| 3 | iOS 路径 A/B 裁决 | **暂缓**（U4 押后，用户 2026-11-13 决定） | `u4-ios` |
 | 4 | Web 端 glass 是否能用 CSS backdrop-filter | 待 U3 | `u3-glass` |
 | 5 | 知识库走哪条路（MCP vs 自建模块） | **已定：MCP + mcp-bridge**（D37） | 编排者 |
 | 6 | skill 是否进 v1 | **已定：进，C3b**（D38）；不含执行通道 | 编排者 |

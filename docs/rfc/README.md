@@ -1,10 +1,13 @@
 # docs/rfc
 
-> 提案目录。RFC-0002 在 `tmp/debt-a` 分支，尚未合入 `dev_gingshan`，故此处不列。
+> 提案目录。状态 `proposed` = 已写、未批准、未实现；`已实施` 需附实施 commit 或契约版本。
 
 | 编号 | 标题 | 状态 |
 |---|---|---|
 | RFC-0001 | 在 C-03 `manifest` 中追加 `subscriptions` | 已实施（C3d，待 C2 追认） |
+| RFC-0002 | 在 C-06 `turn.completed` 中追加 `skills` 字段 | proposed（草稿，未实现） |
 | RFC-0003 | 提示词注入分层：技能目录消息化、工具渐进披露与 stable/context 分段 | proposed（草稿，未实现） |
 | RFC-0004 | 附件与多模态：`POST /ui/blob` 上传协议、压缩图单 `file_id` 与 content parts 消息结构 | proposed（草稿，未实现） |
 | RFC-0005 | 模型能力查询与用量：`model/list`、会话级选择优先级与两级用量口径 | proposed（草稿，未实现） |
+| RFC-0006 | turn 语义补充：中断留痕、工具卡字段、重生成/编辑重发、流式多段与单条长度上限 | proposed（草稿，未实现） |
+| RFC-0007 | 子代理与后台任务：统一 `task.*` 事件族、`task/list` / `log_tail` / `cancel`、审批归属与通知去重 | proposed（草稿，未实现） |

@@ -1,12 +1,12 @@
-# Vade Agent Runtime（Vade）技术方案 v1.18
+# Vade Agent Runtime（Vade）技术方案 v1.19
 
 | 项 | 值 |
 |---|---|
 | 产品名 | **Vade Agent Runtime**（中文「偕行」），简称 **Vade**；包名 / URI scheme / 协议版本用 `vade` |
-| 版本 | v1.18（v1.17 + AMEND-20：纯一致性修订，无行为变更——FR 撞号顺延、A62/A63 重号改 A67–A70、补 AMEND-10 明细、`session_id NOT NULL`、并发枚举统一、C-18 补 `[policy.tool_risk]`/`[server]`/`[dev]`、审批超时统一 60s、`fs` 补 `delete_file`、计数口径对齐） |
-| 对齐需求 | `requirements.md` v1.0 + AMEND-01～20 |
+| 版本 | v1.19（v1.18 + AMEND-21/22：客户端功能全集 52 条；19 条 UI/协议裁定——4 目的地、桌面双栏+可折叠右面板、C-09 扩到 11 组件、附件走 `POST /ui/blob`、只存压缩图、端上转写、Web **数据面**可写（D100 废止 D76，管理面 cookie 仍只读）、会话级模型优先、`waiting_input`、模块 UI 页面 C-19 待冻结） |
+| 对齐需求 | `requirements.md` v1.0 + AMEND-01～22 |
 | 状态 | **已确认**，可进入阶段 3 拆任务 |
-| 变更触发 | AMEND-02（多实例/多端）、AMEND-03（队列/中断）、AMEND-04（皮肤/底栏、T1）、AMEND-08（扩展点/知识库）、AMEND-09（记忆/自进化）、AMEND-12（三面分离/配对码）、AMEND-13（管理面鉴权/rekey）、AMEND-14（setup token）、AMEND-15（token 轮换）、AMEND-16（记忆/技能管理）、AMEND-17（WebView 反转/设备绑定/去 SSH）、AMEND-18（审查修正：setup 门禁/绑定签名/票顺序）、AMEND-19（自进化节流/记忆硬顶/配置面全量化）、AMEND-20（文档一致性修订） |
+| 变更触发 | AMEND-02（多实例/多端）、AMEND-03（队列/中断）、AMEND-04（皮肤/底栏、T1）、AMEND-08（扩展点/知识库）、AMEND-09（记忆/自进化）、AMEND-12（三面分离/配对码）、AMEND-13（管理面鉴权/rekey）、AMEND-14（setup token）、AMEND-15（token 轮换）、AMEND-16（记忆/技能管理）、AMEND-17（WebView 反转/设备绑定/去 SSH）、AMEND-18（审查修正：setup 门禁/绑定签名/票顺序）、AMEND-19（自进化节流/记忆硬顶/配置面全量化）、AMEND-20（文档一致性修订）、AMEND-21（客户端功能全集 52 条）、AMEND-22（19 条 UI/协议裁定；D76 废止） |
 
 ## 0. 本版相对 v1.0 的实质变化
 
@@ -478,6 +478,8 @@ class PromptParts:
 
 浏览器会话怎么建立：管理员在配置页生成 8 位配对码（`purpose=browser`，180s、一次性），浏览器 `POST /ui/session` 换取 `__Host-ac_ui` cookie；WS 升级凭 cookie，**跳过 Noise**，帧为纯文本 JSON-RPC。这条通道在审计里必须标 `e2e=false`，拓扑连线上是空心锁。
 
+> **写权限（D100 / FR-8.75，v1.19）**：`browser_session` 默认**可写**（发送、上传、批准、删除）。写方法必须带与会话绑定的 CSRF token（double-submit）+ `Origin` / `Sec-Fetch-Site` 同源校验，Web 壳 CSP 禁 `unsafe-inline` / `unsafe-eval`；只有**显式只读会话**才返回 `READ_ONLY_SESSION`。**管理面 `:8444` 的 `__Host-ac_admin` 仍是只读（§7.10），两者不是一回事**，不得混为一谈。
+
 ### 3.1 「端到端加密」到底覆盖哪几段（必须说清，不能笼统回答）
 
 | 链路 | 是否 E2E | 靠什么 | 中间节点能看到明文吗 |
@@ -581,7 +583,7 @@ policy 判定 risk=high
 
 | 项 | 决定 |
 |---|---|
-| 鉴权 | **密码（Argon2id）+ 设备密钥（P-256 ECDSA 挑战签名；Ed25519 仅软件密钥）**；会话用 Bearer，不用 cookie（§7.12）。浏览器直连只有密码 → **只读** |
+| 鉴权 | **密码（Argon2id）+ 设备密钥（P-256 ECDSA 挑战签名；Ed25519 仅软件密钥）**；会话用 Bearer，不用 cookie（§7.12）。浏览器直连只有密码 → **管理面只读**（数据面浏览器会话按 D100 可写，见 §7.1.3 注） |
 | 实时 | **SSE** `/admin/api/stream`（单向推送状态；布局写回走普通 `PATCH`，故不需要双向 WS） |
 | 前端 | React + React Flow + TypeScript，源码 `admin-ui/src`，构建产物 `admin-ui/dist` **提交进仓库**；同一份 `dist` 被 core 静态托管（浏览器只读）**和**打进 App 包（WebView 全功能） |
 | 运行时 | core 只做静态托管，**部署不需要 Node**；CI 校验 `dist` 与 `src` 一致 |
@@ -644,10 +646,10 @@ cookie 的作用域是 `(domain, path)`，**不含端口**。所以 `127.0.0.1:8
 |---|---|---|---|
 | **Bearer**（App 内 WebView / 原生端） | 任意 | **密码 + 设备密钥挑战签名** | **可写**。两个因子缺一不可；密码泄露而没有那台设备的私钥仍然进不来 |
 | **Bearer**（本机 CLI / 脚本） | 回环 + `X-AC-Client: cli` | 仅密码 | **可写**。本机已是受信环境；这个头只为把 `curl` 与浏览器区分开，浏览器不发它 |
-| **cookie**（浏览器） | **任意，含回环** | 仅密码 | **只读**：能看状态/拓扑/审计/记忆列表，不能改配置、不能装技能、不能管设备（§7.10） |
+| **cookie**（浏览器·**管理面**） | **任意，含回环** | 仅密码 | **只读**：能看状态/拓扑/审计/记忆列表，不能改配置、不能装技能、不能管设备（§7.10）。数据面 `__Host-ac_ui` 按 D100 可写（带 CSRF token，见 §7.1.3 注） |
 | 无（首次配置） | — | 回环免 token；非回环先验 setup token | 只能完成 setup / 绑定（§7.1.4） |
 
-> **权限由凭据类型决定，不由来源决定。** `Authorization: Bearer` 才能写，`__Host-ac_admin` cookie 一律只读——包括在 core 本机上开的浏览器（它拿不到 `X-AC-Client: cli` 那条路径）。这条是为了让「只读」成为一个可以静态判定的规则（看头就知道），而不是「看来源 IP 猜」。本机用户要写配置，用 App（会拿 Bearer）或 CLI。
+> **权限由凭据类型决定，不由来源决定。** `Authorization: Bearer` 才能写，`__Host-ac_admin` cookie 在**管理面**一律只读——包括在 core 本机上开的浏览器（它拿不到 `X-AC-Client: cli` 那条路径）。这条是为了让「只读」成为一个可以静态判定的规则（看头就知道），而不是「看来源 IP 猜」。本机用户要写配置，用 App（会拿 Bearer）或 CLI。
 
 **密码**
 
@@ -719,7 +721,7 @@ v1.14 写的是「用 `ssh-keygen -t ed25519` 生成」，那条在「用户有�
 3. POST /admin/api/login {challenge_id, password, device_id, signature}
    → 先验密码（常数时间），再验签名
    → 两者都过：有设备签名（或回环 + X-AC-Client: cli）→ access_token(15min) + refresh_token(30d)
-     浏览器来源（无签名、无该头）→ 只设 __Host-ac_admin cookie（只读），响应体不含 token
+     浏览器来源（无签名、无该头）→ 只设 __Host-ac_admin cookie（**管理面**只读），响应体不含 token
    → 任一失败：401 AUTH_FAILED，challenge 立即作废
 
 4. 回环来源可省略 device_id/signature（但仍必须密码）

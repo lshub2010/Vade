@@ -6,7 +6,7 @@
 | 波次 | W5 |
 | 依赖 | **C-09 `Skin.kt` 冻结**（U1 第 3 天）、C0c 的版本矩阵 |
 | 目录所有权 | `ui/composeApp/src/commonMain/kotlin/skin/miuix/` |
-| 产出 | 7 个组件 + 三端 9 张验收截图 |
+| 产出 | **11 个组件**（D93：原 7 + `MessageBubble`/`AttachmentChip`/`ToolCallCard`/`InputBar`）+ 三端 9 张验收截图 |
 | 出口 | 独立验收：miuix × 3 底栏 × 3 平台全部通过 |
 
 ## 一、一句话任务
@@ -17,7 +17,7 @@
 
 | 做 | 不做 |
 |---|---|
-| 实现 `Skin` 的 7 个组件 + 4 组 token | 不改 `Skin.kt`（要改就 RFC） |
+| 实现 `Skin` 的 **11 个组件** + 4 组 token（新增 4 个只要求默认/禁用/错误三态） | 不改 `Skin.kt`（要改就 RFC） |
 | 三端密度适配、模糊底栏 | 不改业务页面、不改构建文件（依赖 U1 已加） |
 | 版本锁定与 API 变更隔离 | 不重写 Miuix 源码 |
 | 9 张截图（3 平台 × 3 底栏） | 不做 glass（U3）、不做 iOS（U4） |
@@ -73,7 +73,7 @@ object MiuixTokens {
 - 颜色只用语义名（`surface`, `onSurface`, `primary`, `danger`…），不散落硬编码色值。
 - 深色模式必须一起做（同一套语义，不同值）。
 
-### T2 · 7 个组件（3 天）
+### T2 · 11 个组件（3 天；新增 4 个只做三态）
 
 | 组件 | 要点 |
 |---|---|

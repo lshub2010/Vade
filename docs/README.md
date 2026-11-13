@@ -7,7 +7,7 @@
 | 项 | 值 |
 |---|---|
 | 文档版本 | v1.18（2026-11-12） |
-| 需求基线 | `requirements.md` v1.0 + AMEND-01～20，86 条决策（D1–D86） |
+| 需求基线 | `requirements.md` v1.0 + AMEND-01～22，105 条决策（D1–D105） |
 | 方案 | `design.md` v1.18 |
 | 状态 | 设计与任务书已就绪，**代码未开工** |
 
@@ -25,11 +25,12 @@
 
 | 文件 | 作用 |
 |---|---|
-| `requirements.md` | 需求冻结基线、AMEND 明细、86 条决策台账、工程约定 |
+| `requirements.md` | 需求冻结基线、AMEND 明细、105 条决策台账、工程约定 |
 | `design.md` | 10 个 core 主组件 + skill-loader 子模块、协议 v1、扩展点三层、记忆两层与自进化、加密、鉴权、UI、6 个模块、配置页拓扑、23 个批次 |
 | `OVERVIEW.md` | 一页看全的总览（Markdown 源） |
 | `overview.html` | 总览的渲染版（含架构图、协议帧、SDK 分层、拓扑示意、并行树） |
 | `status.md` | 批次台账、里程碑、阻塞项 |
+| `dev-windows.md` | Windows 开发环境：五项工具链的位置、重建协议 dll、代理与平台差异 |
 | `agents/README.md` | 23 份开发任务书 + 3 份审查任务书的索引 |
 | `agents/00-orchestration.md` | 编排手册：波次、派活模板、审查、返工、合并门禁 |
 | `agents/01-contracts.md` | 契约台账：18 个契约、错误码、目录所有权、RFC 流程 |

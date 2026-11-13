@@ -6,7 +6,7 @@
 | 波次 | W5 |
 | 依赖 | **C-09 `Skin.kt` 冻结**、C0c 的版本矩阵 |
 | 目录所有权 | `ui/composeApp/src/commonMain/kotlin/skin/glass/` |
-| 产出 | 7 个组件 + 9 张截图 + 给 U4 的 `GLASS_SPEC.md` |
+| 产出 | **11 个组件**（D93：原 7 + `MessageBubble`/`AttachmentChip`/`ToolCallCard`/`InputBar`）+ 9 张截图 + 给 U4 的 `GLASS_SPEC.md` |
 | 出口 | 独立验收：glass × 3 底栏 × 3 平台；Android 12- 不崩不白屏 |
 
 ## 一、一句话任务
@@ -17,7 +17,7 @@
 
 | 做 | 不做 |
 |---|---|
-| 7 个组件 + glass token | 不改 `Skin.kt`、业务页面、构建文件 |
+| **11 个组件** + glass token（新增 4 个只要求默认/禁用/错误三态） | 不改 `Skin.kt`、业务页面、构建文件 |
 | Android AGSL 折射 + 降级 | 不做 miuix（U2） |
 | Desktop/Web 模糊（不折射） | 不做 iOS 实现（U4），只给 spec |
 | 性能保护与降级开关 | 不引第二个模糊库（用 U1 预置的 haze） |
@@ -78,7 +78,7 @@ fun GlassSurface(modifier: Modifier, shape: Shape, content: @Composable () -> Un
 }
 ```
 
-### T2 · 7 个组件（3 天）
+### T2 · 11 个组件（3 天；新增 4 个只做三态）
 
 - `Button`：胶囊；主操作用 tint 更实的玻璃；危险操作用红色 tint（不让玻璃把红色冲淡）。
 - `TextField`：玻璃底 + 内描边；聚焦时描边加亮。

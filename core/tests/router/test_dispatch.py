@@ -206,3 +206,17 @@ def test_validate_arguments_required_and_types():
     assert validate_arguments(schema, {}) == "missing required argument 'n'"
     assert validate_arguments(schema, {"n": "x"}) == "argument 'n' must be integer"
     assert validate_arguments(schema, {"n": 1}) is None
+
+
+def test_clear_cancelled_forgets_only_that_turn():
+    router = Router(FakeCaller(), _registry(make_manifest()))
+    router.cancel_turn("turn-1")
+    router.cancel_turn("turn-2")
+    assert router.was_cancelled("turn-1") is True
+
+    router.clear_cancelled("turn-1")
+    assert router.was_cancelled("turn-1") is False
+    assert router.was_cancelled("turn-2") is True  # other turns are untouched
+
+    router.clear_cancelled("never-seen")  # idempotent: no key error, no flag
+    assert router.was_cancelled("never-seen") is False

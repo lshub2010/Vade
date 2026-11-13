@@ -1,0 +1,10 @@
+# Host-specific, never committed.
+# The SDK location comes from ANDROID_HOME (or sdk.dir in an untracked
+# local.properties) so the same tree builds on Windows and Linux.
+local.properties
+.gradle/
+build/
+node_modules/
+kotlin-js-store/
+# Runtime classpath dump used by the window-capture loop (RESULT.md §十一).
+cp.txt

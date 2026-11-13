@@ -130,9 +130,9 @@
 | `core/vade/events/`、`skill/proposal.py` | C3d | 只读 |
 | `core/vade/policy/`、`audit/`、`admin/` | C5a | 只读 |
 | `sdk/python/` | C4 | 只读 |
-| `modules/<name>/` | 对应 M 代理 | 只读 |
-| `modules/memory/`（含 `manifest.json`、建表 SQL、`evolve/` 空包预置） | **M4a** | M4b 只写 `evolve/` 内已存在的文件，不改 manifest 与 store |
-| `modules/memory/src/memory_module/evolve/` | M4b（内容） | 目录骨架由 M4a 在 W5 预置 |
+| `vade-module-<name>`（独立仓） | 对应 M 代理 | 主仓只读（主仓不含模块源码） |
+| `vade-module-memory`（独立仓，含 `manifest.json`、建表 SQL、`evolve/` 空包预置） | **M4a** | M4b 只写 `evolve/` 内已存在的文件，不改 manifest 与 store |
+| `vade-module-memory/src/memory_module/evolve/` | M4b（内容） | 目录骨架由 M4a 在 W5 预置 |
 | `ui/shared/`、`ui/composeApp/src/commonMain/kotlin/core/`、`skin/material/`、`skin/Skin.kt`、`skin/SkinRegistry.kt` | U1 | 只读 |
 | `ui/composeApp/src/*Main/{android,desktop,wasmJs}/`（仅 `skin/glass/` 子树） | U3 | 树其余部分归 U1 |
 | `ui/shots/`（`material/` / `miuix/` / `glass/` 三个子目录各自归属） | U1 / U2 / U3 | F1 只读汇总 |

@@ -4,3 +4,6 @@ starlette==1.10.0
 websockets==17.4
 # C-11 SKILL.md frontmatter parsing (docs/agents/23 §四: yaml.safe_load only)
 pyyaml==6.0.3
+# C5a admin password hashing (31-C5a §T4 ②: Argon2id m=64MiB,t=3,p=1)
+# Added by C5a after a dependency-availability check; not a C2-side change.
+argon2-cffi==25.1.0

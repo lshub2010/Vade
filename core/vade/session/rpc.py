@@ -128,7 +128,13 @@ class SessionRPC:
         port = self._approval()
         if port is None or not hasattr(port, "decide"):
             raise VadeError("NOT_FOUND", "no approval port is installed")
-        resolved = port.decide(request_id, decision, scope, by=getattr(connection, "device_id", None) or "admin")
+        # Map the authenticated connection to an approver kind explicitly: the
+        # port's default is fail-closed, so relying on it here would refuse a
+        # legitimate device. The two modes are exactly ALLOWED_APPROVER_KINDS.
+        actor_kind = "device_key" if auth_mode == "device_key" else "loopback_admin"
+        resolved = port.decide(request_id, decision, scope,
+                               by=getattr(connection, "device_id", None) or "admin",
+                               actor_kind=actor_kind)
         if inspect.isawaitable(resolved):
             resolved = await resolved
         ok = True

@@ -1,0 +1,1465 @@
+openapi: 3.1.0
+info:
+  title: Vade admin plane API
+  version: 1.0.0
+  x-contract-id: C-08
+  x-owner: C5a
+  x-status: frozen
+  x-frozen-at: "2026-11-13"
+  x-consumers: [C5b, F1, U1]
+  description: |
+    管理面契约。**独立 listener**：`https://127.0.0.1:8444`，不与数据面 `:8443` 同源——
+    数据面上跑的是 `ui` 模块的第三方代码，同源等于把 `/admin/api/nodes`、审计和吊销接口
+    交给一个 XSS。`GET :8443/admin` 必须 404。
+
+    ## 会话模型
+    | mode | 凭据 | 权限 |
+    |---|---|---|
+    | `device` | `Authorization: Bearer`（access 15min / refresh 30d） | 全功能 |
+    | `browser` | `__Host-ac_admin` cookie（仅密码） | **只读**；已认证的非 GET 业务请求 → `403 READ_ONLY_SESSION` |
+
+    非回环**写操作**一律要求设备挑战签名（双因素）；远程仅密码只能拿到只读的 `browser` 会话。
+    拒绝理由只有 `AUTH_FAILED` 一种，不区分「密码错 / 设备未登记 / 签名错」。
+
+    ## 闸门顺序
+    `GET /admin/setup` 在非回环且未解锁时 **只** 返回 `{setup_required, requires_token}`；
+    `bind_url` / `fp8` / `acs_` 只能经 `POST /admin/setup/unlock` 换取。二维码的闸在 unlock，
+    不在前端是否渲染。
+
+    ## 错误
+    统一 `{code, message}`，`code` 只能是 `schema/errors.json` 的 33 个之一（`ErrorCode`）。
+    `message` ≤ 300 字符，绝不回显密钥、token 或原始异常文本。
+
+    ## 实现状态
+    标记 `x-vade-implemented: false` 的操作已在契约中冻结、实现返回 `501 UNSUPPORTED`——
+    C5b / F1 可照契约写 mock，不会因为本批没写完而改契约。
+servers:
+  - url: https://127.0.0.1:8444
+    description: admin plane（默认回环；`--admin-bind` 才对外，对外必须 TLS）
+security:
+  - bearerAuth: []
+  - cookieAuth: []
+tags:
+  - name: setup
+    description: 首次配置；只在未初始化时可用
+  - name: auth
+    description: 密码 + 设备挑战签名
+  - name: devices
+    description: 已登记设备（公钥永不返回）
+  - name: nodes
+    description: 模块/节点治理（数据来自 C2 registry 查询面）
+  - name: invites
+    description: 配对码（一个码只服务一个用途）
+  - name: audit
+    description: 只追加审计
+  - name: governance
+    description: 配置、布局、技能、记忆
+  - name: stream
+    description: SSE
+
+paths:
+  # ------------------------------------------------------------------ setup
+  /admin/setup:
+    get:
+      tags: [setup]
+      summary: 首次配置状态（二维码的闸门）
+      security: []
+      responses:
+        "200":
+          description: |
+            未初始化 + 回环 → 含 `bind_url` 与 `fp8`；
+            未初始化 + 非回环 + 未解锁 → **只有** `requires_token`；
+            未初始化 + 已解锁 → 含 `bind_url` 与 `fp8`；
+            已初始化 → **302 `/login`**（不返回 JSON）。
+          headers:
+            Location:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SetupState"}
+        "302":
+          description: 已初始化，跳转 `/login`
+    post:
+      tags: [setup]
+      summary: 初始化（电脑路径）
+      security: []
+      description: |
+        回环免 token；非回环缺/错 `setup_token` → `401 SETUP_UNAUTHORIZED`。
+        写入顺序：先 `admin.json`（tmp + `os.replace`）→ 再 unlink `setup.token`。
+        已初始化后本端点 404（残留 token 文件也不认）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                setup_token: {type: string, description: "`acs_` + 43 字符；只从 body 读"}
+                password: {type: string, minLength: 12}
+                pubkey: {type: string, description: "可选；P-256 65B base64 或 ssh-ed25519 行"}
+                alg: {type: string, enum: [p256, ed25519]}
+              required: [password]
+              additionalProperties: false
+      responses:
+        "200":
+          description: 已初始化
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  initialized: {type: boolean}
+                  device: {$ref: "#/components/schemas/Device"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /admin/setup/unlock:
+    post:
+      tags: [setup]
+      summary: 用 setup token 解锁二维码（唯一的闸）
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                setup_token: {type: string}
+              required: [setup_token]
+              additionalProperties: false
+      responses:
+        "200":
+          description: 解锁成功；同时下发 `__Host-ac_setup`（10 分钟、HttpOnly、SameSite=Strict、仅 setup 路由）
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+              description: "__Host-ac_setup=…; Secure; HttpOnly; SameSite=Strict; Path=/"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bind_url: {type: string, format: uri}
+                  fp8: {type: string, pattern: "^[0-9a-f]{16}$"}
+                  expires_at: {type: integer}
+                required: [bind_url, fp8, expires_at]
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "429": {$ref: "#/components/responses/TooManyRequests"}
+
+  # ------------------------------------------------------------------- bind
+  /admin/bind/info:
+    get:
+      tags: [setup]
+      summary: 绑定问候（App 用已 pin 的 core_pub 验 hello_sig）
+      security: []
+      parameters:
+        - name: X-Bind-Ticket
+          in: header
+          required: true
+          schema: {type: string, pattern: "^[A-Z2-9]{26}$"}
+      responses:
+        "200":
+          description: 票有效
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BindInfo"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /admin/bind:
+    post:
+      tags: [setup]
+      summary: 绑定设备（信封加密；先验后删）
+      security: []
+      x-vade-implemented: false
+      description: |
+        `{ticket, eph_pub, nonce, ct}`，ticket 明文，其余在密文里。
+        AAD = `"vade-bind-v1" ‖ fp8 ‖ SHA256(ticket) ‖ challenge ‖ kex_pub`。
+        未初始化时同时完成 setup。**失败不消费票**（先验后删）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/BindRequest"}
+      responses:
+        "200":
+          description: 绑定成功，返回 Bearer 会话（`mode=device`）
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TokenPair"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  # ------------------------------------------------------------------- auth
+  /admin/api/login/challenge:
+    post:
+      tags: [auth]
+      summary: 取挑战（无鉴权）
+      security: []
+      description: |
+        60s 一次性，绑定 `challenge_id` + 来源 IP `/24` + 设备表版本。
+        **不绑 TLS session id**（HTTP/2 连接池下不唯一）。
+      responses:
+        "200":
+          description: 挑战与已登记设备（不含公钥）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  challenge_id: {type: string}
+                  challenge: {type: string, description: "base64(32B)"}
+                  expires_at: {type: integer}
+                  devices:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        device_id: {type: string}
+                        label: {type: string}
+                        fp8: {type: string}
+                        alg: {type: string, enum: [p256, ed25519]}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "429": {$ref: "#/components/responses/TooManyRequests"}
+  /admin/api/login:
+    post:
+      tags: [auth]
+      summary: 登录（密码 + 可选设备签名）
+      security: []
+      description: |
+        签名对象 = `"vade-admin-v2\n" ‖ challenge(b64) ‖ "\n" ‖ admin_origin`。
+        先验密码（常数时间），再验签名（按 `alg` 分派；P-256 必须拒 high-S）。
+        任一失败 `401 AUTH_FAILED`，challenge 立即作废，计数合并（防探测）。
+
+        - 回环 + `X-AC-Client: cli` → `mode=device`，返回 Bearer，**不设 cookie**。
+        - 回环无签名无该头 → `mode=browser`，**只 Set-Cookie，响应体无任何 token**。
+        - 非回环 + 密码 + 设备签名 → `mode=device`，返回 Bearer，**不设 cookie**。
+        - 非回环 + 仅密码 → `mode=browser` 只读会话（`403 READ_ONLY_SESSION` 于所有写操作）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                challenge_id: {type: string}
+                password: {type: string}
+                device_id: {type: string}
+                signature: {type: string, description: "base64"}
+              required: [challenge_id, password]
+              additionalProperties: false
+      responses:
+        "200":
+          description: |
+            `mode=device` → `{access_token, refresh_token, expires_in, mode}`，无 `Set-Cookie`；
+            `mode=browser` → `{mode, expires_in, csrf_token}` + `Set-Cookie: __Host-ac_admin=…`
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+              description: "仅 browser 模式：__Host- 前缀 + Secure + HttpOnly + SameSite=Strict + Path=/，不含 Domain"
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/TokenPair"
+                  - $ref: "#/components/schemas/BrowserSession"
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "429": {$ref: "#/components/responses/TooManyRequests"}
+  /admin/api/token/refresh:
+    post:
+      tags: [auth]
+      summary: 刷新 access（每次都要设备签名）
+      security: []
+      description: 签名内容含 `refresh_jti`；只偷到 refresh token 续不了期。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token: {type: string}
+                signature: {type: string}
+                device_id: {type: string}
+              required: [refresh_token, signature]
+      responses:
+        "200":
+          description: 新会话
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TokenPair"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /admin/api/logout:
+    post:
+      tags: [auth]
+      summary: 登出当前会话（browser 模式清 cookie）
+      responses:
+        "200":
+          description: 已登出
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Ok"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /admin/api/logout-all:
+    post:
+      tags: [auth]
+      summary: 吊销当前账户全部会话（含自己，用于「设备丢了」）
+      responses:
+        "200":
+          description: 已吊销
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  revoked: {type: integer}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /admin/api/password:
+    post:
+      tags: [auth]
+      summary: 改密（成功后吊销除当前外所有会话）
+      description: 密码最短 12 字符，拒绝常见弱密码表；`role` 不支持（v1 只有一个管理员）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                old_password: {type: string}
+                new_password: {type: string, minLength: 12}
+              required: [old_password, new_password]
+              additionalProperties: false
+      responses:
+        "200":
+          description: 已改密；返回当前会话的新 token
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TokenPair"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+
+  # ---------------------------------------------------------------- devices
+  /admin/api/devices:
+    get:
+      tags: [devices]
+      summary: 设备列表（**不返回公钥原文**）
+      responses:
+        "200":
+          description: 设备列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/Device"}
+                  max: {type: integer, const: 5}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [devices]
+      summary: 登记新设备（step-up：body 里必须是当前密码）
+      description: 上限 5 台，超出 `BIND_DEVICE_LIMIT`（不自动淘汰）。**不是匿名入口**。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password: {type: string}
+                pubkey: {type: string}
+                alg: {type: string, enum: [p256, ed25519]}
+                label: {type: string, maxLength: 64}
+                hardware_backed: {type: boolean}
+              required: [password, pubkey]
+              additionalProperties: false
+      responses:
+        "200":
+          description: 已登记
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Device"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /admin/api/devices/{id}/revoke:
+    post:
+      tags: [devices]
+      summary: 吊销设备并踢掉它换发的所有会话（立即生效）
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password: {type: string, description: "可选 step-up"}
+      responses:
+        "200":
+          description: 已吊销
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Ok"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /admin/api/devices/ticket:
+    post:
+      tags: [devices]
+      summary: 加一台新设备的绑定票（step-up）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password: {type: string}
+              required: [password]
+      responses:
+        "200":
+          description: 10 分钟一次性
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bind_ticket: {type: string, pattern: "^[A-Z2-9]{26}$"}
+                  bind_url: {type: string, format: uri}
+                  expires_at: {type: integer}
+                required: [bind_ticket, bind_url, expires_at]
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+
+  # ------------------------------------------------------------------ nodes
+  /admin/api/nodes:
+    get:
+      tags: [nodes]
+      summary: 节点列表（字段白名单）
+      description: |
+        字段白名单：id, kind, module_id, instance_id, label, capabilities, state, endpoint,
+        protocol, version, auth_mode, rtt_ms, last_seen, x, y, revoked, tool_count, tool_names。
+        `endpoint` 只保留 `scheme://host:port`；不透传 manifest、公钥、PSK、pair_code、header。
+      responses:
+        "200":
+          description: 节点列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/Node"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /admin/api/nodes/{id}:
+    get:
+      tags: [nodes]
+      summary: 单节点详情
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "200":
+          description: 节点
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Node"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      tags: [nodes]
+      summary: 启用/停用、并发模型覆盖、risk 覆盖
+      description: |
+        响应必须含影响面 `impact` 与 `audit_id`——C5b 的确认弹窗不能前端自己数。
+        降低 risk → `403 RISK_DOWNGRADE_FORBIDDEN`。
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: {type: boolean}
+                concurrency: {type: string, enum: [exclusive, pooled, mirrored]}
+                risk:
+                  type: object
+                  additionalProperties: {type: string, enum: [low, medium, high]}
+                label: {type: string, maxLength: 64}
+              additionalProperties: false
+      responses:
+        "200":
+          description: 已应用
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  id: {type: string}
+                  impact: {$ref: "#/components/schemas/Impact"}
+                  audit_id: {type: string}
+                required: [ok, impact]
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /admin/api/nodes/{id}/revoke:
+    post:
+      tags: [nodes]
+      summary: 吊销节点（破坏性）
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "200":
+          description: 已吊销
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  connections_closed: {type: integer}
+                  audit_id: {type: string}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /admin/api/nodes/{id}/disconnect:
+    post:
+      tags: [nodes]
+      summary: 断开并等待重连
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "200":
+          description: 已断开
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Ok"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # ---------------------------------------------------------------- invites
+  /admin/api/invites:
+    post:
+      tags: [invites]
+      summary: 创建邀请位（pair_code 明文**仅此一次**）
+      description: |
+        `purpose=module` 必须带 `module_id`；一个码只服务一个用途（`module` 走 XX 配对，
+        `browser` 换 cookie）。响应还要带 `node_id`，模块接入时绑同一个节点，
+        否则画布会多出节点。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                purpose: {type: string, enum: [module, browser], default: module}
+                module_id: {type: string}
+                ttl: {type: integer, default: 600}
+              additionalProperties: false
+      responses:
+        "200":
+          description: 邀请位
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invite_id: {type: string}
+                  pair_code: {type: string}
+                  purpose: {type: string}
+                  node_id: {type: [string, "null"]}
+                  expires_at: {type: integer}
+                  qr_payload: {type: string}
+                required: [invite_id, pair_code, purpose, expires_at]
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /admin/api/invites/{id}:
+    delete:
+      tags: [invites]
+      summary: 撤销邀请
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: 已撤销
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Ok"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # ------------------------------------------------------------------ audit
+  /admin/api/audit:
+    get:
+      tags: [audit]
+      summary: 审计查询 / 回放
+      description: 只返回 digest 与脱敏后的参数，**不返回参数原文**。`turn_id` 用于按轮次回放。
+      parameters:
+        - {name: from, in: query, schema: {type: number}}
+        - {name: to, in: query, schema: {type: number}}
+        - {name: module_id, in: query, schema: {type: string}}
+        - {name: kind, in: query, schema: {type: string}}
+        - {name: turn_id, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, maximum: 500, default: 100}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        "200":
+          description: 审计页
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/AuditRow"}
+                  next_cursor: {type: [string, "null"]}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /admin/api/approvals/decide:
+    post:
+      tags: [audit]
+      summary: 审批决定（扩展端点；规范路径是 C3 的 `approval/decide` RPC）
+      x-vade-extension: true
+      description: |
+        `by` 由服务端从会话推导，**不接受客户端自报**。`browser` 会话在到达这里之前就被
+        `READ_ONLY_SESSION` 拒绝；即使绕过，`actor_kind=browser_session` 也会得到
+        `403 APPROVER_INVALID`。重复决定 → `409`（`INVALID_ARGUMENT`，已解析）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                request_id: {type: string}
+                decision: {type: string, enum: [allow, deny]}
+                scope: {type: string, enum: [once, session], default: once}
+              required: [request_id, decision]
+      responses:
+        "200":
+          description: 已解析
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  request_id: {type: string}
+                  decision: {type: string}
+                  by: {type: string}
+                  scope: {type: string}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  # --------------------------------------------------------------- config
+  /admin/api/config:
+    get:
+      tags: [governance]
+      summary: §7.9 白名单配置（密钥类一律不返回）
+      responses:
+        "200":
+          description: 配置项
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/ConfigItem"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    put:
+      tags: [governance]
+      summary: 改一项配置（未知键 400，危险项缺 confirm 409）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                key: {type: string}
+                value: {}
+                confirm: {type: boolean}
+              required: [key, value]
+              additionalProperties: false
+      responses:
+        "200":
+          description: 已应用或需重启
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  applied: {type: boolean}
+                  needs_restart: {type: boolean}
+                  audit_id: {type: string}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /admin/api/config/usage:
+    get:
+      tags: [governance]
+      summary: 今日用量（不含任何记忆内容）
+      responses:
+        "200":
+          description: 用量
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  day: {type: string}
+                  tokens_used: {type: integer}
+                  tokens_budget: {type: integer}
+                  reviews_today: {type: integer}
+                  proposals_today: {type: integer}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  # --------------------------------------------------------------- layout
+  /admin/api/layout:
+    get:
+      tags: [governance]
+      summary: 全量布局
+      responses:
+        "200":
+          description: 布局
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Layout"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    patch:
+      tags: [governance]
+      summary: 保存布局（冲突 409；**L1 布局含 label 不记审计**）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rev: {type: integer}
+                nodes:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id: {type: string}
+                      x: {type: number}
+                      y: {type: number}
+                      label: {type: [string, "null"]}
+                      group_id: {type: [string, "null"]}
+                    required: [id]
+              required: [nodes]
+      responses:
+        "200":
+          description: 新布局
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Layout"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /admin/api/layout/auto:
+    post:
+      tags: [governance]
+      summary: 力导向重算并落库（服务端算，前端不兜底）
+      responses:
+        "200":
+          description: 新布局
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Layout"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+
+  # --------------------------------------------------------------- skills
+  /admin/api/skills:
+    get:
+      tags: [governance]
+      summary: skill 列表
+      x-vade-implemented: false
+      description: |
+        `status ∈ {active, pending, disabled, stale, unavailable}`；`rejected` 是目录不是状态。
+        数据必须来自 C3b 的 `SkillLoader.list_all`——禁止自己解析 SKILL.md frontmatter。
+      responses:
+        "200":
+          description: 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/SkillSummary"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+  /admin/api/skills/install/preview:
+    post:
+      tags: [governance]
+      summary: 安装预检（不落盘）
+      x-vade-implemented: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                source: {type: string, enum: [upload, url]}
+                content: {type: string}
+                url: {type: string}
+              required: [source]
+      responses:
+        "200":
+          description: 预检结果（frontmatter、正文摘要、requires_tools 可用性、重名冲突、preview_token 60s 一次性）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  preview_token: {type: string}
+                  name: {type: string}
+                  frontmatter: {type: object}
+                  excerpt: {type: string}
+                  missing_tools:
+                    type: array
+                    items: {type: string}
+                  conflict: {type: boolean}
+                required: [preview_token]
+        "501": {$ref: "#/components/responses/NotImplemented"}
+  /admin/api/skills/install:
+    post:
+      tags: [governance]
+      summary: 安装到 `skills/pending/`（无 preview_token 一律拒绝；装完不生效）
+      x-vade-implemented: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                preview_token: {type: string}
+              required: [preview_token]
+      responses:
+        "200":
+          description: 已落到 pending，`status=pending`
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SkillSummary"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+  /admin/api/skills/{name}:
+    get:
+      tags: [governance]
+      summary: skill 详情（含后端算好的 diff）
+      x-vade-implemented: false
+      parameters:
+        - $ref: "#/components/parameters/Name"
+      responses:
+        "200":
+          description: 详情
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  revision: {type: integer}
+                  status: {type: string}
+                  body: {type: string}
+                  pending_diff: {type: [string, "null"]}
+                  history:
+                    type: array
+                    items: {type: object}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+    patch:
+      tags: [governance]
+      summary: 启停（只改 meta.json，不改 frontmatter；与 approve 是两件事）
+      x-vade-implemented: false
+      parameters:
+        - $ref: "#/components/parameters/Name"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: {type: string, enum: [active, disabled]}
+              required: [status]
+      responses:
+        "200":
+          description: 已更新
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SkillSummary"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+    delete:
+      tags: [governance]
+      summary: 卸载（移到 `.trash/<name>-<ts>/`，可恢复）
+      x-vade-implemented: false
+      parameters:
+        - $ref: "#/components/parameters/Name"
+      responses:
+        "200":
+          description: 已移入回收站
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Ok"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+  /admin/api/skills/{name}/approve:
+    post:
+      tags: [governance]
+      summary: 提案转正（install 与 proposal 共用；rev+1 + .history/ + 热加载）
+      x-vade-implemented: false
+      parameters:
+        - $ref: "#/components/parameters/Name"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                revision: {type: integer}
+              required: [revision]
+      responses:
+        "200":
+          description: 已转正
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SkillSummary"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+  /admin/api/skills/{name}/reject:
+    post:
+      tags: [governance]
+      summary: 驳回（移到 `.rejected/`，7 天清理）
+      x-vade-implemented: false
+      parameters:
+        - $ref: "#/components/parameters/Name"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                revision: {type: integer}
+                reason: {type: string}
+              required: [revision, reason]
+      responses:
+        "200":
+          description: 已驳回
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Ok"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+  /admin/api/skills/{name}/rollback:
+    post:
+      tags: [governance]
+      summary: 回滚（复制旧版 + rev+1，不删历史）
+      x-vade-implemented: false
+      parameters:
+        - $ref: "#/components/parameters/Name"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                to_revision: {type: integer}
+              required: [to_revision]
+      responses:
+        "200":
+          description: 已回滚
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SkillSummary"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  # --------------------------------------------------------------- memory
+  /admin/api/memory:
+    get:
+      tags: [governance]
+      summary: 记忆分页（只返回条目，不含原始对话）
+      x-vade-implemented: false
+      description: 必须经 C3 的 `MemoryPort.admin_list`；禁止 `import memory_module` 或直连 `memory.db`。
+      parameters:
+        - {name: layer, in: query, schema: {type: string, enum: [session, global]}}
+        - {name: namespace, in: query, schema: {type: string}}
+        - {name: status, in: query, schema: {type: string, enum: [staging, active, archived, superseded]}}
+        - {name: from, in: query, schema: {type: number}}
+        - {name: to, in: query, schema: {type: number}}
+        - {name: q, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, default: 50}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        "200":
+          description: 记忆页
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/MemoryItem"}
+                  next_cursor: {type: [string, "null"]}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+  /admin/api/memory/stats:
+    get:
+      tags: [governance]
+      summary: 记忆配额
+      x-vade-implemented: false
+      responses:
+        "200":
+          description: 统计
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  global_count: {type: integer}
+                  global_limit: {type: integer}
+                  staging_count: {type: integer}
+                  archived_count: {type: integer}
+                  oldest_at: {type: [number, "null"]}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+  /admin/api/memory/{id}:
+    get:
+      tags: [governance]
+      summary: 记忆详情（含 supersedes 链）
+      x-vade-implemented: false
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: 详情
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MemoryItem"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+    patch:
+      tags: [governance]
+      summary: 不存在（禁止编辑记忆原文）
+      x-vade-implemented: false
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "405":
+          description: 没有这个端点
+  /admin/api/memory/{id}/promote:
+    post:
+      tags: [governance]
+      summary: staging → active（写审计）
+      x-vade-implemented: false
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: 已晋升
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Ok"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+  /admin/api/memory/{id}/archive:
+    post:
+      tags: [governance]
+      summary: 归档（必填理由，可恢复，写审计）
+      x-vade-implemented: false
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: {type: string}
+              required: [reason]
+      responses:
+        "200":
+          description: 已归档
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Ok"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+  /admin/api/memory/{id}/restore:
+    post:
+      tags: [governance]
+      summary: archived → active（写审计）
+      x-vade-implemented: false
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: 已恢复
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Ok"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  # --------------------------------------------------------------- stream
+  /admin/api/stream:
+    get:
+      tags: [stream]
+      summary: "SSE（`Last-Event-ID` 续传；15s `: ping`）"
+      description: |
+        事件格式 `id: <seq>\ndata: <json>\n\n`；增量事件 `node.upsert` / `edge.state` / `node.remove`。
+        **序号复用 C3 的 replay seq**，不另造一套。记忆内容不进 SSE。
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: {type: string}
+      responses:
+        "200":
+          description: 事件流
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /admin/api/health:
+    get:
+      tags: [stream]
+      summary: 探活（无鉴权）
+      security: []
+      description: 回环 → `{ok, version, e2e_enabled}`；对外绑定 → **只** `{ok:true}`（不泄露版本）。
+      responses:
+        "200":
+          description: 存活
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {const: true}
+                  version: {type: string}
+                  e2e_enabled: {type: boolean}
+                required: [ok]
+
+components:
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    Name:
+      name: name
+      in: path
+      required: true
+      schema: {type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,63}$"}
+    NodeId:
+      name: id
+      in: path
+      required: true
+      description: "`<module_id>#<instance_id>`"
+      schema: {type: string}
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 设备模式；全功能；access 15 分钟，refresh 30 天（刷新需设备签名）
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: __Host-ac_admin
+      description: 浏览器模式；**只读**。必须 `__Host-` 前缀，非该前缀的 cookie 一律不认
+  schemas:
+    Ok:
+      type: object
+      properties:
+        ok: {type: boolean}
+        audit_id: {type: string}
+      required: [ok]
+    Error:
+      type: object
+      properties:
+        code: {$ref: "#/components/schemas/ErrorCode"}
+        message: {type: string, maxLength: 300}
+      required: [code, message]
+      additionalProperties: false
+    ErrorCode:
+      type: string
+      description: C-04 的 33 个码；模块/管理面都不得新造。
+      enum:
+        - INVALID_ARGUMENT
+        - NOT_FOUND
+        - PERMISSION_DENIED
+        - TIMEOUT
+        - CANCELLED
+        - UNAVAILABLE
+        - OVERLOADED
+        - MEMORY_FULL
+        - PAYLOAD_TOO_LARGE
+        - UNSUPPORTED
+        - PROTOCOL_MISMATCH
+        - MANIFEST_INVALID
+        - TOOL_CONFLICT
+        - RISK_DOWNGRADE_FORBIDDEN
+        - APPROVER_INVALID
+        - ORIGIN_MISMATCH
+        - READ_ONLY_SESSION
+        - BIND_UNAUTHORIZED
+        - BIND_FINGERPRINT_MISMATCH
+        - BIND_HELLO_SIG_INVALID
+        - BIND_DEVICE_LIMIT
+        - BIND_CLOCK_SKEW
+        - BIND_KEY_UNSUPPORTED
+        - BIND_SETUP_LOCKED
+        - AUTH_FAILED
+        - ADMIN_LOCKED
+        - SETUP_UNAUTHORIZED
+        - MODULE_DRAINING
+        - INTERNAL
+        - CONFIRM_REQUIRED
+        - UNKNOWN_CONFIG_KEY
+        - CODE_INVALID
+        - CODE_EXPIRED
+    SetupState:
+      type: object
+      properties:
+        setup_required: {type: boolean}
+        requires_token: {type: boolean}
+        bind_url: {type: string, format: uri}
+        fp8: {type: string, pattern: "^[0-9a-f]{16}$"}
+        expires_at: {type: integer}
+      required: [setup_required]
+      additionalProperties: false
+      description: 非回环未解锁时**只有** `setup_required` 与 `requires_token`。
+    BindInfo:
+      type: object
+      properties:
+        core_pub: {type: string, description: "base64 raw Ed25519"}
+        fp8: {type: string, pattern: "^[0-9a-f]{16}$"}
+        kex_pub: {type: string}
+        challenge: {type: string}
+        setup_required: {type: boolean}
+        expires_at: {type: integer}
+        hello_sig: {type: string}
+      required: [core_pub, fp8, kex_pub, challenge, setup_required, expires_at, hello_sig]
+    BindRequest:
+      type: object
+      properties:
+        ticket: {type: string, pattern: "^[A-Z2-9]{26}$"}
+        eph_pub: {type: string}
+        nonce: {type: string}
+        ct: {type: string}
+      required: [ticket, eph_pub, nonce, ct]
+      additionalProperties: false
+    TokenPair:
+      type: object
+      properties:
+        access_token: {type: string}
+        refresh_token: {type: string}
+        expires_in: {type: integer, const: 900}
+        mode: {type: string, const: device}
+        csrf_token: {type: string}
+      required: [access_token, refresh_token, expires_in, mode]
+    BrowserSession:
+      type: object
+      description: 浏览器只读会话；**响应体不含任何 token**
+      properties:
+        mode: {type: string, const: browser}
+        expires_in: {type: integer}
+        csrf_token: {type: string}
+      required: [mode, expires_in]
+      additionalProperties: false
+    Device:
+      type: object
+      description: 列表视图；**不返回公钥原文**
+      properties:
+        device_id: {type: string}
+        label: {type: string}
+        alg: {type: string, enum: [p256, ed25519]}
+        fp8: {type: string}
+        hardware_backed: {type: boolean}
+        added_at: {type: number}
+        added_from_ip: {type: [string, "null"]}
+        last_used_at: {type: [number, "null"]}
+      required: [device_id, label, alg, fp8, hardware_backed, added_at]
+      additionalProperties: false
+    Node:
+      type: object
+      description: 白名单视图，唯一出口是 `to_public_view`
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [module, device]}
+        module_id: {type: string}
+        instance_id: {type: string}
+        label: {type: [string, "null"]}
+        capabilities:
+          type: array
+          items: {type: string}
+        state: {type: string, enum: [online, offline, pending, degraded, rejected]}
+        endpoint:
+          type: [string, "null"]
+          description: "只保留 scheme://host:port；userinfo/query/fragment 被丢弃"
+        protocol: {type: string, const: vade/v1}
+        version: {type: [string, "null"]}
+        auth_mode: {type: string, enum: [module_key, device_key, browser_session]}
+        rtt_ms: {type: [number, "null"]}
+        last_seen: {type: [number, "null"]}
+        x: {type: [number, "null"]}
+        y: {type: [number, "null"]}
+        revoked: {type: boolean}
+        tool_count: {type: integer}
+        tool_names:
+          type: array
+          items: {type: string}
+      required: [id, kind, module_id, instance_id, state, endpoint, revoked, tool_count, tool_names]
+      additionalProperties: false
+    Impact:
+      type: object
+      properties:
+        tool_count: {type: integer}
+        tool_names:
+          type: array
+          items: {type: string}
+        sessions_affected: {type: integer}
+        changes: {type: object}
+      required: [tool_count, tool_names, sessions_affected]
+    AuditRow:
+      type: object
+      properties:
+        id: {type: integer}
+        ts: {type: number}
+        kind: {type: string}
+        session_id: {type: [string, "null"]}
+        turn_id: {type: [string, "null"]}
+        module_id: {type: [string, "null"]}
+        instance_id: {type: [string, "null"]}
+        method: {type: [string, "null"]}
+        tool: {type: [string, "null"]}
+        duration_ms: {type: [number, "null"]}
+        status: {type: [string, "null"]}
+        code: {type: [string, "null"]}
+        request_id: {type: [string, "null"]}
+        actor: {type: [string, "null"], description: "确认人：设备 id / loopback_admin / system"}
+        args_digest: {type: [string, "null"]}
+        args_redacted:
+          type: [object, "null"]
+          description: 命中 password|token|secret|key|credential 的字段值替换为 `[redacted]`
+        extra: {type: object}
+    ConfigItem:
+      type: object
+      properties:
+        key: {type: string}
+        value: {}
+        default: {}
+        source: {type: string, enum: [default, core.toml, overrides, env, cli]}
+        mode: {type: string, enum: [hot, restart]}
+        min: {type: integer}
+        max: {type: integer}
+        values:
+          type: array
+          items: {type: string}
+      required: [key, value, default, source, mode]
+    Layout:
+      type: object
+      properties:
+        rev: {type: integer}
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: string}
+              x: {type: number}
+              y: {type: number}
+              label: {type: [string, "null"]}
+              group_id: {type: [string, "null"]}
+            required: [id, x, y]
+      required: [rev, nodes]
+    SkillSummary:
+      type: object
+      properties:
+        name: {type: string}
+        revision: {type: integer}
+        status: {type: string, enum: [active, pending, disabled, stale, unavailable]}
+        origin: {type: string}
+        created_by: {type: string}
+        derived_from: {type: [string, "null"]}
+      required: [name, revision, status]
+    MemoryItem:
+      type: object
+      description: 只有条目正文与指针；不含 user_text / assistant_text
+      properties:
+        id: {type: string}
+        text: {type: string}
+        layer: {type: string, enum: [session, global]}
+        namespace: {type: string}
+        status: {type: string, enum: [staging, active, archived, superseded]}
+        session_id: {type: [string, "null"]}
+        turn_id: {type: [string, "null"]}
+        created_at: {type: number}
+        expires_at: {type: [number, "null"]}
+        hit_count: {type: integer}
+        supersedes:
+          type: array
+          items: {type: string}
+      required: [id, layer, namespace, status, created_at]
+  responses:
+    BadRequest:
+      description: 参数不合法
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    Unauthorized:
+      description: 未认证 / 认证失败（`AUTH_FAILED`、`SETUP_UNAUTHORIZED`、`BIND_UNAUTHORIZED`）
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    Forbidden:
+      description: 已认证但越权（`READ_ONLY_SESSION`、`APPROVER_INVALID`、`ORIGIN_MISMATCH`、`RISK_DOWNGRADE_FORBIDDEN`）
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    NotFound:
+      description: 不存在（初始化前 `/admin/api/*` 也走这里）
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    Conflict:
+      description: 冲突（`CONFIRM_REQUIRED`、`BIND_DEVICE_LIMIT`、布局 rev 冲突、重复 decision）
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    TooManyRequests:
+      description: 限流（`ADMIN_LOCKED`、`OVERLOADED`）
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    NotImplemented:
+      description: 契约已冻结、实现未完成（`UNSUPPORTED`）
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}

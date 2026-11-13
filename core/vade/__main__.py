@@ -36,6 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command")
     admin = subparsers.add_parser("admin", add_help=False, help="admin CLI (owned by C5a)")
+    # `add_help=False` is needed so the subcommand flags reach REMAINDER untouched,
+    # but argparse then rejects a bare `--help` before REMAINDER starts. Accept it
+    # here and hand it to C5a's own parser instead of erroring with exit 2.
+    admin.add_argument("-h", "--help", action="store_true", dest="admin_help",
+                       help="show the admin CLI help")
     admin.add_argument("args", nargs=argparse.REMAINDER)
     admin.set_defaults(func=_admin_main)
     return parser
@@ -47,7 +52,8 @@ def _admin_main(args: argparse.Namespace) -> int:
     except ImportError:
         print("vade: admin module is not installed (C5a has not landed yet)", file=sys.stderr)
         return 2
-    return int(admin_main(args.args) or 0)
+    forwarded = ["--help"] if getattr(args, "admin_help", False) else args.args
+    return int(admin_main(forwarded) or 0)
 
 
 def _cli_overrides(args: argparse.Namespace) -> dict[str, Any]:

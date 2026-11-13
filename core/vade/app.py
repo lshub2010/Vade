@@ -46,6 +46,9 @@ class App:
         self.pairing: PairingStore | None = None
         self.registry: Registry | None = None
         self.registry_api: RegistryAPI | None = None
+        #: `router.ModuleCaller` protocol implementation, assigned by `startup()`
+        #: (C2) so C3's `install()` can build the Router instead of None.
+        self.module_caller: Any = None
         self.transport: Any = None
         self.crypto_gateway: Any = None
         self.heartbeat_interval_s = float(config.get("core.heartbeat_interval_s", 10))
@@ -88,6 +91,13 @@ class App:
         self.crypto_gateway = importlib.import_module("vade.crypto_gateway")
         if hasattr(self.crypto_gateway, "install"):
             self.crypto_gateway.install(self)
+        # The core->module RPC client is a transport capability (it needs the
+        # live connection table), so it is assembled here, before
+        # `install_components` builds C3's Router. Without it the router is None
+        # and every turn answers "no capability" — the gap the review found.
+        from .router.caller import ConnectionCaller
+
+        self.module_caller = ConnectionCaller(self._connections)
         self.started = True
 
     async def shutdown(self) -> None:
@@ -200,13 +210,21 @@ def make_rpc_handler(app: App) -> Any:
         method = message.get("method")
         params = message.get("params")
         if method is None:
-            return None  # a response or notification from the peer
+            # A response is not a request: `Connection` routes it to its own
+            # pending-request table before this handler is ever called.
+            return None
         if method == "module/register":
             return app.register_module(connection, params)
         if method == "module/capabilities.update":
             return app.update_module_capabilities(connection, params)
         if method == "module/heartbeat":
             return {}
+        # C3 publishes `app.session_handlers` (ui/attach, ui/submit, ...). One
+        # lookup here is the whole wire; otherwise ui/* is NOT_FOUND on a real
+        # socket and T6 only exists in unit tests.
+        session_handlers = getattr(app, "session_handlers", None) or {}
+        if method in session_handlers:
+            return await session_handlers[method](connection, params)
         return RpcError("NOT_FOUND", f"unknown method {method!r}")
 
     return handler

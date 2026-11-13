@@ -18,10 +18,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from vade.app import App, make_rpc_handler
+from vade.app import App, install_components, make_rpc_handler
 from vade.config import load_config
 from vade.identity.pairing import Purpose
 from vade.identity.store import load_or_create
+from vade.llm.mock import MockLLMProvider
 from vade.transport.server import CoreApp
 from vade.__main__ import build_module_crypto
 
@@ -41,6 +42,16 @@ def _load_fake_module():
     return module
 
 
+def _teardown(app: App) -> None:
+    async def run() -> None:
+        session = getattr(app, "session", None)
+        if session is not None:
+            await session.close()  # detach sinks, stop queue workers, close sqlite
+        await app.shutdown()
+
+    asyncio.run(run())
+
+
 @pytest.fixture()
 def live_core(tmp_path):
     import uvicorn
@@ -48,6 +59,10 @@ def live_core(tmp_path):
     config = load_config(cli={"core.data_dir": str(tmp_path), "core.listen": "127.0.0.1:0"})
     app = App(config)
     asyncio.run(app.startup())  # identity, whitelist, registry, pairing, transport facade
+    # Same second call `__main__._serve` makes: without it `app.session_handlers`
+    # does not exist and every `ui/*` method is NOT_FOUND on a real socket.
+    installed = install_components(app, strict=False)
+    assert {"session", "router"} <= installed, installed
 
     core_app = CoreApp(
         config=config,
@@ -84,7 +99,7 @@ def live_core(tmp_path):
     finally:
         server.should_exit = True
         thread.join(timeout=10)
-        asyncio.run(app.shutdown())
+        _teardown(app)
 
 
 def _hex_pub(identity) -> bytes:
@@ -225,3 +240,92 @@ def test_browser_session_ws_and_revoke_closes_only_that_device(live_core):
     finally:
         first.close()
         second.close()
+
+
+def _recv_until(ws, msg_id, timeout: float = 8.0):
+    """Read frames until the JSON-RPC reply with `msg_id`; collect events seen."""
+    events: list[dict] = []
+    while True:
+        message = json.loads(ws.recv(timeout=timeout))
+        if message.get("id") == msg_id:
+            return message, events
+        if message.get("method") == "event":
+            events.append(message)
+
+
+def _recv_event(ws, predicate, timeout: float = 8.0) -> dict:
+    while True:
+        message = json.loads(ws.recv(timeout=timeout))
+        if message.get("method") == "event" and predicate(message["params"]):
+            return message
+
+
+def _await_event(ws, predicate, already=(), timeout: float = 8.0) -> dict:
+    """Look in the frames already consumed, then keep reading the socket."""
+    for message in already:
+        if message.get("method") == "event" and predicate(message["params"]):
+            return message
+    return _recv_event(ws, predicate, timeout)
+
+
+def test_ui_attach_submit_detach_over_a_real_browser_socket(live_core):
+    """`ui/*` must work on a real WS, not only through a hand-built handler."""
+    from websockets.sync.client import connect
+
+    app, http_url, ws_url, _tmp = live_core
+    assert "ui/submit" in app.session_handlers
+    assert app.session_rpc is not None
+    # No model is needed: with no module online the loop answers honestly and
+    # the turn still completes, which is what proves the queue ran it.
+    app.loop.llm = MockLLMProvider([])
+
+    code = app.pairing.create(Purpose.BROWSER)
+    response = httpx.post(f"{http_url}/ui/session", json={"pair_code": code}, timeout=5)
+    assert response.status_code == 200, response.text
+    token = response.headers["set-cookie"].split("__Host-ac_ui=", 1)[1].split(";", 1)[0]
+
+    ws = connect(ws_url, additional_headers={"Cookie": f"__Host-ac_ui={token}"}, open_timeout=5)
+    try:
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ui/attach",
+                            "params": {"session_id": None}}))
+        reply, events = _recv_until(ws, 1)
+        assert "error" not in reply, reply
+        result = reply["result"]
+        session_id = result["session_id"]
+        assert result["from_seq"] >= 0
+        assert result["snapshot"]["session"]["id"] == session_id
+        assert result["snapshot"]["queue"]["pending"] == []
+        # The attach itself is an event on the same bus.
+        attached = _await_event(ws, lambda p: p["type"] == "session.attached", events)
+        assert attached["params"]["payload"]["snapshot"] is True
+
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "ui/submit", "params": {
+            "session_id": session_id, "client_msg_id": "m1",
+            "content": [{"type": "text", "text": "hello over the wire"}]}}))
+        reply, events = _recv_until(ws, 2)
+        assert "error" not in reply, reply
+        turn_id = reply["result"]["turn_id"]
+        assert reply["result"]["queue_pos"] == 1
+        queued = _await_event(
+            ws, lambda p: p["type"] == "turn.queued" and p["payload"]["turn_id"] == turn_id, events
+        )
+        assert queued["params"]["payload"]["state"] == "queued"
+
+        finished = _await_event(
+            ws, lambda p: p["type"] == "turn.completed" and p["payload"]["turn_id"] == turn_id, events
+        )
+        assert finished["params"]["payload"]["state"] == "completed"
+        persisted = [e.type for e in app.session_store.read_since(session_id, 0)]
+        assert "turn.completed" in persisted and "turn.queued" in persisted
+
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "ui/detach",
+                            "params": {"session_id": session_id}}))
+        reply, _ = _recv_until(ws, 3)
+        assert reply["result"] == {"ok": True}
+        # The second detach is an error the UI can render, not a silent success.
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 4, "method": "ui/detach",
+                            "params": {"session_id": session_id}}))
+        reply, _ = _recv_until(ws, 4)
+        assert reply["error"]["code"] == "NOT_FOUND"
+    finally:
+        ws.close()

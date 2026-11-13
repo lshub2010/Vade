@@ -7,7 +7,7 @@
 |---|---|---|---|---|---|---|---|---|
 | C0a | `c0a-uniffi` | 未开工 | — | — | — | — | 0 | 硬时限 3 天 |
 | C0b | `c0b-wasm` | 未开工 | — | — | — | — | 0 | 硬时限 3 天，出 ADR-001 |
-| C0c | `c0c-miuix` | 进行中 | —（分支 `tmp/c0c-miuix`） | — | — | — | 0 | **Android 侧阻塞**：Miuix 0.9.2～0.9.4 的 AAR 均要求 `minCompileSdk=37`，当前 AGP 8.8.2 无法使用 API 37（无裸 android-37 平台、`compileSdkVersion("android-37.0")` 被拒、目录联接被判 inconsistent）。已验：Desktop 无头 `ImageComposeScene` 渲染通过（8 张 `miuix-desktop-*.png`，**非窗口截图**；Dialog 那张只出触发按钮，真实窗口未跑）、Wasm 只验 `:composeApp:wasmJsBrowserProductionWebpack` 构建通过（**浏览器运行时未跑**；同界面替换口径下 `app.wasm` gzip 936,611 B vs Material 1,013,216 B，小 76,605 B；三皮肤共存增量需 U2 另测）。解除条件：升 AGP 8.13+/9.x + Gradle ≥8.14.4 后复跑 `assembleDebug`。证据 `spike/miuix/RESULT.md` |
+| C0c | `c0c-miuix` | 已合并 | `3c55e50`（merge，含 808189f / ee72a77） | — | R2 **fail→修正**（`../Vade-REVIEW-c0c-r2.md`） | — | 2 | **三端可行**。证据：16 张截图（8 张真实窗口 466×893 + 8 张无头 480×420，无手绘替身）；Android 需 **AGP 9.5.1 + Gradle 9.6.1 + compileSdk 37 + `android.builtInKotlin=false` + `android.newDsl=false`**，出 APK 13,575,772 B（compileSdk 37 / minSdk 24 / targetSdk 36）；Wasm 同界面替换口径 gzip 936,611 B vs Material 1,013,216 B（小 76,605 B，三皮肤共存增量需 U2 另测）；**OverlayDialog 归因已订正**：它只注册 DialogState，绘制由 `MiuixPopupHost` 完成，而 host 只在 Miuix `Scaffold` 内——脱离 Scaffold 时三端都不绘制（不等于 Desktop popup 缺陷）；真实形态是**底部 sheet**。未验：Wasm/Android 弹窗、Android 运行时、浏览器运行时、release 体积 |
 | C1 | `c1-protocol` | 未开工 | — | — | — | — | 0 | 冻结 C-01/C-02（**W1 末**）与 **C-15**（W1 第 2 天），C2 只消费 |
 | C2 | `c2-registry` | 未开工 | — | — | — | — | 0 | 冻结 C-03/04/05/**C-15**/**C-18**（W2 中，config schema） |
 | C3 | `c3-loop` | 未开工 | — | — | — | — | 0 | 冻结 C-06 |
@@ -37,6 +37,7 @@
 |---|---|---|---|---|
 | win-fix | 已合并 | `35c4dde`（merge，含 98617b8 / ccf79f0） | R1/R2 pass（报告：`../Vade-REVIEW-win-fix.md`） | 2026-11-13 换机 Windows 11 x86_64：uv 建 Python 3.12 venv、重编 `protocol/core/python/vade_protocol.dll`、两条 POSIX 权限位断言加 `os.name != "nt"` 守卫（Linux 仍校验）；全量 `pytest core/tests -q` → **378 passed**；环境见 `docs/dev-windows.md` |
 | req-amend | 已合并（文档） | `2fa5470` | 待审查（纯文档，无代码；`docs/check_docs.py` 12 项全绿） | **AMEND-21 客户端功能需求 52 条**（FR-8.26～8.77：M 41 / S 11），追加为 §8.21，不改原文；收敛出 9 族协议缺口（R1–R9，**RFC 编号待编排者分配**）与 8 条待裁定；已在 §8 汇总表登记 AMEND-21 行，`check_docs.py` C3 上限随之上调为 21、C6 增查「AMEND-01～20」，README/OVERVIEW/overview.html/agents 索引的口径同步为「AMEND-01～21」；C1/C2 仍钉 D=86 / AC=69，故本节**未**新增 AC 与 D 编号，待 AC 台账解冻后补 |
+| debt-a | 已合并 | `01e3d3d`（merge，含 3ef8a28 / 8fd0131 / a5da445 / 48d29c5 / 1902913 / 33de1a8） | R1+R2 **fail→返工→父验 pass**（`../Vade-REVIEW-debt-a.md`、`../Vade-REVIEW-debt-a-r2.md`） | 中断语义收口：turn 流所有写入统一经 `_turn_emit` 前置守卫（含 `turn.tool_call`）、已执行工具审计保留并标 `aborted:"interrupted"`、`_cancelled_turns` 按 turn 自身 task 释放（含 pre-task 窗口）、中断轮不再审计为 `turn_completed`；`_finalized`/`_cancel_fired` 有界；**384 passed**、contracts OK；RFC-0002 行号与登记方式订正 |
 
 ## 里程碑
 
@@ -53,7 +54,7 @@
 | # | 事项 | 状态 | 负责人 |
 |---|---|---|---|
 | 1 | W-A/W-B 裁决 | 待 C0b | `c0b-wasm` |
-| 2 | Miuix 三端可行性 | **已验（有保留）：Desktop 无头渲染、Wasm 构建；Android 待升 AGP**（C0c） | `c0c-miuix` |
+| 2 | Miuix 三端可行性 | **已验：Desktop 真实窗口 + Wasm 构建 + Android APK（升 AGP 9.5.1 矩阵）**；弹窗需 Miuix `Scaffold`（C0c） | `c0c-miuix` |
 | 3 | iOS 路径 A/B 裁决 | **暂缓**（U4 押后，用户 2026-11-13 决定） | `u4-ios` |
 | 4 | Web 端 glass 是否能用 CSS backdrop-filter | 待 U3 | `u3-glass` |
 | 5 | 知识库走哪条路（MCP vs 自建模块） | **已定：MCP + mcp-bridge**（D37） | 编排者 |

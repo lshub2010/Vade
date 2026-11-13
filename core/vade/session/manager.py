@@ -115,6 +115,7 @@ class SessionLog:
         self._emit_locks: dict[str, asyncio.Lock] = {}
         self._executor: Callable[[Turn, tuple[dict[str, Any], ...]], Awaitable[Any]] | None = None
         self._cancel_hook: Callable[[str], None] | None = None
+        self._cancel_clear_hook: Callable[[str], None] | None = None
         self._max_pending = max_pending
         self._sink_queue = sink_queue
         self.approval_port: Any = None
@@ -133,6 +134,15 @@ class SessionLog:
 
     def set_cancel_hook(self, fn: Callable[[str], None]) -> None:
         self._cancel_hook = fn
+
+    def set_cancel_clear_hook(self, fn: Callable[[str], None]) -> None:
+        """Paired with `set_cancel_hook`: forget a turn's cancel flag.
+
+        The queue calls it after the turn's terminal event (or, for a turn
+        that was only queued, immediately), so the router's per-turn set does
+        not grow for the life of the process.
+        """
+        self._cancel_clear_hook = fn
 
     # ------------------------------------------------------------------ sessions
     def create_session(self, *, session_id: str | None = None, title: str | None = None) -> Session:
@@ -294,6 +304,7 @@ class SessionLog:
                 emit=self.emit,
                 save_turn=self.store.update_turn,
                 cancel_hook=self._cancel_hook,
+                cancel_clear_hook=self._cancel_clear_hook,
                 max_pending=self._max_pending,
             )
             self._queues[session_id] = q

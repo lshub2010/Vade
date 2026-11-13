@@ -77,10 +77,13 @@ class LoopEngine:
     async def run_turn(self, turn: Turn, content: Sequence[Mapping[str, Any]]) -> TurnOutcome:
         if self.llm is None:
             raise VadeError("UNAVAILABLE", "no LLM provider is configured")
+        # A turn can be interrupted before its executor even starts (the queue
+        # flags it, then creates this coroutine's task). Do not spend a step.
+        self._raise_if_interrupted(turn)
         snapshot = self._snapshot()
         if self.router is None or not snapshot:
             text = "No capabilities are available: no module is online, so I cannot run tools."
-            await self._emit(turn.session_id, "turn.delta", {"turn_id": turn.id, "text": text})
+            await self._turn_emit(turn, "turn.delta", {"turn_id": turn.id, "text": text})
             return TurnOutcome(assistant_text=text, stopped_reason="no_capability")
 
         memory_text = await self._read_memory(turn.session_id)
@@ -107,9 +110,16 @@ class LoopEngine:
             text_parts: list[str] = []
             calls: dict[int, dict[str, str]] = {}
             async for delta in self.llm.chat(messages, tools=snapshot.schemas(), stream=True):
+                # A provider whose `chat()` swallows the cancellation (or answers
+                # after the stream was cancelled) must not append a delta to a
+                # turn the UI already closed. Checked on the write path, so the
+                # invariant does not depend on `llm.chat` re-raising.
+                self._raise_if_interrupted(turn)
                 if delta.text:
                     text_parts.append(delta.text)
-                    await self._emit(turn.session_id, "turn.delta", {"turn_id": turn.id, "text": delta.text})
+                    await self._turn_emit(
+                        turn, "turn.delta", {"turn_id": turn.id, "text": delta.text}
+                    )
                 for fragment in delta.tool_calls:
                     slot = calls.setdefault(fragment.index, {"id": "", "name": "", "arguments": ""})
                     if fragment.id:
@@ -142,29 +152,32 @@ class LoopEngine:
                 name = call["name"]
                 args = _parse_args(call["arguments"])
                 entry = snapshot.get(name)
+                tool_call_payload = {
+                    "turn_id": turn.id, "call_id": call_id, "tool": name,
+                    "args_digest": digest_args(args),
+                }
+                # `turn.tool_call` is a write into the turn stream like any
+                # other, and it is the last one before the side effect: a
+                # provider that ate the cancel and ended its stream lands right
+                # here, so this guarded emit is what keeps the tool from
+                # running inside a turn the UI already closed.
                 if first:
-                    await self._emit(
-                        turn.session_id, "turn.tool_call",
-                        {"turn_id": turn.id, "call_id": call_id, "tool": name,
-                         "args_digest": digest_args(args)},
-                        messages=[assistant],
+                    await self._turn_emit(
+                        turn, "turn.tool_call", tool_call_payload, messages=[assistant]
                     )
                     first = False
                 else:
-                    await self._emit(
-                        turn.session_id, "turn.tool_call",
-                        {"turn_id": turn.id, "call_id": call_id, "tool": name,
-                         "args_digest": digest_args(args)},
-                    )
+                    await self._turn_emit(turn, "turn.tool_call", tool_call_payload)
 
                 if entry is None:
+                    self._raise_if_interrupted(turn)
                     message = (
                         f"Tool {name!r} does not exist. Available tools: "
                         + (", ".join(snapshot.names()) or "(none)")
                         + ". Continue without it."
                     )
-                    await self._emit(
-                        turn.session_id, "turn.tool_result",
+                    await self._turn_emit(
+                        turn, "turn.tool_result",
                         {"turn_id": turn.id, "call_id": call_id, "ok": False,
                          "summary": f"unknown tool {name!r}"},
                         messages=[Message(id=new_id(), session_id=turn.session_id, turn_id=turn.id,
@@ -177,17 +190,18 @@ class LoopEngine:
 
                 decision = await self._check_approval(turn, entry, args)
                 if not decision.allowed:
+                    self._raise_if_interrupted(turn)
                     message = f"Tool call denied: {decision.reason or 'denied by policy'}. Continue without it."
                     if decision.request_id:
-                        await self._emit(
-                            turn.session_id, "turn.approval_resolved",
+                        await self._turn_emit(
+                            turn, "turn.approval_resolved",
                             {"turn_id": turn.id, "request_id": decision.request_id,
                              "decision": "deny", "by": decision.by or "policy",
                              "scope": decision.scope, "state": "running"},
                         )
                     messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": message})
-                    await self._emit(
-                        turn.session_id, "turn.tool_result",
+                    await self._turn_emit(
+                        turn, "turn.tool_result",
                         {"turn_id": turn.id, "call_id": call_id, "ok": False,
                          "summary": "denied"},
                         messages=[Message(id=new_id(), session_id=turn.session_id, turn_id=turn.id,
@@ -200,32 +214,54 @@ class LoopEngine:
                 result = await self.router.call(
                     entry.tool_id, args, session_id=turn.session_id, turn_id=turn.id, call_id=call_id
                 )
+                # The side effect already happened (the module ran), so audit it
+                # BEFORE the interruption guard below can stop the turn: after
+                # the guard there is no code path left that could write it, and
+                # an interrupted turn would leave no trace of a real tool call.
+                audit_event: dict[str, Any] = {
+                    "kind": "tool_call", "session_id": turn.session_id, "turn_id": turn.id,
+                    "tool": entry.tool_id, "ok": result.ok, "code": result.code,
+                }
+                interrupted = self._is_interrupted(turn)
+                if interrupted:
+                    audit_event["aborted"] = "interrupted"
+                self._audit(audit_event)
+                if interrupted:
+                    raise asyncio.CancelledError
                 summary = _summary(result)
                 payload = {"turn_id": turn.id, "call_id": call_id, "ok": result.ok, "summary": summary}
                 if not result.ok:
                     payload["code"] = result.code
                 tool_content = self._tool_content(entry, result)
-                await self._emit(
-                    turn.session_id, "turn.tool_result", payload,
+                await self._turn_emit(
+                    turn, "turn.tool_result", payload,
                     messages=[Message(id=new_id(), session_id=turn.session_id, turn_id=turn.id,
                                       role="tool", name=name, tool_call_id=call_id,
                                       content=tool_content)],
                 )
                 messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": tool_content})
                 recorded.append({"tool": name, "args_digest": digest_args(args), "ok": result.ok})
-                self._audit({"kind": "tool_call", "session_id": turn.session_id, "turn_id": turn.id,
-                             "tool": entry.tool_id, "ok": result.ok, "code": result.code})
             else:
                 continue
 
         else:
             # for/else: the last allowed step still produced tool calls
+            self._raise_if_interrupted(turn)
             stopped_reason = "max_steps"
             notice = (f"Stopped after {self.config.max_steps} steps to avoid an endless tool loop. "
                       "Ask me to continue if you want me to keep going.")
             final_text = (final_text + "\n" + notice).strip()
-            await self._emit(turn.session_id, "turn.delta", {"turn_id": turn.id, "text": notice})
+            await self._turn_emit(turn, "turn.delta", {"turn_id": turn.id, "text": notice})
 
+        if self._is_interrupted(turn):
+            # The stream ended (or the step budget ran out) after the user
+            # interrupted, so `queue.interrupt` already wrote the terminal
+            # event: this turn did NOT complete and must not be audited as one
+            # — the audit is the only place an operator can tell the two apart.
+            self._audit({"kind": "turn_interrupted", "session_id": turn.session_id,
+                         "turn_id": turn.id, "stopped_reason": stopped_reason,
+                         "tool_calls": len(recorded)})
+            raise asyncio.CancelledError
         self._audit({"kind": "turn_completed", "session_id": turn.session_id, "turn_id": turn.id,
                      "stopped_reason": stopped_reason, "tool_calls": len(recorded)})
         return TurnOutcome(
@@ -234,11 +270,57 @@ class LoopEngine:
         )
 
     # ------------------------------------------------------------------ helpers
+    def _is_interrupted(self, turn: Turn) -> bool:
+        """True once `queue.interrupt` has flagged this turn on the router.
+
+        Every write into the turn stream goes through `_turn_emit`, and
+        the `turn_completed` audit consults this predicate directly, so
+        "nothing is written after `turn.interrupted`" is an invariant of THIS
+        module — `turn.delta`, `turn.tool_result`, `turn.tool_call` and the
+        max_steps notice included. It deliberately does not rely on an awaited
+        call re-raising the cancellation: two producers can resume a turn the
+        UI already closed — a module that swallows `tools/cancel`, so
+        `router.call` returns a normal result, and an LLM provider whose
+        `chat()` swallows it, so the stream keeps yielding. The check sits on
+        the write path, not on the await that was supposed to raise, so
+        neither can append to a closed turn.
+        """
+        probe = getattr(self.router, "was_cancelled", None)
+        return bool(callable(probe) and probe(turn.id))
+
+    def _raise_if_interrupted(self, turn: Turn) -> None:
+        """Stop the turn iff `queue.interrupt` already closed it."""
+        if self._is_interrupted(turn):
+            raise asyncio.CancelledError
+
+    async def _turn_emit(
+        self,
+        turn: Turn,
+        event_type: str,
+        payload: Mapping[str, Any],
+        *,
+        messages: Sequence[Message] = (),
+    ) -> None:
+        """The ONE way this module writes into a turn's event stream.
+
+        The guard lives on the emit, not next to the await that produced the
+        data, so a write site cannot be added without it: the producers that
+        outlive `turn.interrupted` (a module or provider that swallows the
+        cancellation) would otherwise keep appending to a closed turn.
+
+        The name is `_turn_emit` and not something longer on purpose:
+        `tools/check_contracts.py` finds emitted event names by scanning calls
+        of the form `emit(<session or turn>, "<event name literal>")`, so every
+        guarded write must stay visible to that C-06 gate.
+        """
+        self._raise_if_interrupted(turn)
+        await self._emit(turn.session_id, event_type, payload, messages=messages)
+
     async def _check_approval(self, turn: Turn, entry: Any, args: Mapping[str, Any]) -> ApprovalDecision:
         request = ApprovalRequest(
             session_id=turn.session_id, turn_id=turn.id, tool_id=entry.tool_id, args=args,
             risk=entry.risk, expires_at=now_ms() + self.config.approval_timeout_s * 1000,
-            emit=lambda event_type, payload: self._emit(turn.session_id, event_type, payload),
+            emit=lambda event_type, payload: self._turn_emit(turn, event_type, payload),
         )
         try:
             return await self.approval.check(request)

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vade.dev/schema/device-bind.json",
+  "title": "C-17 device bind protocol",
+  "version": "0.1.0",
+  "status": "skeleton",
+  "owner": "C5a",
+  "frozen_at": "2026-11-14",
+  "note": "Day-2 skeleton for U1/U4/F1/R3. `hello_sig` and the BIND_* codes are final; the envelope field list may still gain fields without breaking existing members.",
+  "type": "object",
+  "$defs": {
+    "bindUri": {
+      "type": "string",
+      "description": "vade://bind?h=<admin_host>&fp=<fp8>&t=<ticket>&v=1[&tls=<spki8>]",
+      "pattern": "^vade://bind\\?h=[^&]+&fp=[0-9a-f]{16}&t=[A-Z2-9]{26}&v=1(&tls=[0-9a-f]{16})?$",
+      "properties": {
+        "h": {"type": "string", "description": "admin host:port the App must connect to"},
+        "fp": {"type": "string", "pattern": "^[0-9a-f]{16}$", "description": "core identity fp8 = SHA-256(core_pub)[:16]. NOT the TLS fingerprint."},
+        "t": {"type": "string", "pattern": "^[A-Z2-9]{26}$", "description": "26-char base32 bind ticket, one use, 10 minutes"},
+        "v": {"const": "1"},
+        "tls": {"type": "string", "pattern": "^[0-9a-f]{16}$", "description": "optional SPKI pin; rotates, never the identity anchor"}
+      },
+      "required": ["h", "fp", "t", "v"]
+    },
+    "bindInfo": {
+      "type": "object",
+      "description": "GET /admin/bind/info with X-Bind-Ticket",
+      "properties": {
+        "core_pub": {"type": "string", "description": "base64 raw Ed25519 public key of the core identity"},
+        "fp8": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+        "kex_pub": {"type": "string", "description": "base64 raw X25519 ephemeral public key for this ticket"},
+        "challenge": {"type": "string", "description": "base64 32 random bytes, single use"},
+        "setup_required": {"type": "boolean"},
+        "expires_at": {"type": "integer"},
+        "hello_sig": {"type": "string", "description": "base64 Ed25519 over: 'vade-bind-hello-v1\\n' || kex_pub || '\\n' || challenge || '\\n' || SHA256(ticket) || '\\n' || admin_host"}
+      },
+      "required": ["core_pub", "fp8", "kex_pub", "challenge", "setup_required", "expires_at", "hello_sig"]
+    },
+    "bindRequest": {
+      "type": "object",
+      "properties": {
+        "ticket": {"type": "string", "description": "plaintext ticket; everything else is inside ct"},
+        "eph_pub": {"type": "string", "description": "device ephemeral X25519 public key, base64"},
+        "nonce": {"type": "string", "description": "12-byte AES-GCM nonce, base64"},
+        "ct": {"type": "string", "description": "AES-256-GCM ciphertext of {password, device_pub, alg, label, hardware_backed, ts, sig}"}
+      },
+      "required": ["ticket", "eph_pub", "nonce", "ct"],
+      "additionalProperties": false
+    },
+    "bindAad": {
+      "const": "\"vade-bind-v1\" || fp8 || SHA256(ticket) || challenge || kex_pub",
+      "type": "string"
+    },
+    "bindError": {
+      "type": "object",
+      "properties": {"code": {"enum": ["BIND_UNAUTHORIZED", "BIND_FINGERPRINT_MISMATCH", "BIND_HELLO_SIG_INVALID", "BIND_DEVICE_LIMIT", "BIND_CLOCK_SKEW", "BIND_KEY_UNSUPPORTED", "BIND_SETUP_LOCKED"]}, "message": {"type": "string", "maxLength": 300}},
+      "required": ["code", "message"]
+    },
+    "devicePubkey": {
+      "oneOf": [
+        {"type": "object", "properties": {"alg": {"const": "p256"}, "point": {"type": "string", "description": "base64 65-byte uncompressed point 0x04||X||Y"}}, "required": ["alg", "point"]},
+        {"type": "object", "properties": {"alg": {"const": "ed25519"}, "raw": {"type": "string", "description": "base64 32-byte raw key or an ssh-ed25519 line (converted on import)"}}, "required": ["alg", "raw"]}
+      ]
+    }
+  },
+  "errorCodes": {
+    "BIND_UNAUTHORIZED": "ticket unknown, expired, already consumed, or a verification step failed (no oracle)",
+    "BIND_FINGERPRINT_MISMATCH": "the App's pinned fp8 differs from this core",
+    "BIND_HELLO_SIG_INVALID": "hello_sig did not verify against the pinned core_pub",
+    "BIND_DEVICE_LIMIT": "5 devices per account; nothing is evicted automatically",
+    "BIND_CLOCK_SKEW": "ct.ts outside +/-300s",
+    "BIND_KEY_UNSUPPORTED": "alg missing or key encoding malformed",
+    "BIND_SETUP_LOCKED": "setup is in progress in another session"
+  },
+  "atomicity": "Verify-then-delete: decryption, signature and limits must all pass before DELETE ... WHERE consumed_at IS NULL; a failed attempt must NOT burn the ticket (test: wrong signature then correct signature succeeds)."
+}

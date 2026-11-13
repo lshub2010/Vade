@@ -37,6 +37,7 @@ class TurnQueue:
         emit: EmitFn,
         save_turn: SaveTurnFn,
         cancel_hook: Callable[[str], None] | None = None,
+        cancel_clear_hook: Callable[[str], None] | None = None,
         max_pending: int = 100,
         clock: Callable[[], int] = now_ms,
     ) -> None:
@@ -45,6 +46,7 @@ class TurnQueue:
         self._emit = emit
         self._save_turn = save_turn
         self._cancel_hook = cancel_hook
+        self._cancel_clear_hook = cancel_clear_hook
         self._max_pending = max_pending
         self._clock = clock
         self._pending: deque[QueueItem] = deque()
@@ -198,6 +200,33 @@ class TurnQueue:
         await self._emit(self.session_id, "queue.updated", self.state_payload())
         if self._finish is not None and not self._finish.is_set():
             self._finish.set()
+        self._release_cancel(turn.id)
+
+    # ------------------------------------------------------------------ cancel flag
+    def _release_cancel(self, turn_id: str) -> None:
+        """Let the router forget `turn_id` once nothing can consult the flag.
+
+        The flag must outlive the terminal event: `interrupt` returns before
+        the module (and therefore the turn task) is done, and the loop reads
+        `was_cancelled(turn_id)` when the late reply lands to refuse writing
+        into a closed turn. So release on the turn task's completion — and
+        immediately when there is no live task left.
+        """
+        if self._cancel_clear_hook is None:
+            return
+        task = self._turn_task
+        if task is not None and not task.done():
+            task.add_done_callback(lambda _t: self._clear_cancel(turn_id))
+            return
+        self._clear_cancel(turn_id)
+
+    def _clear_cancel(self, turn_id: str) -> None:
+        if self._cancel_clear_hook is None:  # pragma: no cover - guarded by caller
+            return
+        try:
+            self._cancel_clear_hook(turn_id)
+        except Exception:  # pragma: no cover - a broken hook must not break the queue
+            pass
 
     # ------------------------------------------------------------------ control
     async def interrupt(self, turn_id: str, *, by: str = "user") -> bool:
@@ -233,6 +262,9 @@ class TurnQueue:
                     {"turn_id": turn_id, "by": by, "state": TurnState.CANCELLED.value},
                 )
                 await self._emit(self.session_id, "queue.updated", self.state_payload())
+                # A queued turn never reached the router, so there is no
+                # in-flight task that could still read the flag.
+                self._clear_cancel(turn_id)
                 return True
         if self._running is not None and self._running.turn_id == turn_id:
             # Running turns are stopped by interrupt, never by queue.cancel.

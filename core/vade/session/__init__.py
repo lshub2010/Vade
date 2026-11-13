@@ -122,6 +122,9 @@ def install(app: Any) -> Any:
     )
     log.set_executor(engine.run_turn)
     log.set_cancel_hook(lambda turn_id: router.cancel_turn(turn_id) if router is not None else None)
+    log.set_cancel_clear_hook(
+        lambda turn_id: router.clear_cancelled(turn_id) if router is not None else None
+    )
     log.approval_port = approval
 
     rpc = SessionRPC(log, approval=lambda: getattr(app, "approval_port", None))

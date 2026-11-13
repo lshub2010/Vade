@@ -327,6 +327,17 @@ class Router:
     def was_cancelled(self, turn_id: str) -> bool:
         return turn_id in self._cancelled_turns
 
+    def clear_cancelled(self, turn_id: str) -> None:
+        """Forget the turn's cancel flag once the queue has closed it.
+
+        `was_cancelled` is read by the agent loop while a turn unwinds; a set
+        that only grows keeps one entry per interrupted turn for the life of
+        the process. The queue drops the flag right after the turn's terminal
+        event, i.e. when the interrupted task is done and nothing can consult
+        it any more.
+        """
+        self._cancelled_turns.discard(turn_id)
+
     # ------------------------------------------------------------------ state
     def inflight(self, module_id: str, instance_id: str) -> int:
         return self._inflight.get((module_id, instance_id), 0)

@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -16,11 +17,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.path
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import top.yukonga.miuix.kmp.basic.BasicComponent
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
@@ -28,6 +32,7 @@ import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.NavigationBar
 import top.yukonga.miuix.kmp.basic.NavigationBarItem
 import top.yukonga.miuix.kmp.basic.Switch
+import top.yukonga.miuix.kmp.basic.Surface
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
@@ -168,14 +173,20 @@ private fun TextFields() {
 
 @Composable
 private fun Cards() {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Text("卡片标题")
-        Text("用于验证阴影/描边与 insideMargin。Miuix 卡片默认无 Material 的 tonal elevation。")
-    }
-    Card(modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
-        Text("嵌套卡片外层")
-        Card(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
-            Text("嵌套内层（验证圆角同心）")
+    // These two cards must share a Column: dropped straight into the section Box they
+    // were laid on top of each other, and the second card's surface covered the first
+    // one's summary (the "clipped first line" in the old screenshots was this overlap,
+    // not Miuix's card padding). Card chrome is still near-invisible in light theme.
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Text("卡片标题")
+            Text("用于验证阴影/描边与 insideMargin。Miuix 卡片默认无 Material 的 tonal elevation。")
+        }
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Text("嵌套卡片外层")
+            Card(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                Text("嵌套内层（验证圆角同心）")
+            }
         }
     }
 }
@@ -233,19 +244,78 @@ private fun BottomBar() {
 
 @Composable
 private fun Dialogs() {
-    var show by remember { mutableStateOf(true) }
+    // `show` starts false because OverlayDialog does not paint on Desktop at all: it
+    // never creates a popup window (verified by enumerating the process' windows — only
+    // the SunAwtFrame exists), so an initial `true` would only mislead. This whole
+    // change is demo code inside the spike; see RESULT.md §三/§五 R6.
+    var show by remember { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Button(onClick = { show = true }) { Text("打开确认弹窗") }
         Text("对应 C-09 的 ApprovalDialog：遮罩 + 两个按钮横排。")
+        Text("（Desktop 上弹窗不绘制，本页只演示调用点；截图见 shots/miuix-desktop-dialog.png。）")
         OverlayDialog(
             show = show,
             title = "允许执行工具？",
             summary = "fs.write · 请求写入 3 个文件",
             onDismissRequest = { show = false },
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                TextButton(text = "拒绝", onClick = { show = false }, modifier = Modifier.weight(1f))
-                TextButton(text = "允许", onClick = { show = false }, modifier = Modifier.weight(1f))
+            ApprovalActions { show = false }
+        }
+    }
+}
+
+@Composable
+private fun ApprovalActions(onDismiss: () -> Unit) {
+    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        TextButton(text = "拒绝", onClick = onDismiss, modifier = Modifier.weight(1f))
+        TextButton(text = "允许", onClick = onDismiss, modifier = Modifier.weight(1f))
+    }
+}
+
+/**
+ * Content-surface render of the dialog above.
+ *
+ * `OverlayDialog` puts its body in a popup window; on Desktop that window is never
+ * created, so neither a real window capture nor `ImageComposeScene` can see the
+ * dialog. This draws the same pieces the dialog draws — `windowDimming` scrim,
+ * `surface` card with 28 dp corners, title, summary and the two actions — straight
+ * onto the canvas so the body is at least reviewable. It is a screenshot harness,
+ * not a second dialog implementation; RESULT.md labels the PNG "content surface,
+ * not a real popup".
+ */
+@Composable
+internal fun DialogSurfaceShot() {
+    Box(
+        modifier = Modifier.fillMaxSize().background(MiuixTheme.colorScheme.windowDimming),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(0.86f),
+            shape = RoundedCornerShape(28.dp),
+            color = MiuixTheme.colorScheme.surface,
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 22.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "允许执行工具？",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MiuixTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = "fs.write · 请求写入 3 个文件",
+                    fontSize = 14.sp,
+                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                )
+                Row(
+                    modifier = Modifier.padding(top = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    TextButton(text = "拒绝", onClick = {}, modifier = Modifier.weight(1f))
+                    TextButton(text = "允许", onClick = {}, modifier = Modifier.weight(1f))
+                }
             }
         }
     }

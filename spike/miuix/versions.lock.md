@@ -66,11 +66,11 @@
 
 | 候选 | 证据 | 风险 |
 |---|---|---|
-| **AGP 8.13.2**（8.x 末版，已发布） + Gradle ≥ 8.14.4 + `compileSdk = 37` | Google Maven `com/android/tools/build/gradle/maven-metadata.xml` 里 8.x 稳定版止于 `8.13.2` | **推荐路径**：改动面最小，KGP 2.4.20 / CMP 1.12.0 大概率不用动。Gradle 下界需按 AGP 官方兼容表复核（本 spike 只到 8.10.2，没装 8.14.x） |
-| **AGP 9.x**（Maven 上已到 `9.5.1`） | 同上元数据 | 需连带核 Gradle 9、KGP 2.4.20、Compose 插件 1.12.0 的兼容性，且 AGP 9 的 DSL 有移除项 → 建议 U2 之后单独排一次 |
+| **AGP 8.13.2** + Gradle 8.14.4 + `compileSdk = 37` | 本机实测：平台能解析（仅警告 tested up to 36.1），但 `checkDebugAarMetadata` 失败——`androidx.compose.ui:ui-android:1.12.0` 与 `material3-android:1.5.0-alpha22` 要求 **AGP ≥ 9.1.0** | **不足**：CMP 1.12.0 的 androidx 传递依赖已把下限抬到 9.1，8.x 末版救不回来 |
+| **AGP 9.5.1 + Gradle 9.6.1** + `compileSdk = 37` + `android.builtInKotlin=false` + `android.newDsl=false` | 本机实测：`BUILD SUCCESSFUL in 2m59s`；`composeApp-debug.apk` **13,575,772 B**；`aapt2 dump badging` 显示 compileSdkVersion 37 / minSdk 24 / targetSdk 36 | **已验证可行**（Desktop/Wasm 同组合仍可构）。两个开关已 deprecated，AGP 10 移除，届时需拆 androidApp 模块 |
 | 换 Miuix 更老版本 / fork 去掉 AAR metadata | — | **禁止**（任务书 §六禁止改 Miuix 源码让它编过）。且 0.9.2/0.9.3 同样 37，向下没有出路 |
 
-**给审核人的一句话**：Android 的红不是「Miuix 不支持 Android」，是「Miuix 用 API 37 编译，我们的 AGP 8.8.2 提供不了 API 37」。换 AGP 就会绿，但换 AGP 会牵动全工程构建，不属 C0c 范围。
+**给审核人的一句话**：Android 的红不是「Miuix 不支持 Android」，是「Miuix 用 API 37 编译，我们的 AGP 8.8.2 提供不了 API 37」。升到 **AGP 9.5.1 + Gradle 9.6.1**（带 `android.builtInKotlin=false` / `android.newDsl=false`）就会绿——已在 scratch 副本验证出 APK；但换 AGP 会牵动全工程构建，不属 C0c 范围，留给 U1 开工前统一改矩阵。
 
 ## 四、改动本矩阵前的检查清单
 

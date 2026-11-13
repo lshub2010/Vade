@@ -2,3 +2,5 @@
 uvicorn==0.54.0
 starlette==1.10.0
 websockets==17.4
+# C-11 SKILL.md frontmatter parsing (docs/agents/23 §四: yaml.safe_load only)
+pyyaml==6.0.3

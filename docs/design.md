@@ -1856,7 +1856,7 @@ C0 → C1 → C2 → C3 ─┬─ C3b ── C3d
 ### 15.1 统一目录结构
 
 ```
-modules/fs/
+vade-module-fs/   # 模块独立仓（不在主仓）
 ├── manifest.json          # 由 tools.py 的装饰器生成，不手写
 ├── src/fs_module/
 │   ├── tools.py           # 纯函数实现，不依赖 SDK

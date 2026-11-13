@@ -14,6 +14,11 @@ Checks (each one has broken at least once in review):
      emitted event name exists in the schema, payload `required` fields are a
      subset of the declared payload, `state` is present exactly on the
      state-change events (rule 4), and `turn_states` matches `TurnState`.
+  8. C-14's push topics are checked at their own emit site: `EventBus._dispatch`
+     is the only producer of `events/deliver` notifications, so it is scanned
+     instead of being exempted. Every entry the schema marks
+     `x-vade.push: events/deliver` must be pushed, every pushed topic must be
+     declared, and the marked set must equal the topic set the bus serves.
 
 Run:  python3 tools/check_contracts.py      (exit 0 = green)
 """
@@ -34,6 +39,11 @@ CORE = ROOT / "core" / "vade"
 #: Events emitted through a variable (`queue.py` maps a TurnState to a name);
 #: the static scan cannot see them, so they are listed and checked explicitly.
 DYNAMIC_EVENT_TYPES = {"turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"}
+
+#: C-14 push topics: emitted as `events/deliver` notifications, not as
+#: `SessionLog.emit()` events. The marker lives on the event entry itself, so a
+#: new push topic cannot be exempted by editing this file.
+PUSH_TRANSPORT = "events/deliver"
 
 #: C-06 rule 4: `state` is required on exactly these, forbidden as a required
 #: field on the high-frequency payload events.
@@ -85,6 +95,46 @@ def emitted_event_names() -> set[str]:
     for path in sorted(CORE.rglob("*.py")):
         names |= set(pattern.findall(path.read_text(encoding="utf-8")))
     return names
+
+
+def push_declared(events: dict) -> set[str]:
+    """Event names whose schema entry says `x-vade.push: events/deliver`."""
+    out: set[str] = set()
+    for name, spec in (events.get("events") or {}).items():
+        if name == "turn.state":
+            continue
+        if (spec.get("x-vade") or {}).get("push") == PUSH_TRANSPORT:
+            out.add(name)
+    return out
+
+
+def pushed_event_names() -> set[str]:
+    """Topics the events package pushes: `_dispatch("<domain.action>", ...)`.
+
+    C-14 events never reach `SessionLog.emit()`: they are assembled by
+    `deliver.py` and pushed as `events/deliver` notifications. The C-06 scan
+    above therefore cannot see them, and a plain allowlist would make the gate
+    vacuous. Scanning the actual call site keeps both directions honest: drop a
+    topic from the schema and `pushed - schema_events` goes red.
+    """
+    pattern = re.compile(r"_dispatch\(\s*[\"']([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)[\"']")
+    names: set[str] = set()
+    for path in sorted((CORE / "events").rglob("*.py")):
+        names |= set(pattern.findall(path.read_text(encoding="utf-8")))
+    return names
+
+
+def code_topics() -> set[str]:
+    """The topic set the bus actually serves (`subscribe.EVOLVE_TOPICS | ADMIN_TOPICS`)."""
+    text = (CORE / "events" / "subscribe.py").read_text(encoding="utf-8")
+    out: set[str] = set()
+    for const in ("EVOLVE_TOPICS", "ADMIN_TOPICS"):
+        block = re.search(rf"{const}: frozenset\[str\] = frozenset\((.*?)\)", text, re.S)
+        if block is None:
+            FAILURES.append(f"core/vade/events/subscribe.py: cannot locate {const}")
+            continue
+        out |= set(re.findall(r"\"([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)\"", block.group(1)))
+    return out
 
 
 def code_turn_states() -> set[str]:
@@ -174,8 +224,19 @@ def main() -> int:
     schema_events = {name for name in declared_events if name != "turn.state"}
     unknown = emitted_event_names() - schema_events
     check(not unknown, f"events.json: code emits event names absent from C-06: {sorted(unknown)}")
-    missing_handlers = schema_events - emitted_event_names() - {"turn.approval_required"}
+    pushed = pushed_event_names()
+    marked = push_declared(events)
+    missing_handlers = schema_events - emitted_event_names() - pushed - {"turn.approval_required"}
     check(not missing_handlers, f"events.json: declared events nobody emits: {sorted(missing_handlers)}")
+    # C-14: push topics are not exempt, they are scanned at `_dispatch()`.
+    unknown_push = pushed - schema_events
+    check(not unknown_push, f"events.json: events/deliver pushes topics absent from C-06: {sorted(unknown_push)}")
+    unmarked_push = pushed - marked
+    check(not unmarked_push, f"events.json: pushed topics missing `x-vade.push: {PUSH_TRANSPORT}`: {sorted(unmarked_push)}")
+    unserved = marked - code_topics()
+    check(not unserved, f"events.json: declared push topics the bus does not serve: {sorted(unserved)}")
+    unmarked = code_topics() - marked
+    check(not unmarked, f"core/vade/events/subscribe.py serves topics not declared as push in C-06: {sorted(unmarked)}")
     for name, spec in declared_events.items():
         if name == "turn.state":
             continue

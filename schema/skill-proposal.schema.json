@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vade.local/schema/skill-proposal.schema.json",
+  "title": "Vade skill proposal payload (C-13)",
+  "description": "Frozen contract C-13. The request body of `skill/proposal` (module -> core). A proposal is a suggestion, never an install: it can only land in <data_dir>/skills/pending/<name>/, is never injected into a prompt and never appears in `skill_catalog` until a human approves it through C3b's SkillLoader. The payload carries a whole SKILL.md plus the revision it was written against; `base_revision` is what makes a stale proposal detectable instead of silently clobbering a newer skill.",
+  "x-vade": {
+    "contract": "C-13",
+    "version": "1.0.0",
+    "frozen": "2026-11-13",
+    "owner": "C3d",
+    "doc": "docs/agents/24-C3d-events-skill-proposal.md",
+    "name_pattern": "^[a-z][a-z0-9-]{1,31}$",
+    "content_max_chars": 16384,
+    "body_max_chars": 8192,
+    "body_max_lines": 200,
+    "required_sections": ["When to Use", "Procedure", "Pitfalls", "Verification"],
+    "states": ["pending", "approved", "rejected", "superseded"],
+    "base_revision": {
+      "field": "base_revision",
+      "meaning": "The revision the proposal was authored against, i.e. the `revision` integer in <data_dir>/skills/<name>/meta.json of the ACTIVE skill at the moment the proposal was written. A pending proposal never advances it: two proposals against revision 3 both say 3, and the second one supersedes the first rather than stacking.",
+      "create": "must be absent or 0. A `create` whose name already exists as an active skill is TOOL_CONFLICT; a `create` on a name that only exists as a pending proposal is allowed and supersedes that pending directory.",
+      "patch": "required and must equal the active revision at intake. A mismatch is TOOL_CONFLICT and the message MUST carry the actual revision so the caller can re-read and re-propose instead of guessing. A patch with no active skill to patch is NOT_FOUND.",
+      "approve": "approval is refused with TOOL_CONFLICT when the pending SKILL.md sha256 differs from the one recorded in pending/<name>/meta.json at intake: an edited pending file is a new proposal, not an approval."
+    },
+    "rejection_codes": {
+      "schema_or_frontmatter_or_body": "MANIFEST_INVALID",
+      "name_or_revision_conflict": "TOOL_CONFLICT",
+      "no_active_skill_to_patch": "NOT_FOUND",
+      "quota": "OVERLOADED",
+      "secret_in_content": "INVALID_ARGUMENT",
+      "path_escape_or_actor_spoof": "PERMISSION_DENIED"
+    },
+    "secret_scan": {
+      "kinds": ["sk- key", "BEGIN ... PRIVATE KEY"],
+      "stricter_than_loader": "C3b only warns on a secret-shaped body because skills come from the local disk and a manual may legitimately quote a fake key. A proposal comes from a model, so the same shapes are a hard rejection here."
+    },
+    "provenance": {
+      "derived_from": "recorded verbatim in pending/<name>/meta.json; it is how a reviewer sees which session/turns/model produced the proposal",
+      "origin": "always 'proposal' for this path, never 'manual'"
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/create" },
+    { "$ref": "#/$defs/patch" }
+  ],
+  "$defs": {
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "action", "content"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,31}$",
+          "description": "Skill name; also the directory name under skills/pending/."
+        },
+        "action": {
+          "type": "string",
+          "enum": ["create", "patch"]
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "description": "The whole SKILL.md, frontmatter included. The body (after frontmatter) is capped separately at body_max_chars."
+        },
+        "base_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "See x-vade.base_revision."
+        },
+        "derived_from": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["session_id"],
+          "properties": {
+            "session_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "turn_ids": {
+              "type": "array",
+              "maxItems": 64,
+              "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "model": { "type": "string", "maxLength": 128 }
+          }
+        }
+      }
+    },
+    "create": {
+      "allOf": [
+        { "$ref": "#/$defs/proposal" },
+        { "required": ["action"], "properties": { "action": { "const": "create" } } },
+        { "properties": { "base_revision": { "const": 0 } } }
+      ]
+    },
+    "patch": {
+      "allOf": [
+        { "$ref": "#/$defs/proposal" },
+        { "required": ["action", "base_revision"], "properties": { "action": { "const": "patch" } } },
+        { "properties": { "base_revision": { "type": "integer", "minimum": 0 } } }
+      ]
+    }
+  }
+}

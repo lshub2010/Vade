@@ -246,6 +246,130 @@
         "cancelled"
       ],
       "notes": "Not an event: the enum every state-change turn.* payload's `state` takes. turn.delta / turn.tool_call / turn.tool_result do not carry it (see rules)."
+    },
+    "session.turn": {
+      "payload": {
+        "session_id": "string",
+        "turn_id": "string",
+        "state": "turn.state (terminal only)",
+        "user_text": "string (the user message of that turn, verbatim)",
+        "assistant_text": "string (the final assistant message of that turn)",
+        "tool_calls": [
+          {
+            "tool": "string (LLM-side name)",
+            "args_digest": "sha256:hex",
+            "ok": "bool|null (null while the outcome is unknown)"
+          }
+        ]
+      },
+      "required": [
+        "session_id",
+        "turn_id",
+        "state",
+        "user_text",
+        "assistant_text",
+        "tool_calls"
+      ],
+      "x-vade": {"push": "events/deliver"},
+      "notes": "C-14 append. One event per finished turn, delivered only to role=evolve modules that are allowlisted, declare the topic and run with [evolve] allow_transcript=true. user_text and assistant_text are separate on purpose (AMEND-19): a consumer must never have to guess which side of a merged messages[] it is reading. `state` is terminal (completed|failed|interrupted|cancelled). turn.state carries no text, so a consumer that only sees it cannot build a turn."
+    },
+    "session.closed": {
+      "payload": {
+        "session_id": "string",
+        "turns_total": "int",
+        "turns": [
+          {
+            "turn_id": "string",
+            "state": "turn.state",
+            "tool_calls": [
+              {
+                "tool": "string",
+                "args_digest": "sha256:hex",
+                "ok": "bool|null"
+              }
+            ],
+            "negative": "bool",
+            "self_corrected": "bool"
+          }
+        ],
+        "tail": [
+          {
+            "turn_id": "string",
+            "user_text": "string",
+            "assistant_text": "string"
+          }
+        ],
+        "closed_at": "int (unix ms)"
+      },
+      "required": [
+        "session_id",
+        "turns_total",
+        "turns",
+        "tail",
+        "closed_at"
+      ],
+      "x-vade": {"push": "events/deliver"},
+      "notes": "C-14 append. Deliberately NOT the whole transcript and NOT a rolling summary: `tail` is the last 10 turns of original text, truncated by core, and the consumer accumulates its own summary in the same pass (AMEND-19). Best-effort: if the module is offline when the session closes, this one event is lost; v1 has no redelivery for session.closed (use session.turn with since_seq instead)."
+    },
+    "skill.proposed": {
+      "payload": {
+        "name": "string",
+        "origin": "string (always 'proposal' for this topic)",
+        "revision": "int (the revision an approval would produce)",
+        "base_revision": "int (revision the proposal was authored against; 0 for create)",
+        "status": "pending"
+      },
+      "required": [
+        "name",
+        "origin",
+        "revision",
+        "base_revision",
+        "status"
+      ],
+      "x-vade": {"push": "events/deliver"},
+      "notes": "C-14 append. Metadata only: the body never travels here, otherwise a UI event would become a way to read unpublished skill text. Consumers: ui/admin front ends refreshing the pending list (C5a /skills). No session, so seq_from = seq_to = 0."
+    }
+  },
+  "x-vade": {
+    "append": {
+      "contract": "C-14",
+      "version": "1.0.0",
+      "frozen": "2026-11-13",
+      "owner": "C3d",
+      "doc": "docs/agents/24-C3d-events-skill-proposal.md",
+      "adds": [
+        "session.turn",
+        "session.closed",
+        "skill.proposed"
+      ],
+      "rewrites": "none. Every C-06 entry, rule and enum above is byte-identical to the frozen 1.0.0 file; C3d has append rights only. `skill.proposed` is appended here too (v1.18 correction: C-14 carries three topics).",
+    "push_transport": {
+      "transport": "events/deliver",
+      "emit_site": "EventBus._dispatch(topic, ...) -- never SessionLog.emit(), so the C-06 static scan cannot see these three",
+      "marker": "each appended entry carries x-vade.push = events/deliver; tools/check_contracts.py scans _dispatch() and requires the marker on every pushed topic"
+    }
+    },
+    "topic_gate": {
+      "session.turn": "role=evolve AND (module_id, fingerprint) in [evolve] allowlist AND topic declared in manifest.subscriptions AND [evolve] allow_transcript=true",
+      "session.closed": "same four gates as session.turn",
+      "skill.proposed": "role=ui|admin AND the topic declared in manifest.subscriptions; no transcript gate (no transcript in the payload)"
+    },
+    "deliver_envelope": {
+      "transport": "JSON-RPC 2.0 notification core->module: {jsonrpc:'2.0', method:'events/deliver', params:{topic, session_id, seq_from, seq_to, payload}}",
+      "seq_from": "int: first seq of the source events this payload was assembled from (0 for topics with no session stream)",
+      "seq_to": "int: last seq; a reconnecting module passes it as `since_seq` to resume",
+      "dedupe": "exactly one delivery per (topic, session_id, turn_id); consumers MUST still de-duplicate by seq_to because a reconnect replay can overlap a live push (same rule as C-06)."
+    },
+    "redaction": {
+      "owner": "core config [evolve] redact; a module may not change it, and `redact: []` in a request is recorded as an override attempt, not honoured",
+      "replace_with": "sha256(value)[:16]",
+      "flag": "payload.redacted = true only when a field was actually replaced"
+    },
+    "backpressure": {
+      "queue": "one bounded queue per instance, 32 entries",
+      "full": "drop oldest and increment delivery_dropped; a slow evolve module must never stall a session",
+      "send_timeout_s": 5,
+      "on_failure": "delivery_failed, no retry (v1 is best-effort; reconnect + since_seq is the recovery path)"
     }
   }
 }

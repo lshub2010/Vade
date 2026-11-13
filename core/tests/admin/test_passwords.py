@@ -11,6 +11,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 
 from argon2 import PasswordHasher
 
@@ -79,7 +80,8 @@ def test_login_upgrades_a_legacy_hash_in_place(ctx, app):
     on_disk = json.loads(doc_path.read_text(encoding="utf-8"))
     assert on_disk["password"].startswith("$argon2id$")
     assert on_disk["password_rehashed_at"]
-    assert (doc_path.stat().st_mode & 0o777) == 0o600
+    if os.name != "nt":  # POSIX mode bits are a no-op on Windows (chmod does nothing)
+        assert (doc_path.stat().st_mode & 0o777) == 0o600
 
 
 def test_a_failed_login_does_not_rewrite_the_legacy_hash(ctx, app):

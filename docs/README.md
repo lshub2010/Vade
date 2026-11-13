@@ -30,6 +30,7 @@
 | `OVERVIEW.md` | 一页看全的总览（Markdown 源） |
 | `overview.html` | 总览的渲染版（含架构图、协议帧、SDK 分层、拓扑示意、并行树） |
 | `status.md` | 批次台账、里程碑、阻塞项 |
+| `dev-windows.md` | Windows 开发环境：五项工具链的位置、重建协议 dll、代理与平台差异 |
 | `agents/README.md` | 23 份开发任务书 + 3 份审查任务书的索引 |
 | `agents/00-orchestration.md` | 编排手册：波次、派活模板、审查、返工、合并门禁 |
 | `agents/01-contracts.md` | 契约台账：18 个契约、错误码、目录所有权、RFC 流程 |

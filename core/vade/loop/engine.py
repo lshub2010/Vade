@@ -158,6 +158,7 @@ class LoopEngine:
                     )
 
                 if entry is None:
+                    self._raise_if_interrupted(turn)
                     message = (
                         f"Tool {name!r} does not exist. Available tools: "
                         + (", ".join(snapshot.names()) or "(none)")
@@ -177,6 +178,7 @@ class LoopEngine:
 
                 decision = await self._check_approval(turn, entry, args)
                 if not decision.allowed:
+                    self._raise_if_interrupted(turn)
                     message = f"Tool call denied: {decision.reason or 'denied by policy'}. Continue without it."
                     if decision.request_id:
                         await self._emit(
@@ -200,6 +202,7 @@ class LoopEngine:
                 result = await self.router.call(
                     entry.tool_id, args, session_id=turn.session_id, turn_id=turn.id, call_id=call_id
                 )
+                self._raise_if_interrupted(turn)
                 summary = _summary(result)
                 payload = {"turn_id": turn.id, "call_id": call_id, "ok": result.ok, "summary": summary}
                 if not result.ok:
@@ -234,6 +237,19 @@ class LoopEngine:
         )
 
     # ------------------------------------------------------------------ helpers
+    def _raise_if_interrupted(self, turn: Turn) -> None:
+        """Stop before writing into a turn the UI already saw as interrupted.
+
+        `interrupt` marks the turn on the router (`cancel_turn`) *before* it
+        cancels this task. A module that swallows `tools/cancel` and answers
+        anyway makes `router.call` return normally, so without this check the
+        loop would resume and append a `turn.tool_result` (and the next step's
+        deltas) after `turn.interrupted` — a tool call a UI cannot reconcile.
+        """
+        probe = getattr(self.router, "was_cancelled", None)
+        if callable(probe) and probe(turn.id):
+            raise asyncio.CancelledError
+
     async def _check_approval(self, turn: Turn, entry: Any, args: Mapping[str, Any]) -> ApprovalDecision:
         request = ApprovalRequest(
             session_id=turn.session_id, turn_id=turn.id, tool_id=entry.tool_id, args=args,

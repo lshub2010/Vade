@@ -10,6 +10,12 @@ Why single writer + Queue: concurrent `ws.send` interleaves frames.
 Backpressure: 256 queued frames per connection (config), then close 1013.
 Frames are sealed inline: a seal is < 2 ms. A loop-lag monitor flips this to
 `asyncio.to_thread` if p95 exceeds 5 ms (see `LoopLagMonitor`).
+
+Core->module requests: `request()` allocates an id, parks a Future in
+`_pending`, and the read loop hands a method-less message to that table
+(`_resolve_response`). Without this table every `tools/call` reply was
+dropped on the floor — C2's dispatcher returned `None` for responses and no
+one was waiting.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ from collections import deque
 from enum import Enum
 from typing import Any, Awaitable, Callable
 
-from ..errors import VadeError
+from ..errors import ERROR_CODES, VadeError
 from ..logging import get_logger
 from .framing import decode_handshake, encode_handshake, FrameType
 
@@ -120,6 +126,9 @@ class Connection:
         self._pending_close: tuple[int, str] | None = None
         self._last_rx = time.monotonic()
         self._closed = False
+        #: Core->module request correlation: id -> Future of the peer's `result`.
+        self._pending: dict[Any, asyncio.Future[Any]] = {}
+        self._request_seq = 0
 
     # ------------------------------------------------------------------ lifecycle
     async def run(self) -> None:
@@ -195,6 +204,11 @@ class Connection:
         except (UnicodeDecodeError, json.JSONDecodeError):
             await self.close(CLOSE_NORMAL, "malformed json")
             return
+        if message.get("method") is None:
+            # A response to a core->module request (tools/call). Route it by id
+            # to the waiting Future; the RPC handler must NOT see it.
+            self._resolve_response(message)
+            return
         if self._on_rpc is None:
             return
         result = await self._on_rpc(self, message)
@@ -203,6 +217,59 @@ class Connection:
                 await self.send_json({"jsonrpc": "2.0", "id": message["id"], "error": result.to_dict()})
             else:
                 await self.send_json({"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+    # ------------------------------------------------------------------ requests
+    async def request(self, method: str, params: Any = None, *, timeout_s: float | None = None) -> Any:
+        """Send one request and await the peer's `result` (or raise VadeError).
+
+        The id is allocated here, never by the caller: two modules answering
+        the same id is exactly the kind of bug that only shows up under load.
+        """
+        if self._closed:
+            raise VadeError("UNAVAILABLE", "connection is closed")
+        loop = asyncio.get_running_loop()
+        self._request_seq += 1
+        request_id = self._request_seq
+        future: asyncio.Future[Any] = loop.create_future()
+        # Consume the exception if nobody awaits the future (timeout path).
+        future.add_done_callback(_silence_unretrieved)
+        self._pending[request_id] = future
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        try:
+            await self.send_json(message)
+            if timeout_s is None:
+                return await future
+            return await asyncio.wait_for(future, timeout=timeout_s)
+        finally:
+            self._pending.pop(request_id, None)
+
+    async def notify(self, method: str, params: Any = None) -> None:
+        """Fire-and-forget notification (tools/cancel): no id, no reply."""
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        await self.send_json(message)
+
+    def _resolve_response(self, message: dict[str, Any]) -> None:
+        request_id = message.get("id")
+        if request_id is None:
+            return
+        future = self._pending.pop(request_id, None)
+        if future is None or future.done():
+            log.debug("response for an unknown request id", extra={"code": "NOT_FOUND",
+                                                                   "connection_id": self.connection_id})
+            return
+        error = message.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or "INTERNAL")
+            if code not in ERROR_CODES:
+                # C-04: a module may only return declared codes.
+                code = "INTERNAL"
+            future.set_exception(VadeError(code, str(error.get("message", ""))[:300]))
+            return
+        future.set_result(message.get("result"))
 
     async def send_json(self, obj: Any) -> None:
         payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -294,6 +361,7 @@ class Connection:
             return
         self._closed = True
         self.state = ConnectionState.CLOSED
+        self._fail_pending(VadeError("UNAVAILABLE", "connection closed before the reply arrived"))
         for task in (self._heartbeat_task, self._writer_task):
             if task is not None:
                 task.cancel()
@@ -307,3 +375,21 @@ class Connection:
             pass
         if self._on_close is not None:
             self._on_close(self)
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        """No caller may hang on a socket that is already gone."""
+        pending = list(self._pending.values())
+        self._pending.clear()
+        for future in pending:
+            if not future.done():
+                future.set_exception(exc)
+
+
+def _silence_unretrieved(future: asyncio.Future[Any]) -> None:
+    """Mark the exception retrieved without consuming it for the real awaiter.
+
+    `close()` and `wait_for` can both abandon a pending reply; without this the
+    loop logs "Future exception was never retrieved" for a normal disconnect.
+    """
+    if not future.cancelled():
+        future.exception()

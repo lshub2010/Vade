@@ -7,3 +7,4 @@
 | RFC-0001 | 在 C-03 `manifest` 中追加 `subscriptions` | 已实施（C3d，待 C2 追认） |
 | RFC-0003 | 提示词注入分层：技能目录消息化、工具渐进披露与 stable/context 分段 | proposed（草稿，未实现） |
 | RFC-0004 | 附件与多模态：`POST /ui/blob` 上传协议、压缩图单 `file_id` 与 content parts 消息结构 | proposed（草稿，未实现） |
+| RFC-0005 | 模型能力查询与用量：`model/list`、会话级选择优先级与两级用量口径 | proposed（草稿，未实现） |

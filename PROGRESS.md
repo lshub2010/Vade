@@ -10,7 +10,7 @@
 | 基线分支 | `debug`（只接受 PR） |
 | 开发分支 | `dev_gingshan`（当前 HEAD `35c4dde`，win-fix 合并后） |
 | 模块仓 | https://github.com/lshub2010/vade-module-echo （私有，`main`） |
-| 本快照分支 | `tmp/u1-ui`（`153f73a`，U1 骨架 WIP）、`tmp/c0c-miuix`（C0c WIP） |
+| 本快照分支 | `tmp/u1-ui`（`153f73a`，U1 骨架 WIP）、`tmp/c0c-miuix`（当前头 `589ec1d`；另有两轮未合入：`7062f15`、`aa8c808`） |
 
 主仓结构：
 
@@ -40,7 +40,7 @@ modules/      只有 README 索引（模块独立仓）
 | W4 | C3d | 事件推送 + C-13/C-14 + `manifest.subscriptions`（RFC-0001）；**328 tests** | PR #8 |
 | W4 | C5a | 审批/审计/admin 后端 + C-08/C-17；**308 tests**（Argon2 拖慢） | PR #9 |
 | — | — | 模块迁出主仓（独立仓约定） | PR #7 |
-| — | win-fix | 2026-11-13 换机 Windows 11 x86_64：uv 建 Python 3.12 venv、重编协议原生库 `protocol/core/python/vade_protocol.dll`、两条 POSIX 权限位断言加 `os.name != "nt"` 守卫（Linux 上仍校验）；全量 `pytest core/tests -q` → **378 passed**；环境见 `docs/dev-windows.md` | `35c4dde`（merge，含 98617b8 / ccf79f0；R1/R2 pass） |
+| — | win-fix | 2026-11-13 换机 Windows 11 x86_64：uv 建 Python 3.12 venv、重编协议原生库 `protocol/core/python/vade_protocol.dll`、两条 POSIX 权限位断言加 `os.name != "nt"` 守卫（Linux 上仍校验）；全量 `pytest core/tests -q` → **378 passed**；环境见 `docs/dev-windows.md` | `35c4dde`（merge，含 98617b8 / ccf79f0；R1/R2 pass，报告：`../Vade-REVIEW-win-fix.md`） |
 
 当前全量：`pytest core/tests -q` → **378 passed**（Windows 11 开发机，2026-11-13 基线）。
 
@@ -49,7 +49,7 @@ modules/      只有 README 索引（模块独立仓）
 | 项 | 状态 | 说明 |
 |---|---|---|
 | **U1** | WIP `tmp/u1-ui` | 只有 Gradle 骨架（`ui/settings.gradle.kts` 等，`153f73a`）；C-09/C-10 契约、界面、测试都未做 |
-| **C0c** | Wasm/Desktop 已验证，Android 待升 AGP | **Desktop 通过**：`:composeApp:screenshot`，8 张 `miuix-desktop-*.png` 在 Windows 上重生。**Wasm 通过**：`:composeApp:wasmJsBrowserProductionWebpack`，composeApp `app.wasm` gzip **936,611 B** vs 纯 Material baseline **1,013,216 B**（即 Miuix 无体积增量，反而更小）；`skiko.wasm` gzip 3,328,940 B 为两端公共。**Android 未通过**：Miuix 0.9.2～0.9.4 的 AAR 均要求 `minCompileSdk=37`，当前 AGP 8.8.2 无法使用 API 37（无裸 android-37 平台、`compileSdkVersion("android-37.0")` 被拒、目录联接被判 inconsistent），需升 AGP 8.13+/9.x + Gradle ≥8.14.4。数据与复现命令以 `spike/miuix/RESULT.md` 为准（`tmp/c0c-miuix`） |
+| **C0c** | Desktop/Wasm 已验（有保留），Android 待升 AGP | **Desktop 通过（有保留）**：无头 `ImageComposeScene` 渲染（`:composeApp:screenshot`）在 Windows 上重生 8 张 `miuix-desktop-*.png`——**非窗口截图**，8 张中 Dialog 那张只画出触发按钮、弹窗本体未渲染；`:composeApp:run` 真实窗口未跑。**Wasm 只验构建**：`:composeApp:wasmJsBrowserProductionWebpack` 通过，**浏览器运行时未跑**；**同界面替换口径**下 Miuix 版 `app.wasm` gzip **936,611 B**，比纯 Material 对照 **1,013,216 B** 小 **76,605 B**——三皮肤（material + miuix + glass）共存的边际增量需 U2 另测，不能引用此差值；`skiko.wasm` gzip 3,328,940 B 为两端公共。**Android 未通过**：Miuix 0.9.2～0.9.4 的 AAR 均要求 `minCompileSdk=37`，当前 AGP 8.8.2 无法使用 API 37（无裸 android-37 平台、`compileSdkVersion("android-37.0")` 被拒、目录联接被判 inconsistent），需升 AGP 8.13+/9.x + Gradle ≥8.14.4。数据与复现命令以 `spike/miuix/RESULT.md` 为准（`tmp/c0c-miuix`） |
 | **U4（iOS）** | **暂缓（用户 2026-11-13 决定）** | v1 首批只做 Android / Desktop / Web 三端；G4「iOS 真机」不再作为当前门禁。代码与任务书保持现状，恢复需用户重新拍板 |
 | **C5a 前端** | 未开工 | `admin-ui/` 只有占位 README（B-4） |
 | **W5** | 未开工 | fs/shell/web/memory/mcp-bridge/model 六个模块（各自独立仓）+ C5b 拓扑画布 + U2/U3 皮肤 |
@@ -58,8 +58,8 @@ modules/      只有 README 索引（模块独立仓）
 ## 四、已知缺陷 / 技术债（审查遗留，按优先级）
 
 1. **C-18 缺 `llm.model_module` / `llm.fallback_to_builtin`**（仍在）：schema `additionalProperties:false` 会拒，代码用默认值绕过；需增补契约或 RFC。
-2. **`turn.completed.skills` 未接（进行中）**：C3b 已回填 `activated_skills`，C3 的 `TurnOutcome` 还没带进 payload（两行改动）；已另开批次处理，尚未合入。
-3. **模块吞 `CancelledError` 时**（进行中）：interrupt 后仍可能发 `tool_result`（未加守卫）；已另开批次处理，尚未合入。
+2. **`turn.completed.skills` 未接 —— 阻塞（RFC-0002 待批）**：C3b 已回填 `activated_skills`，但 C-06 `schema/events.json` 的 `turn.completed.payload`（149–162 行）**没有** `skills` 字段；C-06 已冻结，改契约须先批准 RFC 草案 `docs/rfc/RFC-0002-turn-completed-skills.md`（`tmp/debt-a` 已写），实现待批准后再动。
+3. **模块吞 `CancelledError` 时 —— 已修，未合入**：`tmp/debt-a` 的 `5fb7d8e` 在每次写 `tool_result` 前查 `router.was_cancelled()`（`LoopEngine._raise_if_interrupted()`），命中即抛 `CancelledError` 结束本轮；全量 `pytest core/tests -q` → **379 passed**（378 + 1 条新回归，`core/tests/session/test_queue.py::test_interrupt_emits_no_tool_result_when_the_module_answers_after_cancel`）。**尚未合入 `dev_gingshan`**，合入前仍按未修看待。
 4. **`admin-ui` 未交付**，但 C5a RESULT 已如实标注。
 5. **scrypt 旧哈希迁移**（仍在）：已支持在线重哈希，但没做批量迁移脚本。
 6. **C0c 的 wasm 构建卡在 npm 下载**：需配 `registry.npmmirror.com` + `kotlin.js.yarn=false` + `nodejs.download=false`；2026-11-13 Windows 上 wasm 生产构建已跑通，这些 npm 配置是否仍需保留**待确认**。

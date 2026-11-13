@@ -212,8 +212,9 @@ class EventBus:
         self._watermarks: dict[str, int] = {}
         self._seen: dict[str, OrderedDict[str, None]] = {}
         self._closed_sessions: set[str] = set()
-        #: `subscriptions` is not surfaced by C2's Manifest today (see RESULT):
-        #: `declare()` is the core-side seam a future registration path can call.
+        #: Fallback only: `identify()` reads `record.manifest.subscriptions`
+        #: first (C-03 append, RFC-0001). This map is for a registry that does
+        #: not retain the manifest -- tests, or a future remote table.
         self._declared: dict[tuple[str, str], tuple[str, ...]] = {}
         self._audit_records: Deque[dict[str, Any]] = deque(maxlen=AUDIT_RECORDS)
 
@@ -253,11 +254,12 @@ class EventBus:
         connection_id: str
 
     def declare(self, *, module_id: str, instance_id: str, topics: Iterable[str]) -> None:
-        """Record a module's `manifest.subscriptions` (core-side, not request-side).
+        """Record `manifest.subscriptions` for a registry that does not keep it.
 
-        C2's `Manifest` drops unknown fields, so today nothing can hand this to
-        us from the registration path. This is the seam: one call per accepted
-        registration and the manifest gate is real instead of always-empty.
+        The normal path is passive: `manifest.subscriptions` now survives
+        validation (C-03 append, RFC-0001) and `identify()` reads it off the
+        record, so a plain `registry.register()` is enough. This stays as the
+        explicit seam for a registry whose records are not local objects.
         """
         self._declared[(str(module_id), str(instance_id))] = tuple(str(t) for t in topics or ())
 

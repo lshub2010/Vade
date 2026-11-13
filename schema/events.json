@@ -270,6 +270,7 @@
         "assistant_text",
         "tool_calls"
       ],
+      "x-vade": {"push": "events/deliver"},
       "notes": "C-14 append. One event per finished turn, delivered only to role=evolve modules that are allowlisted, declare the topic and run with [evolve] allow_transcript=true. user_text and assistant_text are separate on purpose (AMEND-19): a consumer must never have to guess which side of a merged messages[] it is reading. `state` is terminal (completed|failed|interrupted|cancelled). turn.state carries no text, so a consumer that only sees it cannot build a turn."
     },
     "session.closed": {
@@ -307,6 +308,7 @@
         "tail",
         "closed_at"
       ],
+      "x-vade": {"push": "events/deliver"},
       "notes": "C-14 append. Deliberately NOT the whole transcript and NOT a rolling summary: `tail` is the last 10 turns of original text, truncated by core, and the consumer accumulates its own summary in the same pass (AMEND-19). Best-effort: if the module is offline when the session closes, this one event is lost; v1 has no redelivery for session.closed (use session.turn with since_seq instead)."
     },
     "skill.proposed": {
@@ -324,6 +326,7 @@
         "base_revision",
         "status"
       ],
+      "x-vade": {"push": "events/deliver"},
       "notes": "C-14 append. Metadata only: the body never travels here, otherwise a UI event would become a way to read unpublished skill text. Consumers: ui/admin front ends refreshing the pending list (C5a /skills). No session, so seq_from = seq_to = 0."
     }
   },
@@ -339,7 +342,12 @@
         "session.closed",
         "skill.proposed"
       ],
-      "rewrites": "none. Every C-06 entry, rule and enum above is byte-identical to the frozen 1.0.0 file; C3d has append rights only. `skill.proposed` is appended here too (v1.18 correction: C-14 carries three topics)."
+      "rewrites": "none. Every C-06 entry, rule and enum above is byte-identical to the frozen 1.0.0 file; C3d has append rights only. `skill.proposed` is appended here too (v1.18 correction: C-14 carries three topics).",
+    "push_transport": {
+      "transport": "events/deliver",
+      "emit_site": "EventBus._dispatch(topic, ...) -- never SessionLog.emit(), so the C-06 static scan cannot see these three",
+      "marker": "each appended entry carries x-vade.push = events/deliver; tools/check_contracts.py scans _dispatch() and requires the marker on every pushed topic"
+    }
     },
     "topic_gate": {
       "session.turn": "role=evolve AND (module_id, fingerprint) in [evolve] allowlist AND topic declared in manifest.subscriptions AND [evolve] allow_transcript=true",

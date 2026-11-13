@@ -6,7 +6,8 @@
 | KAT（C-02） | ✅ 生成：`protocol/v1/kat.json`，sha256 `e154100b…` |
 | 单测 | ✅ **58 passed / 0 failed**（15 lib + 7 frame_kat + 10 interop + 26 negative） |
 | clippy | ✅ `--all-features --all-targets -D warnings` 干净 |
-| C-15 `schema/pair-code.json` | ⚠️ 已补（256 汉字表待入库） |
+| C-15 `schema/pair-code.json` | ⚠️ 已补，状态 `frozen-partial`（256 汉字表待入库） |
+| Python 绑定（T5） | ✅ 生成 `protocol/core/python/vade_protocol.py`；`version()=0.1.0`、`protocol_version()=1`；wheel 未打 |
 | `cargo test --all-features` | ⚠️ 未跑完（编译超时 400s，非失败） |
 | bench / wasm32 / 三语言绑定 / fuzz | ❌ 未验证 |
 
@@ -48,6 +49,6 @@ cd protocol/core && cargo test
 | `cargo test --all-features` | 编译超时 400s（该机 8 核/5GB 高负载），非已知失败；clippy --all-features 已证明 uniffi 路径可编译 |
 | `cargo bench --bench aead` | 未跑，NFR-2/NFR-3 无实测数字 |
 | wasm32 构建 | 未验证；C0b 的 `getrandom/js` 注意事项仍适用于使用方 |
-| Python/Kotlin/Swift 绑定 | `ffi.rs` 只证明导出面可编译，未生成绑定 |
+| Kotlin/Swift 绑定 | 未做（Python 已生成并冒烟，见下） |
 | `cargo-fuzz` 10 分钟 | 未做 |
 | 256 汉字表 | 未入库，`normalize()` 只校验后 6 位 |

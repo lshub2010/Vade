@@ -64,6 +64,8 @@ modules/      只有 README 索引（模块独立仓）
 5. **scrypt 旧哈希迁移**（仍在）：已支持在线重哈希，但没做批量迁移脚本。
 6. **C0c 的 wasm 构建卡在 npm 下载**：需配 `registry.npmmirror.com` + `kotlin.js.yarn=false` + `nodejs.download=false`；2026-11-13 Windows 上 wasm 生产构建已跑通，这些 npm 配置是否仍需保留**待确认**。
 7. **模块仓 SDK 依赖未锁版本**：echo 测试目前复用主仓 venv。
+8. **`_release_pending` 有一条极窄的悬挂路径**（PR #10 审查 A2）：`interrupt` 落在 `turn.started` 之后、`create_task` 之前，且 `create_task` 本身抛异常时，`_release_pending` 里的 turn_id 不会被清理（只泄漏一个字符串，不影响正确性）。修法：在 `_execute_one` 的 `except` 分支里 `_forget_turn(turn.id)`。
+9. **仓库无 CI**（PR #10 审查 A1）：`.github/workflows/` 不存在，384 测试 / 契约 / 文档三道门禁全靠本地跑。补 CI 需要 runner 上装 Rust + 构建 `vade_protocol.dll`（或 so），单独立项。
 
 ## 五、环境与命令
 

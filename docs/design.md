@@ -111,6 +111,8 @@
 >
 > 与 FR-1.1 的「8 个组件」对应关系：`session-store` 属于 Agent 循环的状态部分，`llm-adapter` 属于模型接入的默认实现，两者都不是新增职责；需求侧仍按 8 个逻辑组件计。
 
+> **审计 kind（agent-loop / policy 写入，v1.19 登记）**：`turn_completed`、`turn_interrupted`（被用户中断的 turn **不得**记成 completed）、`tool_call`（工具已真实执行但 turn 被中断时带 `aborted: "interrupted"`）、审批决策（`approval.*`）。新增或改名 kind 必须同时更新本节与 `docs/status.md` 的口径，否则审计口径会与代码漂移。
+
 ## 2. 协议 v1
 
 ### 2.1 帧格式

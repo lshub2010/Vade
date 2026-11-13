@@ -1,0 +1,142 @@
+{
+  "id": "C-05",
+  "version": "1.0.0",
+  "status": "frozen",
+  "frozen_at": "2026-11-13",
+  "owner": "C2",
+  "source_of_truth": "docs/design.md §2.5",
+  "transport": "JSON-RPC 2.0 over a Noise transport frame (type 0x02) or over plain text frames on the browser_session channel",
+  "envelope": {
+    "request": {"jsonrpc": "2.0", "id": "int|string", "method": "string", "params": "object"},
+    "response": {"jsonrpc": "2.0", "id": "int|string", "result": "object"},
+    "error": {"jsonrpc": "2.0", "id": "int|string|null", "error": {"code": "string (C-04)", "message": "string <=300", "data": "object|null"}},
+    "notification": {"jsonrpc": "2.0", "method": "string", "params": "object"},
+    "notes": [
+      "`error.code` is always a C-04 name, never a number and never a custom string.",
+      "`error.data` carries structured fields only (field pointer, retry_after). Never a stack trace.",
+      "Notifications (no `id`) must not be answered. modules MUST NOT call core tools back (design §2.5)."
+    ]
+  },
+  "tool_result": {
+    "ok": {"ok": true, "result": {}, "truncated": false, "duration_ms": "int"},
+    "err": {"ok": false, "error": {"code": "C-04 name", "message": "string", "retriable": "bool"}}
+  },
+  "directions": {
+    "module_to_core": {
+      "module/register": {
+        "params": "manifest (schema/manifest.schema.json)",
+        "result": {"accepted": "bool", "session_id": "string", "tool_names": ["string"]},
+        "errors": ["MANIFEST_INVALID", "TOOL_CONFLICT", "PROTOCOL_MISMATCH", "PAYLOAD_TOO_LARGE"],
+        "notes": "First RPC after handshake. Rejection never reveals other modules' data: TOOL_CONFLICT names only the conflicting tool id and the caller's own id."
+      },
+      "module/capabilities.update": {
+        "params": "manifest (full resubmission; re-runs every T4 check)",
+        "result": {"accepted": "bool", "cap_epoch": "int", "tool_names": ["string"]},
+        "errors": ["MANIFEST_INVALID", "RISK_DOWNGRADE_FORBIDDEN", "TOOL_CONFLICT", "MODULE_DRAINING"],
+        "notes": "Atomic swap on success (cap_epoch += 1), old manifest kept on failure. Any tool whose risk drops below the effective value rejects the whole update. New tools default to `high`."
+      },
+      "module/heartbeat": {
+        "params": {"load": "number 0..1", "inflight": "int >= 0"},
+        "result": {"ok": true, "server_time": "RFC3339 string"},
+        "errors": ["INVALID_ARGUMENT"]
+      },
+      "module/event": {
+        "params": {"topic": "string", "payload": "object"},
+        "result": null,
+        "notification": true,
+        "errors": ["INVALID_ARGUMENT", "PERMISSION_DENIED"]
+      },
+      "events/subscribe": {
+        "params": {"topics": ["string"], "redact": ["string"]},
+        "result": {"accepted": ["string"], "rejected": ["string"]},
+        "errors": ["INVALID_ARGUMENT"],
+        "notes": "Whitelist-checked. Rejected topics are reported, not silently dropped."
+      },
+      "skill/proposal": {
+        "params": {"name": "string", "action": "create|update", "content": "string", "base_revision": "string|null", "derived_from": "object"},
+        "result": {"accepted": "bool", "path": "string"},
+        "errors": ["INVALID_ARGUMENT", "PERMISSION_DENIED", "MANIFEST_INVALID"]
+      }
+    },
+    "core_to_module": {
+      "tools/call": {
+        "params": {"call_id": "string", "tool": "string (name only, not module_id/tool)", "args": "object", "deadline_ms": "int"},
+        "result": "tool_result (ok or error)",
+        "errors": ["TIMEOUT", "CANCELLED", "OVERLOADED", "UNAVAILABLE", "PERMISSION_DENIED", "INVALID_ARGUMENT"],
+        "notes": "The transport frame cap is 65519 bytes of plaintext. Larger args are a C3/C4 problem (no v1 fragmentation); modules should expect PAYLOAD_TOO_LARGE rather than a 1 MiB frame."
+      },
+      "tools/cancel": {
+        "params": {"call_id": "string"},
+        "result": {"cancelled": "bool"},
+        "errors": ["NOT_FOUND"]
+      },
+      "prompts/get": {
+        "params": {"id": "string"},
+        "result": {"content": "string"},
+        "errors": ["NOT_FOUND"]
+      },
+      "events/deliver": {
+        "params": {"topic": "string", "session_id": "string", "seq_from": "int", "seq_to": "int", "payload": "object"},
+        "result": {"ok": true},
+        "errors": ["PERMISSION_DENIED", "INVALID_ARGUMENT"]
+      },
+      "module/drain": {
+        "params": {"grace_ms": "int"},
+        "result": {"accepted": true},
+        "errors": ["MODULE_DRAINING"],
+        "notes": "Core stops routing new calls. In-flight calls finish or time out, then close."
+      }
+    },
+    "ui_to_core": {
+      "ui/attach": {
+        "params": {"session_id": "string|null", "last_seq": "int|null"},
+        "result": {"session_id": "string", "from_seq": "int", "snapshot": "object|null"},
+        "errors": ["NOT_FOUND", "PERMISSION_DENIED"]
+      },
+      "ui/detach": {
+        "params": {"session_id": "string"},
+        "result": {"ok": true},
+        "errors": ["NOT_FOUND"]
+      },
+      "ui/submit": {
+        "params": {"session_id": "string", "content": ["object"], "client_msg_id": "string"},
+        "result": {"turn_id": "string", "queue_pos": "int"},
+        "errors": ["INVALID_ARGUMENT", "READ_ONLY_SESSION", "OVERLOADED"]
+      },
+      "ui/interrupt": {
+        "params": {"session_id": "string", "turn_id": "string"},
+        "result": {"ok": true},
+        "errors": ["NOT_FOUND"]
+      },
+      "ui/queue.cancel": {
+        "params": {"session_id": "string", "turn_id": "string"},
+        "result": {"ok": true},
+        "errors": ["NOT_FOUND"]
+      },
+      "approval/decide": {
+        "params": {"request_id": "string", "decision": "approve|deny", "scope": "once|session"},
+        "result": {"ok": true},
+        "errors": ["APPROVER_INVALID", "READ_ONLY_SESSION", "NOT_FOUND"]
+      }
+    }
+  },
+  "events_core_to_ui": {
+    "note": "C-06 owns this table (schema/events.json). Listed here only so method-table consumers know the names referenced by ui/*.",
+    "names": [
+      "session.attached",
+      "turn.queued",
+      "turn.started",
+      "turn.delta",
+      "turn.tool_call",
+      "turn.tool_result",
+      "turn.approval_required",
+      "turn.approval_resolved",
+      "turn.completed",
+      "turn.failed",
+      "turn.interrupted",
+      "queue.updated",
+      "module.status"
+    ],
+    "owner": "C3"
+  }
+}

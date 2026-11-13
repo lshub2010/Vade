@@ -264,6 +264,10 @@ class Router:
                 pending = self._calls.get(turn_id, [])
                 if (target, call_id) in pending:
                     pending.remove((target, call_id))
+            # `_cancel_fired` only dedupes frames for a LIVE call; once this one
+            # is over nothing can fire for it again (`_calls` no longer holds
+            # the pair either), so keep the set from growing one tuple per call.
+            self._cancel_fired.discard((target.module_id, target.instance_id, call_id))
 
         duration_ms = int((self._clock() - started) * 1000)
         if not isinstance(reply, Mapping):

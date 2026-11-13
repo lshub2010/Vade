@@ -52,7 +52,15 @@ class TurnQueue:
         self._pending: deque[QueueItem] = deque()
         self._running: QueueItem | None = None
         self._worker: asyncio.Task[None] | None = None
+        #: Kept for `shutdown()`/introspection only: decisions are turn-scoped
+        #: (`_turn_tasks`), never made off this mutable attribute.
         self._turn_task: asyncio.Task[Any] | None = None
+        #: turn_id -> its executor task, so a clear is bound to the turn it
+        #: belongs to (a shared attribute binds it to the previous turn's task).
+        self._turn_tasks: dict[str, asyncio.Task[Any]] = {}
+        #: Turns interrupted between `turn.started` and `create_task`: the flag
+        #: must stay (the task does not exist yet) and is armed when it appears.
+        self._release_pending: set[str] = set()
         self._finish: asyncio.Event | None = None
         self._finalized: set[str] = set()
         self._orphans: set[asyncio.Task[Any]] = set()
@@ -112,6 +120,19 @@ class TurnQueue:
                 self.ensure_worker()
 
     async def _run_one(self, item: QueueItem) -> None:
+        """Run one turn, then drop the `_finalized` marker it needed.
+
+        The marker only covers the window in which the turn's terminal state
+        may still be written twice (worker vs. `interrupt`), i.e. exactly this
+        coroutine's lifetime. Leaving it in the set grows one id per turn for
+        the life of the process — the same leak class as the cancel flags.
+        """
+        try:
+            await self._execute_one(item)
+        finally:
+            self._finalized.discard(item.turn_id)
+
+    async def _execute_one(self, item: QueueItem) -> None:
         turn = item.turn.with_state(TurnState.RUNNING, started_at=self._clock())
         item = item.with_turn(turn)
         self._running = item
@@ -123,7 +144,13 @@ class TurnQueue:
         self._finish = finish
         task = asyncio.create_task(self._executor(turn, item.content), name=f"turn-{turn.id[:8]}")
         self._turn_task = task
+        self._turn_tasks[turn.id] = task
         task.add_done_callback(lambda _t: finish.set())
+        if turn.id in self._release_pending:
+            # `interrupt` landed in the pre-task window and deliberately kept
+            # the flag; it exists now, so bind the clear to THIS task.
+            self._release_pending.discard(turn.id)
+            self._release_cancel(turn.id, task)
         try:
             await finish.wait()
         finally:
@@ -134,7 +161,8 @@ class TurnQueue:
             return  # interrupt/cancel already wrote the terminal state
         if task.cancelled():
             await self._finalize(turn, TurnState.INTERRUPTED, {"turn_id": turn.id, "by": "external",
-                                                               "state": TurnState.INTERRUPTED.value})
+                                                               "state": TurnState.INTERRUPTED.value},
+                                 task=task)
             return
         exc = task.exception()
         if exc is not None:
@@ -146,6 +174,7 @@ class TurnQueue:
                  "state": TurnState.FAILED.value},
                 error_code=code,
                 error_message=message,
+                task=task,
             )
             return
 
@@ -170,6 +199,7 @@ class TurnQueue:
             {"turn_id": turn.id, "usage": usage, "state": TurnState.COMPLETED.value,
              "stopped_reason": stopped_reason},
             messages=messages,
+            task=task,
         )
 
     async def _finalize(
@@ -181,6 +211,7 @@ class TurnQueue:
         messages: Sequence[Message] = (),
         error_code: str | None = None,
         error_message: str | None = None,
+        task: asyncio.Task[Any] | None = None,
     ) -> None:
         if turn.id in self._finalized:
             return
@@ -200,28 +231,44 @@ class TurnQueue:
         await self._emit(self.session_id, "queue.updated", self.state_payload())
         if self._finish is not None and not self._finish.is_set():
             self._finish.set()
-        self._release_cancel(turn.id)
+        self._release_cancel(turn.id, task)
 
     # ------------------------------------------------------------------ cancel flag
-    def _release_cancel(self, turn_id: str) -> None:
+    def _release_cancel(self, turn_id: str, task: asyncio.Task[Any] | None) -> None:
         """Let the router forget `turn_id` once nothing can consult the flag.
 
         The flag must outlive the terminal event: `interrupt` returns before
         the module (and therefore the turn task) is done, and the loop reads
         `was_cancelled(turn_id)` when the late reply lands to refuse writing
-        into a closed turn. So release on the turn task's completion — and
-        immediately when there is no live task left.
+        into a closed turn.
+
+        The task is a PARAMETER, never `self._turn_task`: `interrupt` can land
+        while another turn's task is the current one (the pre-task window), and
+        a clear bound to that task either fires at the wrong time or never —
+        the flag then outlives its own turn. Three cases:
+          * the turn's executor is still running: clear when it is done;
+          * it is already done: clear now;
+          * it does not exist yet (`interrupt` landed between `turn.started`
+            and `create_task`): keep the flag and arm the clear when
+            `_execute_one` creates the task — clearing now would hand the loop
+            a turn whose `was_cancelled` is already False.
         """
-        if self._cancel_clear_hook is None:
+        if task is None:
+            self._release_pending.add(turn_id)
             return
-        task = self._turn_task
-        if task is not None and not task.done():
-            task.add_done_callback(lambda _t: self._clear_cancel(turn_id))
+        if task.done():
+            self._forget_turn(turn_id)
             return
+        task.add_done_callback(lambda _t, tid=turn_id: self._forget_turn(tid))
+
+    def _forget_turn(self, turn_id: str) -> None:
+        """Drop every per-turn remnant once nothing can read it any more."""
+        self._turn_tasks.pop(turn_id, None)
+        self._release_pending.discard(turn_id)
         self._clear_cancel(turn_id)
 
     def _clear_cancel(self, turn_id: str) -> None:
-        if self._cancel_clear_hook is None:  # pragma: no cover - guarded by caller
+        if self._cancel_clear_hook is None:
             return
         try:
             self._cancel_clear_hook(turn_id)
@@ -239,7 +286,7 @@ class TurnQueue:
                 self._cancel_hook(turn_id)  # tools/cancel; sync + non-blocking
             except Exception:  # pragma: no cover - cancel must never raise into UI
                 pass
-        task = self._turn_task
+        task = self._turn_tasks.get(turn_id)
         if task is not None and not task.done():
             task.cancel()
             task.add_done_callback(self._consume_orphan)
@@ -247,6 +294,7 @@ class TurnQueue:
         await self._finalize(
             item.turn, TurnState.INTERRUPTED,
             {"turn_id": turn_id, "by": by, "state": TurnState.INTERRUPTED.value},
+            task=task,
         )
         return True
 
@@ -264,7 +312,10 @@ class TurnQueue:
                 await self._emit(self.session_id, "queue.updated", self.state_payload())
                 # A queued turn never reached the router, so there is no
                 # in-flight task that could still read the flag.
-                self._clear_cancel(turn_id)
+                self._forget_turn(turn_id)
+                # It also never reaches `_run_one`, which is what drops the
+                # `_finalized` marker: drop it here so the set stays bounded.
+                self._finalized.discard(turn_id)
                 return True
         if self._running is not None and self._running.turn_id == turn_id:
             # Running turns are stopped by interrupt, never by queue.cancel.
@@ -288,8 +339,10 @@ class TurnQueue:
             await asyncio.shield(worker)
 
     async def shutdown(self) -> None:
-        if self._turn_task is not None and not self._turn_task.done():
-            self._turn_task.cancel()
+        for task in list(self._turn_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._release_pending.clear()
         if self._worker is not None:
             self._worker.cancel()
         for task in list(self._orphans):

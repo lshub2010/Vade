@@ -125,3 +125,39 @@ $ /root/HermesWorkspace/Vade/.venv/bin/python -m pytest core/tests -q
 - 能力索引 key 为 `module_id/tool@instance_id`（pooled 三实例 = 三条 binding，`tool_count()` 按 `module_id/tool` 去重）。
 - `Registry(close_connection=...)` 是治理写接口唯一的连接副作用入口；C5a 必须经它停用/吊销。
 - `App` 上的四个扩展位（`prompt_hooks` / `tool_failure_hooks` / `on_session_end` / `approval_port`）已由 `slots.install_slots` 建好。
+
+
+---
+
+## 修复轮（第二轮，2026-11-13）
+
+审查报告 `/root/HermesWorkspace/Vade-REVIEW-C2.md` 指出 3 个阻塞 + P1–P3。本轮全部修复：
+
+| 项 | 修复 | 测试 |
+|---|---|---|
+| 阻塞 A · IK 无 remote_pub | 白名单存 `public_key`，`CandidateKeySession` 逐候选重试；`build_module_crypto` 真正接线 | `test_handshake_wiring.py` 4 条真握手 |
+| 阻塞 B · 关连接空转 | `Connection.request_close()` 跨线程调度；修 `transport.install` 早退 | `test_close.py` 3 条 |
+| 阻塞 C · 缺夹具/真实监听 | `tests/fixtures/fake_module.py` + uvicorn 真端口 + httpx/websockets | `test_live_server.py` 5 条 |
+| P1 配对码约束 5 | `consume(..., fingerprint=)`，按模块指纹判定 | 3 条 |
+| P2 `note_failure` 死代码 | 失败走 `_note_failure_row`，5 次销毁 | 4 条 |
+| P2 XFF 绕过 | `trust_forwarded_for=False` 默认；uvicorn `proxy_headers=False` | 伪造 4 个 XFF 仍 429 |
+| P2 rejected 快照崩 | `manifest: Manifest \| None`，`tool_count=0` | 1 条 |
+| P3 索引误伤 / 降级键错 | `_rebuild_index()` + `{module}/{name}@{instance}` | 2 条 |
+| 汉字表 | 去重补到 **256 unique**，`test_hanzi_table_is_256_unique` 守门 | 通过 |
+
+**额外发现（审查未列，最严重）**：`pairing._verify()` 的盐解析判断写反（`salt_hex.startswith("{")` 直接 return False），
+导致**任何配对码都永远无法消费**——`/ui/session` 全链路此前是死的。已修，附 4 种写法归一化测试。
+
+### 实测
+
+```
+pytest core/tests -q          → 84 passed, 4 warnings
+tools/check_contracts.py      → contracts: OK (C-03/C-04/C-05/C-18, 33 codes)
+```
+
+### 已知限制（本轮未验证）
+
+- TLS / `wss://` 未跑（`cryptography` 未装）
+- XXpsk3 首次配对未跑
+- `fake_module.py` 未作为独立子进程 CLI 跑
+- `trust_forwarded_for` 只是构造参数，未加 config 键 → 反代部署暂时无法从 `core.toml` 开启

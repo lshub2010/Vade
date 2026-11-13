@@ -25,10 +25,12 @@ from .identity.pairing import PairingStore
 from .identity.store import Identity, load_or_create
 from .identity.whitelist import Whitelist
 from .registry.api import RegistryAPI
+from .registry.manifest import ManifestError, validate_manifest
 from .registry.table import Registry
 from .slots import install_slots
+from .transport.connection import RpcError
 
-__all__ = ["App", "create_app", "install_components", "INFRA", "REQUIRED"]
+__all__ = ["App", "create_app", "install_components", "make_rpc_handler", "INFRA", "REQUIRED"]
 
 INFRA = {"transport", "crypto_gateway", "registry", "identity"}
 REQUIRED = {"session", "policy", "audit"}
@@ -72,12 +74,14 @@ class App:
         self.whitelist = Whitelist(data_dir / "identity" / "whitelist.json", on_revoke=self._revoke_connection)
         self.pairing = PairingStore(
             data_dir / "pairing.sqlite3",
-            existing_fingerprint=lambda module_id, instance_id: self.whitelist.fingerprint_for(module_id, "*")
-            if self.whitelist
-            else None,
+            existing_fingerprint=self._existing_module_fingerprint,
         )
 
         install_slots(self)
+        # Import first, then let the package replace the attribute with its
+        # facade. `install()` used to early-return because `app.transport` was
+        # already the module object, so the facade dict (and its connection
+        # table) never existed.
         self.transport = importlib.import_module("vade.transport")
         if hasattr(self.transport, "install"):
             self.transport.install(self)
@@ -92,10 +96,27 @@ class App:
         self.started = False
 
     # ------------------------------------------------------------------ hooks
+    def _connections(self) -> dict[str, Any]:
+        """Live connection table, whichever shape `transport` currently has."""
+        transport = self.transport
+        if isinstance(transport, dict):
+            return transport.get("connections") or {}
+        return getattr(transport, "CONNECTIONS", None) or {}
+
     def _close_connection(self, connection_id: str) -> None:
-        app_connections = getattr(self.transport, "CONNECTIONS", None)
-        if app_connections and connection_id in app_connections:
-            app_connections[connection_id].close(1001, "closed by core")
+        """Called by `Registry` from a sync (admin) thread.
+
+        `Connection.close` is async, so the old direct call only built a
+        coroutine and closed nothing. `request_close` schedules the real close
+        on the connection's own loop.
+        """
+        connection = self._connections().get(connection_id)
+        if connection is not None:
+            connection.request_close(1001, "closed by core")
+
+    def _existing_module_fingerprint(self, module_id: str) -> str | None:
+        """Constraint 5 input: the key already paired to this module, if any."""
+        return self.whitelist.fingerprint_for(module_id) if self.whitelist is not None else None
 
     def _revoke_connection(self, fingerprint: str) -> None:
         if self.registry is not None:
@@ -109,10 +130,86 @@ class App:
         """
         if self.identity is None:
             data_dir = Path(str(self.config.get("core.data_dir", "./data")))
-            identity = load_or_create(data_dir)
-        else:
-            identity = self.identity
-        return identity.fp8
+            if not (data_dir / "core.key").exists():
+                # A read-only query must not create key material as a side
+                # effect; `load_or_create` on an existing file only loads.
+                raise VadeError("NOT_FOUND", "core identity does not exist yet; start the core once to create data/core.key")
+            self.identity = load_or_create(data_dir)
+        return self.identity.fp8
+
+    # ------------------------------------------------------------------ module RPC
+    def _peer_fingerprint(self, connection: Any) -> str:
+        crypto = getattr(connection, "crypto", None)
+        fingerprint = getattr(crypto, "remote_fingerprint", None) if crypto is not None else None
+        if not fingerprint:
+            raise VadeError("PERMISSION_DENIED", "module RPC requires an authenticated Noise session", fatal=True)
+        return str(fingerprint)
+
+    def register_module(self, connection: Any, params: Any) -> Any:
+        """`module/register`: validate first, then place the node in the table.
+
+        Rejections come back as a JSON-RPC error on the same connection (the
+        module may fix the manifest and retry); only an unauthenticated caller
+        is fatal.
+        """
+        if self.registry is None:
+            raise VadeError("INTERNAL", "registry is not available")
+        try:
+            manifest = validate_manifest(params if params is not None else {})
+        except ManifestError as exc:
+            return RpcError("MANIFEST_INVALID", exc.message)
+        except VadeError as exc:
+            return RpcError(exc.code, exc.message)
+
+        kind = "device" if manifest.role == "ui" else "module"
+        auth_mode = "module_key"
+        try:
+            registration = self.registry.register(
+                manifest,
+                fingerprint=self._peer_fingerprint(connection),
+                connection_id=connection.connection_id,
+                kind=kind,
+                auth_mode=auth_mode,
+            )
+        except VadeError as exc:
+            return RpcError(exc.code, exc.message)
+        return {
+            "accepted": registration.accepted,
+            "session_id": registration.session_id,
+            "tool_names": list(registration.tool_names),
+        }
+
+    def update_module_capabilities(self, connection: Any, params: Any) -> Any:
+        if self.registry is None:
+            raise VadeError("INTERNAL", "registry is not available")
+        fingerprint = self._peer_fingerprint(connection)
+        try:
+            manifest = validate_manifest(params if params is not None else {})
+            epoch = self.registry.update_capabilities(manifest, fingerprint=fingerprint)
+        except ManifestError as exc:
+            return RpcError("MANIFEST_INVALID", exc.message)
+        except VadeError as exc:
+            return RpcError(exc.code, exc.message)
+        return {"accepted": True, "cap_epoch": epoch, "tool_names": list(manifest.tool_names)}
+
+
+def make_rpc_handler(app: App) -> Any:
+    """JSON-RPC dispatcher for the data plane (C2 owns the wire, not the tools)."""
+
+    async def handler(connection: Any, message: dict[str, Any]) -> Any:
+        method = message.get("method")
+        params = message.get("params")
+        if method is None:
+            return None  # a response or notification from the peer
+        if method == "module/register":
+            return app.register_module(connection, params)
+        if method == "module/capabilities.update":
+            return app.update_module_capabilities(connection, params)
+        if method == "module/heartbeat":
+            return {}
+        return RpcError("NOT_FOUND", f"unknown method {method!r}")
+
+    return handler
 
 
 def install_components(app: App, strict: bool) -> set[str]:

@@ -2,7 +2,7 @@
 
 Shape: 2 hanzi + 6 base32, displayed `青松-A7K2M9`.
   alphabet: ABCDEFGHJKLMNPQRSTUVWXYZ23456789  (no I/O/0/1)
-  entropy : 256^2 * 32^6 ~= 2^46
+  entropy : 256^2 * 32^6 ~= 2^46  (the table is 256 unique chars)
 
 Five constraints that make this safe (21-C2 T1):
   1. `purpose ∈ {module, browser}` and consumption must match.
@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import secrets
 import sqlite3
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -46,18 +47,21 @@ MAX_FAILS_PER_CODE = 5
 IP_WINDOW_S = 300
 IP_MAX_ATTEMPTS = 5
 
-#: Placeholder 256-char table. C-15's `hanzi_table` is still null in
-#: schema/pair-code.json; generation needs *some* anchor characters, but nothing
-#: downstream depends on WHICH characters (consumption validates shape only,
-#: exactly like protocol/core/src/paircode.rs). Replace when C-15 lands its table.
+#: Placeholder 256-char table, 256 UNIQUE characters (asserted by
+#: `core/tests/identity/test_pairing.py::test_hanzi_table_is_256_unique`).
+#: C-15's `hanzi_table` is still null in schema/pair-code.json; generation
+#: needs *some* anchor characters, but nothing downstream depends on WHICH
+#: characters (consumption validates shape only, exactly like
+#: protocol/core/src/paircode.rs). Replace when C-15 lands its table.
 _HANZI = (
-    "青松明月山川云海风雨雷电江河湖泽林森木火土金水晶光天日星辰春夏秋冬东南西北"
-    "中和正大平安康健喜乐福寿仁义礼智信忠孝廉耻勇诚敬谦慎勤恒思学志远宁静"
-    "清泉溪谷岩峰岭原野田禾苗花草竹梅兰菊莲桂枫柳柏槐梧桐鸿雁鹤鹰燕雀鱼龙"
-    "虎豹鹿马牛羊鸡犬象狮熊鹰凤麟龟蛇蝶蜂蝉萤虹霞露霜雪冰雾烟波潮汐浪涛"
-    "舟桥岸渡城乡村镇街巷庭院楼阁台亭廊窗门户墙垣阶梯径路里程尺寸斤两"
-    "书琴棋画诗酒茶香墨砚笔纸卷轴章句篇章词曲歌舞蹈戏剧鼓钟铃箫笛弦"
-    "剑弓刀斧锤钩绳索网罗囊袋箱柜桌椅床榻枕席帘幔帐帷幕"
+    "青松明月山川云海风雨雷电江河湖泽林森木火土金水晶光天日星辰春夏秋"
+    "冬东南西北中和正大平安康健喜乐福寿仁义礼智信忠孝廉耻勇诚敬谦慎勤"
+    "恒思学志远宁静清泉溪谷岩峰岭原野田禾苗花草竹梅兰菊莲桂枫柳柏槐梧"
+    "桐鸿雁鹤鹰燕雀鱼龙虎豹鹿马牛羊鸡犬象狮熊凤麟龟蛇蝶蜂蝉萤虹霞露霜"
+    "雪冰雾烟波潮汐浪涛舟桥岸渡城乡村镇街巷庭院楼阁台亭廊窗门户墙垣阶"
+    "梯径路里程尺寸斤两书琴棋画诗酒茶香墨砚笔纸卷轴章句篇词曲歌舞蹈戏"
+    "剧鼓钟铃箫笛弦剑弓刀斧锤钩绳索网罗囊袋箱柜桌椅床榻枕席帘幔帐帷幕"
+    "峦崖壁峡涧源潭渊泊汉淮汛洲渚滩礁屿岛堤坝梁道衢市井郊畴阡陌稼稻麦"
 )
 
 
@@ -95,9 +99,15 @@ def _verify(code: str, stored: str) -> bool:
         algo, salt_hex, digest_hex = stored.split(":")
     except ValueError:
         return False
-    if algo != "scrypt" or salt_hex.startswith("{") or not salt_hex.endswith("}"):
+    # Stored format: `scrypt:{<salt hex>}:<digest hex>`; the algo prefix keeps
+    # old rows readable if the KDF changes.
+    if algo != "scrypt" or not (salt_hex.startswith("{") and salt_hex.endswith("}")):
         return False
-    expected = _hash(code, bytes.fromhex(salt_hex.strip("{}"))).rsplit(":", 1)[-1]
+    try:
+        salt = bytes.fromhex(salt_hex[1:-1])
+        expected = _hash(code, salt).rsplit(":", 1)[-1]
+    except ValueError:
+        return False
     return hmac.compare_digest(expected, digest_hex)
 
 
@@ -114,6 +124,11 @@ class PairingStore:
         self._clock = clock
         self._existing_fingerprint = existing_fingerprint
         self._db = sqlite3.connect(self._path, check_same_thread=False)
+        # One connection, two threads in production (uvicorn's loop calls
+        # /ui/session while admin code runs elsewhere). Without a lock the
+        # implicit transactions interleave and committed attempt rows go
+        # missing, which silently disables the 5/5min budget.
+        self._lock = threading.RLock()
         self._db.execute(
             """CREATE TABLE IF NOT EXISTS pair_codes (
                    code_hash TEXT PRIMARY KEY,
@@ -141,10 +156,22 @@ class PairingStore:
         expected_fp: str | None = None,
         ttl: int = TTL_DEFAULT,
     ) -> str:
+        with self._lock:
+            return self._create(purpose, module_id, expected_fp, ttl)
+
+    def _create(
+        self,
+        purpose: Purpose | str,
+        module_id: str | None = None,
+        expected_fp: str | None = None,
+        ttl: int = TTL_DEFAULT,
+    ) -> str:
         purpose = Purpose(purpose)
         if purpose is Purpose.MODULE and not module_id:
-            # A module code without module_id cannot enforce constraint 5.
-            module_id = None
+            # Without module_id constraint 5 cannot be enforced, and a code that
+            # can be replayed against any module is exactly the displacement
+            # hole the constraint exists for.
+            raise VadeError("INVALID_ARGUMENT", "purpose=module requires module_id (constraint 5)")
         plaintext = self._generate()
         stored = _hash(normalize(plaintext), secrets.token_bytes(16))
         self._db.execute(
@@ -161,10 +188,29 @@ class PairingStore:
         return f"{anchor}-{body}"
 
     # ------------------------------------------------------------------ consume
-    def consume(self, code: str, purpose: Purpose | str, *, ip: str | None = None) -> PairCode:
-        purpose = Purpose(purpose)
-        self._check_ip(ip)
+    def consume(
+        self,
+        code: str,
+        purpose: Purpose | str,
+        *,
+        ip: str | None = None,
+        fingerprint: str | None = None,
+    ) -> PairCode:
+        """Consume a code for `purpose`.
 
+        `fingerprint` is the key that is *actually* claiming the module (known
+        only after the handshake, e.g. from `remote_static`). Constraint 5
+        compares it with `existing_fingerprint(module_id)`: a code must not
+        silently displace an already-paired module, and if the module IS paired
+        the caller has to prove the new key matches — an absent fingerprint is
+        refused rather than trusted.
+        """
+        purpose = Purpose(purpose)
+        with self._lock:
+            return self._consume_locked(code, purpose, ip, fingerprint)
+
+    def _consume_locked(self, code: str, purpose: Purpose, ip: str | None, fingerprint: str | None) -> PairCode:
+        self._check_ip(ip)
         normalized = normalize(code)
         if not code_shape_ok(normalized):
             # Never echo the submitted code.
@@ -172,15 +218,22 @@ class PairingStore:
             raise VadeError("CODE_INVALID", "pair code is not valid")
 
         row = self._db.execute(
-            "SELECT code_hash, purpose, module_id, expected_fp, expires_at, fails FROM pair_codes WHERE purpose=?",
-            (purpose.value,),
+            "SELECT code_hash, purpose, module_id, expected_fp, expires_at, fails FROM pair_codes"
         ).fetchall()
         match = next((r for r in row if _verify(normalized, r[0])), None)
         if match is None:
             self._record_ip(ip)
             raise VadeError("CODE_INVALID", "pair code is not valid")
 
-        code_hash, _, module_id, expected_fp, expires_at, fails = match
+        code_hash, stored_purpose, module_id, expected_fp, expires_at, _fails = match
+        if stored_purpose != purpose.value:
+            # The code exists but was issued for the other flow. Count it and
+            # answer exactly like an unknown code: revealing "this is a browser
+            # code" would hand an attacker a type oracle.
+            self._note_failure_row(code_hash)
+            self._record_ip(ip)
+            raise VadeError("CODE_INVALID", "pair code is not valid")
+
         if self._clock() > expires_at:
             self._db.execute("DELETE FROM pair_codes WHERE code_hash=?", (code_hash,))
             self._db.commit()
@@ -188,19 +241,32 @@ class PairingStore:
             raise VadeError("CODE_EXPIRED", "pair code expired")
 
         if module_id and self._existing_fingerprint is not None:
-            current = self._existing_fingerprint(module_id, None)
-            if current and expected_fp and current != expected_fp:
-                raise VadeError("PERMISSION_DENIED", "module is already paired to another key; revoke it first")
+            current = self._existing_fingerprint(module_id)
+            if current:
+                candidate = fingerprint or expected_fp
+                if candidate is None:
+                    raise VadeError(
+                        "PERMISSION_DENIED",
+                        f"{module_id} is already paired; the claiming key must be supplied before the code is consumed",
+                    )
+                if current != candidate:
+                    raise VadeError("PERMISSION_DENIED", "module is already paired to another key; revoke it first")
 
         # Consume = DELETE, judged by rowcount. Idempotent under concurrency.
         cursor = self._db.execute("DELETE FROM pair_codes WHERE code_hash=? AND purpose=?", (code_hash, purpose.value))
         self._db.commit()
         if cursor.rowcount != 1:
+            self._record_ip(ip)
             raise VadeError("CODE_INVALID", "pair code is not valid")
-        self._record_ip(ip)
+        # A success is NOT an attempt: charging it against the per-IP budget
+        # locks out an admin who pairs several modules in a row.
         return PairCode(purpose=purpose, module_id=module_id, expected_fp=expected_fp, expires_at=expires_at)
 
     def revoke(self, code: str) -> bool:
+        with self._lock:
+            return self._revoke(code)
+
+    def _revoke(self, code: str) -> bool:
         normalized = normalize(code)
         rows = self._db.execute("SELECT code_hash FROM pair_codes").fetchall()
         for (stored,) in rows:
@@ -212,22 +278,31 @@ class PairingStore:
 
     def note_failure(self, code: str) -> None:
         """Increment the per-code failure counter; 5 strikes destroys the code."""
-        normalized = normalize(code)
-        for stored, fails in self._db.execute("SELECT code_hash, fails FROM pair_codes").fetchall():
-            if _verify(normalized, stored):
-                if fails + 1 >= MAX_FAILS_PER_CODE:
-                    self._db.execute("DELETE FROM pair_codes WHERE code_hash=?", (stored,))
-                else:
-                    self._db.execute("UPDATE pair_codes SET fails=? WHERE code_hash=?", (fails + 1, stored))
-                self._db.commit()
-                return
+        with self._lock:
+            normalized = normalize(code)
+            for (stored,) in self._db.execute("SELECT code_hash FROM pair_codes").fetchall():
+                if _verify(normalized, stored):
+                    self._note_failure_row(stored)
+                    return
+
+    def _note_failure_row(self, code_hash: str) -> None:
+        """Count one failed attempt against a row we already matched."""
+        row = self._db.execute("SELECT fails FROM pair_codes WHERE code_hash=?", (code_hash,)).fetchone()
+        if row is None:
+            return
+        fails = int(row[0]) + 1
+        if fails >= MAX_FAILS_PER_CODE:
+            self._db.execute("DELETE FROM pair_codes WHERE code_hash=?", (code_hash,))
+        else:
+            self._db.execute("UPDATE pair_codes SET fails=? WHERE code_hash=?", (fails, code_hash))
+        self._db.commit()
 
     # ------------------------------------------------------------------ rate limit
     def _check_ip(self, ip: str | None) -> None:
         if ip is None:
             return
         cutoff = self._clock() - IP_WINDOW_S
-        self._db.execute("DELETE FROM pair_attempts WHERE ts < ?", (cutoff - IP_WINDOW_S,))
+        self._db.execute("DELETE FROM pair_attempts WHERE ts < ?", (cutoff,))
         count = self._db.execute("SELECT COUNT(*) FROM pair_attempts WHERE ip=? AND ts>=?", (ip, cutoff)).fetchone()[0]
         if count >= IP_MAX_ATTEMPTS:
             raise VadeError("ADMIN_LOCKED", "too many pair-code attempts from this address", data={"retry_after": IP_WINDOW_S})
@@ -239,4 +314,5 @@ class PairingStore:
         self._db.commit()
 
     def close(self) -> None:
-        self._db.close()
+        with self._lock:
+            self._db.close()

@@ -62,7 +62,9 @@ class NodeRecord:
     kind: str  # "module" | "device"
     auth_mode: str  # "module_key" | "device_key" | "browser_session"
     role: str
-    manifest: Manifest
+    #: `None` only for a rejected node that was never registered (the topology
+    #: still draws it, so every accessor must tolerate the empty case).
+    manifest: Manifest | None
     enabled: bool = True
     health: HealthState = HealthState.PENDING
     connection_id: str | None = None
@@ -80,7 +82,7 @@ class NodeRecord:
 
     @property
     def tool_count(self) -> int:
-        return len(self.manifest.tools)
+        return len(self.manifest.tools) if self.manifest is not None else 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,11 +187,15 @@ class Registry:
 
         Pooled instances each get their own entry (three instances -> three
         bindings for the same tool), so the router can pick the least-inflight
-        one. A tool name held by a DIFFERENT module is a conflict.
+        one. A tool name held by a DIFFERENT module is a conflict. Disabled
+        instances contribute nothing: `set_enabled(False)` must stop routing
+        without touching the other instances of the same module.
         """
         index: dict[str, ToolBinding] = {}
         for (module_id, instance_id), record in self._records.items():
             if module_id == manifest.module_id and instance_id == exclude_instance:
+                continue
+            if not record.enabled or record.manifest is None:
                 continue
             for spec in record.manifest.tools:
                 index[f"{module_id}/{spec.name}@{instance_id}"] = ToolBinding(
@@ -200,7 +206,6 @@ class Registry:
                     effective_risk=self._effective_risk(record.module_id, spec),
                 )
 
-        holders = {binding.module_id for binding in index.values()}
         for pos, spec in enumerate(manifest.tools):
             foreign = {b.module_id for b in index.values() if b.spec.name == spec.name} - {manifest.module_id}
             if foreign:
@@ -222,7 +227,22 @@ class Registry:
                 "TOOL_CONFLICT",
                 f"global tool budget exhausted: {len(distinct_ids)} distinct tools > {self._max_global_tools}",
             )
-        _ = holders
+        return index
+
+    def _rebuild_index(self) -> dict[str, ToolBinding]:
+        """Index the current table as-is (skips disabled / manifest-less nodes)."""
+        index: dict[str, ToolBinding] = {}
+        for (module_id, instance_id), record in self._records.items():
+            if not record.enabled or record.manifest is None:
+                continue
+            for spec in record.manifest.tools:
+                index[f"{module_id}/{spec.name}@{instance_id}"] = ToolBinding(
+                    tool_id=f"{module_id}/{spec.name}",
+                    module_id=module_id,
+                    instance_id=instance_id,
+                    spec=spec,
+                    effective_risk=self._effective_risk(module_id, spec),
+                )
         return index
 
     def _effective_risk(self, module_id: str, spec: ToolSpec) -> str:
@@ -252,7 +272,7 @@ class Registry:
                 previous = old.tool(spec.name)
                 if previous is None:
                     continue
-                binding = self._index.get(spec.name)
+                binding = self._index.get(f"{manifest.module_id}/{spec.name}@{manifest.instance_id}")
                 current = binding.effective_risk if binding else previous.risk
                 if _RISK_RANK[spec.risk] < _RISK_RANK[current]:
                     raise VadeError(
@@ -378,7 +398,9 @@ class Registry:
             self._records[key] = replace(record, enabled=enabled)
             if not enabled:
                 self._records[key] = replace(self._records[key], health=HealthState.OFFLINE, connection_id=None)
-                self._index = {k: v for k, v in self._index.items() if v.module_id != module_id}
+                # Re-index the whole table: filtering by module_id also removed
+                # the OTHER instances of a pooled module.
+                self._index = self._rebuild_index()
         if not enabled and record.connection_id and self._close_connection:
             self._close_connection(record.connection_id)
 

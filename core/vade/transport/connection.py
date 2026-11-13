@@ -25,7 +25,7 @@ from ..errors import VadeError
 from ..logging import get_logger
 from .framing import decode_handshake, encode_handshake, FrameType
 
-__all__ = ["Connection", "ConnectionState", "LoopLagMonitor", "MAX_QUEUE_DEFAULT"]
+__all__ = ["Connection", "ConnectionState", "LoopLagMonitor", "RpcError", "MAX_QUEUE_DEFAULT"]
 
 log = get_logger("vade.transport.connection")
 
@@ -33,6 +33,28 @@ MAX_QUEUE_DEFAULT = 256
 CLOSE_NORMAL = 1000
 CLOSE_GOING_AWAY = 1001
 CLOSE_TRY_AGAIN = 1013
+
+
+class RpcError:
+    """A JSON-RPC error reply the dispatcher should send instead of a result.
+
+    Manifest rejections must be reported to the module (the CLI prints the
+    pointer), NOT turned into a close: a module with a bad manifest is allowed
+    to fix it and retry on the same connection.
+    """
+
+    __slots__ = ("code", "message", "data")
+
+    def __init__(self, code: str, message: str, data: dict[str, Any] | None = None) -> None:
+        self.code = code
+        self.message = message
+        self.data = data
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"code": self.code, "message": self.message}
+        if self.data is not None:
+            payload["data"] = self.data
+        return payload
 
 
 class ConnectionState(str, Enum):
@@ -94,11 +116,20 @@ class Connection:
         self._on_close = on_close
         self._writer_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._pending_close: tuple[int, str] | None = None
         self._last_rx = time.monotonic()
         self._closed = False
 
     # ------------------------------------------------------------------ lifecycle
     async def run(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        if self._pending_close is not None:
+            # Governance closed this connection before it started running.
+            code, reason = self._pending_close
+            self._pending_close = None
+            await self.close(code, reason)
+            return
         self._writer_task = asyncio.create_task(self._writer_loop(), name=f"writer-{self.connection_id}")
         try:
             if self.browser_session:
@@ -168,7 +199,10 @@ class Connection:
             return
         result = await self._on_rpc(self, message)
         if result is not None and message.get("id") is not None:
-            await self.send_json({"jsonrpc": "2.0", "id": message["id"], "result": result})
+            if isinstance(result, RpcError):
+                await self.send_json({"jsonrpc": "2.0", "id": message["id"], "error": result.to_dict()})
+            else:
+                await self.send_json({"jsonrpc": "2.0", "id": message["id"], "result": result})
 
     async def send_json(self, obj: Any) -> None:
         payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -229,6 +263,31 @@ class Connection:
     async def drain(self) -> None:
         if self.state is ConnectionState.ESTABLISHED:
             self.state = ConnectionState.DRAINING
+
+    def request_close(self, code: int = CLOSE_GOING_AWAY, reason: str = "closed by core") -> None:
+        """Sync, thread-safe close for governance hooks (`Registry` runs on the
+        admin thread and cannot await).
+
+        `Connection.close` is a coroutine; calling it without awaiting only
+        creates a coroutine object and leaves the socket open (the bug this
+        method replaces). Here the close is scheduled on the loop that owns the
+        connection, so the writer task is cancelled and the WS is really shut.
+        """
+        if self._closed:
+            return
+        loop = self._loop
+        if loop is None:
+            # Not running yet (or never started): remember it so run() exits.
+            self._pending_close = (code, reason)
+            return
+        try:
+            loop.call_soon_threadsafe(self._spawn_close, code, reason)
+        except RuntimeError:  # pragma: no cover - loop already closed
+            self._closed = True
+            self.state = ConnectionState.CLOSED
+
+    def _spawn_close(self, code: int, reason: str) -> None:
+        asyncio.ensure_future(self.close(code, reason))
 
     async def close(self, code: int = CLOSE_NORMAL, reason: str = "") -> None:
         if self._closed:

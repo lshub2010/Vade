@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import hashlib
 from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from ..errors import VadeError
 from ..transport.framing import DEFAULT_MAX_PAYLOAD, FrameHeader, FrameType, ReplayWindow, open_frame as open_wire, seal as seal_wire
 from .errors import from_ffi
 
-__all__ = ["CryptoSession", "GatewayState", "MODES", "fingerprint_of"]
+__all__ = ["CryptoSession", "CandidateKeySession", "GatewayState", "MODES", "fingerprint_of"]
 
 
 def fingerprint_of(public_key: bytes) -> str:
@@ -183,7 +183,8 @@ class CryptoSession:
             self._fail()
             raise VadeError("PERMISSION_DENIED", "peer key revoked during handshake", fatal=True)
         self._handshake = None
-        self._replay.reset(self._transport.send_generation() * 0 + 1)
+        # Receive direction starts on generation 1 (the transport's first key).
+        self._replay.reset(1)
         self._state = GatewayState.ESTABLISHED
 
     # ------------------------------------------------------------------ records
@@ -252,6 +253,162 @@ class CryptoSession:
                 "INVALID_ARGUMENT",
                 f"operation requires state {expected.value}, session is {self._state.value}",
             )
+
+
+class CandidateKeySession:
+    """IK responder that picks the peer's static key from a whitelist pool.
+
+    Why this exists: protocol-core refuses `IK` without `remote_pub` for BOTH
+    roles (no XX fallback), while an inbound connection only reveals the
+    initiator's static key inside msg1. A single `CryptoSession` therefore
+    cannot be built before the first frame arrives. This wrapper keeps a fresh
+    `CryptoSession` per candidate and re-reads msg1 with the next key when the
+    AEAD check fails.
+
+    Trying a wrong candidate is indistinguishable from talking to a stranger, so
+    a failure is only a hint to try the next key. The authoritative decision is
+    still made by `CryptoSession.read_handshake` -> `whitelist.allows()`: a
+    candidate that decrypts msg1 but is not stored is rejected with
+    `PERMISSION_DENIED` and never produces msg2 on the wire.
+
+    Not wired: XXpsk3 pairing (first contact, PSK from the pair code). That
+    needs the pairing RPC surface owned by C3/C5a; `mode` is explicit rather
+    than guessed so no downgrade can hide here.
+    """
+
+    def __init__(
+        self,
+        local_identity: Any,
+        candidates: Iterable[bytes],
+        *,
+        connection: str = "module_initiated",
+        whitelist: _Whitelist | None = None,
+        max_payload: int = DEFAULT_MAX_PAYLOAD,
+        protocol_module: Any | None = None,
+    ) -> None:
+        if connection not in CONNECTIONS:
+            raise VadeError("INVALID_ARGUMENT", f"connection must be one of {CONNECTIONS}, got {connection!r}")
+        self._identity = local_identity
+        self._candidates = tuple(bytes(c) for c in candidates)
+        self._connection = connection
+        self._whitelist = whitelist
+        self._max_payload = max_payload
+        self._protocol = protocol_module
+        self._next = 0
+        self._session: CryptoSession | None = None
+        self._last_error: BaseException | None = None
+        self._closed = False
+        if not self._candidates:
+            # Fail closed and loudly: a core with an empty whitelist must not
+            # accept a module, and silently waiting for a handshake that can
+            # never verify is worse than telling the operator why.
+            raise VadeError(
+                "PERMISSION_DENIED",
+                "no whitelisted module public key is stored; pair the module first",
+                fatal=True,
+            )
+        self._session = self._make(self._candidates[0])
+
+    def _make(self, remote_pub: bytes) -> CryptoSession:
+        return CryptoSession(
+            self._identity,
+            mode="ik",
+            role="responder",
+            connection=self._connection,
+            remote_pub=remote_pub,
+            whitelist=self._whitelist,
+            max_payload=self._max_payload,
+            protocol_module=self._protocol,
+        )
+
+    # ------------------------------------------------------------------ props
+    @property
+    def state(self) -> GatewayState:
+        return self._session.state if self._session is not None else GatewayState.CLOSED
+
+    @property
+    def mode(self) -> str:
+        return "ik"
+
+    @property
+    def remote_static(self) -> bytes | None:
+        return self._session.remote_static if self._session is not None else None
+
+    @property
+    def remote_fingerprint(self) -> str | None:
+        return self._session.remote_fingerprint if self._session is not None else None
+
+    @property
+    def transport(self) -> Any:
+        if self._session is None:
+            raise VadeError("INVALID_ARGUMENT", "transport not available: session is closed")
+        return self._session.transport
+
+    @property
+    def attempted_keys(self) -> int:
+        return self._next + (1 if self._session is not None else 0)
+
+    # ------------------------------------------------------------------ handshake
+    def start(self) -> None:
+        return None  # responder
+
+    def read_handshake(self, message: bytes) -> bytes | None:
+        while True:
+            if self._session is None:
+                raise VadeError("PERMISSION_DENIED", "no candidate key could read the handshake", fatal=True)
+            try:
+                return self._session.read_handshake(message)
+            except VadeError as exc:
+                self._last_error = exc
+                if self._session.state is not GatewayState.CLOSED or self._next + 1 >= len(self._candidates):
+                    raise
+                # This key could not authenticate msg1. Try the next stored one.
+                self._next += 1
+                self._session = self._make(self._candidates[self._next])
+
+    def is_finished(self) -> bool:
+        return bool(self._session.is_finished()) if self._session is not None else False
+
+    def establish(self) -> None:
+        if self._session is None:
+            raise VadeError("INVALID_ARGUMENT", "session is closed")
+        self._session.establish()
+
+    # ------------------------------------------------------------------ records
+    def seal(self, frame_type: FrameType, plaintext: bytes) -> bytes:
+        if self._session is None:
+            raise VadeError("INVALID_ARGUMENT", "session is closed")
+        return self._session.seal(frame_type, plaintext)
+
+    def open(self, wire: bytes) -> tuple[FrameHeader, bytes]:
+        if self._session is None:
+            raise VadeError("INVALID_ARGUMENT", "session is closed")
+        return self._session.open(wire)
+
+    def maybe_rekey(self) -> bytes | None:
+        if self._session is None:
+            raise VadeError("INVALID_ARGUMENT", "session is closed")
+        return self._session.maybe_rekey()
+
+    def send_generation(self) -> int:
+        if self._session is None:
+            raise VadeError("INVALID_ARGUMENT", "session is closed")
+        return self._session.send_generation()
+
+    def recv_generation(self) -> int:
+        if self._session is None:
+            raise VadeError("INVALID_ARGUMENT", "session is closed")
+        return self._session.recv_generation()
+
+    # ------------------------------------------------------------------ lifecycle
+    def drain(self) -> None:
+        if self._session is not None:
+            self._session.drain()
+
+    def close(self) -> None:
+        if self._session is not None:
+            self._session.close()
+        self._closed = True
 
 
 def _load_protocol() -> Any:

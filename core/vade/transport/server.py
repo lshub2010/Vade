@@ -8,6 +8,11 @@ admin API to third-party code. C5a owns 127.0.0.1:8444 separately.
 CORS: exact-match allowlist from `[server].ui_origins`, `Allow-Credentials:
 true`, never `*`. A wildcard with credentials is rejected by browsers anyway,
 and worse, it suggests a security model that does not exist.
+
+Client IP: `X-Forwarded-For` is only honoured when the app is constructed with
+`trust_forwarded_for=True` (i.e. behind a proxy that overwrites the header).
+By default any client could send a fresh XFF on every request and reset the
+5/5min pair-code budget, which is the whole rate limit.
 """
 
 from __future__ import annotations
@@ -17,12 +22,19 @@ import secrets
 import time
 from typing import Any, Awaitable, Callable, Mapping
 
-from ..errors import VadeError
+from ..errors import VadeError, http_status
 from .connection import Connection
 
-__all__ = ["CoreApp", "AsgiWebSocket"]
+__all__ = ["CoreApp", "AsgiWebSocket", "CONNECTIONS"]
 
 CORE_VERSION = "0.1.0"
+
+#: A pair-code POST is a tiny JSON body; anything bigger is abuse.
+MAX_UI_SESSION_BODY = 64 * 1024
+
+#: Live connections by connection_id. CoreApp registers here by default so
+#: governance hooks (`App._close_connection`) see the same objects.
+CONNECTIONS: dict[str, Connection] = {}
 
 
 class AsgiWebSocket:
@@ -62,6 +74,8 @@ class CoreApp:
         close_connection: Callable[[str], None] | None = None,
         policy_mode: str = "default",
         version: str = CORE_VERSION,
+        trust_forwarded_for: bool = False,
+        connections: dict[str, Connection] | None = None,
     ) -> None:
         self.config = config
         self.identity = identity
@@ -72,10 +86,11 @@ class CoreApp:
         self._close_connection = close_connection
         self._policy_mode = policy_mode
         self._version = version
+        self._trust_forwarded_for = trust_forwarded_for
         self._ui_origins = tuple(config.get("server.ui_origins", []) or [])
         self._listen_hosts = tuple(config.get("server.listen_hosts", []) or [])
         self._sessions: dict[str, dict[str, Any]] = {}
-        self._connections: dict[str, Connection] = {}
+        self._connections: dict[str, Connection] = CONNECTIONS if connections is None else connections
 
     # ------------------------------------------------------------------ ASGI
     async def __call__(self, scope: Mapping[str, Any], receive: Callable[[], Awaitable[dict[str, Any]]], send: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
@@ -123,6 +138,9 @@ class CoreApp:
             return
 
         body = await self._read_body(receive)
+        if body is None:
+            await self._json(send, 413, {"code": "PAYLOAD_TOO_LARGE", "message": "body too large"}, cors)
+            return
         try:
             payload = json.loads(body or b"{}")
             code = str(payload["pair_code"])
@@ -139,7 +157,8 @@ class CoreApp:
         try:
             record = self._pairing.consume(code, "browser", ip=client_ip)
         except VadeError as exc:
-            await self._json(send, exc.code == "CODE_EXPIRED" and 400 or 400, exc.to_dict(), cors)
+            extra = self._status_headers(exc)
+            await self._json(send, http_status(exc.code), exc.to_dict(), cors, extra)
             return
 
         device_id = f"ui-{secrets.token_hex(8)}"
@@ -152,6 +171,12 @@ class CoreApp:
         await self._json(send, 200, {"device_id": device_id}, cors, extra)
         _ = record
 
+    @staticmethod
+    def _status_headers(exc: VadeError) -> dict[str, str]:
+        if exc.code == "ADMIN_LOCKED" and exc.data and "retry_after" in exc.data:
+            return {"Retry-After": str(int(exc.data["retry_after"]))}
+        return {}
+
     def _cors_headers(self, origin: str | None) -> dict[str, str] | None:
         if not origin:
             return {}
@@ -159,21 +184,25 @@ class CoreApp:
             return {"Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true", "Vary": "Origin"}
         return None
 
-    @staticmethod
-    def _client_ip(scope: Mapping[str, Any], headers: Mapping[str, str]) -> str | None:
-        if "x-forwarded-for" in headers:
+    def _client_ip(self, scope: Mapping[str, Any], headers: Mapping[str, str]) -> str | None:
+        if self._trust_forwarded_for and "x-forwarded-for" in headers:
             return headers["x-forwarded-for"].split(",")[0].strip()
         client = scope.get("client")
         return client[0] if client else None
 
     @staticmethod
-    async def _read_body(receive: Callable[[], Awaitable[dict[str, Any]]]) -> bytes:
+    async def _read_body(receive: Callable[[], Awaitable[dict[str, Any]]]) -> bytes | None:
         chunks: list[bytes] = []
+        total = 0
         while True:
             message = await receive()
             if message["type"] != "http.request":
                 break
-            chunks.append(message.get("body", b""))
+            chunk = message.get("body", b"")
+            total += len(chunk)
+            if total > MAX_UI_SESSION_BODY:
+                return None
+            chunks.append(chunk)
             if not message.get("more_body", False):
                 break
         return b"".join(chunks)
@@ -207,7 +236,16 @@ class CoreApp:
         await send({"type": "websocket.accept"})
         ws = AsgiWebSocket(send, receive)
         connection_id = secrets.token_hex(8)
-        crypto = None if browser else self._make_crypto(connection_id)  # type: ignore[misc]
+        crypto = None
+        if not browser:
+            try:
+                crypto = self._make_crypto(connection_id)  # type: ignore[misc]
+            except VadeError:
+                # No usable key pool / protocol binding: refuse before a reader
+                # task is started. 1011 = internal error, never 1008 (policy)
+                # because the peer did not do anything wrong.
+                await send({"type": "websocket.close", "code": 1011})
+                return
         connection = Connection(
             ws,
             crypto,
@@ -219,6 +257,7 @@ class CoreApp:
             on_close=self._forget,
             browser_session=browser,
         )
+        connection.ui_token = token if browser else None  # type: ignore[attr-defined]
         self._connections[connection_id] = connection
         await connection.run()
 
@@ -235,11 +274,17 @@ class CoreApp:
 
     # ------------------------------------------------------------------ governance
     def revoke_session(self, device_id: str) -> tuple[str, ...]:
+        """Revoke one browser device: drop its tokens and close only ITS sockets.
+
+        A revoke used to return every browser connection id, which would have
+        kicked every logged-in UI when one device was revoked.
+        """
+        tokens = {token for token, meta in self._sessions.items() if meta["device_id"] == device_id}
         closed: list[str] = []
-        for token, meta in list(self._sessions.items()):
-            if meta["device_id"] == device_id:
-                meta["revoked"] = True
-                for connection in list(self._connections.values()):
-                    if connection.browser_session:
-                        closed.append(connection.connection_id)
+        for token in tokens:
+            del self._sessions[token]
+        for connection in list(self._connections.values()):
+            if connection.browser_session and getattr(connection, "ui_token", None) in tokens:
+                closed.append(connection.connection_id)
+                connection.request_close(1001, "session revoked")
         return tuple(closed)

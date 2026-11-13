@@ -20,7 +20,7 @@ from .config import ConfigError, load_config
 from .identity import tls as tls_module
 from .errors import VadeError
 
-__all__ = ["main", "build_parser"]
+__all__ = ["main", "build_parser", "build_module_crypto"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,7 +75,11 @@ def main(argv: list[str] | None = None) -> int:
 
     app = App(config)
     if args.print_fingerprint:
-        print(app.print_fingerprint())
+        try:
+            print(app.print_fingerprint())
+        except VadeError as exc:
+            print(f"vade: {exc.code}: {exc}", file=sys.stderr)
+            return 2
         return 0
     if args.print_tls_fingerprint:
         cert = config.get("tls.cert")
@@ -99,33 +103,49 @@ def main(argv: list[str] | None = None) -> int:
     return int(_serve(app, uvicorn, strict=args.strict))
 
 
+def build_module_crypto(app: App) -> Any:
+    """IK responder factory for inbound modules.
+
+    A stored fingerprint cannot be turned back into a public key, so the
+    factory hands the gateway the whole whitelist pool and lets it try each key
+    on msg1 (`CandidateKeySession`). An empty pool raises and `CoreApp` closes
+    the socket with 1011 — fail closed, no anonymous session.
+    """
+    from .crypto_gateway.session import CandidateKeySession
+    from .transport.framing import MAX_FRAME_PLAINTEXT
+
+    whitelist = app.whitelist
+
+    def make_crypto(connection_id: str) -> CandidateKeySession:
+        if app.identity is None or whitelist is None:
+            raise VadeError("INTERNAL", "core identity or whitelist is not loaded")
+        return CandidateKeySession(
+            app.identity.ffi,
+            whitelist.candidate_keys(),
+            connection="module_initiated",
+            whitelist=whitelist,
+            max_payload=MAX_FRAME_PLAINTEXT,
+        )
+
+    return make_crypto
+
+
 def _serve(app: App, uvicorn: Any, *, strict: bool) -> int:
     import asyncio
 
-    from .app import install_components
-    from .crypto_gateway.session import CryptoSession
-    from .transport.framing import MAX_FRAME_PLAINTEXT
+    from .app import install_components, make_rpc_handler
     from .transport.server import CoreApp
 
     asyncio.run(app.startup())
     install_components(app, strict=strict)
-
-    def make_crypto(connection_id: str) -> CryptoSession:
-        return CryptoSession(
-            app.identity.ffi,
-            mode="ik",
-            role="responder",
-            connection="module_initiated",
-            whitelist=app.whitelist,
-            max_payload=MAX_FRAME_PLAINTEXT,
-        )
 
     core_app = CoreApp(
         config=app.config,
         identity=app.identity,
         registry=app.registry,
         pairing=app.pairing,
-        make_crypto=make_crypto,
+        make_crypto=build_module_crypto(app),
+        on_rpc=make_rpc_handler(app),
         policy_mode="allow_all" if app.config.get("dev.allow_all") else "default",
     )
 
@@ -134,7 +154,19 @@ def _serve(app: App, uvicorn: Any, *, strict: bool) -> int:
     cert, key = app.config.get("tls.cert"), app.config.get("tls.key")
     if cert and key:
         tls = {"ssl_certfile": cert, "ssl_keyfile": key}
-    uvicorn.run(core_app, host=host or "127.0.0.1", port=int(port_text), log_level="warning", **tls)
+    uvicorn.run(
+        core_app,
+        host=host or "127.0.0.1",
+        port=int(port_text),
+        log_level="warning",
+        # uvicorn's ProxyHeadersMiddleware trusts X-Forwarded-For from
+        # 127.0.0.1 by default and rewrites scope["client"]. That silently
+        # defeats the pair-code rate limit (any client can rotate the header).
+        # Behind a real reverse proxy, enable it deliberately AND construct
+        # CoreApp(trust_forwarded_for=True).
+        proxy_headers=False,
+        **tls,
+    )
     return 0
 
 

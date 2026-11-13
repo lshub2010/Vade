@@ -1,0 +1,4 @@
+# Vade core runtime deps (C2)
+uvicorn==0.54.0
+starlette==1.10.0
+websockets==17.4

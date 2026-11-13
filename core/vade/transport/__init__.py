@@ -23,7 +23,7 @@ from .framing import (
     seal,
     split_stream,
 )
-from .server import AsgiWebSocket, CoreApp
+from .server import AsgiWebSocket, CONNECTIONS, CoreApp
 
 __all__ = [
     "Connection",
@@ -47,11 +47,19 @@ __all__ = [
 ]
 
 #: Live connections by connection_id; filled by CoreApp, read by governance.
-CONNECTIONS: dict[str, Connection] = {}
+__all__ += ["CONNECTIONS"]
 
 
 def install(app: Any) -> None:
-    """Idempotent: attach the transport facade to the app object."""
-    if getattr(app, "transport", None) is not None:
+    """Idempotent: attach the transport facade to the app object.
+
+    `App.startup` imports this module before calling `install`, so
+    `app.transport` is briefly the module itself. Treat both that and a
+    previous facade dict as "already installed" only for the dict; the module
+    is replaced with the facade so governance reads `connections` from one
+    place.
+    """
+    current = getattr(app, "transport", None)
+    if isinstance(current, dict) and "connections" in current:
         return
-    app.transport = {"connections": CONNECTIONS, "core_app": CoreApp}
+    app.transport = {"connections": CONNECTIONS, "core_app": CoreApp, "module": current}

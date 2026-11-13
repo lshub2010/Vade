@@ -95,7 +95,11 @@ def load_or_create(data_dir: Path | str, *, protocol_module: Any | None = None) 
     proto = protocol_module or _load_protocol()
     ffi = proto.FfiIdentity.generate()
     secret = str(ffi.to_secret_hex())
-    key_path.write_text(secret + "\n", encoding="utf-8")
+    # Create 0600 from the first byte; write_text() would briefly apply the
+    # umask (usually 0644) to a private key.
+    fd = os.open(key_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(secret + "\n")
     _protect(key_path)
     return Identity(ffi, secret)
 

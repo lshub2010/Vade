@@ -10,7 +10,7 @@ dist/
 build/
 target/
 *.log
-data/
+/data/
 .env
 .DS_Store
 

@@ -22,7 +22,7 @@ core 现在既没有 `model/*` RPC，也没有任何“这个模型能读图吗�
 | 2 | 未声明 `capabilities.models` 的 `chat` 模块仍出现在列表里，条目为 `<module_id>/*`、能力字段全 `null` | 否则现有 M6 模块在切换器里“隐身”，FR-8.46 的只读徽标会变成空列表 |
 | 3 | 会话选择落在 `sessions.model_id`，在 turn **出队时**解析，运行中的 turn 不受影响 | “下一轮生效”是可验收的边界；运行中换模型会让同一 turn 的 usage 无法归因 |
 | 4 | 显式选择**禁用** `fallback_to_builtin`；全局默认和 priority 路径保留回落 | 用户选了 B，core 静默用 A 回答，比报错更糟；运维默认则允许降级 |
-| 5 | 预算只告警、不硬断；`turn.completed.usage` 与审计 `llm.call` 必须逐 turn 对账 | usage 可能 `source="none"`（provider 不报），用不可靠的账硬断会吞掉用户消息；对账是 D102 的底线 |
+| 5 | 预算**默认真阻断**（FR-8.49）；仅当 usage 不可信（`source="none"`）时降级为告警并标注 `degraded`；`turn.completed.usage` 与审计 `llm.call` 必须逐 turn 对账 | 需求原文要求超限拒绝；但用不可靠的账硬断会吞消息，所以只在“账可信”时硬断 |
 
 ## 2. 动机与证据
 
@@ -77,7 +77,7 @@ RFC-0004 §9 已把接口收敛为四个字段（`input_modalities`、`max_image
 | N2 | 不做计费/价格表/成本估算（FR-10.3 的“成本”一半仍缺，见 Q3） |
 | N3 | 不做会话级高级参数（FR-8.48）：`session/*` 名字空间预留，本提案只定义 `model.*` 与 `usage.get` |
 | N4 | 不做主动能力探测：不发试探请求、不从 4xx 反推能力、不从模型名映射能力表 |
-| N5 | 不改 C-04 枚举、不新增错误码；不改 C-09 组件接口（只消费 RFC-0004 的 `AttachmentChip`） |
+| N5 | 不改 C-09 组件接口（只消费 RFC-0004 的 `AttachmentChip`）；C-04 **仅追加**一个 `BUDGET_EXCEEDED`（见 §6.4；产品不接受则退化为 `PERMISSION_DENIED` + `data.reason`） |
 | N6 | 不做模块内部 LLM 调用的归因：模块自己调上游模型的花费对 core 不可见，v1 只归因 core 发起的调用 |
 
 ## 4. `model/list`
@@ -281,7 +281,7 @@ RFC-0004 §9 已把接口收敛为四个字段（`input_modalities`、`max_image
 
 `day` 的“当天”用 **UTC**，与 `audit/writer.py:day_key()` 和 `admin/app.py:864` 一致；跨时区显示由 UI 转换，core 不猜用户时区（Q3）。`day.core_total_tokens` 是聚合值，**不给**其他会话的明细，避免 `session/usage.get` 变成跨会话窥探口。
 
-### 6.4 预算与超限：只告警，不硬断
+### 6.4 预算与超限：默认真阻断，用量不可信时降级
 
 | 键（`[usage]`） | 默认 | 生效 | 语义 |
 |---|---|---|---|
@@ -290,11 +290,14 @@ RFC-0004 §9 已把接口收敛为四个字段（`input_modalities`、`max_image
 | `daily_tokens` | `0` | hot | core 当天总 token 预算；0 = 关 |
 | `warn_ratio` | `0.8` | hot | 达到该比例进入 `warn` |
 | `include_aux` | `true` | hot | 预算是否把 `aux` 计入；关掉只算 `chat` |
+| `enforce` | `block` | hot | **`block`** = 超限拒新 turn（FR-8.49 默认）；`warn` = 只提示 |
 
 - 状态机：`ok` → `warn`（`used >= limit * warn_ratio`）→ `exceeded`（`used >= limit`）；`limit=0` 恒为 `off`。
-- **不拒绝任何 turn**。达到 `exceeded` 只发一次 `usage.budget`，并在 `session/usage.get` 里返回 `state="exceeded"`；UI 负责提示与解释（D102：“预算判定归 core，UI 只负责提示”）。
+- **`exceeded` + `enforce="block"` + usage 可信 → 拒绝新 turn**：`ui/submit` 返回 **`BUDGET_EXCEEDED`**（C-04 追加一个码）并带 `data.state="exceeded"`、`data.scope`、`data.used`、`data.limit`；已在队列中的 turn 不回溯取消，只拒新提交。
+- **降级**：若本轮 usage 的 `source="none"`（provider 不报账），视为“账不可信”，自动降级为告警（`enforce` 不改），发一次 `usage.budget` 且 `degraded=true`，`session/usage.get` 的 `state` 仍为 `exceeded`。降级只影响“拒 turn”这一个动作，不影响记账与提示。
+- UI 负责提示与解释（D102：“预算判定归 core，UI 只负责提示”）。
 - 事件去重：每个 `(scope, state, period)` 只发一次（session scope 的 period 是 `session_id`，day scope 是 UTC 日期）；重启后最多重发一次，客户端按三元组去重。事件的“真相”仍是 `session/usage.get` 的 `state`，事件只是通知。
-- **这是对 FR-8.49 验收句“超限后新 turn 被拒”的偏离**，理由见 §11-D 与 Q5：usage 可能 `source="none"`，用不可靠的账硬断会吞用户消息；单机自托管场景下“超限即拒绝”弊大于利。需要产品追认或改需求原文。
+- **与 FR-8.49 对齐**：默认 `enforce="block"`，满足验收句“超限后新 turn 被拒”；唯一例外是 usage 不可信时的降级（见上），并在 `usage.budget` 里显式标 `degraded=true`，不静默放过。
 
 ### 6.5 对账规则（D102 的可测定义）
 
@@ -360,7 +363,7 @@ RFC-0004 §9 已把接口收敛为四个字段（`input_modalities`、`max_image
 
 ### 7.6 不改
 
-C-04（复用 `INVALID_ARGUMENT` / `NOT_FOUND` / `UNAVAILABLE` / `READ_ONLY_SESSION` / `PERMISSION_DENIED`）、C-09（不新增组件）、`schema/errors.json`、`turn_states`、`Router` / 审批 / 风险判定、`[evolve]` 与 `[compaction]` 的既有键。
+C-04 的既有码（`INVALID_ARGUMENT` / `NOT_FOUND` / `UNAVAILABLE` / `READ_ONLY_SESSION` / `PERMISSION_DENIED`，**只追加** `BUDGET_EXCEEDED` 一个）、C-09（不新增组件）、`turn_states`、`Router` / 审批 / 风险判定、`[evolve]` 与 `[compaction]` 的既有键。
 
 ## 8. 验收
 
@@ -411,7 +414,7 @@ A1–A12 全部要求真实执行；截图与手写记录不算证据。
 | A. core 反向 RPC `models/list` 问模块 | 列表在模块离线时最需要，反向 RPC 恰好在这时失败；每次刷新多一跳，还要自造超时与缓存。manifest 声明 + `capabilities.update` 已有原子刷新 |
 | B. 会话覆盖写进 `data/config.overrides.json` | 那是管理面单例配置，写的是全局值；把会话状态塞进去会让“会话级”变成“全局”，且与 C-18 的 override 语义冲突 |
 | C. 客户端自己累加事件、自己存累计 | snapshot 不含 turns（§2.4），换端必丢；且 D102 明确“core 给口径”，客户端累加等于第二份真相 |
-| D. 预算硬断（FR-8.49 原文） | `source="none"` 时用量不可信，硬断会吞用户消息；单机自托管没有多租户配额压力。保留 `[usage]` 键位，v2 再评估 `enforce` |
+| D. 预算只告警 | 与 FR-8.49 验收句直接冲突，且会让“预算”形同虚设；改为默认 `enforce="block"`，只在 usage 不可信时降级 |
 | E. 价格表 / 成本估算 | 非目标 N2：需要币种、单价、缓存折扣与供应商差异，产出的是不可执行的信息，不是可执行决策 |
 | F. 发一张 1×1 图探测视觉能力 | 有成本、有延迟、有副作用（部分 provider 会计费），且探测失败无法区分“不支持”与“暂时故障” |
 
@@ -423,7 +426,7 @@ A1–A12 全部要求真实执行；截图与手写记录不算证据。
 | Q2 | **多 provider 同名模型怎么展示与持久化？** | `id` 已用 `<provider>/<model>` 消歧；`display_name` 冲突时切换器按 provider 分组，不合并。若模块 `module_id` 改名，旧 `sessions.model_id` 变成悬空且**没有别名表**——v1 接受悬空 + 提示，v2 再考虑 alias |
 | Q3 | **预算单位与日界？** | v1 用 token + UTC 日（与审计 `day_key` 对齐）。成本口径缺价格表（N2）；本地时区日界会让“今天”在同一 core 的审计与会话视图里不一致，暂不做。缓存命中是否按折扣权重计 token，也留给 v2 |
 | Q4 | **历史用量是否回填？** | 倾向不回填：审计里没有历史 `llm.call` 行，任何回填都是编数。UI 显示“历史轮次未计量”，`partial_turns` 计数；若产品要求“累计看起来完整”，只能从 `turns.usage` 反推 chat 部分，aux 永远缺 |
-| Q5 | **告警 vs 阻断（FR-8.49 原文“超限后新 turn 被拒”）** | 本提案选“仅告警”（§6.4）。需要产品追认并改 FR-8.49 验收句，或在 v2 加 `[usage].enforce="warn"\|"block"`；在 usage 可能为 `none` 的前提下，block 必须先解决“未知用量怎么算” |
+| Q5 | **新增 `BUDGET_EXCEEDED` 错误码是否接受** | 本提案默认 `enforce="block"`（§6.4），用新码表达“预算超限拒 turn”；若不允许新增 C-04 码，则退化为 `PERMISSION_DENIED` + `data.reason="budget_exceeded"` |
 | Q6 | **`max_image_px` 是长边还是总像素？** | 按 RFC-0004 §9 的“与 `max_edge` 取 min”解释为**长边**。字段名容易被读成“总像素”，建议 v2 改名 `max_image_edge`，但改名要同步 RFC-0004，v1 先按长边写死并在注记里说明 |
 | Q7 | **provider 每 chunk 都报 usage 时怎么算？** | 现有 `engine.py:131-134` 是逐 delta 累加，重复上报会翻倍。本提案不改累加语义（N1），要求 provider 适配层每步只 emit 一次；若实测有 provider 逐 chunk 上报，需在 llm 层去重（记为本提案落地后的跟进项，不是契约变更） |
 

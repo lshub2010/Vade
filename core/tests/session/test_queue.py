@@ -14,7 +14,7 @@ from vade.loop.engine import LoopEngine, TurnOutcome
 from vade.loop.tools import build_snapshot
 from vade.registry.manifest import validate_manifest
 from vade.registry.table import Registry
-from vade.router.dispatch import Router, ToolCallResult
+from vade.router.dispatch import Router
 from vade.session.manager import SessionLog
 from vade.session.models import TurnState
 from vade.session.replay import ReplayBuffer
@@ -22,26 +22,40 @@ from vade.session.sqlite_store import SQLiteStore
 from .helpers import CollectSink, GateExecutor, make_manifest, wait_until
 
 
-class _LateAnswerRouter(Router):
-    """A module that eats `tools/cancel` and answers anyway, as core sees it.
-
-    `Router.call` is where the cancellation lands when the caller is waiting on
-    the module. This subclass turns that cancellation into the late success a
-    swallowing module would produce, so the engine resumes exactly as it does
-    in production when `tools/cancel` is ignored.
-    """
-
-    async def call(self, tool_id, args, **kwargs):  # type: ignore[override]
-        try:
-            return await super().call(tool_id, args, **kwargs)
-        except asyncio.CancelledError:
-            return ToolCallResult(True, tool_id, result={"content": "late"})
-
-
 def _log(tmp_path, executor) -> SessionLog:
     log = SessionLog(SQLiteStore(tmp_path / "sessions.db"), replay=ReplayBuffer(maxlen=500))
     log.set_executor(executor)
     return log
+
+
+async def _await_settled(log: SessionLog, session_id: str, timeout: float = 2.0) -> list:
+    """Join the turn task, then wait until the persisted event stream stops.
+
+    `wait_idle` drains the queue worker only. An interrupted turn whose module
+    eats `tools/cancel` outlives the worker as an orphan task, and that task —
+    not the worker — is what would write a late `turn.delta`/`turn.tool_result`.
+    Asserting before it is done is a false pass, so: wait for the task itself,
+    then require the event count to be identical across two consecutive polls.
+    `_queues`/`_turn_task` are read on purpose — `SessionLog` exposes no
+    accessor for the turn task, and the point here is to join the real one.
+    """
+    queue = log._queues.get(session_id)
+    task = getattr(queue, "_turn_task", None) if queue is not None else None
+    if task is not None:
+        deadline = time.monotonic() + timeout
+        while not task.done() and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert task.done(), "the interrupted turn task never finished"
+        await asyncio.sleep(0)  # let its done-callbacks (cancel-flag clear) run
+    previous = len(log.store.read_since(session_id, 0))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+        current = len(log.store.read_since(session_id, 0))
+        if current == previous:
+            return log.store.read_since(session_id, 0)
+        previous = current
+    raise AssertionError("the event stream never settled: a writer is still running")
 
 
 def test_submit_is_serial_and_event_seq_has_no_gap(tmp_path):
@@ -309,6 +323,7 @@ def test_interrupt_really_cancels_the_turn_and_stops_the_event_stream(tmp_path):
         engine = LoopEngine(router, llm, lambda: build_snapshot(registry), log.emit)
         log.set_executor(engine.run_turn)
         log.set_cancel_hook(router.cancel_turn)
+        log.set_cancel_clear_hook(router.clear_cancelled)
         session = log.create_session()
 
         turn, _ = await log.submit(session.id, [{"type": "text", "text": "read a"}], "m1")
@@ -327,13 +342,15 @@ def test_interrupt_really_cancels_the_turn_and_stops_the_event_stream(tmp_path):
 
         # Drain the queue, then look at what the interrupted turn wrote.
         await log.wait_idle(session.id)
-        events = log.store.read_since(session.id, 0)
+        events = await _await_settled(log, session.id)
         types = [e.type for e in events]
         assert types.count("turn.interrupted") == 1
         after = types[types.index("turn.interrupted") + 1:]
         assert "turn.tool_result" not in after, f"events after interrupt: {after}"
         assert "turn.delta" not in after, f"events after interrupt: {after}"
         assert log.store.load(session.id).turns[0].state is TurnState.INTERRUPTED
+        # The per-turn cancel flag does not outlive the turn it belongs to.
+        assert router.was_cancelled(turn.id) is False
         await log.close()
 
     asyncio.run(scenario())
@@ -343,10 +360,12 @@ def test_interrupt_emits_no_tool_result_when_the_module_answers_after_cancel(tmp
     """A module that eats `tools/cancel` must not resurrect the turn.
 
     The module swallows the CancelledError injected into its in-flight
-    `tools/call`, then answers successfully. From the engine's side that lands
-    as a normal `ToolCallResult` (see `_LateAnswerRouter`), so without a guard
-    the loop resumes and writes `turn.tool_result` *after* `turn.interrupted` —
-    a UI then shows a completed tool call inside an interrupted turn.
+    `tools/call`, then answers successfully. A plain `Router` hands that reply
+    back to the engine as an ordinary `ToolCallResult`, exactly as production
+    sees it — the swallow point is the module coroutine, so no test double is
+    needed. Without the guard the loop resumes and writes `turn.tool_result`
+    (and then the next step's `turn.delta`) *after* `turn.interrupted` — a UI
+    then shows a completed tool call inside an interrupted turn.
     """
 
     async def scenario():
@@ -368,21 +387,30 @@ def test_interrupt_emits_no_tool_result_when_the_module_answers_after_cancel(tmp
             async def cancel(self, target, call_id):
                 self.cancels.append(call_id)
 
+        class RecordingAudit:
+            def __init__(self) -> None:
+                self.events: list[dict] = []
+
+            def record(self, event):
+                self.events.append(dict(event))
+
         module = SwallowingModule()
+        audit = RecordingAudit()
         registry = Registry()
         registry.register(
             validate_manifest(make_manifest()), fingerprint="fp-fs", connection_id="c-fs"
         )
-        router = _LateAnswerRouter(module, registry)
+        router = Router(module, registry)
         llm = MockLLMProvider([
             [Delta(tool_calls=(ToolCallDelta(index=0, id="call-1", name="fs__read_file",
                                              arguments='{"path":"a"}'),))],
             [Delta(text="late answer")],
         ])
         log = SessionLog(SQLiteStore(tmp_path / "sessions.db"), replay=ReplayBuffer(maxlen=500))
-        engine = LoopEngine(router, llm, lambda: build_snapshot(registry), log.emit)
+        engine = LoopEngine(router, llm, lambda: build_snapshot(registry), log.emit, audit=audit)
         log.set_executor(engine.run_turn)
         log.set_cancel_hook(router.cancel_turn)
+        log.set_cancel_clear_hook(router.clear_cancelled)
         session = log.create_session()
 
         turn, _ = await log.submit(session.id, [{"type": "text", "text": "read a"}], "m1")
@@ -392,19 +420,90 @@ def test_interrupt_emits_no_tool_result_when_the_module_answers_after_cancel(tmp
             "interrupt did not cancel the in-flight module call"
         await log.wait_idle(session.id)
 
-        events = log.store.read_since(session.id, 0)
+        # The turn task outlives the worker here; assert on a settled stream.
+        events = await _await_settled(log, session.id)
         types = [e.type for e in events]
         assert types.count("turn.interrupted") == 1
         after = types[types.index("turn.interrupted") + 1:]
         assert "turn.tool_result" not in after, f"tool_result written after interrupt: {after}"
         assert "turn.delta" not in after, f"delta written after interrupt: {after}"
+        assert "turn.completed" not in after, f"turn.completed written after interrupt: {after}"
 
         loaded = log.store.load(session.id)
         assert loaded.turns[0].state is TurnState.INTERRUPTED
         assert all(m.role != "tool" for m in loaded.messages), \
             "the interrupted turn persisted a late tool message"
-        assert "late answer" not in [m.content for m in loaded.messages], \
-            "the interrupted turn persisted the late assistant answer"
+
+        # The module really ran, so the call must stay in the audit trail — and
+        # say why it has no `turn.tool_result` to go with it.
+        tool_calls = [e for e in audit.events if e["kind"] == "tool_call"]
+        assert len(tool_calls) == 1, f"executed tool call lost from audit: {audit.events}"
+        assert tool_calls[0]["tool"] == "com.example.fs/read_file"
+        assert tool_calls[0]["aborted"] == "interrupted"
+        assert [e for e in audit.events if e["kind"] == "turn_completed"] == [], \
+            "an interrupted turn must not be audited as completed"
+        # ... and the router forgot the turn once its task was done.
+        assert router.was_cancelled(turn.id) is False
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_interrupt_drops_a_late_delta_from_a_provider_that_swallows_the_cancel(tmp_path):
+    """The stream guard must not depend on `llm.chat` re-raising the cancel.
+
+    A provider can eat the CancelledError thrown into its in-flight
+    `__anext__` and yield one more delta. The engine checks `_is_interrupted`
+    on the write path, so that late delta is dropped instead of being appended
+    to a turn the UI already saw as interrupted.
+    """
+
+    async def scenario():
+        class LateDeltaLLM:
+            def __init__(self) -> None:
+                self.streaming = asyncio.Event()
+                self.swallowed = 0
+
+            async def chat(self, messages, tools=None, stream=True):
+                yield Delta(text="first")
+                self.streaming.set()
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    self.swallowed += 1  # the debt: the provider eats the cancel
+                yield Delta(text="after the cancel")
+
+        class IdleModule:
+            async def call(self, target, method, params, deadline_ms):  # pragma: no cover
+                return {"ok": True, "result": {}}
+
+            async def cancel(self, target, call_id):  # pragma: no cover
+                return None
+
+        llm = LateDeltaLLM()
+        registry = Registry()
+        registry.register(
+            validate_manifest(make_manifest()), fingerprint="fp-fs", connection_id="c-fs"
+        )
+        router = Router(IdleModule(), registry)
+        log = SessionLog(SQLiteStore(tmp_path / "sessions.db"), replay=ReplayBuffer(maxlen=500))
+        engine = LoopEngine(router, llm, lambda: build_snapshot(registry), log.emit)
+        log.set_executor(engine.run_turn)
+        log.set_cancel_hook(router.cancel_turn)
+        log.set_cancel_clear_hook(router.clear_cancelled)
+        session = log.create_session()
+
+        turn, _ = await log.submit(session.id, [{"type": "text", "text": "hi"}], "m1")
+        assert await wait_until(lambda: llm.streaming.is_set(), 1.0), "the stream never started"
+        assert await log.interrupt(session.id, turn.id) is True
+        assert await wait_until(lambda: llm.swallowed == 1, 1.0), \
+            "interrupt did not reach the provider's in-flight await"
+        await log.wait_idle(session.id)
+
+        events = await _await_settled(log, session.id)
+        texts = [e.payload.get("text") for e in events if e.type == "turn.delta"]
+        assert texts == ["first"], f"a late delta landed after the interrupt: {texts}"
+        assert log.store.load(session.id).turns[0].state is TurnState.INTERRUPTED
         await log.close()
 
     asyncio.run(scenario())

@@ -107,6 +107,12 @@ class LoopEngine:
             text_parts: list[str] = []
             calls: dict[int, dict[str, str]] = {}
             async for delta in self.llm.chat(messages, tools=snapshot.schemas(), stream=True):
+                # A provider whose `chat()` swallows the cancellation (or answers
+                # after the stream was cancelled) must not append a delta to a
+                # turn the UI already closed. Checked on the write path, so the
+                # invariant does not depend on `llm.chat` re-raising.
+                if self._is_interrupted(turn):
+                    raise asyncio.CancelledError
                 if delta.text:
                     text_parts.append(delta.text)
                     await self._emit(turn.session_id, "turn.delta", {"turn_id": turn.id, "text": delta.text})
@@ -158,7 +164,8 @@ class LoopEngine:
                     )
 
                 if entry is None:
-                    self._raise_if_interrupted(turn)
+                    if self._is_interrupted(turn):
+                        raise asyncio.CancelledError
                     message = (
                         f"Tool {name!r} does not exist. Available tools: "
                         + (", ".join(snapshot.names()) or "(none)")
@@ -178,7 +185,8 @@ class LoopEngine:
 
                 decision = await self._check_approval(turn, entry, args)
                 if not decision.allowed:
-                    self._raise_if_interrupted(turn)
+                    if self._is_interrupted(turn):
+                        raise asyncio.CancelledError
                     message = f"Tool call denied: {decision.reason or 'denied by policy'}. Continue without it."
                     if decision.request_id:
                         await self._emit(
@@ -202,7 +210,20 @@ class LoopEngine:
                 result = await self.router.call(
                     entry.tool_id, args, session_id=turn.session_id, turn_id=turn.id, call_id=call_id
                 )
-                self._raise_if_interrupted(turn)
+                # The side effect already happened (the module ran), so audit it
+                # BEFORE the interruption guard below can stop the turn: after
+                # the guard there is no code path left that could write it, and
+                # an interrupted turn would leave no trace of a real tool call.
+                audit_event: dict[str, Any] = {
+                    "kind": "tool_call", "session_id": turn.session_id, "turn_id": turn.id,
+                    "tool": entry.tool_id, "ok": result.ok, "code": result.code,
+                }
+                interrupted = self._is_interrupted(turn)
+                if interrupted:
+                    audit_event["aborted"] = "interrupted"
+                self._audit(audit_event)
+                if interrupted:
+                    raise asyncio.CancelledError
                 summary = _summary(result)
                 payload = {"turn_id": turn.id, "call_id": call_id, "ok": result.ok, "summary": summary}
                 if not result.ok:
@@ -216,13 +237,13 @@ class LoopEngine:
                 )
                 messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": tool_content})
                 recorded.append({"tool": name, "args_digest": digest_args(args), "ok": result.ok})
-                self._audit({"kind": "tool_call", "session_id": turn.session_id, "turn_id": turn.id,
-                             "tool": entry.tool_id, "ok": result.ok, "code": result.code})
             else:
                 continue
 
         else:
             # for/else: the last allowed step still produced tool calls
+            if self._is_interrupted(turn):
+                raise asyncio.CancelledError
             stopped_reason = "max_steps"
             notice = (f"Stopped after {self.config.max_steps} steps to avoid an endless tool loop. "
                       "Ask me to continue if you want me to keep going.")
@@ -237,18 +258,22 @@ class LoopEngine:
         )
 
     # ------------------------------------------------------------------ helpers
-    def _raise_if_interrupted(self, turn: Turn) -> None:
-        """Stop before writing into a turn the UI already saw as interrupted.
+    def _is_interrupted(self, turn: Turn) -> bool:
+        """True once `queue.interrupt` has flagged this turn on the router.
 
-        `interrupt` marks the turn on the router (`cancel_turn`) *before* it
-        cancels this task. A module that swallows `tools/cancel` and answers
-        anyway makes `router.call` return normally, so without this check the
-        loop would resume and append a `turn.tool_result` (and the next step's
-        deltas) after `turn.interrupted` — a tool call a UI cannot reconcile.
+        Every write into the turn stream (`turn.delta`, `turn.tool_result`, the
+        max_steps notice) consults this first and raises `CancelledError` on a
+        hit, so "nothing is written after `turn.interrupted`" is an invariant
+        of THIS module. It deliberately does not rely on an awaited call
+        re-raising the cancellation: two producers can resume a turn the UI
+        already closed — a module that swallows `tools/cancel`, so
+        `router.call` returns a normal result, and an LLM provider whose
+        `chat()` swallows it, so the stream keeps yielding. The check sits on
+        the write path, not on the await that was supposed to raise, so
+        neither can append to a closed turn.
         """
         probe = getattr(self.router, "was_cancelled", None)
-        if callable(probe) and probe(turn.id):
-            raise asyncio.CancelledError
+        return bool(callable(probe) and probe(turn.id))
 
     async def _check_approval(self, turn: Turn, entry: Any, args: Mapping[str, Any]) -> ApprovalDecision:
         request = ApprovalRequest(

@@ -27,3 +27,4 @@ spike/uniffi/kotlin/build/
 
 # C1 python binding cdylib (rebuild with uniffi feature)
 protocol/core/python/*.so
+protocol/core/python/*.dll

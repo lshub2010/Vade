@@ -260,7 +260,8 @@ def test_valid_zip_with_references_installs_and_is_not_executable(tmp_path: Path
     for path in root.rglob("*"):
         if path.is_file():
             assert stat.S_IMODE(path.stat().st_mode) & 0o111 == 0, path
-    assert stat.S_IMODE((tmp_path / "pending").stat().st_mode) == 0o700
+    if os.name != "nt":  # POSIX mode bits are a no-op on Windows (chmod does nothing)
+        assert stat.S_IMODE((tmp_path / "pending").stat().st_mode) == 0o700
 
 
 def _parts(message: str):

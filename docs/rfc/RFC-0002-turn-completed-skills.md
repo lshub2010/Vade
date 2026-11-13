@@ -21,8 +21,10 @@
 
 实现侧已走到一半：C3b 的 loader 在 hook 返回时回填 `PromptParts.activated_skills`
 （`core/vade/skill/loader.py:741`，`core/vade/loop/prompt.py:32`），C3 的 `TurnOutcome`
-（`core/vade/loop/engine.py:41`）**没有**这个字段，`TurnQueue._finalize` 的 payload
-（`core/vade/session/queue.py:168`）也没有它 —— 名字在 loop 里被丢掉了。
+（`core/vade/loop/engine.py:41`）**没有**这个字段；`TurnQueue._run_one` 里组装的 COMPLETED
+payload 字面量（`core/vade/session/queue.py:170-171`）也没有它 —— 那个字面量在 `_run_one`
+里，是作为参数传给 `_finalize`（同文件 175 行）的，`_finalize` 只负责落库与发事件，
+自己不构造 payload。
 
 但**契约里没有这个字段**。`schema/events.json:149-162` 原文：
 
@@ -110,7 +112,53 @@ C-06 顶部 `status` 是 `frozen`，`docs/agents/01-contracts.md` §七 写明�
 
 ## 6. 未决问题
 
-1. 台账登记：C-06 的消费者是 UI（可忽略）与 M4b（审计，需读取）——批准后是否要在
-   `docs/agents/01-contracts.md` §八变更记录里加一行？
-2. 版本号：C-06 当前 `version: 1.0.0`。纯追加按既有惯例是否升 `1.1.0`，或只加
-   `x-vade.appends`（RFC-0001 对 C-03 的做法）？本草案倾向前者，但由编排者决定。
+1. **台账登记是硬要求，不是可选项**：`docs/agents/01-contracts.md` §七.3 写的是「通知消费方：
+   在台账表登记，列出需要适配的批次」。批准后必须在同文件 §八「变更记录」加一行：
+   `C-06` / `turn.completed.payload + skills` / 影响面 `UI`（忽略未知键即可）与 `M4b`（审计需读取）。
+   不登记就实施，按 §七.4「边做边改，一律打回」处理。
+2. **版本号与登记方式（按既有文件的实际形态）**：C-06 的 `schema/events.json` 顶部只有一个
+   **单数对象** `x-vade.append`（`333-347` 行）：`contract: C-14`、`owner: C3d`、
+   `adds: [session.turn, session.closed, skill.proposed]`。它登记的是「C3d 在 C-06 之上**追加了
+   哪些 topic**」，不是「谁给某个 payload 加了字段」的通用台账；C3 是 C-06 的 owner，改自己的
+   契约不走这条通道，也不能把 `append` 扩成通用登记表。
+   `x-vade.appends`（复数、数组）只出现在 `schema/manifest.schema.json:22`，属 C-03，记录的是
+   C-14 给 manifest 追加 `subscriptions` 字段（RFC-0001），与 C-06 无关。
+   所以落地方式只有一条：按 §七.2「先改契约文件 + 升版本，再改实现」，把 `schema/events.json`
+   的 `version` 从 `1.0.0` 升到 `1.1.0`（纯追加），在 `turn.completed.payload` 加 `skills` 一行，
+   并在 `notes` 补说明；`x-vade.append` 一个字都不动。需要编排者确认的是**版本号取 1.1.0**，
+   而不是「要不要登记」。
+
+## 7. 验收
+
+本草案本身**不改契约、不改实现**：`skills` 的落地全部留给批准后的实施批次。因此 7.1 现在
+就能跑，且必须「空 diff + 全绿」；7.2 是实施批次的验收口径，届时才允许出现 schema 改动。
+
+### 7.1 本草案（当前批次，必须全绿）
+
+```bash
+# 1) 契约文件一行未动：输出必须为空
+git diff --stat 35c4dde..HEAD -- schema/
+
+# 2) 契约门禁：最后一行必须是 contracts: OK
+python tools/check_contracts.py
+
+# 3) 相关测试不受影响
+python -m pytest core/tests/session/test_queue.py -q    # 期望：全 passed
+```
+
+### 7.2 批准后（实施批次）
+
+```bash
+# 4) 两处实现：TurnOutcome.activated_skills 带出 + _run_one 的 COMPLETED payload 加 skills
+python -m pytest core/tests/loop/test_engine.py core/tests/session/test_queue.py -q
+#    期望全绿，且必须新增两例（命名以此为准）：
+#    core/tests/loop/test_engine.py::test_hook_activated_skills_reach_the_outcome
+#    core/tests/session/test_queue.py::test_turn_completed_payload_carries_activated_skills
+
+# 5) schema 改动只能是 events.json 一处：version 1.0.0→1.1.0 与 payload 新增 skills 一行
+git diff --stat <impl-base>..HEAD -- schema/
+#    期望：只有 schema/events.json 出现在输出里，其它 schema 文件不出现
+
+# 6) 门禁仍绿：skills 是可选键，required 未变
+python tools/check_contracts.py    # 期望：contracts: OK
+```

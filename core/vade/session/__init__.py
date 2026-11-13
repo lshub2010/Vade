@@ -143,6 +143,13 @@ def install(app: Any) -> Any:
         name: (lambda conn, params, _name=name: rpc.dispatch(conn, _name, params))
         for name in rpc.handlers()
     }
+    # A component that installs *before* this one cannot write into the dict
+    # above (install_components is alphabetical: events < session). It publishes
+    # a provider instead and this is the single place that drains them, so
+    # `events/subscribe` and `skill/proposal` are reachable on a real socket.
+    for provider in tuple(getattr(app, "handler_providers", ()) or ()):
+        for name, handler in (provider() or {}).items():
+            app.session_handlers.setdefault(name, handler)
     return app
 
 

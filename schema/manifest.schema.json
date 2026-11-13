@@ -18,7 +18,16 @@
       "max_payload_ceiling": 65519,
       "timeout_ms_min": 100,
       "timeout_ms_max": 600000
-    }
+    },
+    "appends": [
+      {
+        "contract": "C-14",
+        "version": "1.0.0",
+        "fields": ["subscriptions"],
+        "doc": "docs/rfc/RFC-0001-manifest-subscriptions.md",
+        "why": "C-03 shipped without the field C-14's manifest gate reads. `additionalProperties: true` let a module send it, but `Manifest` dropped it, so every real registration was rejected `not in manifest`."
+      }
+    ]
   },
   "type": "object",
   "required": ["module_id", "instance_id", "version", "protocol", "capabilities", "limits"],
@@ -122,6 +131,17 @@
       "maxItems": 8,
       "uniqueItems": true,
       "items": {"type": "string", "enum": ["session_id"]}
+    },
+    "subscriptions": {
+      "type": "array",
+      "description": "C-14 append (RFC-0001). Topics this module wants pushed through `events/deliver`. Registration checks the shape only; topic names are validated at `events/subscribe`, where an unknown or ungranted topic is a per-topic rejection (`rejected: [{topic, reason}]`) rather than a manifest error -- C-03 is frozen and must not start rejecting names C-14 owns.",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+        "maxLength": 64
+      }
     },
     "extensions": {
       "type": "object",

@@ -23,3 +23,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "vade-spike-miuix"
 include(":composeApp")
+// Material-3-only control group for the wasm size delta (same toolchain).
+include(":baselineApp")

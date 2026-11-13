@@ -88,7 +88,10 @@ compose.desktop {
     application {
         mainClass = "vade.spike.miuix.MainKt"
         nativeDistributions {
-            targetFormats(TargetFormat.Deb)
+            // Was TargetFormat.Deb on the Linux host. jpackage on Windows can
+            // only emit Msi/Exe; the spike never actually packages (it renders
+            // headless), this only has to configure cleanly.
+            targetFormats(TargetFormat.Msi)
             packageName = "vade-miuix-spike"
             packageVersion = "0.0.1"
         }

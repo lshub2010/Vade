@@ -8,6 +8,13 @@ import time
 import pytest
 
 from vade.errors import VadeError
+from vade.llm.base import Delta, ToolCallDelta
+from vade.llm.mock import MockLLMProvider
+from vade.loop.engine import LoopEngine, TurnOutcome
+from vade.loop.tools import build_snapshot
+from vade.registry.manifest import validate_manifest
+from vade.registry.table import Registry
+from vade.router.dispatch import Router
 from vade.session.manager import SessionLog
 from vade.session.models import TurnState
 from vade.session.replay import ReplayBuffer
@@ -105,10 +112,12 @@ def test_interrupt_releases_queue_immediately_even_if_module_ignores_cancel(tmp_
         await asyncio.wait_for(started.wait(), 1)
         began = time.monotonic()
         assert await log.interrupt(session.id, turn.id) is True
-        assert time.monotonic() - began < 0.5
+        # Wall-clock tolerance, not a latency budget: the stubborn module sleeps
+        # 5s, so anything well under that proves core did not wait for it.
+        assert time.monotonic() - began < 2.0
 
         nxt, _ = await log.submit(session.id, [{"type": "text", "text": "next"}], "s2")
-        assert await wait_until(lambda: log.queue_state(session.id)["running"] == nxt.id, 0.5)
+        assert await wait_until(lambda: log.queue_state(session.id)["running"] == nxt.id, 2.0)
 
         # No message lost: both user messages persisted, interrupted turn recorded.
         loaded = log.store.load(session.id)
@@ -199,6 +208,116 @@ def test_broadcast_happens_after_persist(tmp_path):
         await log.wait_idle(session.id)
         await asyncio.sleep(0.05)
         assert seen == list(range(1, len(seen) + 1))
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_six_concurrent_submits_stay_serial_fifo_and_gapless(tmp_path):
+    """6 paths submit at once: one worker, FIFO by core arrival, seq 1..N."""
+
+    async def scenario():
+        counters = {"active": 0, "max_active": 0}
+        executed: list[str] = []
+
+        async def executor(turn, content):
+            counters["active"] += 1
+            counters["max_active"] = max(counters["max_active"], counters["active"])
+            executed.append(turn.user_text)
+            try:
+                await asyncio.sleep(0.01)  # a real await: a second turn could sneak in
+            finally:
+                counters["active"] -= 1
+            return TurnOutcome(assistant_text=f"echo:{turn.user_text}", stopped_reason="stop")
+
+        log = _log(tmp_path, executor)
+        session = log.create_session()
+        texts = [f"m{i}" for i in range(6)]
+        submitted = await asyncio.gather(*(
+            log.submit(session.id, [{"type": "text", "text": text}], f"msg-{text}")
+            for text in texts
+        ))
+        arrivals = [turn.id for turn, _pos in submitted]
+        await log.wait_idle(session.id)
+        await asyncio.sleep(0.05)
+
+        assert counters["max_active"] == 1, "two turns ran at the same time in one session"
+        # FIFO: execution order is core arrival order, which is gather order.
+        assert executed == texts
+        events = log.store.read_since(session.id, 0)
+        assert [e.seq for e in events] == list(range(1, len(events) + 1))
+        assert [e.payload["turn_id"] for e in events if e.type == "turn.queued"] == arrivals
+        loaded = log.store.load(session.id)
+        assert [t.id for t in loaded.turns] == arrivals
+        assert [t.state for t in loaded.turns] == [TurnState.COMPLETED] * 6
+        assert [m.content for m in loaded.messages if m.role == "user"] == texts
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_interrupt_really_cancels_the_turn_and_stops_the_event_stream(tmp_path):
+    """A real Router + real engine: one tools/cancel, nothing after the terminal."""
+
+    async def scenario():
+        class SlowModule:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+                self.cancels: list[str] = []
+                self.cancelled_inflight = 0
+
+            async def call(self, target, method, params, deadline_ms):
+                self.calls.append(dict(params))
+                try:
+                    await asyncio.sleep(5)  # never answers in time: cancel must do it
+                except asyncio.CancelledError:
+                    self.cancelled_inflight += 1
+                    raise
+                return {"ok": True, "result": {"content": "late"}}
+
+            async def cancel(self, target, call_id):
+                self.cancels.append(call_id)
+
+        module = SlowModule()
+        registry = Registry()
+        registry.register(
+            validate_manifest(make_manifest()), fingerprint="fp-fs", connection_id="c-fs"
+        )
+        router = Router(module, registry)
+        llm = MockLLMProvider([
+            [Delta(tool_calls=(ToolCallDelta(index=0, id="call-1", name="fs__read_file",
+                                             arguments='{"path":"a"}'),))],
+            [Delta(text="late answer")],
+        ])
+        log = SessionLog(SQLiteStore(tmp_path / "sessions.db"), replay=ReplayBuffer(maxlen=500))
+        engine = LoopEngine(router, llm, lambda: build_snapshot(registry), log.emit)
+        log.set_executor(engine.run_turn)
+        log.set_cancel_hook(router.cancel_turn)
+        session = log.create_session()
+
+        turn, _ = await log.submit(session.id, [{"type": "text", "text": "read a"}], "m1")
+        assert await wait_until(lambda: module.calls, 1.0), "the tool call never reached the module"
+        assert await wait_until(lambda: log.queue_state(session.id)["running"] == turn.id, 1.0)
+
+        assert await log.interrupt(session.id, turn.id) is True
+        # The in-flight await was really cancelled, not just abandoned.
+        assert await wait_until(lambda: module.cancelled_inflight == 1, 1.0), \
+            "interrupt did not cancel the running turn task"
+        assert await wait_until(lambda: module.cancels, 1.0)
+        assert module.cancels == ["call-1"], "the module must see exactly one tools/cancel"
+
+        await asyncio.sleep(0.1)  # a second cancel frame would land here
+        assert module.cancels == ["call-1"], "interrupt re-sent tools/cancel"
+
+        # Drain the queue, then look at what the interrupted turn wrote.
+        await log.wait_idle(session.id)
+        events = log.store.read_since(session.id, 0)
+        types = [e.type for e in events]
+        assert types.count("turn.interrupted") == 1
+        after = types[types.index("turn.interrupted") + 1:]
+        assert "turn.tool_result" not in after, f"events after interrupt: {after}"
+        assert "turn.delta" not in after, f"events after interrupt: {after}"
+        assert log.store.load(session.id).turns[0].state is TurnState.INTERRUPTED
         await log.close()
 
     asyncio.run(scenario())

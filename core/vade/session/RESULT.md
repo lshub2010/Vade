@@ -150,3 +150,47 @@ Task was destroyed but it is pending! task: <Task pending name='queue-...'>
 - router：命名冲突/稳定性、exclusive 离线、pooled 最少在途、ctx 仅在声明时注入、伪造 session_id 覆盖/拒绝、超时+取消、未知错误码→INTERNAL、5 次超时熔断+30s half-open、超长参数 `PAYLOAD_TOO_LARGE`。
 - loop：工具链事件顺序、分片 tool_call 参数拼接、未知工具回填、max_steps 可读终止、无模块可读提示、**源码不含具体工具名**、high risk 无审批拒绝、assemble 纯函数、裁剪+blob。
 - e2e：完整 turn 事件序列与调用链、重启后从 SQLite replay 还原调用链、三端同 seq 流、中断后两条用户消息都不丢。
+
+
+---
+
+## 审查修复轮（2026-11-13）
+
+审查报告 `/root/HermesWorkspace/Vade-REVIEW-C3.md` 判不通过，列 5 条真缺陷。本轮回合：
+
+| 缺陷 | 修复 |
+|---|---|
+| `app.module_caller` 从未赋值 → 每个 turn 只回「无可用能力」 | `startup()` 装配 `ConnectionCaller(self._connections)`，`session.install()` 据此建 Router |
+| `tools/call` 响应被丢弃（无 pending 表） | `Connection._pending` + `request()/notify()`，无 method 消息按 id 派发；`close()` 时 `_fail_pending(UNAVAILABLE)` |
+| `ui/*` 六方法 NOT_FOUND | `make_rpc_handler` 增加 `app.session_handlers` 查表 |
+| `ModuleLLMProvider` 未实现 | 新增 `core/vade/llm/module.py`（priority 选路、Router 调 `model/chat`、fallback） |
+| `module.status` 零发射 | `registry.table.add_listener` + `_publish_status`（7 个触发点）+ `session/status.py` |
+| C-06 rule 4 自相矛盾 | 改为「仅状态变更事件携带 `state`」；`check_contracts.py` 增加 C-06 门禁 |
+
+**改了 C2 目录**（`transport/connection.py`、`app.py`、`registry/table.py`）：pending-request 属传输层、`module_caller` 属装配、registry 缺变更回调；C-01/C-03/C-04 语义未动。
+
+### 测试
+
+```
+pytest core/tests -q          → 150 passed
+pytest core/tests/integration → 5 passed
+check_contracts.py            → OK（含 C-06 event gate）
+```
+
+新增：并发串行（6 路 gather → max_active=1、FIFO、seq 无洞）、中断真取消（模块收到 cancel 恰好一次、interrupted 后无 tool_result/delta）、SSE 分片拼接、ModuleLLMProvider 7 条、module.status 2 条、真 WS `ui/*` 端到端 1 条。
+
+**red_evidence**（两处突变，均逐字节还原）：
+- 去掉 `TurnQueue.interrupt` 的 `task.cancel()` → `AssertionError: interrupt did not cancel the running turn task`
+- `Connection._dispatch` 改回「无 method 直接 return」→ `tools/call` 结果变成 `TIMEOUT`，断言红
+
+**flaky 修正**：`test_interrupt_releases_queue_immediately_even_if_module_ignores_cancel` 原用 0.5s 墙钟阈值，高负载下偶发假红；改为 2.0s（模块本身 sleep 5s，语义不变）。
+
+### 契约缺口（待 C-18 授权）
+
+`llm.model_module` / `llm.fallback_to_builtin` 不在 `config.schema.json` 内，代码用 `cfg.get` 带默认值读取；C-18 的 `additionalProperties: false` 会拒绝这两个键，需要在 C-18 增补或走 RFC。
+
+### 残留 unverified
+
+- 模块吞掉 `CancelledError` 并正常返回时，engine 仍可能在 `turn.interrupted` 之后再发 `tool_result`（未加守卫）
+- TLS、XXpsk3 首次配对（C2 遗留）
+- 真实 LLM 端点（只测了 mock）

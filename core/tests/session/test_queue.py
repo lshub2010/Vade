@@ -16,7 +16,8 @@ from vade.registry.manifest import validate_manifest
 from vade.registry.table import Registry
 from vade.router.dispatch import Router
 from vade.session.manager import SessionLog
-from vade.session.models import TurnState
+from vade.session.models import Turn, TurnState
+from vade.session.queue import TurnQueue
 from vade.session.replay import ReplayBuffer
 from vade.session.sqlite_store import SQLiteStore
 from .helpers import CollectSink, GateExecutor, make_manifest, wait_until
@@ -505,5 +506,230 @@ def test_interrupt_drops_a_late_delta_from_a_provider_that_swallows_the_cancel(t
         assert texts == ["first"], f"a late delta landed after the interrupt: {texts}"
         assert log.store.load(session.id).turns[0].state is TurnState.INTERRUPTED
         await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_interrupt_before_the_tool_call_keeps_the_tool_from_running(tmp_path):
+    """`turn.tool_call` is a stream write, so the guard has to cover it too.
+
+    The provider yields the tool call, then eats the cancel thrown into its
+    next `__anext__` and simply ends the stream. The engine is past every
+    in-loop check, so the guarded emit is the only thing left between the
+    interrupt and the module: without it the tool really runs inside a closed
+    turn and `turn.tool_call` lands after `turn.interrupted`.
+    """
+
+    async def scenario():
+        class SwallowingToolCallLLM:
+            def __init__(self) -> None:
+                self.in_stream = asyncio.Event()
+                self.swallowed = 0
+
+            async def chat(self, messages, tools=None, stream=True):
+                yield Delta(tool_calls=(ToolCallDelta(index=0, id="call-1", name="fs__read_file",
+                                                      arguments='{"path":"a"}'),))
+                self.in_stream.set()
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    self.swallowed += 1  # the debt: eat it, then end the stream
+                return
+
+        class RecordingModule:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            async def call(self, target, method, params, deadline_ms):
+                self.calls.append(dict(params))
+                return {"ok": True, "result": {"content": "late"}}
+
+            async def cancel(self, target, call_id):  # pragma: no cover
+                return None
+
+        llm = SwallowingToolCallLLM()
+        module = RecordingModule()
+        registry = Registry()
+        registry.register(
+            validate_manifest(make_manifest()), fingerprint="fp-fs", connection_id="c-fs"
+        )
+        router = Router(module, registry)
+        log = SessionLog(SQLiteStore(tmp_path / "sessions.db"), replay=ReplayBuffer(maxlen=500))
+        engine = LoopEngine(router, llm, lambda: build_snapshot(registry), log.emit)
+        log.set_executor(engine.run_turn)
+        log.set_cancel_hook(router.cancel_turn)
+        log.set_cancel_clear_hook(router.clear_cancelled)
+        session = log.create_session()
+
+        turn, _ = await log.submit(session.id, [{"type": "text", "text": "read a"}], "m1")
+        assert await wait_until(lambda: llm.in_stream.is_set(), 1.0), "the stream never started"
+        assert await log.interrupt(session.id, turn.id) is True
+        assert await wait_until(lambda: llm.swallowed == 1, 1.0), \
+            "interrupt did not reach the provider's in-flight await"
+        await log.wait_idle(session.id)
+
+        events = await _await_settled(log, session.id)
+        types = [e.type for e in events]
+        assert types.count("turn.interrupted") == 1
+        after = types[types.index("turn.interrupted") + 1:]
+        assert "turn.tool_call" not in after, f"turn.tool_call written after interrupt: {after}"
+        assert "turn.tool_result" not in after, f"tool_result written after interrupt: {after}"
+        assert module.calls == [], "the tool ran inside a turn the user already interrupted"
+        assert log.store.load(session.id).turns[0].state is TurnState.INTERRUPTED
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_interrupted_turn_is_never_audited_as_completed(tmp_path):
+    """A turn the user closed must not be audited as a completed turn.
+
+    Plain-text provider: it swallows the cancel and ends its stream, so the
+    loop leaves through its normal exit (no tool call, no guard raised). The
+    terminal event is already `turn.interrupted`; an audit entry saying
+    `turn_completed` contradicts it and is all an operator sees afterwards.
+    """
+
+    async def scenario():
+        class SwallowingTextLLM:
+            def __init__(self) -> None:
+                self.streaming = asyncio.Event()
+                self.swallowed = 0
+
+            async def chat(self, messages, tools=None, stream=True):
+                yield Delta(text="first")
+                self.streaming.set()
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    self.swallowed += 1  # the debt: eat it, then end the stream
+                return
+
+        class IdleModule:
+            async def call(self, target, method, params, deadline_ms):  # pragma: no cover
+                return {"ok": True, "result": {}}
+
+            async def cancel(self, target, call_id):  # pragma: no cover
+                return None
+
+        class RecordingAudit:
+            def __init__(self) -> None:
+                self.events: list[dict] = []
+
+            def record(self, event):
+                self.events.append(dict(event))
+
+        llm = SwallowingTextLLM()
+        audit = RecordingAudit()
+        registry = Registry()
+        registry.register(
+            validate_manifest(make_manifest()), fingerprint="fp-fs", connection_id="c-fs"
+        )
+        router = Router(IdleModule(), registry)
+        log = SessionLog(SQLiteStore(tmp_path / "sessions.db"), replay=ReplayBuffer(maxlen=500))
+        engine = LoopEngine(router, llm, lambda: build_snapshot(registry), log.emit, audit=audit)
+        log.set_executor(engine.run_turn)
+        log.set_cancel_hook(router.cancel_turn)
+        log.set_cancel_clear_hook(router.clear_cancelled)
+        session = log.create_session()
+
+        turn, _ = await log.submit(session.id, [{"type": "text", "text": "hi"}], "m1")
+        assert await wait_until(lambda: llm.streaming.is_set(), 1.0), "the stream never started"
+        assert await log.interrupt(session.id, turn.id) is True
+        assert await wait_until(lambda: llm.swallowed == 1, 1.0), \
+            "interrupt did not reach the provider's in-flight await"
+        await log.wait_idle(session.id)
+
+        events = await _await_settled(log, session.id)
+        assert [e.type for e in events].count("turn.interrupted") == 1
+        assert "turn.completed" not in [e.type for e in events]
+        kinds = [e["kind"] for e in audit.events]
+        assert "turn_completed" not in kinds, f"interrupted turn audited as completed: {audit.events}"
+        assert "turn_interrupted" in kinds, f"the interrupted turn left no audit trace: {audit.events}"
+        assert log.store.load(session.id).turns[0].state is TurnState.INTERRUPTED
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_clear_is_bound_to_its_own_turn_when_the_previous_task_is_an_orphan():
+    """The clear follows THIS turn's task, not `self._turn_task`.
+
+    Turn 1 is an orphan: its module eats `tools/cancel` and never returns.
+    Turn 2 is interrupted in the pre-task window — after `turn.started`, before
+    its executor task exists. A clear bound to "whatever task is current" then
+    hangs off turn 1's orphan and never fires, so `was_cancelled(turn2)`
+    outlives the turn it belongs to. Clearing too early is just as wrong: the
+    loop would then never see the flag, so both directions are asserted.
+    """
+
+    async def scenario():
+        flags: set[str] = set()
+        events: list[tuple[str, dict]] = []
+        flag_seen: dict[str, bool] = {}
+        orphan_started = asyncio.Event()
+        pre_task = asyncio.Event()
+        release = asyncio.Event()
+
+        orphan_turn = Turn(id="turn-orphan", session_id="s1", user_text="orphan")
+        next_turn: Turn | None = None
+
+        async def executor(turn, content):
+            if turn.id == orphan_turn.id:
+                orphan_started.set()
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    pass  # the debt: swallow it and keep running
+                await asyncio.sleep(10)  # a second cancel (shutdown) ends it
+                return TurnOutcome(assistant_text="never", stopped_reason="stop")
+            flag_seen[turn.id] = turn.id in flags
+            return TurnOutcome(assistant_text="done", stopped_reason="stop")
+
+        async def emit(session_id, event_type, payload=None, *, messages=()):
+            payload = dict(payload or {})
+            events.append((event_type, payload))
+            if event_type == "turn.started" and next_turn is not None \
+                    and payload.get("turn_id") == next_turn.id:
+                pre_task.set()
+                await release.wait()
+
+        queue = TurnQueue(
+            "s1",
+            executor=executor,
+            emit=emit,
+            save_turn=lambda session_id, turn: None,
+            cancel_hook=flags.add,
+            cancel_clear_hook=flags.discard,
+        )
+
+        queue.enqueue(orphan_turn, ())
+        queue.ensure_worker()
+        assert await wait_until(lambda: orphan_started.is_set(), 1.0), "the orphan never started"
+        assert await queue.interrupt(orphan_turn.id) is True
+
+        next_turn = Turn(id="turn-next", session_id="s1", user_text="next")
+        queue.enqueue(next_turn, ())
+        queue.ensure_worker()
+        assert await wait_until(lambda: pre_task.is_set(), 1.0), \
+            "turn 2 never reached the pre-task window"
+        assert orphan_turn.id in flags, "the orphan task may still read its own flag"
+
+        # Interrupt inside the window: no executor task exists for turn 2 yet.
+        assert await queue.interrupt(next_turn.id) is True
+        release.set()
+        await queue.drain()  # turn 2's executor task is created and joined here
+        await asyncio.sleep(0.02)  # let its done-callbacks (the clear) run
+
+        assert flag_seen.get(next_turn.id) is True, \
+            "the interrupt was not visible to the turn it happened to"
+        assert next_turn.id not in flags, \
+            f"was_cancelled({next_turn.id}) outlived the turn it belongs to"
+        assert orphan_turn.id in flags, "the still-running orphan lost its flag"
+        # Per-turn bookkeeping does not outlive the turns either.
+        assert queue._finalized == set(), f"finalized markers leaked: {queue._finalized}"
+        await queue.shutdown()
+
+        await asyncio.sleep(0)
 
     asyncio.run(scenario())

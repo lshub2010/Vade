@@ -117,7 +117,7 @@ C-06 顶部 `status` 是 `frozen`，`docs/agents/01-contracts.md` §七 写明�
    `C-06` / `turn.completed.payload + skills` / 影响面 `UI`（忽略未知键即可）与 `M4b`（审计需读取）。
    不登记就实施，按 §七.4「边做边改，一律打回」处理。
 2. **版本号与登记方式（按既有文件的实际形态）**：C-06 的 `schema/events.json` 顶部只有一个
-   **单数对象** `x-vade.append`（`333-347` 行）：`contract: C-14`、`owner: C3d`、
+   **单数对象** `x-vade.append`（`333-351` 行）：`contract: C-14`、`owner: C3d`、
    `adds: [session.turn, session.closed, skill.proposed]`。它登记的是「C3d 在 C-06 之上**追加了
    哪些 topic**」，不是「谁给某个 payload 加了字段」的通用台账；C3 是 C-06 的 owner，改自己的
    契约不走这条通道，也不能把 `append` 扩成通用登记表。

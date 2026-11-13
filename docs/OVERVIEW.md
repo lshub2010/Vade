@@ -2,7 +2,7 @@
 
 > 全称 **Vade Agent Runtime**，中文「偕行」；简称 **Vade**。正文统一用简称。
 
-> 本文是 `requirements.md`（求求基线 v1.0 + AMEND-01～20）与 `design.md`（方案 v1.18）的汇总视图。
+> 本文是 `requirements.md`（求求基线 v1.0 + AMEND-01～21）与 `design.md`（方案 v1.18）的汇总视图。
 > 两份原文为准，本文只做导览。
 
 | 文档 | 作用 | 什么时候读 |

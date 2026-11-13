@@ -15,7 +15,7 @@ check_docs.py —— Vademecum 文档包一致性检查（纯标准库，无第�
   C3  AMEND 编号连续、无缺号
   C4  批次集合：status.md / 00-orchestration 波次表 / agents 任务书 三处一致
   C5  契约文件数 = 01-contracts 契约表行数 = docs/README 声明数
-  C6  版本口径：全包不再出现过期硬编码「AMEND-01～18」「方案 v1.16」「78 条」「16 个契约」「24 个批次」
+  C6  版本口径：全包不再出现过期硬编码「AMEND-01～20」「AMEND-01～18」「方案 v1.16」「78 条」「16 个契约」「24 个批次」
   C7  FR-13.19~13.21 不再被两组条款重复定义（撞号检测）
   C8  AMEND-19 的 A 编号不与 AMEND-18 的 A 编号重号
   C9  §8 小节号与 AMEND 号一一对应
@@ -137,8 +137,8 @@ def main():
     # ---- C3 AMEND 编号 ----
     am_nums = numbers_from(req, r"\|\s*AMEND-(\d+)\s*\|")
     ok, why = check_continuous(am_nums)
-    ok = ok and max(am_nums) == 20
-    r.check("C3", "AMEND-01–20 连续、无缺号（requirements.md §8 汇总表）",
+    ok = ok and max(am_nums) == 21
+    r.check("C3", "AMEND-01–21 连续、无缺号（requirements.md §8 汇总表）",
             ok, why or f"最大 AMEND-{max(am_nums)}")
 
     # ---- C4 批次集合 ----
@@ -175,6 +175,7 @@ def main():
     live_files = [docs_readme_p, path("README.md"), path("docs", "OVERVIEW.md"),
                   path("overview.html"), agents_readme_p, orch_p]
     stale_patterns = [
+        (r"AMEND-01～20", "AMEND-01～20"),
         (r"AMEND-01～18", "AMEND-01～18"),
         (r"方案 v1\.16", "方案 v1.16"),
         (r"\b78 条", "78 条"),
@@ -189,7 +190,7 @@ def main():
             # OVERVIEW/overview.html 的正文引用「（方案 v1.17）」属历史，但已改成 v1.18
             if re.search(pat, txt):
                 stale.append(f"{os.path.relpath(p, ROOT)}: 出现「{label}」")
-    r.check("C6", "现状口径文件无过期硬编码（AMEND-01～18 / 方案 v1.16 / 78 条 / 16 个契约 / 24 个批次）",
+    r.check("C6", "现状口径文件无过期硬编码（AMEND-01～20 / 方案 v1.16 / 78 条 / 16 个契约 / 24 个批次）",
             not stale, "\n".join(stale))
 
     # ---- C7 FR-13.19~21 撞号 ----

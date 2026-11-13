@@ -36,6 +36,7 @@
 | 变更 | 状态 | 交付 commit | 审查 | 备注 |
 |---|---|---|---|---|
 | win-fix | 已合并 | `35c4dde`（merge，含 98617b8 / ccf79f0） | R1/R2 pass（报告：`../Vade-REVIEW-win-fix.md`） | 2026-11-13 换机 Windows 11 x86_64：uv 建 Python 3.12 venv、重编 `protocol/core/python/vade_protocol.dll`、两条 POSIX 权限位断言加 `os.name != "nt"` 守卫（Linux 仍校验）；全量 `pytest core/tests -q` → **378 passed**；环境见 `docs/dev-windows.md` |
+| req-amend | 已合并（文档） | `2fa5470` | 待审查（纯文档，无代码；`docs/check_docs.py` 12 项全绿） | **AMEND-21 客户端功能需求 52 条**（FR-8.26～8.77：M 41 / S 11），追加为 §8.21，不改原文；收敛出 9 族协议缺口（R1–R9，**RFC 编号待编排者分配**）与 8 条待裁定；已在 §8 汇总表登记 AMEND-21 行，`check_docs.py` C3 上限随之上调为 21、C6 增查「AMEND-01～20」，README/OVERVIEW/overview.html/agents 索引的口径同步为「AMEND-01～21」；C1/C2 仍钉 D=86 / AC=69，故本节**未**新增 AC 与 D 编号，待 AC 台账解冻后补 |
 
 ## 里程碑
 

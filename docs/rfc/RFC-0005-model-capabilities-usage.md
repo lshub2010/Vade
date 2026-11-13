@@ -380,7 +380,8 @@ A1–A12 全部要求真实执行；截图与手写记录不算证据。
 | A7 | `turn.completed.usage` 保留三个旧键并含 `model_id`/`provider`/`source`/`steps`/`cached_tokens`/`reasoning_tokens`；旧客户端 golden 只读旧键不崩 | `core/tests/session/test_usage_shape.py` |
 | A8 | 连跑 5 轮 → `session/usage.get.chat.total_tokens == Σ turn.usage.total_tokens`；第二台设备 attach 后调同一方法得到完全相同的数字与 `budget.state` | `core/tests/session/test_usage_cumulative.py` |
 | A9 | 每个 turn：Σ 审计 `llm.call`（`purpose="chat"`）的三项 token == `turn.usage` 同名项；模块调用的 `module_id` 等于目标模块；内置调用 `module_id=null` | `core/tests/model/test_audit_attribution.py` |
-| A10 | `session_tokens` 设为实际用量的 80% → 恰好 1 条 `usage.budget(state="warn")`，且**没有** turn 被拒；超过 100% → 1 条 `exceeded`，下一条 turn 仍正常执行 | `core/tests/session/test_budget.py` |
+| A10 | `session_tokens` 设为实际用量的 80% → 恰好 1 条 `usage.budget(state="warn")`，且**没有** turn 被拒；超过 100% 且 `enforce="block"` → 1 条 `exceeded`，下一条 `ui/submit` 返回 **`BUDGET_EXCEEDED`** 且**不入队**（对齐 FR-8.49） | `core/tests/session/test_budget.py` |
+| A10b | 本轮 usage `source="none"`（账不可信）且已 `exceeded` → **不拒**新 turn，`usage.budget` 带 `degraded=true`，`session/usage.get.state` 仍为 `exceeded` | `core/tests/session/test_budget_degraded.py` |
 | A11 | 模块被 drain 后：`session/model.get.resolved=false`、`reason="model_unavailable"`；`ui/submit` → `UNAVAILABLE` 且**未**调用内置回退；UI 出现横幅 | `core/tests/model/test_dangling.py` |
 | A12 | 同时写 `purpose="chat"` 与 `purpose="evolve"` 的 `llm.call` → `admin` 的 `tokens_used` 只等于 evolve 部分；当天 chat 行超过 500 条也不截断 | `core/tests/admin/test_config_usage.py` |
 

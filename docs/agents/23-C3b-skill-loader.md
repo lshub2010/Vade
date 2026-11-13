@@ -89,7 +89,8 @@ frontmatter 解析用 `pyyaml.safe_load`，**不用 `yaml.load`**。解析失败
 2. 工具说明（由 router 的工具快照生成）
 3. 【skill 目录 L0】—— 每行 `- name: description`，含 unavailable / stale 标记
 4. 【已激活 skill L1】—— 每个一节，正文原样
-5. 会话上下文
+5. 会话记忆（session_memory）
+6. 会话上下文
 ```
 
 **三层预算**（AMEND-19/D83）：
@@ -107,7 +108,7 @@ frontmatter 解析用 `pyyaml.safe_load`，**不用 `yaml.load`**。解析失败
 
 ### T4 · 审计与脱敏（0.5 天）
 
-- `turn.completed` 增加 `skills: ["kb-guide", "code-review"]`，**只记名字**；`turn.failed` 同理。
+- `turn.completed` / `turn.failed` 的 `skills` 字段**由 C3 的 loop 写入**（`loop/engine.py` 的 `TurnOutcome` → `queue` payload）；C3b 只负责 `render()` 回填 `activated_skills`，不改 `loop/`。
 - 加载时对 body 做一次扫描：`sk-[A-Za-z0-9]{20,}`、`BEGIN [A-Z ]*PRIVATE KEY`、长度 > 200 的连续 base64。命中只 **warning + 计数**，不改写、不阻断（可能误报）。
 - 日志里**禁止**出现 body 全文；要 debug 只打 `path` 与 `sha256(body)[:8]`。
 

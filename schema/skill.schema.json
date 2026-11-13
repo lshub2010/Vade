@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vade.local/schema/skill.schema.json",
+  "title": "Vade SKILL.md frontmatter (C-11)",
+  "description": "Frozen contract C-11. The YAML frontmatter of every <data_dir>/skills/<name>/SKILL.md validates against this root schema. The four body sections (When to Use / Procedure / Pitfalls / Verification) are mandatory and are checked by the loader from `x-vade.required_sections`; a skill missing any of them is `invalid`: it never enters the catalog and is never injected. A skill is a manual, not a capability: it cannot register tools, execute scripts or load from the network.",
+  "x-vade": {
+    "contract": "C-11",
+    "version": "1.0.0",
+    "frozen": "2026-11-13",
+    "owner": "C3b",
+    "doc": "docs/agents/23-C3b-skill-loader.md",
+    "name_pattern": "^[a-z][a-z0-9-]{1,31}$",
+    "required_sections": ["When to Use", "Procedure", "Pitfalls", "Verification"],
+    "injection_order": ["persona", "tool_block", "skill_catalog", "skill_bodies", "session_memory", "context"],
+    "max_activated": 3,
+    "body_max_chars": 8192,
+    "body_max_lines": 200,
+    "body_budget_chars": 12288,
+    "l0_token_budget": 3000,
+    "reserved_names": ["pending", ".history", ".trash", ".rejected"],
+    "unknown_frontmatter": "reject",
+    "install": {
+      "max_entries": 32,
+      "max_uncompressed_bytes": 5242880,
+      "max_skill_md_depth": 2,
+      "exactly_one_skill_md": true,
+      "forbidden_names": [
+        "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+        "setup.py", "setup.sh", "pyproject.toml", "requirements.txt",
+        "Makefile", "Dockerfile", "docker-compose.yml"
+      ],
+      "forbidden_suffixes": [
+        ".sh", ".bash", ".zsh", ".fish", ".py", ".pyc", ".exe", ".dll", ".so",
+        ".dylib", ".bin", ".bat", ".cmd", ".ps1", ".com", ".msi", ".jar",
+        ".war", ".class", ".wasm", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl",
+        ".php", ".lua", ".app", ".run", ".service", ".socket"
+      ]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "description", "when_to_use"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,31}$",
+      "description": "Must equal the directory name. Reserved install directories are not legal names."
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "One line shown in the L0 catalog."
+    },
+    "when_to_use": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300,
+      "description": "Activation hint for the model; also the trigger documentation."
+    },
+    "triggers": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "maxLength": 64},
+      "maxItems": 20,
+      "uniqueItems": true,
+      "default": [],
+      "description": "Case-insensitive substring matches against the user message. v1 does no semantic matching."
+    },
+    "requires_tools": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9._-]{0,63}(__|/)[a-z][a-z0-9_]{0,63}$"
+      },
+      "maxItems": 32,
+      "uniqueItems": true,
+      "default": [],
+      "description": "LLM tool names ({module}__{tool}) or protocol ids ({module_id}/{tool}). Missing tools make the skill unavailable: catalog line only, no body."
+    },
+    "trust_updates": {
+      "type": "boolean",
+      "default": false,
+      "description": "Only honoured with a valid SKILL.md.sig; otherwise every update lands in skills/pending/."
+    }
+  },
+  "$defs": {
+    "meta": {
+      "title": "meta.json (runtime state, never the frontmatter)",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "revision": {"type": "integer", "minimum": 0, "default": 0},
+        "status": {
+          "enum": ["pending", "active", "disabled", "stale", "unavailable", "invalid"],
+          "default": "active"
+        },
+        "origin": {"enum": ["manual", "install", "proposal"], "default": "manual"},
+        "last_used_at": {"type": ["integer", "null"], "default": null},
+        "fail_count": {"type": "integer", "minimum": 0, "default": 0},
+        "derived_from": {"type": ["string", "null"], "default": null},
+        "hardware": {"type": ["string", "null"], "default": null},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "trust_updates": {"type": "boolean", "default": false}
+      }
+    },
+    "catalog_snapshot": {
+      "title": "Catalog snapshot entry: exactly {name, revision, status}",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "revision", "status"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$"},
+        "revision": {"type": "integer", "minimum": 0},
+        "status": {"enum": ["active", "disabled", "stale", "unavailable"]}
+      }
+    },
+    "catalog_snapshot_file": {
+      "title": "Ordered catalog snapshot (sorted by name; digest is sha256 of the canonical entries)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiVersion", "digest", "entries"],
+      "properties": {
+        "apiVersion": {"const": "vade/skill-snapshot/v1"},
+        "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "entries": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/catalog_snapshot"}
+        }
+      }
+    },
+    "injection_order": {
+      "title": "Fixed prompt assembly order (design §2.7.3); the loader writes only the two skill slots",
+      "const": ["persona", "tool_block", "skill_catalog", "skill_bodies", "session_memory", "context"]
+    },
+    "reserved_names": {
+      "title": "Directories the scanner must never enter",
+      "type": "array",
+      "items": {"enum": ["pending", ".history", ".trash", ".rejected"]}
+    }
+  }
+}

@@ -1,0 +1,272 @@
+{
+  "aead": [
+    {
+      "aad": "",
+      "ct": "10324f800a160bd9a1794255be7ec29d",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "name": "chacha20poly1305-empty",
+      "nonce": "000000000000000000000000",
+      "pt": "",
+      "source": "generated",
+      "tag_len": 16
+    },
+    {
+      "aad": "",
+      "ct": "2bd6eadd3ad0c685ca2444853970a3fff6",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "name": "chacha20poly1305-1b",
+      "nonce": "000000000000000000000001",
+      "pt": "42",
+      "source": "generated",
+      "tag_len": 16
+    },
+    {
+      "aad": "",
+      "ct": "4dcbb2f40e786153c537b2c6c1fd4717dbb7dd6f7a0060425e8cbab940413e3d",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "name": "chacha20poly1305-16b",
+      "nonce": "000000000000000000000002",
+      "pt": "000102030405060708090a0b0c0d0e0f",
+      "source": "generated",
+      "tag_len": 16
+    },
+    {
+      "aad": "",
+      "ct": "80441eb8364fa2768046f601b7ea984c77cd5ed4d4c8495013131c73bda89fdd59fc9907274629c8a744dac1f11086c1473179369c821b9069c1e8e98a7a8faa7533b755ac05a334e455b1cf514203b3d0417f8ebcb93cb9c407ed7952646abf57f21ee0fe65c0d02b7a97fd44e453b212fe3097fd0dbf142d26a934b1ed3c0c1187ee157dfabe8328eb29acef7da68cf3ffdab5e944ded46e7f09c717dfe9b12db32d50eb2c480600292a602ea59b2b46f989b77d5b09e8883fee82672b23897f8db182c2ab9647b3c7b309c6e7bd1c1db7098ee036397729caccdea3f07ea136493f28ad6a32dab0932129ec43dd7059e8015df6c01dc74e096130da7bd707a4f3accd7d9410c2efb1513fdb7f389b44d2af3ce94bb22f0b93714fa5e77ad3cb6cc3b430d2a1df95021d789cdc76650e82d2e1ebc5e9cc65e9dcbb3a49799691ac7f86bfa40746db4c303638ce3e6c669089ccb418aea746a456277dca033983ac58bd6b48d87402f5ce0524387f9335d29f2b03af0b794dba55cdb1b69f1be3cc1fffbcf2fe83c0752741fa53fb84221a87a0a3a320607ce803f40590e96d8b297a2964c7d1087579edb6509c2e65babcf7974d02ad4e6fde1df46ccc1dba53bf06aa3e6535275bd4c1e373dd892f0e1d087341bc94ca7057649564ddf52feb4b721d1f63ddafedee0ed58bd552607130364faf902298e7af918dd609a032bc424cfec93da7dba58f8d3167776352771cf780f731d3958026a1517cf385ee7d7b7eb665ba4ba16d12bec04f5a9be7d84cb97fe18124d3bb952e36da08038d5af05b640d49db7faf691424a689060cc7bc331e73f3b90f0935a3b0fcd9117eda280f93efe27f164e6a4f146fa13518adb1b1a8e40bb069748f8063450501b4e93fa1d1b1488f0fc3b3276a593f4c7734a5dcdfd0c8593c43c1a87e7c5f3e52a394c91c418cd00509ea6f4c8dbbe1581ddb3234abbe5c31adf84233266ff58eb23b0327bdb801f0a345017d21cd2a732ddd3b6021e982020bce38a0072ebec4633a95634fbf1e18bfda04f1ae33dc6b9cf3a89c48b11012429da62a8e9a6d3958f96a955e77a92d2d5f1689b3f5fec7379039b26bb8481cf49c5c3bf8170530de7ad7a55be7ac1f07d065b9a9885f017af3fac20d775cbe41fc47281a371b5ace044362fdbfec2da30597df45a5b9986fdd36fe8cb613e41f971c9c6a83b76fddbf6e2de5d452fc1b064dceb799b8c8abaad039e530add463207a5bf9187f4d17ffeb6b095b86970e5f039c8eeee9952e303ac49d63a45f772c5b6bafb1573d70a69588f5f7cf3a54cd7f1ad5ac180cd0d38dcb51a97292a863624a4c6eb48f0338abff5115cbdbe071c599bcdd45ac950112ae258bc7b93cebd1eaf0cfd4983b74eda4833a92548717347d38c93a917d80377b86e88f04b27231a8ca9336a3b9b16be94fb3052ce4d94b141e15a1bd",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "name": "chacha20poly1305-1kb",
+      "nonce": "000000000000000000000003",
+      "pt": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fa000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fa000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fa000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fa000102030405060708090a0b0c0d0e0f10111213",
+      "source": "generated",
+      "tag_len": 16
+    }
+  ],
+  "crate_version": "0.1.0",
+  "frame": [
+    {
+      "body_len": 96,
+      "counter": 0,
+      "flags": 0,
+      "frame_len": 116,
+      "generation": 0,
+      "hex": "0101000000000060000000000000000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "name": "handshake-msg1-96",
+      "note": "body is a plaintext Noise message stand-in (deterministic pattern)",
+      "payload_len": 96,
+      "rsv": 0,
+      "source": "generated",
+      "type": 1,
+      "ver": 1
+    },
+    {
+      "body_len": 1040,
+      "counter": 1,
+      "flags": 0,
+      "frame_len": 1060,
+      "generation": 1,
+      "hex": "0102000000000400000000010000000000000001695d7eda350fbe7d25787424bf19191d00e02d53daa4ea625d23af3335f38115f30cce2997de88a40961c10f8ace84e1f5cf7740bd5e62025c022a75532a11465f9322f9867fcf6a35396f86fdca1959d8512ae564c3f09eb1e8e224cd6bdef556a073c123042d2e0b83e862f72020206cf693f8465a32630a448d5a6b788ec3049f000a28fbd6886046bf1c285a9a982f50fc2c7b6ebdc141e3b7791d2b8e4305944765b3f68763ce1ddcd6aacf85b7bd6729ce7c1855fda483edae6268d777dafa31bac8ea9488a052fa901606127b40fabde01d4418a7074cf1ceec1f8435e10139dfcc1c6aef3603f81860114dac7f5600987235fa1c50964af38b739f4d78faf0315c9ae22aefe5883440d4b541a2f737f5834ebb691d5d7fc6f4e6ed5886bd4b9ed72023f4088a152261fdd9cb76f9184ee0f862a9cea8120dc07235534fcc4fd7935ad9d460cacbd9cb25ae33b0671937c1d8af18f39b5aa89acfd86f30c0f99a9fad4007790d391d8339de6967d89a274603bbbbee490aef3f36f7f70d81afbd13eb0c2b1d226c2e5923da46af693dcf2b533610d836a3874d2f248fa59b5c33d981d86d07c193dfe5c7080abf43eba223e62b053a2a65f26d083d0467985a26ba5f35ebd71301d7d12bdada496d87281ceaeff45d49d3cfbff7ff2928b7db502d156f3ce8bb7259d95e9e2854d62c57f2cb32b02637ae6e2d12c29c9dc1e9400fdd526bf7cdaea4f58859279884127b4cc78c626853987dc84a226c4f5312172f34c36b8a1309ff6635ed4d415899d739baae4a2ed33dc153eff576ef9237149717d48bfe13d39913cd408f21e30566270358e54048bd67d727696b13725641e2cd2d60eb8733a78a02b138784d4e22717e634129f782e5c132f56bff0e2ec0778a5d66e4e5ef6ec774c2638907cd17aa86bcf759c8af122d5f8a4ff58ae691f9a71b5748ce0baa18942d15c18a804f6989683957f119ba86d21cf7163b236c1b1432efd66d7fc3d14e4358068ef9f80bfb8fa792d881589ec055c5cf697f85cdfe6ce6cec8632838e62524ae81341c2ecdf11050a0e917e09488c979b77f086e678d1bb1131c03a3899f575fada8339fcdd26c7caa2c2ee862c6ea910dfa94657b2d4341a4e6601e267c14b60c7841bdf7021475aa28055dc1f122ef5c574028558964eb1424932c0234b9033393793fbf79ecbb8eb50625ae6e401e045d6099b1e285729b9c80b57e0826aa3c598a36f4aecf9c9f6f8afb72e9c39613cd77a721526a236f5d65dc6eef98e25056f10f195e4137857509ea332dc22cea4934838e2f41688da925f2ef85e675231f6ee4f36599e6d361b8e5cd4450897aa0ac28c71549797ce179ef02183fa12985be03132d2b4b8d6b920c586650a1934aed1ee6a7943a1c6e52e7cbd3bc7d22fea1ceea2aefcaa402832410283e93940f8e85dc9ad7ca108d3517a40b46",
+      "name": "rpc-1kb",
+      "note": "body = ChaCha20-Poly1305(kat_key, nonce 000000000000000000000001, zero-aad, pt=pattern(1024))",
+      "payload_len": 1024,
+      "rsv": 0,
+      "source": "generated",
+      "type": 2,
+      "ver": 1
+    },
+    {
+      "body_len": 16,
+      "counter": 2,
+      "flags": 0,
+      "frame_len": 36,
+      "generation": 1,
+      "hex": "0102000000000000000000010000000000000002fa0e145e8775eb78c274755606de74fb",
+      "name": "rpc-empty",
+      "note": "body = ChaCha20-Poly1305(kat_key, nonce 000000000000000000000001, zero-aad, pt=pattern(0))",
+      "payload_len": 0,
+      "rsv": 0,
+      "source": "generated",
+      "type": 2,
+      "ver": 1
+    },
+    {
+      "body_len": 80,
+      "counter": 7,
+      "flags": 0,
+      "frame_len": 100,
+      "generation": 1,
+      "hex": "0103000000000040000000010000000000000007695d7eda350fbe7d25787424bf19191d00e02d53daa4ea625d23af3335f38115f30cce2997de88a40961c10f8ace84e1f5cf7740bd5e62025c022a75532a11467d75061d7094eccffcc7dd014ee7b8cc",
+      "name": "event-64",
+      "note": "body = ChaCha20-Poly1305(kat_key, nonce 000000000000000000000001, zero-aad, pt=pattern(64))",
+      "payload_len": 64,
+      "rsv": 0,
+      "source": "generated",
+      "type": 3,
+      "ver": 1
+    },
+    {
+      "body_len": 32,
+      "counter": 12345,
+      "flags": 0,
+      "frame_len": 52,
+      "generation": 1,
+      "hex": "0104000000000010000000010000000000003039695d7eda350fbe7d25787424bf19191d2fafe91ac27d51cf9d1e1d58323562fa",
+      "name": "heartbeat-16",
+      "note": "body = ChaCha20-Poly1305(kat_key, nonce 000000000000000000000001, zero-aad, pt=pattern(16))",
+      "payload_len": 16,
+      "rsv": 0,
+      "source": "generated",
+      "type": 4,
+      "ver": 1
+    },
+    {
+      "body_len": 48,
+      "counter": 999,
+      "flags": 0,
+      "frame_len": 68,
+      "generation": 1,
+      "hex": "01050000000000200000000100000000000003e7695d7eda350fbe7d25787424bf19191d00e02d53daa4ea625d23af3335f381153a3f5bd32d2628b22c57dfbb09f00d0b",
+      "name": "close-32",
+      "note": "body = ChaCha20-Poly1305(kat_key, nonce 000000000000000000000001, zero-aad, pt=pattern(32))",
+      "payload_len": 32,
+      "rsv": 0,
+      "source": "generated",
+      "type": 5,
+      "ver": 1
+    },
+    {
+      "body_len": 20,
+      "counter": 99,
+      "flags": 0,
+      "frame_len": 40,
+      "generation": 1,
+      "hex": "0106000000000004000000010000000000000063695d7eda57833613af5e8c49d59a4203347d7696",
+      "name": "rekey-gen1-99",
+      "note": "body = ChaCha20-Poly1305(kat_key, nonce 000000000000000000000001, zero-aad, pt=pattern(4))",
+      "payload_len": 4,
+      "rsv": 0,
+      "source": "generated",
+      "type": 6,
+      "ver": 1
+    },
+    {
+      "body_len": 24,
+      "counter": 1099511627777,
+      "flags": 0,
+      "frame_len": 44,
+      "generation": 7,
+      "hex": "0102000000000008000000070000010000000001695d7eda350fbe7dcb9b5dea9d8ec16cd866e90070ee4eaa",
+      "name": "rpc-gen7-big-counter",
+      "note": "body = ChaCha20-Poly1305(kat_key, nonce 000000000000000000000001, zero-aad, pt=pattern(8))",
+      "payload_len": 8,
+      "rsv": 0,
+      "source": "generated",
+      "type": 2,
+      "ver": 1
+    },
+    {
+      "body_len": 20,
+      "counter": 18446744073709550591,
+      "flags": 0,
+      "frame_len": 40,
+      "generation": 1,
+      "hex": "010200000000000400000001fffffffffffffbff695d7eda57833613af5e8c49d59a4203347d7696",
+      "name": "rpc-gen1-max-counter",
+      "note": "body = ChaCha20-Poly1305(kat_key, nonce 000000000000000000000001, zero-aad, pt=pattern(4))",
+      "payload_len": 4,
+      "rsv": 0,
+      "source": "generated",
+      "type": 2,
+      "ver": 1
+    }
+  ],
+  "generator": "protocol/core/src/bin/gen-kat.rs",
+  "hkdf": [
+    {
+      "core_fp": "94c037e49434bdeaafaa52ad9d84efd67a3ef77cbf2b5df2968933d80407056e",
+      "core_pub": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "info": "",
+      "name": "pair-psk",
+      "normalized": "青松A7K2M9",
+      "pair_code": "青松-A7K2M9",
+      "psk": "7ad55a3f3fa7ff29f841ab3066467607caa3c7bb5765414c867b523c511501fe",
+      "salt": "vade/pair/v1",
+      "source": "generated"
+    },
+    {
+      "core_fp": "94c037e49434bdeaafaa52ad9d84efd67a3ef77cbf2b5df2968933d80407056e",
+      "core_pub": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "info": "",
+      "name": "pair-psk-fullwidth",
+      "normalized": "青松A7K2M9",
+      "pair_code": "青松－Ａ７Ｋ２Ｍ９",
+      "psk": "7ad55a3f3fa7ff29f841ab3066467607caa3c7bb5765414c867b523c511501fe",
+      "salt": "vade/pair/v1",
+      "source": "generated"
+    },
+    {
+      "core_fp": "94c037e49434bdeaafaa52ad9d84efd67a3ef77cbf2b5df2968933d80407056e",
+      "core_pub": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "info": "",
+      "name": "pair-psk-lower",
+      "normalized": "青松A7K2M9",
+      "pair_code": "青松 a7k2m9",
+      "psk": "7ad55a3f3fa7ff29f841ab3066467607caa3c7bb5765414c867b523c511501fe",
+      "salt": "vade/pair/v1",
+      "source": "generated"
+    },
+    {
+      "core_fp": "94c037e49434bdeaafaa52ad9d84efd67a3ef77cbf2b5df2968933d80407056e",
+      "core_pub": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "info": "",
+      "name": "pair-psk-middle-dot",
+      "normalized": "青松A7K2M9",
+      "pair_code": "青松·A7K2M9",
+      "psk": "7ad55a3f3fa7ff29f841ab3066467607caa3c7bb5765414c867b523c511501fe",
+      "salt": "vade/pair/v1",
+      "source": "generated"
+    }
+  ],
+  "how_generated": "cargo run --features kat-gen --bin gen-kat (every vector is computed by this build; nothing is transcribed)",
+  "normalize": [
+    {
+      "expected": "青松A7K2M9",
+      "input": "青松-A7K2M9",
+      "name": "normalize-"
+    },
+    {
+      "expected": "青松A7K2M9",
+      "input": "青松－Ａ７Ｋ２Ｍ９",
+      "name": "normalize-fullwidth"
+    },
+    {
+      "expected": "青松A7K2M9",
+      "input": "青松 a7k2m9",
+      "name": "normalize-lower"
+    },
+    {
+      "expected": "青松A7K2M9",
+      "input": "青松·A7K2M9",
+      "name": "normalize-middle-dot"
+    }
+  ],
+  "notes": [
+    "frame.hex is the complete wire frame: 20-byte header + body. Non-handshake bodies are real ChaCha20-Poly1305 output over pattern(payload_len) with the kat key and the nonce in `note`.",
+    "aead.aad is always empty because Noise's cipherstate does not authenticate a header.",
+    "hkdf.psk = HKDF-SHA256(ikm = utf8(normalized) || BLAKE2s256(core_pub), salt = salt, info = empty, L = 32).",
+    "prologue = b\"vade/v1\" || role_byte; both peers of one connection MUST send the same connection_role."
+  ],
+  "prologue": [
+    {
+      "byte": 1,
+      "bytes_hex": "766164652f763101",
+      "connection_role": "core_initiated"
+    },
+    {
+      "byte": 2,
+      "bytes_hex": "766164652f763102",
+      "connection_role": "module_initiated"
+    }
+  ],
+  "protocol": "vade/v1",
+  "version": 1
+}

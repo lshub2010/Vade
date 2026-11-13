@@ -1,0 +1,77 @@
+{
+  "id": "C-15",
+  "version": "v1",
+  "status": "frozen-partial",
+  "frozen_at": "2026-11-12",
+  "source_of_truth": "protocol/v1/frames.md §6",
+  "code": {
+    "length": 8,
+    "shape": "2 汉字 + 6 位 base32",
+    "base32_alphabet": "ABCDEFGHJKLMNPQRSTUVWXYZ23456789",
+    "base32_excluded": [
+      "I",
+      "O",
+      "0",
+      "1"
+    ],
+    "hanzi_table": null,
+    "hanzi_table_note": "256 字表尚未入库；当前实现只校验长度与后 6 位在 base32 表内（见 protocol/v1/RESULT.md §五）"
+  },
+  "normalize": {
+    "steps": [
+      "NFKC",
+      "去掉 '-'、空格（含 U+3000）、'\\t'、'·'(U+00B7)、'・'(U+30FB)",
+      "逐字符 to_uppercase（与 locale 无关）",
+      "结果必须是 8 个字符"
+    ],
+    "separators": [
+      "-",
+      " ",
+      "　",
+      "\t",
+      "·",
+      "・"
+    ]
+  },
+  "psk": {
+    "kdf": "HKDF-SHA256",
+    "ikm": "utf8(normalize(code)) || BLAKE2s256(core_static_pub)",
+    "ikm_note": "BLAKE2s256 取 32 字节原始摘要，不是 hex 字符串",
+    "salt": "vade/pair/v1",
+    "info": "",
+    "length": 32,
+    "frozen_note": "info 为空是冻结决定；以后加 info 属于破坏性变更，走 RFC"
+  },
+  "vectors": [
+    {
+      "name": "normalize-dash",
+      "input": "青松-A7K2M9",
+      "normalized": "青松A7K2M9"
+    },
+    {
+      "name": "normalize-fullwidth",
+      "input": "青松－Ａ７Ｋ２Ｍ９",
+      "normalized": "青松A7K2M9"
+    },
+    {
+      "name": "normalize-lower",
+      "input": "青松 a7k2m9",
+      "normalized": "青松A7K2M9"
+    },
+    {
+      "name": "normalize-middle-dot",
+      "input": "青松·A7K2M9",
+      "normalized": "青松A7K2M9"
+    },
+    {
+      "name": "pair-psk",
+      "pair_code": "青松-A7K2M9",
+      "normalized": "青松A7K2M9",
+      "core_pub": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "core_fp": "94c037e49434bdeaafaa52ad9d84efd67a3ef77cbf2b5df2968933d80407056e",
+      "psk": "7ad55a3f3fa7ff29f841ab3066467607caa3c7bb5765414c867b523c511501fe"
+    }
+  ],
+  "vectors_note": "完整向量（含 4 组等价输入的同一 PSK）见 protocol/v1/kat.json 的 normalize / hkdf 段；本文件只登记规则与 1 组样例。",
+  "completeness_note": "除 256 汉字表外均已冻结；汉字表入库前 normalize() 只校验长度与 base32 字符集"
+}

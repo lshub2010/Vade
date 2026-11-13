@@ -172,13 +172,13 @@ footer{margin-top:70px; padding-top:18px; border-top:1px solid var(--line);
 <aside>
   <div class="brand">VADEMECUM</div>
   <div class="bn">开发概览<br><span style="font-size:12px;color:var(--muted);font-weight:400">求求 + 方案 汇总视图</span></div>
-  <nav><a href="#s0">一、这个系统是什么</a><a href="#s1">二、已经冻结的 86 条决策</a><a href="#s2">三、求求骨架</a><a href="#s3">四、技术方案要点</a><a href="#s4">五、开发组织</a><a href="#s5">六、批次与里程碑</a><a href="#s6">七、风险清单</a><a href="#s7">八、下一步</a></nav>
+  <nav><a href="#s0">一、这个系统是什么</a><a href="#s1">二、已经冻结的 105 条决策</a><a href="#s2">三、求求骨架</a><a href="#s3">四、技术方案要点</a><a href="#s4">五、开发组织</a><a href="#s5">六、批次与里程碑</a><a href="#s6">七、风险清单</a><a href="#s7">八、下一步</a></nav>
 </aside>
 <main>
 <h1>Vademecum（Vade）开发概览</h1>
 <blockquote>
 <p>全称 <strong>Vademecum</strong>（拉丁 <code>vade mecum</code>，「走，与我一起」），中文「偕行」；简称 <strong>Vade</strong>。正文统一用简称。</p>
-<p>本文是 <code>requirements.md</code>（求求基线 v1.0 + AMEND-01～21）与 <code>design.md</code>（方案 v1.18）的汇总视图。
+<p>本文是 <code>requirements.md</code>（求求基线 v1.0 + AMEND-01～22）与 <code>design.md</code>（方案 v1.18）的汇总视图。
 两份原文为准，本文只做导览。</p>
 </blockquote>
 <table>
@@ -192,7 +192,7 @@ footer{margin-top:70px; padding-top:18px; border-top:1px solid var(--line);
 <tbody>
 <tr>
 <td><code>requirements.md</code></td>
-<td>求求冻结基线、86 条决策台账、工程约定（§11）</td>
+<td>求求冻结基线、105 条决策台账、工程约定（§11）</td>
 <td>对求求有疑问、要改求求时</td>
 </tr>
 <tr>
@@ -244,7 +244,7 @@ footer{margin-top:70px; padding-top:18px; border-top:1px solid var(--line);
 <p>三个面<strong>不同源</strong>：数据面 <code>:8443</code>、管理面 <code>:8444</code>（<strong>默认回环，可显式对外</strong>）、模块 app 由 <code>ui</code> 模块自己 serve。同源会让模块的一个 XSS 直接读走管理 API——<code>HttpOnly</code> 只防读 cookie，不防借用 cookie 发请求。</p>
 <p><strong>一条不可破的判据</strong>：core 源码里搜不到任何具体模块的 <code>id</code> / 名称 / 路径；删掉所有模块，core 仍能启动。这条会写成会失败的测试，不是口号。</p>
 <hr />
-<h2 id="s1">二、已经冻结的 86 条决策</h2>
+<h2 id="s1">二、已经冻结的 105 条决策</h2>
 <table>
 <thead>
 <tr>
@@ -683,6 +683,101 @@ footer{margin-top:70px; padding-top:18px; border-top:1px solid var(--line);
 <td>D86</td>
 <td>配置页策略项</td>
 <td>10 项热生效；三项二次确认；写 <code>overrides.json</code> 不回写 toml</td>
+</tr>
+<tr>
+<td>D87</td>
+<td>一级目的地</td>
+<td>4 个：会话 / 活动 / 能力 / 我的；不设第 5 个</td>
+</tr>
+<tr>
+<td>D88</td>
+<td>手机会话详情</td>
+<td>隐藏底栏，全屏 + 顶栏返回</td>
+</tr>
+<tr>
+<td>D89</td>
+<td>桌面布局</td>
+<td>双栏 + 可折叠右面板（默认收起，⌘\）；面板样式可自定义、可承载模块页面</td>
+</tr>
+<tr>
+<td>D90</td>
+<td>新建会话入口</td>
+<td>列表顶栏右侧 ✎ + 桌面 ⌘N；顶栏可为浮动胶囊</td>
+</tr>
+<tr>
+<td>D91</td>
+<td>设置入口</td>
+<td>手机「我的」tab；桌面 rail 底部头像 + ⌘,</td>
+</tr>
+<tr>
+<td>D92</td>
+<td>消息形态</td>
+<td>助手全宽（≤760dp）+ 用户右对齐气泡</td>
+</tr>
+<tr>
+<td>D93</td>
+<td>C-09 组件数</td>
+<td>7 → 11（+MessageBubble / AttachmentChip / ToolCallCard / InputBar），须在冻结前落地</td>
+</tr>
+<tr>
+<td>D94</td>
+<td>工具卡默认态</td>
+<td>成功折叠 / 失败自动展开 / 高风险审批永远展开</td>
+</tr>
+<tr>
+<td>D95</td>
+<td>附件上传通道</td>
+<td>独立 HTTPS <code>POST /ui/blob</code>（设备密钥鉴权），不进 JSON-RPC 帧</td>
+</tr>
+<tr>
+<td>D96</td>
+<td>图片存储</td>
+<td>只存压缩图（长边 2048 / ≤5MB），core 只存一个 <code>file_id</code></td>
+</tr>
+<tr>
+<td>D97</td>
+<td>语音转写</td>
+<td>端上转写，音频不出设备；桌面无系统 STT 则隐藏麦克风按钮</td>
+</tr>
+<tr>
+<td>D98</td>
+<td>UI 状态归属</td>
+<td>真相只存 core；客户端仅持可丢弃派生状态（草稿 / 索引 / 皮肤）</td>
+</tr>
+<tr>
+<td>D99</td>
+<td>技能管理位置</td>
+<td>原生技能页 + 复用 FR-9.40 三步；WebView 连 admin 强制 Bearer</td>
+</tr>
+<tr>
+<td>D100</td>
+<td>Web 端写权限</td>
+<td>三端同源、可写（+CSRF/XSS 防护与安全评审）；<code>READ_ONLY_SESSION</code> 仅限显式只读会话；废止 D76</td>
+</tr>
+<tr>
+<td>D101</td>
+<td>模型选择优先级</td>
+<td>会话级显式选择 &gt; 全局默认 &gt; <code>manifest.priority</code></td>
+</tr>
+<tr>
+<td>D102</td>
+<td>用量口径</td>
+<td>两者并存：审计按模块归因 + UI 会话累计与预算</td>
+</tr>
+<tr>
+<td>D103</td>
+<td>ask-user 状态</td>
+<td>新增 <code>waiting_input</code>（C-06 枚举改动，走 RFC-0008）</td>
+</tr>
+<tr>
+<td>D104</td>
+<td>模块页面宿主</td>
+<td>manifest 声明 <code>ui.pages[]</code>，原生声明式 schema 渲染；新契约 C-19（待冻结）</td>
+</tr>
+<tr>
+<td>D105</td>
+<td>手机模块页入口</td>
+<td>「能力」tab 内「模块页面」；模块无页面则不显示</td>
 </tr>
 </tbody>
 </table>

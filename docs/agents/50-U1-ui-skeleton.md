@@ -95,7 +95,7 @@ interface Skin {
 
 - `BtnStyle`：`Primary / Secondary / Danger / Text`。
 - `BottomBarStyle`：`Fixed / Floating / FloatingBlur`。
-- **只这 7 个组件**，不要加第 8 个（加就破坏了 U2/U3 的并行边界）；确实需要就提 RFC。
+- **共 11 个组件**（AMEND-22 / D93：原有 7 个 + `MessageBubble` / `AttachmentChip` / `ToolCallCard` / `InputBar`）；冻结后不得再加第 12 个（加就破坏 U2/U3 的并行边界），确实需要就提 RFC。
 - 冻结后只能加带默认值的可选参数。
 
 **必须同时产出的注册表**（否则 U2/U3 的皮肤永远选不中）：

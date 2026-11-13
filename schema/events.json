@@ -15,7 +15,7 @@
     "seq is allocated only by core, strictly +1 per session; clients never supply one.",
     "Persist before broadcast: every event is written to `events` before it is queued to a UI sink, otherwise a reconnect replay has a hole.",
     "Clients MUST de-duplicate by seq: a reconnect may deliver an overlapping segment.",
-    "Every turn.* payload carries `state` (see turn.state) so a UI can render without inferring.",
+    "Every turn's STATE-CHANGE event carries `state` (see turn.state): turn.queued, turn.started, turn.completed, turn.failed, turn.interrupted, turn.cancelled and turn.approval_resolved. turn.delta / turn.tool_call / turn.tool_result are payload-only and never carry `state`; a UI keeps the last state event and applies these deltas on top of it.",
     "errors inside payloads use C-04 names only; no traceback ever appears in an event.",
     "C3d may APPEND session.turn / session.closed (C-14); this file may not be rewritten by other batches."
   ],
@@ -141,7 +141,8 @@
         "request_id",
         "decision",
         "by",
-        "scope"
+        "scope",
+        "state"
       ],
       "notes": "The ONLY signal that closes dialogs on the other devices; must be broadcast even when the decision lost a first-wins race."
     },
@@ -184,7 +185,7 @@
         "state",
         "by"
       ],
-      "notes": "Emitted after tools/cancel is fired; core does not wait for the module."
+      "notes": "Emitted after tools/cancel is fired; core does not wait for the module. No turn.* event may follow this one for that turn; an interrupted assistant's partial text is reconstructable only from turn.delta events."
     },
     "turn.cancelled": {
       "payload": {
@@ -244,7 +245,7 @@
         "interrupted",
         "cancelled"
       ],
-      "notes": "Not an event: the enum every turn.* payload's `state` takes. Terminal values are final; `waiting_approval` blocks only the queue head."
+      "notes": "Not an event: the enum every state-change turn.* payload's `state` takes. turn.delta / turn.tool_call / turn.tool_result do not carry it (see rules)."
     }
   }
 }

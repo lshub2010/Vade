@@ -104,7 +104,7 @@ def install(app: Any) -> Any:
     except ValueError:
         compaction = CompactionConfig()
 
-    llm = _build_llm(cfg)
+    llm = _build_llm(cfg, router=router, registry=getattr(app, "registry", None))
     approval = _LazyApproval(app)
     memory = _LazyMemory(app)
     engine = LoopEngine(
@@ -125,6 +125,13 @@ def install(app: Any) -> Any:
     log.approval_port = approval
 
     rpc = SessionRPC(log, approval=lambda: getattr(app, "approval_port", None))
+    # `module.status` rides the same seq bus; the registry (C2) is the trigger.
+    from .status import ModuleStatusPublisher
+
+    status = ModuleStatusPublisher(log)
+    if getattr(app, "registry", None) is not None:
+        status.attach(app.registry)
+    app.module_status = status
     app.session_store = store
     app.session = log
     app.session_log = log
@@ -147,17 +154,29 @@ def _history_of(log: Any) -> Any:
     return history
 
 
-def _build_llm(cfg: Any) -> Any:
+def _build_llm(cfg: Any, *, router: Any = None, registry: Any = None) -> Any:
     from ..llm.mock import MockLLMProvider
 
     provider = str(cfg.get("llm.provider", "openai") or "openai")
     if provider == "mock":
         return MockLLMProvider([])
+    builtin = _build_builtin(cfg)
     if provider == "module":
-        # ModuleLLMProvider (T5) is not delivered in this round; fail closed by
-        # falling back only when explicitly configured.
-        if cfg.get("llm.fallback_to_builtin", True) is False:
-            return None
+        from ..llm.module import ModuleLLMProvider
+
+        # `fallback_to_builtin` is read with a default because C-18 does not
+        # declare it yet (see RESULT: config schema gap, not a C3 decision).
+        fallback = builtin if cfg.get("llm.fallback_to_builtin", True) else None
+        return ModuleLLMProvider(
+            router,
+            registry,
+            model_module=cfg.get("llm.model_module"),
+            fallback=fallback,
+        )
+    return builtin
+
+
+def _build_builtin(cfg: Any) -> Any:
     base_url = cfg.get("llm.base_url")
     if not base_url:
         return None

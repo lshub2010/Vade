@@ -119,6 +119,13 @@ class SessionLog:
         self._sink_queue = sink_queue
         self.approval_port: Any = None
         self._closed = False
+        #: Bound on the first async call; `status.ModuleStatusPublisher` needs
+        #: to know which loop to hop onto when the registry (sync) changes.
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop | None:
+        return self._loop
 
     # ------------------------------------------------------------------ wiring
     def set_executor(self, fn: Callable[[Turn, tuple[dict[str, Any], ...]], Awaitable[Any]]) -> None:
@@ -160,6 +167,7 @@ class SessionLog:
         messages: Sequence[Message] = (),
     ) -> Event:
         """Allocate seq, persist (messages + event), replay-add, then broadcast."""
+        self._loop = asyncio.get_running_loop()
         async with self._emit_lock(session_id):
             seq = self._seq.next(session_id)
             event = Event(
@@ -245,6 +253,10 @@ class SessionLog:
 
     def attached_count(self, session_id: str) -> int:
         return len(self._sinks.get(session_id, {}))
+
+    def attached_sessions(self) -> tuple[str, ...]:
+        """Sessions with at least one live sink (module.status fan-out)."""
+        return tuple(session_id for session_id, workers in self._sinks.items() if workers)
 
     # ------------------------------------------------------------------ snapshot
     def snapshot(self, session_id: str) -> dict[str, Any]:

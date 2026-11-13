@@ -139,6 +139,9 @@ class Router:
         # Target carries a dict (input_schema) so it is not hashable: keep a list.
         self._calls: dict[str, list[tuple[Target, str]]] = {}
         self._cancelled_turns: set[str] = set()
+        #: `cancel_turn` and the task cancellation in `call()` both fire a
+        #: cancel for the same call; the module must see exactly one.
+        self._cancel_fired: set[tuple[str, str, str]] = set()
 
     # ------------------------------------------------------------------ targets
     def _targets(self, tool_id: str) -> list[Target]:
@@ -311,6 +314,10 @@ class Router:
         self._calls.pop(turn_id, None)
 
     def _fire_cancel(self, target: Target, call_id: str) -> None:
+        key = (target.module_id, target.instance_id, call_id)
+        if key in self._cancel_fired:
+            return  # cancel_turn already told the module; a second frame is noise
+        self._cancel_fired.add(key)
         try:
             task = asyncio.ensure_future(self._caller.cancel(target, call_id))
         except RuntimeError:  # pragma: no cover - no running loop

@@ -107,6 +107,9 @@ class Manifest:
     events: tuple[str, ...]
     injects: tuple[str, ...]
     digest: str
+    #: C-14 append (RFC-0001). Trailing default so every existing construction
+    #: still type-checks and a manifest that predates the field keeps working.
+    subscriptions: tuple[str, ...] = ()
 
     @property
     def protocol_major(self) -> int:
@@ -254,6 +257,20 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
     prompts_raw = raw["capabilities"].get("prompts", [])
     events_raw = raw["capabilities"].get("events", [])
     injects_raw = raw.get("injects", [])
+    # C-14 append (RFC-0001): shape only. Topic names are validated at
+    # `events/subscribe`, where an unknown or ungranted topic must become a
+    # per-topic `rejected` row, not a manifest error that kills the module.
+    subscriptions_raw = raw.get("subscriptions") or []
+    if not isinstance(subscriptions_raw, list):
+        raise ManifestError(
+            "/subscriptions", f"must be an array of strings, got {type(subscriptions_raw).__name__}"
+        )
+    subscriptions: list[str] = []
+    for index, topic in enumerate(subscriptions_raw):
+        if not isinstance(topic, str):
+            raise ManifestError(f"/subscriptions/{index}", f"must be a string, got {type(topic).__name__}")
+        if topic not in subscriptions:  # preserve order, drop repeats
+            subscriptions.append(topic)
     for index, inject in enumerate(injects_raw):
         if inject != "session_id":
             raise ManifestError(
@@ -279,4 +296,5 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
         events=tuple(str(e) for e in events_raw),
         injects=tuple(str(i) for i in injects_raw),
         digest=digest,
+        subscriptions=tuple(subscriptions),
     )

@@ -113,6 +113,38 @@ class Registry:
         self._close_connection = close_connection
         self._revoked: set[str] = set()
         self._risk_overrides: dict[tuple[str, str], str] = {}
+        #: Sync listeners for `module.status` (C3 subscribes). Called with a
+        #: C-06 payload; never awaited here because mutation may happen on the
+        #: admin thread.
+        self._listeners: list[Callable[[Mapping[str, Any]], None]] = []
+
+    # ------------------------------------------------------------------ status events
+    def add_listener(self, listener: Callable[[Mapping[str, Any]], None]) -> None:
+        """Subscribe to node status changes (`module.status`, C-06)."""
+        with self._lock:
+            if listener not in self._listeners:
+                self._listeners.append(listener)
+
+    def _record_status(self, record: NodeRecord) -> dict[str, Any]:
+        return {
+            "module_id": record.module_id,
+            "instance_id": record.instance_id,
+            "online": record.health is HealthState.ONLINE and record.connection_id is not None,
+            "version": record.manifest.version if record.manifest is not None else None,
+        }
+
+    def _publish_status(self, *records: NodeRecord) -> None:
+        """Notify listeners AFTER the table is consistent (never inside a swap)."""
+        listeners = list(self._listeners)
+        if not listeners:
+            return
+        for record in records:
+            payload = self._record_status(record)
+            for listener in listeners:
+                try:
+                    listener(payload)
+                except Exception:  # pragma: no cover - a listener must not break registration
+                    pass
 
     # ------------------------------------------------------------------ register
     def register(
@@ -164,7 +196,9 @@ class Registry:
             self._cap_epoch[manifest.module_id] = self._cap_epoch.get(manifest.module_id, 0) + (
                 0 if existing else 1
             )
-            return Registration(accepted=True, session_id=f"{manifest.module_id}#{manifest.instance_id}", tool_names=manifest.tool_names)
+            registration = Registration(accepted=True, session_id=f"{manifest.module_id}#{manifest.instance_id}", tool_names=manifest.tool_names)
+        self._publish_status(record)
+        return registration
 
     def _check_concurrency(self, manifest: Manifest, existing: NodeRecord | None) -> None:
         siblings = [r for r in self._records.values() if r.module_id == manifest.module_id and r.instance_id != manifest.instance_id]
@@ -281,10 +315,14 @@ class Registry:
                     )
 
             new_index = self._build_index(manifest, exclude_instance=manifest.instance_id)
-            self._records[key] = replace(record, manifest=manifest)
+            updated = replace(record, manifest=manifest)
+            self._records[key] = updated
             self._index = new_index
             self._cap_epoch[manifest.module_id] = self._cap_epoch.get(manifest.module_id, 0) + 1
-            return self._cap_epoch[manifest.module_id]
+            epoch = self._cap_epoch[manifest.module_id]
+        # A new manifest version is a status change the admin surface must see.
+        self._publish_status(updated)
+        return epoch
 
     # ------------------------------------------------------------------ queries
     def cap_epoch(self, module_id: str) -> int:
@@ -342,7 +380,9 @@ class Registry:
             if record is None:
                 return
             # Record is retained so the topology can still draw a grey dotted line.
-            self._records[key] = replace(record, connection_id=None, health=HealthState.OFFLINE)
+            gone = replace(record, connection_id=None, health=HealthState.OFFLINE)
+            self._records[key] = gone
+        self._publish_status(gone)
 
     def mark_rejected(self, module_id: str, instance_id: str, reason: str, *, fingerprint: str = "") -> NodeRecord:
         with self._lock:
@@ -361,10 +401,12 @@ class Registry:
                 rejected_reason=reason,
             )
             self._records[key] = record
-            return record
+        self._publish_status(record)
+        return record
 
     def refresh_health(self) -> None:
         now = self._clock()
+        changed: list[NodeRecord] = []
         with self._lock:
             for key, record in list(self._records.items()):
                 if record.connection_id is None:
@@ -378,7 +420,11 @@ class Registry:
                         timeout_rate=record.timeout_rate,
                     )
                 if state != record.health:
-                    self._records[key] = replace(record, health=state)
+                    record = replace(record, health=state)
+                    self._records[key] = record
+                    changed.append(record)
+        if changed:
+            self._publish_status(*changed)
 
     def set_circuit(self, module_id: str, instance_id: str, open_: bool, timeout_rate: float = 0.0) -> None:
         with self._lock:
@@ -395,12 +441,15 @@ class Registry:
             record = self._records.get(key)
             if record is None:
                 raise VadeError("NOT_FOUND", f"{module_id}#{instance_id} is not registered")
-            self._records[key] = replace(record, enabled=enabled)
+            updated = replace(record, enabled=enabled)
             if not enabled:
-                self._records[key] = replace(self._records[key], health=HealthState.OFFLINE, connection_id=None)
+                updated = replace(updated, health=HealthState.OFFLINE, connection_id=None)
+            self._records[key] = updated
+            if not enabled:
                 # Re-index the whole table: filtering by module_id also removed
                 # the OTHER instances of a pooled module.
                 self._index = self._rebuild_index()
+        self._publish_status(updated)
         if not enabled and record.connection_id and self._close_connection:
             self._close_connection(record.connection_id)
 
@@ -412,6 +461,7 @@ class Registry:
 
     def revoke_fingerprint(self, fingerprint: str) -> tuple[str, ...]:
         """Revoke a key: closes live connections NOW, not just future handshakes."""
+        changed: list[NodeRecord] = []
         with self._lock:
             self._revoked.add(fingerprint)
             closed: list[str] = []
@@ -419,9 +469,13 @@ class Registry:
                 if record.fingerprint == fingerprint:
                     if record.connection_id:
                         closed.append(record.connection_id)
-                    self._records[key] = replace(
+                    revoked = replace(
                         record, connection_id=None, health=HealthState.REJECTED, rejected_reason="fingerprint revoked"
                     )
+                    self._records[key] = revoked
+                    changed.append(revoked)
+        if changed:
+            self._publish_status(*changed)
         for connection_id in closed:
             if self._close_connection:
                 self._close_connection(connection_id)

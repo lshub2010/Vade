@@ -1,0 +1,375 @@
+{
+  "id": "C-06",
+  "version": "1.0.0",
+  "status": "frozen",
+  "frozen_at": "2026-11-13",
+  "owner": "C3",
+  "source_of_truth": "docs/design.md §2.5, §2.6",
+  "transport": "JSON-RPC 2.0 notification on the data plane: {jsonrpc:'2.0', method:'event', params:{type, seq, payload}}",
+  "envelope": {
+    "type": "string (domain.action, past tense)",
+    "seq": "int >= 1, per session, allocated by core",
+    "payload": "object"
+  },
+  "rules": [
+    "seq is allocated only by core, strictly +1 per session; clients never supply one.",
+    "Persist before broadcast: every event is written to `events` before it is queued to a UI sink, otherwise a reconnect replay has a hole.",
+    "Clients MUST de-duplicate by seq: a reconnect may deliver an overlapping segment.",
+    "Every turn's STATE-CHANGE event carries `state` (see turn.state): turn.queued, turn.started, turn.completed, turn.failed, turn.interrupted, turn.cancelled and turn.approval_resolved. turn.delta / turn.tool_call / turn.tool_result are payload-only and never carry `state`; a UI keeps the last state event and applies these deltas on top of it.",
+    "errors inside payloads use C-04 names only; no traceback ever appears in an event.",
+    "C3d may APPEND session.turn / session.closed (C-14); this file may not be rewritten by other batches."
+  ],
+  "turn_states": [
+    "queued",
+    "waiting_approval",
+    "running",
+    "completed",
+    "failed",
+    "interrupted",
+    "cancelled"
+  ],
+  "events": {
+    "session.attached": {
+      "payload": {
+        "session_id": "string",
+        "from_seq": "int",
+        "state": "open|closed",
+        "snapshot": "bool",
+        "replay_count": "int (only when snapshot=false)"
+      },
+      "required": [
+        "session_id",
+        "from_seq",
+        "state",
+        "snapshot"
+      ],
+      "notes": "First event a ui/attach caller sees. snapshot=false means from_seq+1.. is replayed contiguously; snapshot=true means the RPC result carried a snapshot and from_seq is its point."
+    },
+    "turn.queued": {
+      "payload": {
+        "turn_id": "string",
+        "state": "turn.state",
+        "client_msg_id": "string"
+      },
+      "required": [
+        "turn_id",
+        "state"
+      ],
+      "notes": "Emitted after the turn row and the user message are persisted."
+    },
+    "turn.started": {
+      "payload": {
+        "turn_id": "string",
+        "state": "turn.state"
+      },
+      "required": [
+        "turn_id",
+        "state"
+      ]
+    },
+    "turn.delta": {
+      "payload": {
+        "turn_id": "string",
+        "text": "string (increment, not cumulative)"
+      },
+      "required": [
+        "turn_id",
+        "text"
+      ],
+      "notes": "Concatenate in seq order; no delta is re-sent after a reconnect that was covered by replay."
+    },
+    "turn.tool_call": {
+      "payload": {
+        "turn_id": "string",
+        "call_id": "string",
+        "tool": "string (LLM-side name)",
+        "args_digest": "sha256:hex"
+      },
+      "required": [
+        "turn_id",
+        "call_id",
+        "tool",
+        "args_digest"
+      ],
+      "notes": "Only the digest goes to UI; full arguments travel in turn.approval_required for risk=high."
+    },
+    "turn.tool_result": {
+      "payload": {
+        "turn_id": "string",
+        "call_id": "string",
+        "ok": "bool",
+        "summary": "string <=300",
+        "code": "C-04 name (only when ok=false)"
+      },
+      "required": [
+        "turn_id",
+        "call_id",
+        "ok",
+        "summary"
+      ]
+    },
+    "turn.approval_required": {
+      "payload": {
+        "turn_id": "string",
+        "request_id": "string",
+        "tool": "string",
+        "args": "object (FULL arguments, not a digest)",
+        "risk": "low|medium|high",
+        "expires_at": "int (unix ms)"
+      },
+      "required": [
+        "turn_id",
+        "request_id",
+        "tool",
+        "args",
+        "risk",
+        "expires_at"
+      ],
+      "notes": "Broadcast to every attached UI. timeout = deny (fail-closed)."
+    },
+    "turn.approval_resolved": {
+      "payload": {
+        "turn_id": "string",
+        "request_id": "string",
+        "decision": "approve|deny",
+        "by": "device_id|admin",
+        "scope": "once|session",
+        "state": "turn.state"
+      },
+      "required": [
+        "turn_id",
+        "request_id",
+        "decision",
+        "by",
+        "scope",
+        "state"
+      ],
+      "notes": "The ONLY signal that closes dialogs on the other devices; must be broadcast even when the decision lost a first-wins race."
+    },
+    "turn.completed": {
+      "payload": {
+        "turn_id": "string",
+        "state": "turn.state",
+        "usage": "object",
+        "stopped_reason": "stop|max_steps|no_capability|null"
+      },
+      "required": [
+        "turn_id",
+        "state",
+        "usage"
+      ],
+      "notes": "state is exactly 'completed' (never 'done')."
+    },
+    "turn.failed": {
+      "payload": {
+        "turn_id": "string",
+        "state": "turn.state",
+        "code": "C-04 name",
+        "message": "string <=300"
+      },
+      "required": [
+        "turn_id",
+        "state",
+        "code",
+        "message"
+      ]
+    },
+    "turn.interrupted": {
+      "payload": {
+        "turn_id": "string",
+        "state": "turn.state",
+        "by": "string"
+      },
+      "required": [
+        "turn_id",
+        "state",
+        "by"
+      ],
+      "notes": "Emitted after tools/cancel is fired; core does not wait for the module. No turn.* event may follow this one for that turn; an interrupted assistant's partial text is reconstructable only from turn.delta events."
+    },
+    "turn.cancelled": {
+      "payload": {
+        "turn_id": "string",
+        "state": "turn.state",
+        "by": "string"
+      },
+      "required": [
+        "turn_id",
+        "state",
+        "by"
+      ],
+      "notes": "Only for queued turns (ui/queue.cancel). A running turn is stopped with ui/interrupt, which returns INVALID_ARGUMENT for queue.cancel."
+    },
+    "queue.updated": {
+      "payload": {
+        "session_id": "string",
+        "running": "string|null",
+        "running_state": "turn.state|null",
+        "pending": [
+          {
+            "turn_id": "string",
+            "state": "turn.state",
+            "client_msg_id": "string|null",
+            "enqueued_at": "int"
+          }
+        ]
+      },
+      "required": [
+        "session_id",
+        "running",
+        "pending"
+      ],
+      "notes": "Sent on every enqueue/start/finish/cancel so a UI never has to guess queue_pos."
+    },
+    "module.status": {
+      "payload": {
+        "module_id": "string",
+        "instance_id": "string",
+        "online": "bool",
+        "version": "string|null"
+      },
+      "required": [
+        "module_id",
+        "instance_id",
+        "online"
+      ],
+      "notes": "Emitted from registry changes through the same seq bus (C3 consumes registry, C2 produces the change)."
+    },
+    "turn.state": {
+      "enum": [
+        "queued",
+        "waiting_approval",
+        "running",
+        "completed",
+        "failed",
+        "interrupted",
+        "cancelled"
+      ],
+      "notes": "Not an event: the enum every state-change turn.* payload's `state` takes. turn.delta / turn.tool_call / turn.tool_result do not carry it (see rules)."
+    },
+    "session.turn": {
+      "payload": {
+        "session_id": "string",
+        "turn_id": "string",
+        "state": "turn.state (terminal only)",
+        "user_text": "string (the user message of that turn, verbatim)",
+        "assistant_text": "string (the final assistant message of that turn)",
+        "tool_calls": [
+          {
+            "tool": "string (LLM-side name)",
+            "args_digest": "sha256:hex",
+            "ok": "bool|null (null while the outcome is unknown)"
+          }
+        ]
+      },
+      "required": [
+        "session_id",
+        "turn_id",
+        "state",
+        "user_text",
+        "assistant_text",
+        "tool_calls"
+      ],
+      "x-vade": {"push": "events/deliver"},
+      "notes": "C-14 append. One event per finished turn, delivered only to role=evolve modules that are allowlisted, declare the topic and run with [evolve] allow_transcript=true. user_text and assistant_text are separate on purpose (AMEND-19): a consumer must never have to guess which side of a merged messages[] it is reading. `state` is terminal (completed|failed|interrupted|cancelled). turn.state carries no text, so a consumer that only sees it cannot build a turn."
+    },
+    "session.closed": {
+      "payload": {
+        "session_id": "string",
+        "turns_total": "int",
+        "turns": [
+          {
+            "turn_id": "string",
+            "state": "turn.state",
+            "tool_calls": [
+              {
+                "tool": "string",
+                "args_digest": "sha256:hex",
+                "ok": "bool|null"
+              }
+            ],
+            "negative": "bool",
+            "self_corrected": "bool"
+          }
+        ],
+        "tail": [
+          {
+            "turn_id": "string",
+            "user_text": "string",
+            "assistant_text": "string"
+          }
+        ],
+        "closed_at": "int (unix ms)"
+      },
+      "required": [
+        "session_id",
+        "turns_total",
+        "turns",
+        "tail",
+        "closed_at"
+      ],
+      "x-vade": {"push": "events/deliver"},
+      "notes": "C-14 append. Deliberately NOT the whole transcript and NOT a rolling summary: `tail` is the last 10 turns of original text, truncated by core, and the consumer accumulates its own summary in the same pass (AMEND-19). Best-effort: if the module is offline when the session closes, this one event is lost; v1 has no redelivery for session.closed (use session.turn with since_seq instead)."
+    },
+    "skill.proposed": {
+      "payload": {
+        "name": "string",
+        "origin": "string (always 'proposal' for this topic)",
+        "revision": "int (the revision an approval would produce)",
+        "base_revision": "int (revision the proposal was authored against; 0 for create)",
+        "status": "pending"
+      },
+      "required": [
+        "name",
+        "origin",
+        "revision",
+        "base_revision",
+        "status"
+      ],
+      "x-vade": {"push": "events/deliver"},
+      "notes": "C-14 append. Metadata only: the body never travels here, otherwise a UI event would become a way to read unpublished skill text. Consumers: ui/admin front ends refreshing the pending list (C5a /skills). No session, so seq_from = seq_to = 0."
+    }
+  },
+  "x-vade": {
+    "append": {
+      "contract": "C-14",
+      "version": "1.0.0",
+      "frozen": "2026-11-13",
+      "owner": "C3d",
+      "doc": "docs/agents/24-C3d-events-skill-proposal.md",
+      "adds": [
+        "session.turn",
+        "session.closed",
+        "skill.proposed"
+      ],
+      "rewrites": "none. Every C-06 entry, rule and enum above is byte-identical to the frozen 1.0.0 file; C3d has append rights only. `skill.proposed` is appended here too (v1.18 correction: C-14 carries three topics).",
+    "push_transport": {
+      "transport": "events/deliver",
+      "emit_site": "EventBus._dispatch(topic, ...) -- never SessionLog.emit(), so the C-06 static scan cannot see these three",
+      "marker": "each appended entry carries x-vade.push = events/deliver; tools/check_contracts.py scans _dispatch() and requires the marker on every pushed topic"
+    }
+    },
+    "topic_gate": {
+      "session.turn": "role=evolve AND (module_id, fingerprint) in [evolve] allowlist AND topic declared in manifest.subscriptions AND [evolve] allow_transcript=true",
+      "session.closed": "same four gates as session.turn",
+      "skill.proposed": "role=ui|admin AND the topic declared in manifest.subscriptions; no transcript gate (no transcript in the payload)"
+    },
+    "deliver_envelope": {
+      "transport": "JSON-RPC 2.0 notification core->module: {jsonrpc:'2.0', method:'events/deliver', params:{topic, session_id, seq_from, seq_to, payload}}",
+      "seq_from": "int: first seq of the source events this payload was assembled from (0 for topics with no session stream)",
+      "seq_to": "int: last seq; a reconnecting module passes it as `since_seq` to resume",
+      "dedupe": "exactly one delivery per (topic, session_id, turn_id); consumers MUST still de-duplicate by seq_to because a reconnect replay can overlap a live push (same rule as C-06)."
+    },
+    "redaction": {
+      "owner": "core config [evolve] redact; a module may not change it, and `redact: []` in a request is recorded as an override attempt, not honoured",
+      "replace_with": "sha256(value)[:16]",
+      "flag": "payload.redacted = true only when a field was actually replaced"
+    },
+    "backpressure": {
+      "queue": "one bounded queue per instance, 32 entries",
+      "full": "drop oldest and increment delivery_dropped; a slow evolve module must never stall a session",
+      "send_timeout_s": 5,
+      "on_failure": "delivery_failed, no retry (v1 is best-effort; reconnect + since_seq is the recovery path)"
+    }
+  }
+}

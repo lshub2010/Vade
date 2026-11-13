@@ -1,26 +1,22 @@
 package vade.spike.miuix
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.ImageComposeScene
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.Density
 import org.jetbrains.skia.EncodedImageFormat
-import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.theme.lightColorScheme
 import java.io.File
 
 /**
  * Headless renderer: no display, no Skiko window. Useful on CI; the result is the
- * same composables the real window draws, with one exception.
+ * same composables the real window draws.
  *
- * Exception — dialog: `OverlayDialog` never gets a popup window on Desktop, so it
- * does not paint here either (same root cause as the real window, not a headless
- * quirk). The dialog section is therefore rendered through [DialogSurfaceShot],
- * which composes the dialog's surface/content directly onto the canvas. That PNG
- * is a content-surface render, NOT a real popup — see RESULT.md §三.
+ * Dialog: `OverlayDialog` does not use a platform popup window at all — it registers
+ * a `DialogState`, and Miuix's `MiuixPopupHost` (present only inside Miuix's
+ * `Scaffold`, which `App()` now applies to the dialog section) draws it through an
+ * `AnimatedVisibility` enter transition. So it is a normal in-composition overlay and
+ * renders here too, as long as the scene is advanced past the enter animation. The
+ * first frame is alpha 0, which is why a single `render()` looked blank and was
+ * earlier misread as "Desktop cannot draw OverlayDialog".
  *
  * args: [0] output dir, [1] optional section slug (renders just that one).
  */
@@ -36,18 +32,16 @@ fun main(args: Array<String>) {
     for (section in sections) {
         val scene = ImageComposeScene(width = width, height = height, density = Density(1f)) {
             if (section == Section.Dialog) {
-                // Bypasses OverlayDialog: only its body can be drawn on this canvas.
-                MiuixTheme(colors = lightColorScheme()) {
-                    Box(Modifier.fillMaxSize().background(MiuixTheme.colorScheme.background)) {
-                        DialogSurfaceShot()
-                    }
-                }
+                // Real sheet: App() puts the dialog section in a Miuix Scaffold and opens it.
+                App(section, dialogOpenOnStart = true)
             } else {
                 App(section)
             }
         }
         try {
-            val image = scene.render()
+            scene.render() // first frame at t=0: composes, starts enter transitions (alpha 0)
+            scene.render(600_000_000L) // applies the dialog state registered during frame 1
+            val image = scene.render(1_200_000_000L) // past OverlayDialog's enter animation
             val data = image.encodeToData(EncodedImageFormat.PNG) ?: error("PNG encode failed for ${section.slug}")
             File(outDir, "miuix-desktop-${section.slug}.png").writeBytes(data.bytes)
             written++

@@ -6,3 +6,5 @@ local.properties
 build/
 node_modules/
 kotlin-js-store/
+# Runtime classpath dump used by the window-capture loop (RESULT.md §十一).
+cp.txt

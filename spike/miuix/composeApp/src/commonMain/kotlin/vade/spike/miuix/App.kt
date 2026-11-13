@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -17,7 +16,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -31,6 +29,7 @@ import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.NavigationBar
 import top.yukonga.miuix.kmp.basic.NavigationBarItem
+import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Surface
 import top.yukonga.miuix.kmp.basic.Text
@@ -77,16 +76,34 @@ private val DemoIcon: ImageVector by lazy {
 }
 
 @Composable
-fun App(section: Section? = null) {
+fun App(section: Section? = null, dialogOpenOnStart: Boolean = false) {
     MiuixTheme(colors = lightColorScheme()) {
         if (section != null) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(MiuixTheme.colorScheme.background)
-                    .padding(16.dp),
-            ) {
-                SectionBody(section)
+            if (section == Section.Dialog) {
+                // OverlayDialog only registers a DialogState; the actual drawing is done by
+                // MiuixPopupHost, which exists *only* inside Miuix's Scaffold. A bare Box/Column
+                // therefore renders no dialog on any platform (desktop, wasm and Android alike).
+                // This used to be misattributed to a missing desktop popup window — see RESULT.md §五 R6.
+                Scaffold { insets ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(insets)
+                            .background(MiuixTheme.colorScheme.background)
+                            .padding(16.dp),
+                    ) {
+                        SectionBody(section, dialogOpenOnStart)
+                    }
+                }
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(MiuixTheme.colorScheme.background)
+                        .padding(16.dp),
+                ) {
+                    SectionBody(section)
+                }
             }
         } else {
             FullPage()
@@ -120,7 +137,7 @@ private fun FullPage() {
 }
 
 @Composable
-private fun SectionBody(section: Section) {
+private fun SectionBody(section: Section, dialogOpenOnStart: Boolean = false) {
     when (section) {
         Section.Button -> Buttons()
         Section.TextField -> TextFields()
@@ -128,7 +145,7 @@ private fun SectionBody(section: Section) {
         Section.ListItem -> ListItems()
         Section.Switch -> Switches()
         Section.BottomBar -> BottomBar()
-        Section.Dialog -> Dialogs()
+        Section.Dialog -> Dialogs(openOnStart = dialogOpenOnStart)
         Section.TopAppBar -> Bars()
     }
 }
@@ -243,16 +260,16 @@ private fun BottomBar() {
 }
 
 @Composable
-private fun Dialogs() {
-    // `show` starts false because OverlayDialog does not paint on Desktop at all: it
-    // never creates a popup window (verified by enumerating the process' windows — only
-    // the SunAwtFrame exists), so an initial `true` would only mislead. This whole
-    // change is demo code inside the spike; see RESULT.md §三/§五 R6.
-    var show by remember { mutableStateOf(false) }
+private fun Dialogs(openOnStart: Boolean = false) {
+    // OverlayDialog needs a MiuixPopupHost ancestor (provided by Miuix's Scaffold — see
+    // App()). With one, it pops a real bottom sheet; without one it silently draws nothing.
+    // `openOnStart` only exists so the screenshot harness can capture the sheet without a
+    // synthetic click. See RESULT.md §三.3 / §五 R6.
+    var show by remember { mutableStateOf(openOnStart) }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Button(onClick = { show = true }) { Text("打开确认弹窗") }
-        Text("对应 C-09 的 ApprovalDialog：遮罩 + 两个按钮横排。")
-        Text("（Desktop 上弹窗不绘制，本页只演示调用点；截图见 shots/miuix-desktop-dialog.png。）")
+        Text("对应 C-09 的 ApprovalDialog：遮罩 + 底部卡片 + 两个按钮横排。")
+        Text("（真实形态是底部 sheet，不是居中圆角卡；截图见 shots/miuix-window-dialog.png。）")
         OverlayDialog(
             show = show,
             title = "允许执行工具？",
@@ -269,55 +286,6 @@ private fun ApprovalActions(onDismiss: () -> Unit) {
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         TextButton(text = "拒绝", onClick = onDismiss, modifier = Modifier.weight(1f))
         TextButton(text = "允许", onClick = onDismiss, modifier = Modifier.weight(1f))
-    }
-}
-
-/**
- * Content-surface render of the dialog above.
- *
- * `OverlayDialog` puts its body in a popup window; on Desktop that window is never
- * created, so neither a real window capture nor `ImageComposeScene` can see the
- * dialog. This draws the same pieces the dialog draws — `windowDimming` scrim,
- * `surface` card with 28 dp corners, title, summary and the two actions — straight
- * onto the canvas so the body is at least reviewable. It is a screenshot harness,
- * not a second dialog implementation; RESULT.md labels the PNG "content surface,
- * not a real popup".
- */
-@Composable
-internal fun DialogSurfaceShot() {
-    Box(
-        modifier = Modifier.fillMaxSize().background(MiuixTheme.colorScheme.windowDimming),
-        contentAlignment = Alignment.Center,
-    ) {
-        Surface(
-            modifier = Modifier.fillMaxWidth(0.86f),
-            shape = RoundedCornerShape(28.dp),
-            color = MiuixTheme.colorScheme.surface,
-        ) {
-            Column(
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 22.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Text(
-                    text = "允许执行工具？",
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = MiuixTheme.colorScheme.onSurface,
-                )
-                Text(
-                    text = "fs.write · 请求写入 3 个文件",
-                    fontSize = 14.sp,
-                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                )
-                Row(
-                    modifier = Modifier.padding(top = 10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    TextButton(text = "拒绝", onClick = {}, modifier = Modifier.weight(1f))
-                    TextButton(text = "允许", onClick = {}, modifier = Modifier.weight(1f))
-                }
-            }
-        }
     }
 }
 

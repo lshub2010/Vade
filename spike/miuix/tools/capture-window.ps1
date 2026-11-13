@@ -3,8 +3,9 @@
 # Launches the Desktop app from the compiled classpath, pins the Skiko window
 # top-most, crops by its DWM extended frame bounds (GetWindowRect keeps an 8 px
 # invisible resize border that would pull neighbours into the crop) and saves a
-# PNG. One SunAwtFrame per process is what we see; an OverlayDialog never adds
-# a window, which is why the dialog cannot be captured this way.
+# PNG. One SunAwtFrame per process is what we see; an OverlayDialog draws inside
+# that same window (a bottom sheet via MiuixPopupHost inside Miuix's Scaffold), it
+# never adds a window of its own — pass -ClickX/-ClickY to open it before the shot.
 #
 # Prerequisite (from spike/miuix):
 #   gradle :composeApp:desktopMainClasses :composeApp:printRuntimeClasspath -q | tail -1 > cp.txt

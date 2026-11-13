@@ -1,0 +1,36 @@
+{
+  "module_id": "com.example.fs",
+  "instance_id": "fs-01",
+  "version": "1.0.0",
+  "protocol": "vade/v2",
+  "concurrency": "pooled",
+  "capabilities": {
+    "tools": [
+      {
+        "name": "read_file",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      }
+    ]
+  },
+  "limits": {
+    "max_concurrency": 4,
+    "max_payload": 65519
+  },
+  "injects": [
+    "session_id"
+  ]
+}

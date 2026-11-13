@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vade.local/schema/config.schema.json",
+  "title": "Vade core.toml (C-18)",
+  "description": "C-18. The single source of default values, apply semantics (hot|restart) and ownership for every core.toml key. Core loads it at startup; C3/C3b/C5a/M4a/M4b/F1 must read defaults from here instead of hardcoding numbers. Unknown keys are REJECTED at startup with UNKNOWN_CONFIG_KEY, never silently defaulted.",
+  "type": "object",
+  "additionalProperties": false,
+  "x-vade": {
+    "contract": "C-18",
+    "version": "1.0.0",
+    "status": "frozen",
+    "frozen_at": "2026-11-13",
+    "owner": "C2",
+    "consumers": ["C3", "C3b", "C5a", "M4a", "M4b", "F1"],
+    "merge_order": ["cli", "env", "overrides", "toml", "defaults"],
+    "merge_order_note": "Later entries are overridden by earlier ones: CLI > env > data/config.overrides.json > core.toml > defaults.",
+    "env_prefix": "VADE_",
+    "env_nesting": "__",
+    "env_example": "VADE_CORE__LISTEN=127.0.0.1:9443 overrides [core].listen",
+    "overrides_path": "data/config.overrides.json",
+    "overrides_note": "Written by the admin page only. Never written back into core.toml: upgrades would clobber it, diffs and audit would lie. C2 only reads and validates it.",
+    "secrets_rule": "Secret-bearing keys accept an ENV VAR NAME only (e.g. api_key_env = \"OPENAI_API_KEY\"), never a literal. A literal `sk-...` in core.toml aborts startup.",
+    "unknown_key_rule": "Any key not present in this schema -> UNKNOWN_CONFIG_KEY and abort startup (typos must not fall back to defaults).",
+    "apply_values": ["hot", "restart"],
+    "config_changed": {
+      "audit_event": "config.changed",
+      "payload": {
+        "keys": ["string (dotted path)"],
+        "apply": "hot|restart",
+        "actor": "string (admin user id or 'cli')",
+        "source": "overrides|cli|env",
+        "before_digest": "sha256 hex of the previous value set",
+        "after_digest": "sha256 hex of the new value set"
+      },
+      "note": "Never carries secret VALUES, only key names and digests. C5a emits it; C2 defines the shape here."
+    }
+  },
+  "properties": {
+    "core": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "listen": {"type": "string", "default": "127.0.0.1:8443", "x-vade": {"apply": "restart", "owner": "C2", "pattern": "^[^:]+:[0-9]{1,5}$"}},
+        "admin_host": {"type": "string", "default": "127.0.0.1:8444", "x-vade": {"apply": "restart", "owner": "C5a"}},
+        "data_dir": {"type": "string", "default": "./data", "x-vade": {"apply": "restart", "owner": "C2"}},
+        "log_level": {"type": "string", "enum": ["debug", "info", "warning", "error"], "default": "info", "x-vade": {"apply": "hot", "owner": "C2"}},
+        "heartbeat_interval_s": {"type": "number", "minimum": 1, "maximum": 120, "default": 10, "x-vade": {"apply": "restart", "owner": "C2"}},
+        "handshake_timeout_s": {"type": "number", "minimum": 1, "maximum": 60, "default": 5, "x-vade": {"apply": "restart", "owner": "C2"}},
+        "send_queue_frames": {"type": "integer", "minimum": 8, "maximum": 4096, "default": 256, "x-vade": {"apply": "restart", "owner": "C2"}},
+        "rekey_after_s": {"type": "integer", "minimum": 60, "default": 86400, "x-vade": {"apply": "restart", "owner": "C2"}},
+        "rekey_after_bytes": {"type": "integer", "minimum": 1048576, "default": 1073741824, "x-vade": {"apply": "restart", "owner": "C2"}},
+        "rekey_after_frames": {"type": "integer", "minimum": 1024, "default": 1048576, "x-vade": {"apply": "restart", "owner": "C2"}}
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cert": {"type": ["string", "null"], "default": null, "x-vade": {"apply": "restart", "owner": "C2", "note": "null = auto-generated self-signed; loopback only."}},
+        "key": {"type": ["string", "null"], "default": null, "x-vade": {"apply": "restart", "owner": "C2"}},
+        "spki_pin": {"type": ["string", "null"], "default": null, "x-vade": {"apply": "restart", "owner": "C2", "pattern": "^[0-9a-f]{16,64}$"}},
+        "san": {"type": "array", "items": {"type": "string"}, "default": [], "x-vade": {"apply": "restart", "owner": "C2"}}
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "approval_timeout_s": {"type": "integer", "minimum": 5, "maximum": 3600, "default": 60, "x-vade": {"apply": "hot", "owner": "C5a"}},
+        "max_steps": {"type": "integer", "minimum": 1, "maximum": 500, "default": 40, "x-vade": {"apply": "hot", "owner": "C3"}},
+        "max_tool_result_tokens": {"type": "integer", "minimum": 128, "maximum": 200000, "default": 4000, "x-vade": {"apply": "hot", "owner": "C3"}},
+        "tool_risk": {
+          "type": "object",
+          "description": "Risk adjudication table keyed by module_id then tool name. Anything absent is `high`. Values may only raise the manifest-declared risk; shell / fs.write / fs.delete / *forget* have a hard-coded floor of `high` that this table cannot lower.",
+          "default": {},
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {"type": "string", "enum": ["low", "medium", "high"]}
+          },
+          "x-vade": {"apply": "hot", "owner": "C5a"}
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "retention_days": {"type": "integer", "minimum": 1, "maximum": 3650, "default": 30, "x-vade": {"apply": "restart", "owner": "C5a"}},
+        "path": {"type": "string", "default": "data/audit.sqlite3", "x-vade": {"apply": "restart", "owner": "C5a"}}
+      }
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ui_origins": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^https?://[^/]+$"},
+          "default": [],
+          "x-vade": {"apply": "restart", "owner": "C2", "note": "Exact-match CORS allowlist for /ui/session. `*` is forbidden. Empty = emit no CORS headers. Each origin's host must be in listen_hosts or startup is refused."}
+        },
+        "listen_hosts": {
+          "type": "array",
+          "items": {"type": "string"},
+          "default": ["127.0.0.1", "localhost"],
+          "x-vade": {"apply": "restart", "owner": "C2", "note": "Accepted Host header names on the data plane. One listener, several DNS names — do not start two listeners for these."}
+        }
+      }
+    },
+    "dev": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow_all": {"type": "boolean", "default": false, "x-vade": {"apply": "restart", "owner": "C2", "note": "Allows the AllowAll policy (skips approvals). Production must refuse to start without policy/audit components regardless of this flag."}},
+        "allow_missing_components": {"type": "boolean", "default": false, "x-vade": {"apply": "restart", "owner": "C2", "note": "Inverse of strict component discovery: false => missing session/policy/audit aborts startup (fail-closed)."}}
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "global_capacity": {"type": "integer", "minimum": 1, "default": 5000, "x-vade": {"apply": "restart", "owner": "M4a"}},
+        "session_capacity": {"type": "integer", "minimum": 1, "default": 200, "x-vade": {"apply": "hot", "owner": "M4a"}},
+        "session_inject_char_limit": {"type": "integer", "minimum": 0, "default": 4200, "x-vade": {"apply": "hot", "owner": "M4a", "note": "Injection-side budget."}},
+        "recall_k_max": {"type": "integer", "minimum": 1, "default": 20, "x-vade": {"apply": "hot", "owner": "M4a"}},
+        "recall_token_limit": {"type": "integer", "minimum": 64, "default": 800, "x-vade": {"apply": "hot", "owner": "M4a"}},
+        "ttl_days": {"type": "integer", "minimum": 0, "default": 7, "x-vade": {"apply": "restart", "owner": "M4a"}},
+        "embedding_model": {"type": "string", "default": "", "x-vade": {"apply": "restart", "owner": "M4a"}},
+        "embedding_dim": {"type": "integer", "minimum": 1, "default": 1536, "x-vade": {"apply": "restart", "owner": "M4a", "note": "Mismatch with the stored index aborts startup."}}
+      }
+    },
+    "evolve": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "default": false, "x-vade": {"apply": "hot", "owner": "M4b", "confirm_required": true}},
+        "allow_transcript": {"type": "boolean", "default": false, "x-vade": {"apply": "hot", "owner": "M4b"}},
+        "allowlist": {"type": "array", "items": {"type": "string"}, "default": [], "x-vade": {"apply": "restart", "owner": "M4b", "note": "module_id + public key fingerprint. `role=evolve` is only honoured for entries here."}},
+        "nudge_interval": {"type": "integer", "minimum": 1, "default": 10, "x-vade": {"apply": "hot", "owner": "M4b", "confirm_required": true}},
+        "flush_min_turns": {"type": "integer", "minimum": 1, "default": 6, "x-vade": {"apply": "hot", "owner": "M4b"}},
+        "session_char_limit": {"type": "integer", "minimum": 0, "default": 4200, "x-vade": {"apply": "hot", "owner": "M4b", "note": "Write-side budget; exceeding it yields MEMORY_FULL."}},
+        "summary_token_ratio": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.05, "x-vade": {"apply": "hot", "owner": "M4b"}},
+        "lesson_confidence_floor": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.6, "x-vade": {"apply": "hot", "owner": "M4b"}},
+        "failure_learning": {"type": "boolean", "default": true, "x-vade": {"apply": "hot", "owner": "M4b"}},
+        "daily_token_budget": {"type": "integer", "minimum": 0, "default": 200000, "x-vade": {"apply": "hot", "owner": "M4b", "confirm_required": true, "note": "0 = unlimited (not recommended)."}},
+        "daily_budget_skills": {"type": "integer", "minimum": 0, "default": 5, "x-vade": {"apply": "hot", "owner": "M4b"}},
+        "session_budget_skills": {"type": "integer", "minimum": 0, "default": 1, "x-vade": {"apply": "hot", "owner": "M4b"}},
+        "redact": {"type": "array", "items": {"type": "string"}, "default": ["tool_args", "file_content"], "x-vade": {"apply": "restart", "owner": "M4b", "note": "Changing this changes the event shape."}},
+        "model": {"type": "string", "default": "cheap", "x-vade": {"apply": "hot", "owner": "M4b"}}
+      }
+    },
+    "compaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "default": true, "x-vade": {"apply": "hot", "owner": "C3"}},
+        "threshold": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5, "x-vade": {"apply": "hot", "owner": "C3"}},
+        "target_ratio": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.2, "x-vade": {"apply": "hot", "owner": "C3"}},
+        "protect_last_n": {"type": "integer", "minimum": 0, "default": 20, "x-vade": {"apply": "hot", "owner": "C3"}},
+        "protect_first_n": {"type": "integer", "minimum": 0, "default": 3, "x-vade": {"apply": "restart", "owner": "C3"}},
+        "tail_mode": {"type": "string", "enum": ["lean", "full"], "default": "lean", "x-vade": {"apply": "restart", "owner": "C3"}},
+        "proactive_prune_tokens": {"type": "integer", "minimum": 0, "default": 0, "x-vade": {"apply": "hot", "owner": "C3", "note": "0 = off."}},
+        "model": {"type": "string", "default": "cheap", "x-vade": {"apply": "hot", "owner": "C3"}}
+      }
+    },
+    "skills": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "active_limit": {"type": "integer", "minimum": 1, "default": 64, "x-vade": {"apply": "restart", "owner": "C3b"}},
+        "body_max_chars": {"type": "integer", "minimum": 256, "default": 8192, "x-vade": {"apply": "restart", "owner": "C3b"}},
+        "l0_token_budget": {"type": "integer", "minimum": 128, "default": 3000, "x-vade": {"apply": "hot", "owner": "C3b"}},
+        "pending_ttl_days": {"type": "integer", "minimum": 1, "default": 7, "x-vade": {"apply": "restart", "owner": "C3b"}},
+        "auto_approve": {"type": "boolean", "default": false, "x-vade": {"apply": "hot", "owner": "C3b", "note": "core-only setting; modules must not be able to set it."}}
+      }
+    },
+    "llm": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Core-side LLM routing only ([fs]/[bridge] stay in module configs). Secrets are env var NAMES.",
+      "properties": {
+        "provider": {"type": "string", "default": "openai_compatible", "x-vade": {"apply": "restart", "owner": "C3"}},
+        "base_url": {"type": "string", "default": "", "x-vade": {"apply": "restart", "owner": "C3"}},
+        "model": {"type": "string", "default": "", "x-vade": {"apply": "hot", "owner": "C3"}},
+        "api_key_env": {"type": "string", "default": "", "x-vade": {"apply": "restart", "owner": "C3", "secret": "env-name-only"}}
+      }
+    }
+  }
+}

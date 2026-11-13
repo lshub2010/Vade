@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vade.local/schema/manifest.schema.json",
+  "title": "Vade module manifest",
+  "description": "C-03. The only accepted shape of `module/register` and `module/capabilities.update` payloads. Forward compatible: unknown fields are ignored (`additionalProperties: true` everywhere), unknown capability types are ignored with a warning by the registry. The `schema/` file is the single source of truth; core/vade/registry/manifest.py implements the checks that JSON Schema cannot express (protocol major, global tool budget, cross-module conflicts).",
+  "x-vade": {
+    "contract": "C-03",
+    "version": "1.0.0",
+    "status": "frozen",
+    "frozen_at": "2026-11-13",
+    "owner": "C2",
+    "consumers": ["C4", "M1", "M2", "M3", "M4a", "M4b", "M5", "M6", "C5a"],
+    "limits": {
+      "tools_per_module": 64,
+      "tools_global": 128,
+      "tool_name_max_len": 64,
+      "description_max_len": 512,
+      "max_payload_ceiling": 65519,
+      "timeout_ms_min": 100,
+      "timeout_ms_max": 600000
+    }
+  },
+  "type": "object",
+  "required": ["module_id", "instance_id", "version", "protocol", "capabilities", "limits"],
+  "additionalProperties": true,
+  "properties": {
+    "module_id": {
+      "type": "string",
+      "description": "Reverse-DNS, lowercase. Must not contain '/', '#', control characters.",
+      "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9_-]*)+$",
+      "minLength": 3,
+      "maxLength": 128
+    },
+    "instance_id": {
+      "type": "string",
+      "description": "Unique inside one module. `module_id#instance_id` is the node id in the admin topology.",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"
+    },
+    "version": {
+      "type": "string",
+      "description": "SemVer 2.0.0.",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "protocol": {
+      "type": "string",
+      "description": "Protocol version. Major version must be 1; the registry rejects `vade/v2` with PROTOCOL_MISMATCH before anything else is trusted. Patch/minor are accepted with a warning.",
+      "pattern": "^vade/v[0-9]+(\\.[0-9]+){0,2}$"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "role": {
+      "type": "string",
+      "description": "Self-declared role. `evolve` is only honoured when the fingerprint is in core's [evolve].allowlist; otherwise it is demoted to `tool`.",
+      "enum": ["tool", "evolve", "ui"],
+      "default": "tool"
+    },
+    "concurrency": {
+      "type": "string",
+      "description": "exclusive: one instance per module (second registration -> TOOL_CONFLICT). pooled: up to limits.max_concurrency instances, least-inflight routing. mirrored: any number, no load, events broadcast.",
+      "enum": ["exclusive", "pooled", "mirrored"],
+      "default": "exclusive"
+    },
+    "priority": {
+      "type": "integer",
+      "description": "Model module selection order; higher wins.",
+      "minimum": 0,
+      "maximum": 100,
+      "default": 0
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["tools"],
+      "additionalProperties": true,
+      "properties": {
+        "tools": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/tool"}
+        },
+        "prompts": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/prompt"}
+        },
+        "events": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+            "maxLength": 64
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "required": ["max_concurrency", "max_payload"],
+      "additionalProperties": true,
+      "properties": {
+        "max_concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 1
+        },
+        "max_payload": {
+          "type": "integer",
+          "description": "Logical payload limit. Physical ceiling is 65519 bytes of plaintext per frame (Noise MAXMSGLEN 65535 minus 16-byte tag, C-01 §7.5); the registry rejects values above it instead of silently promising more than the transport can carry.",
+          "minimum": 1024,
+          "maximum": 65519,
+          "default": 65519
+        }
+      }
+    },
+    "injects": {
+      "type": "array",
+      "description": "Only declared sources are injected. `session_id` is the only source implemented in v1; anything else is rejected.",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {"type": "string", "enum": ["session_id"]}
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Opaque to core. Never parsed, never forwarded to the admin API."
+    }
+  },
+  "$defs": {
+    "tool": {
+      "type": "object",
+      "required": ["name", "description", "input_schema", "risk", "timeout_ms", "idempotent"],
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "description": "Matches `^[a-z][a-z0-9_]{0,63}$`; total length <= 64. `module_id/name` is globally unique."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Non-empty: the model cannot decide when to call an undescribed tool."
+        },
+        "input_schema": {
+          "type": "object",
+          "description": "Any JSON Schema, but the root `type` must be `object`.",
+          "required": ["type"],
+          "properties": {
+            "type": {"const": "object"}
+          },
+          "additionalProperties": true
+        },
+        "risk": {
+          "type": "string",
+          "description": "Declared risk. core adjudicates against [policy.tool_risk] and may only raise it. Unlisted tools become `high`.",
+          "enum": ["low", "medium", "high"]
+        },
+        "idempotent": {"type": "boolean"},
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 600000,
+          "default": 30000
+        },
+        "output_schema": {
+          "type": "object",
+          "description": "Optional. Root type must also be `object` when present."
+        }
+      }
+    },
+    "prompt": {
+      "type": "object",
+      "required": ["id", "content"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "content": {"type": "string", "minLength": 1, "maxLength": 32768},
+        "description": {"type": "string", "maxLength": 512}
+      }
+    }
+  }
+}

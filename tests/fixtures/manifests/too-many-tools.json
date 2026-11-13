@@ -1,0 +1,1188 @@
+{
+  "module_id": "com.example.fs",
+  "instance_id": "fs-01",
+  "version": "1.0.0",
+  "protocol": "vade/v1",
+  "concurrency": "pooled",
+  "capabilities": {
+    "tools": [
+      {
+        "name": "tool_00",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_01",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_02",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_03",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_04",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_05",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_06",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_07",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_08",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_09",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_10",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_11",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_12",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_13",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_14",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_15",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_16",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_17",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_18",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_19",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_20",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_21",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_22",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_23",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_24",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_25",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_26",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_27",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_28",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_29",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_30",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_31",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_32",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_33",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_34",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_35",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_36",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_37",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_38",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_39",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_40",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_41",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_42",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_43",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_44",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_45",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_46",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_47",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_48",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_49",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_50",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_51",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_52",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_53",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_54",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_55",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_56",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_57",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_58",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_59",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_60",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_61",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_62",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_63",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      },
+      {
+        "name": "tool_64",
+        "description": "Read a UTF-8 text file and return its contents",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "risk": "low",
+        "idempotent": true,
+        "timeout_ms": 10000
+      }
+    ]
+  },
+  "limits": {
+    "max_concurrency": 4,
+    "max_payload": 65519
+  },
+  "injects": [
+    "session_id"
+  ]
+}

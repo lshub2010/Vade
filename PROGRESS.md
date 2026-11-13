@@ -56,8 +56,8 @@ modules/      只有 README 索引（模块独立仓）
 ## 四、已知缺陷 / 技术债（审查遗留，按优先级）
 
 1. **C-18 缺 `llm.model_module` / `llm.fallback_to_builtin`**：schema `additionalProperties:false` 会拒，代码用默认值绕过；需增补契约或 RFC。
-2. **`turn.completed.skills` 未接**：C3b 已回填 `activated_skills`，C3 的 `TurnOutcome` 还没带进 payload（两行改动）。
-3. **模块吞 `CancelledError` 时**：interrupt 后仍可能发 `tool_result`（未加守卫）。
+2. **`turn.completed.skills` 未接 —— 阻塞（需 RFC）**：C3b 已回填 `activated_skills`，但 C-06 `schema/events.json` 的 `turn.completed.payload`（149–162 行）**没有** `skills` 字段；C-06 已冻结，改契约须先批准 `docs/rfc/RFC-0002-turn-completed-skills.md`，实现待批准后再动。
+3. **模块吞 `CancelledError` 时**：已修（`tmp/debt-a`）—— `LoopEngine._raise_if_interrupted()` 在每次写 `tool_result` 前查 `router.was_cancelled()`，测试见 `core/tests/session/test_queue.py::test_interrupt_emits_no_tool_result_when_the_module_answers_after_cancel`。
 4. **`admin-ui` 未交付**，但 C5a RESULT 已如实标注。
 5. **scrypt 旧哈希迁移**：已支持在线重哈希，但没做批量迁移脚本。
 6. **C0c 的 wasm 构建卡在 npm 下载**：需配 `registry.npmmirror.com` + `kotlin.js.yarn=false` + `nodejs.download=false`。

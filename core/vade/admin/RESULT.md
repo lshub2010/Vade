@@ -62,20 +62,31 @@ GET|POST|PATCH|PUT|DELETE
 
 对应的能力（skill 安装/审批/回滚、memory 提升/归档/恢复）**没有实现**，只有路由占位。
 
-## 3. 偏离：scrypt 代替 Argon2id
+### 2.1 前端 `admin-ui/`：整批未交付（B-4，独立批次）
 
-设计稿要求 `argon2id(normalize(password))`。本仓库依赖集里没有 `argon2-cffi`，也不 vendor wheel，所以 `core/vade/admin/auth.py` 用 `hashlib.scrypt`（标准库、内存硬）代替：
+任务书 T5 要求的管理面 UI（登录页、列表页、审计页、设置页、skill 审核页、`npm run build` 产物入库、窄屏布局、验收截图）**一行都没有交付**：`admin-ui/` 里只有一个占位 `README.md`，本 commit 对 `admin-ui/` 的改动为零。
+
+因此：
+
+- **C5a 的实际范围是「后端 + 契约」，不是「管理面 UI」。** 前端是**独立批次**，需要自己的任务书、验收表和截图要求，**不能算 C5a 已交付**。
+- 下游 F1 / U 组不要按"管理面 UI 已就绪"排期；本批能提供的只有 `schema/admin-api.yaml` 契约与 `/admin/api/*` 实现。
+- 这条不是"没做完的边角"，而是批次交付项缺失，所以单列在此，而不是塞进 §7 的 unverified。
+
+## 3. 口令哈希：Argon2id（B-2 已修复）
+
+设计稿要求 `Argon2id(m=64 MiB, t=3, p=1)`。初版用 `hashlib.scrypt(n=2**14)` 的理由（"依赖不可得"）不成立——镜像里 `argon2-cffi` 可取。本批已改正：
 
 ```
-scrypt$<n>$<r>$<p>$<base64 salt>$<base64 digest>
-n = 2**14 (16 MiB), r = 8, p = 1, dklen = 32, salt = 16 字节随机
+argon2-cffi==25.1.0        # requirements.txt 新增
+Argon2id, m=65536 KiB (64 MiB), t=3, p=1, hash_len=32, salt=16 随机字节
+存储串（PHC）：$argon2id$v=19$m=65536,t=3,p=1$<salt>$<hash>
 ```
 
-- 参数与算法前缀**随哈希一起存储**，`verify_password` 按存储里的参数校验，因此后续换 Argon2id 不会让已有口令失效（换算法只需在 `hash_password` 加分支并重算）。
-- `n=2**14` 而非 `2**15`：OpenSSL 的 scrypt 有默认内存上限，`2**15` 会被拒绝；`identity/pairing.py` 里的配对码哈希也用 `2**14`，两处一致。
-- 与 Argon2id 的差距是**真实存在的**：scrypt 没有 Argon2id 的抗侧信道/抗 GPU 调参特性，`2**14` 也低于 OWASP 当前对 Argon2id 的建议档位。这是"依赖不可得"下的诚实降级，不是等价替换。
-
-同样的偏离在 `core/vade/identity/pairing.py`（配对码哈希）里重复出现，理由相同。
+- **依赖**：`requirements.txt` 增加 `argon2-cffi==25.1.0`，并在注释里标明这是 C5a 的跨目录依赖变更（不是 C2 侧悄悄改的）。
+- **新口令**：`hash_password()` 只产出 Argon2id；`password_needs_rehash()` 覆盖"旧 scrypt 串"和"参数低于当前档位的 Argon2id"两种情况。
+- **旧哈希兼容**：`verify_password()` 先走 Argon2id，再回退到 `scrypt$n$r$p$salt$digest` 校验。既有 `admin.json` 不会被孤立。
+- **迁移是在线的，没有离线脚本**：`SetupService.rehash_password()` 只在密码校验通过后被调用，原子重写 `admin.json`（tmp + `os.replace`、0600），写入 `password_rehashed_at`，并落一条 `admin.password_rehashed` 审计。校验失败不动文件；校验与写入之间若 `/password` 改了哈希，`stored` 不等则放弃升级，不覆盖没验证过的凭据。
+- **配对码哈希不动**：`core/vade/identity/pairing.py` 仍用 `scrypt(n=2**14)`。那是短生命周期、一次性的配对码，不是管理员凭据；改它属于 C3b 语义，不在本批范围。
 
 ## 4. 测试数字
 
@@ -90,6 +101,12 @@ n = 2**14 (16 MiB), r = 8, p = 1, dklen = 32, salt = 16 字节随机
 2. **测试依赖真实等待**：把 `await asyncio.sleep(0.01)` + `[pending] = manager.pending_requests()` 换成轮询 `_pending()`；决策驱动的用例把截止时间放到 30s（只有"断言超时"的那一步才缩到 50ms）。测试不再拿调度抖动当被测行为。
 3. **`python -m vade admin --help` 退出码 2**：顶层 `admin` 子解析器 `add_help=False` + `REMAINDER`，argparse 在 REMAINDER 开始前拒绝 `--help`。改为显式接受 `-h/--help` 并转发给 C5a 自己的解析器。
 4. **skills/memory 嵌套路径返回 404**：`{name}`/`{id}` 只匹配一层，`/skills/{name}/approve`、`/memory/{id}/promote` 等落到 404。补齐 13 条路径，统一 501。
+
+### 5.1 审查阻塞项（B-1 / B-2 / B-3）的修复
+
+5. **B-1 · 浏览器会话越权写**：`READONLY_EXEMPT` 移除了 `/admin/api/logout-all`；`change_password` 不再传 `readonly_check=False`。现在 browser 对两条端点都 403 `READ_ONLY_SESSION`，`logout-all` 不会踢掉已登记设备，`/password` 不会改密。另外把豁免面收敛成两个常量（`READONLY_EXEMPT` 精确路径 + `PREAUTH_PREFIXES` 的 setup/bind），由 `readonly_exempt()` 单点判定；`change_password` 对 browser 分支只回 cookie、**永不**把 `access_token`/`refresh_token` 放进响应体（即使 guard 将来被放宽，这条不变量仍在）。新增 4 条测试：打 `logout-all`、打 `/password`、枚举路由表里**所有**写路由 × browser → 403、以及豁免清单与设计稿逐项相等。
+6. **B-2 · scrypt → Argon2id**：见 §3；旧 scrypt 哈希可验证并在成功登录时原地升级。
+7. **B-3 · `decide()` 默认 fail-closed**：`ApprovalManager.decide(..., actor_kind="")`，不传即 `APPROVER_INVALID`；`PolicyAdapter` 同样不再提供放行侧默认值；C3 的 `session/rpc.py` 显式把 `auth_mode` 映射成 `device_key` / `loopback_admin`（与原有 `auth_mode` 白名单等价，不改变 C-03 语义）。新增 2 条测试：manager 默认拒绝、adapter 默认拒绝；被拒的请求仍保持 pending。
 
 ## 6. 验证记录
 

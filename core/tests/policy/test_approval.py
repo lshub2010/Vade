@@ -104,6 +104,51 @@ def test_browser_session_cannot_approve_a_high_risk_call(tmp_path):
     asyncio.run(scenario())
 
 
+def test_an_unspecified_approver_is_refused(tmp_path):
+    """B-3: the default is fail-closed, not the permissive `device_key`.
+
+    C3's `approval/decide` handler is the only caller that can forget to say who
+    is approving. If it does, the request must stay pending and answer
+    `APPROVER_INVALID` rather than silently approving a high-risk call.
+    """
+
+    async def scenario():
+        manager, writer = _manager(tmp_path)
+        task = asyncio.create_task(manager.request(_request()))
+        [pending] = await _pending(manager)
+        with pytest.raises(VadeError) as excinfo:
+            await manager.decide(pending["request_id"], "allow", by="forgetful")
+        assert excinfo.value.code == "APPROVER_INVALID"
+        # Refused, not consumed: a real approver can still resolve it.
+        assert manager.pending_requests()[0]["request_id"] == pending["request_id"]
+        ok, _ = await manager.decide(pending["request_id"], "allow", by="dev-1",
+                                     actor_kind="device_key")
+        assert ok and (await asyncio.wait_for(task, 10)).allowed
+        writer.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_adapter_does_not_default_the_approver_kind(tmp_path):
+    """The C3 seam (`PolicyAdapter`) must not re-introduce a permissive default."""
+    from vade.policy.adapter import PolicyAdapter
+
+    async def scenario():
+        manager, writer = _manager(tmp_path)
+        adapter = PolicyAdapter(manager)
+        task = asyncio.create_task(manager.request(_request()))
+        [pending] = await _pending(manager)
+        with pytest.raises(VadeError) as excinfo:
+            await adapter.decide(pending["request_id"], "allow", by="forgetful")
+        assert excinfo.value.code == "APPROVER_INVALID"
+        ok, _ = await adapter.decide(pending["request_id"], "allow", by="dev-1",
+                                    actor_kind="device_key")
+        assert ok and (await asyncio.wait_for(task, 10)).allowed
+        writer.close()
+
+    asyncio.run(scenario())
+
+
 def test_a_timed_out_request_leaves_nothing_pending(tmp_path):
     """Contract: a timeout retires the request in the same lock that decide() takes.
 
@@ -120,7 +165,7 @@ def test_a_timed_out_request_leaves_nothing_pending(tmp_path):
         request_id = decision.request_id
         assert manager.pending_count == 0 and manager.pending_requests() == []
         with pytest.raises(VadeError) as excinfo:
-            await manager.decide(request_id, "allow", by="dev-1")
+            await manager.decide(request_id, "allow", by="dev-1", actor_kind="device_key")
         assert excinfo.value.code == "INVALID_ARGUMENT"
         assert "already resolved" in excinfo.value.message
         writer.close()
@@ -133,7 +178,7 @@ def test_session_scope_is_keyed_by_arguments_not_just_the_tool(tmp_path):
         manager, writer = _manager(tmp_path)
         first = asyncio.create_task(manager.request(_request(args={"path": "a"})))
         [pending] = await _pending(manager)
-        await manager.decide(pending["request_id"], "allow", scope="session", by="dev-1")
+        await manager.decide(pending["request_id"], "allow", scope="session", by="dev-1", actor_kind="device_key")
         assert (await asyncio.wait_for(first, 10)).allowed
 
         cached = await manager.request(_request(args={"path": "a"}))
@@ -158,10 +203,10 @@ def test_generic_executors_are_once_only(tmp_path):
         task = asyncio.create_task(manager.request(_request(tool_id="com.example.shell/shell", args={"cmd": "ls"})))
         [pending] = await _pending(manager)
         with pytest.raises(VadeError) as excinfo:
-            await manager.decide(pending["request_id"], "allow", scope="session", by="dev-1")
+            await manager.decide(pending["request_id"], "allow", scope="session", by="dev-1", actor_kind="device_key")
         assert excinfo.value.code == "INVALID_ARGUMENT"
         assert "shell" in GENERIC_EXECUTORS
-        await manager.decide(pending["request_id"], "allow", scope="once", by="dev-1")
+        await manager.decide(pending["request_id"], "allow", scope="once", by="dev-1", actor_kind="device_key")
         assert (await asyncio.wait_for(task, 10)).allowed
         writer.close()
 
@@ -173,9 +218,9 @@ def test_a_second_decision_is_rejected(tmp_path):
         manager, writer = _manager(tmp_path)
         task = asyncio.create_task(manager.request(_request()))
         [pending] = await _pending(manager)
-        await manager.decide(pending["request_id"], "deny", by="dev-1")
+        await manager.decide(pending["request_id"], "deny", by="dev-1", actor_kind="device_key")
         with pytest.raises(VadeError) as excinfo:
-            await manager.decide(pending["request_id"], "allow", by="dev-1")
+            await manager.decide(pending["request_id"], "allow", by="dev-1", actor_kind="device_key")
         assert excinfo.value.code == "INVALID_ARGUMENT"
         assert "already resolved" in excinfo.value.message
         decision = await asyncio.wait_for(task, 10)

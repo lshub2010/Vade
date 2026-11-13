@@ -57,10 +57,23 @@ __all__ = [
 COOKIE_NAME = "__Host-ac_admin"
 SETUP_COOKIE = "__Host-ac_setup"
 CSRF_HEADER = "x-csrf-token"
+#: 31-C5a §T4 ⑤ exemption list, exactly: the only paths a browser cookie may
+#: reach with a write method. `logout-all` and `password` are deliberately NOT
+#: here — both are destructive and device-only. Adding a path to this set is
+#: the one way to widen browser writes, and a test pins the set.
 READONLY_EXEMPT = frozenset({
     "/admin/api/login", "/admin/api/login/challenge", "/admin/api/logout",
-    "/admin/api/logout-all", "/admin/api/token/refresh", "/admin/api/health",
+    "/admin/api/token/refresh", "/admin/api/health",
 })
+#: First-run setup and binding happen before any session exists; `guard()` is
+#: never called there. Declared next to the exemption list so every path that
+#: escapes the read-only rule lives in one place.
+PREAUTH_PREFIXES = ("/admin/setup", "/admin/bind")
+
+
+def readonly_exempt(path: str) -> bool:
+    """True iff a browser session may issue a non-GET request to `path`."""
+    return path in READONLY_EXEMPT or path.startswith(PREAUTH_PREFIXES)
 
 #: §7.9 whitelist. Anything not listed here is `UNKNOWN_CONFIG_KEY` on PUT and
 #: absent from GET — the config page cannot become a config-file editor.
@@ -332,7 +345,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         if session is None:
             raise VadeError("AUTH_FAILED", "authentication failed")
         if readonly_check and session.mode == "browser" and request.method not in {"GET", "HEAD"}:
-            if request.url.path not in READONLY_EXEMPT:
+            if not readonly_exempt(request.url.path):
                 ctx.write_audit(kind="admin.rejected", status="denied", code="READ_ONLY_SESSION",
                                 actor=session.device_id or "browser", method=request.method,
                                 extra={"path": request.url.path})
@@ -457,12 +470,18 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         challenge_raw = ctx.challenges.consume(challenge_id, ip, ctx.devices.version)
         challenge_b64 = base64.b64encode(challenge_raw).decode()
         password = str(body.get("password") or "")
-        if not verify_password(password, ctx.setup.password_hash()):
+        stored = ctx.setup.password_hash()
+        if not verify_password(password, stored):
             limiter.hit(f"pw:{ip}", 300)
             limiter.password_failure(ip)
             ctx.write_audit(kind="admin.login", status="denied", code="AUTH_FAILED", actor=None,
                             extra={"ip": ip, "reason": "password"}, )
             raise VadeError("AUTH_FAILED", "password or device is incorrect")
+        # The password is proven, so legacy scrypt material (or Argon2id with
+        # weaker parameters) can be replaced in place. No offline migration.
+        if ctx.setup.rehash_password(password, stored):
+            ctx.write_audit(kind="admin.password_rehashed", status="ok", actor=None,
+                            extra={"ip": ip, "to": "argon2id"})
 
         device_id = body.get("device_id")
         signature = body.get("signature")
@@ -534,7 +553,9 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         return response
 
     async def logout_all(request: Request) -> Response:
-        session = guard(request, readonly_check=False)
+        # Destructive: one stolen browser cookie must not be able to kick every
+        # enrolled device offline (a DoS, not an escalation). Device-only.
+        session = guard(request)
         count = ctx.sessions.revoke_all()
         ctx.write_audit(kind="admin.logout_all", status="ok", actor=actor_of(session),
                         extra={"sessions": count})
@@ -543,7 +564,10 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         return response
 
     async def change_password(request: Request) -> Response:
-        session = guard(request, readonly_check=False)
+        # Device-only: the design gives the browser no second factor, so a
+        # password change must come from the App. `guard()` 403s a browser
+        # session here, which also means the browser never receives tokens.
+        session = guard(request)
         body = await _json(request)
         old = str(body.get("old_password") or "")
         new = str(body.get("new_password") or "")
@@ -553,13 +577,19 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         ctx.sessions.bump_password_version()
         tokens = ctx.sessions.issue(mode=mode, device_id=device_id, ip=_client(request))
         ctx.write_audit(kind="admin.password_changed", status="ok", actor=actor_of(session))
-        response = JSONResponse({"ok": True, "access_token": tokens["access_token"],
-                                 "refresh_token": tokens["refresh_token"],
-                                 "expires_in": tokens["expires_in"], "mode": mode})
+        payload: dict[str, Any] = {"ok": True, "expires_in": tokens["expires_in"], "mode": mode}
+        response = JSONResponse(payload)
         if mode == "browser":
+            # Unreachable through `guard()`, but the invariant is load-bearing:
+            # a browser response body never carries a token (XSS can read a
+            # body; HttpOnly keeps a cookie out of reach). Keep the new cookie
+            # and drop the body tokens rather than trusting the guard forever.
             response.set_cookie(COOKIE_NAME, tokens["access_token"], max_age=ctx.config.access_ttl_s,
                                 secure=True, httponly=True, samesite="strict", path="/")
-        return response
+            return response
+        payload["access_token"] = tokens["access_token"]
+        payload["refresh_token"] = tokens["refresh_token"]
+        return JSONResponse(payload)
 
     # ------------------------------------------------------------------ devices
     async def list_devices(request: Request) -> Response:

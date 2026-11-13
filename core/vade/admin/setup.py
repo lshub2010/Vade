@@ -58,6 +58,41 @@ class SetupService:
         doc = self.load_admin()
         return doc.get("password") if doc else None
 
+    def _write_admin(self, doc: Mapping[str, Any]) -> None:
+        """tmp + `os.replace`, mode 0600. The only writer of `admin.json`."""
+        path = self.admin_doc_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, json.dumps(dict(doc), ensure_ascii=False, indent=2).encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+
+    def rehash_password(self, password: str, stored: str | None = None) -> bool:
+        """Upgrade a verified credential in place (scrypt → Argon2id, or weak params).
+
+        Called only after `verify_password` returned True for `password`. The
+        `stored` comparison closes the window where another request already
+        changed the password between verify and write: never overwrite a hash
+        the caller did not just prove knowledge of.
+        """
+        from .auth import hash_password, password_needs_rehash
+
+        current = stored if stored is not None else self.password_hash()
+        if not password_needs_rehash(current):
+            return False
+        doc = self.load_admin()
+        if doc is None or doc.get("password") != current:
+            return False
+        doc["password"] = hash_password(password)
+        doc["password_rehashed_at"] = self.wall()
+        self._write_admin(doc)
+        return True
+
     def state(self, *, loopback: bool, unlocked: bool) -> dict[str, Any]:
         """The payload of `GET /admin/setup`. Gate first, QR second."""
         if not self.initialized():
@@ -148,17 +183,7 @@ class SetupService:
             "password_changed_at": self.wall(),
             "created_from_ip": ip,
         }
-        path = self.admin_doc_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)
-        tmp = path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8"))
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
-        os.chmod(path, 0o600)
+        self._write_admin(doc)
         # Only now: a crash between the two leaves a token that is ignored
         # because admin.json exists, which is recoverable without `reset`.
         setup_token.consume(self.data_dir)
@@ -189,12 +214,4 @@ class SetupService:
             raise VadeError("INVALID_ARGUMENT", str(exc)) from None
         doc["password"] = hash_password(new)
         doc["password_changed_at"] = self.wall()
-        path = self.admin_doc_path
-        tmp = path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8"))
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
-        os.chmod(path, 0o600)
+        self._write_admin(doc)

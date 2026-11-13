@@ -218,12 +218,17 @@ class ApprovalManager:
         scope: str = "once",
         by: str | None = None,
         *,
-        actor_kind: str = "device_key",
+        actor_kind: str = "",
     ) -> tuple[bool, dict[str, Any]]:
         """Called by C3's `approval/decide` handler after it authenticated the caller.
 
-        Raises `APPROVER_INVALID` for a browser/UI actor, `NOT_FOUND` for an
-        unknown id and `INVALID_ARGUMENT` when the id is already resolved.
+        `actor_kind` defaults to the empty string on purpose: a caller that
+        forgets to say who is approving gets `APPROVER_INVALID`, not the
+        permissive `device_key` branch. Secure defaults fail closed.
+
+        Raises `APPROVER_INVALID` for a browser/UI actor or an unspecified one,
+        `NOT_FOUND` for an unknown id and `INVALID_ARGUMENT` when the id is
+        already resolved.
         """
         if actor_kind not in ALLOWED_APPROVER_KINDS:
             self._write_audit(

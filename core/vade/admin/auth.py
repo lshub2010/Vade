@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from argon2 import PasswordHasher, Type
+from argon2.exceptions import InvalidHashError, VerificationError
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils as asym_utils
@@ -30,9 +32,10 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils as asym
 from ..errors import VadeError
 
 __all__ = [
-    "hash_password", "verify_password", "validate_password", "PasswordPolicyError",
-    "ChallengeStore", "SessionStore", "Session", "verify_signature", "normalize_pubkey",
-    "is_loopback", "host_allowed", "origin_allowed", "ADMIN_ORIGIN_SCHEME",
+    "hash_password", "verify_password", "password_needs_rehash", "validate_password",
+    "PasswordPolicyError", "ChallengeStore", "SessionStore", "Session", "verify_signature",
+    "normalize_pubkey", "is_loopback", "host_allowed", "origin_allowed",
+    "ADMIN_ORIGIN_SCHEME", "ARGON2_TIME_COST", "ARGON2_MEMORY_KIB",
 ]
 
 ADMIN_ORIGIN_SCHEME = "https"
@@ -70,35 +73,71 @@ def validate_password(password: str) -> None:
         raise PasswordPolicyError("password has too few distinct characters")
 
 
-def hash_password(password: str, *, n: int = 2 ** 14, r: int = 8, p: int = 1) -> str:
-    """PHC-ish string with the KDF parameters embedded.
+#: Argon2id parameters from 31-C5a §T4 ② / design.md: m=64 MiB, t=3, p=1.
+#: 64 MiB is 2**16 KiB; `memory_cost` is in KiB, not bytes.
+ARGON2_TIME_COST = 3
+ARGON2_MEMORY_KIB = 64 * 1024
+ARGON2_PARALLELISM = 1
+ARGON2_HASH_LEN = 32
+ARGON2_SALT_LEN = 16
 
-    `argon2id` is the design's choice; `argon2-cffi` is not in the dependency
-    set and this repo does not vendor wheels. `hashlib.scrypt` is the stdlib
-    memory-hard stand-in; parameters travel with the hash so a later move to
-    Argon2id does not invalidate existing passwords.
+_hasher = PasswordHasher(
+    time_cost=ARGON2_TIME_COST, memory_cost=ARGON2_MEMORY_KIB,
+    parallelism=ARGON2_PARALLELISM, hash_len=ARGON2_HASH_LEN,
+    salt_len=ARGON2_SALT_LEN, type=Type.ID,
+)
 
-    n=2**14 (16 MiB) rather than 2**15: OpenSSL's scrypt refuses anything above
-    its default 32 MiB envelope, and pairing.py already uses 2**14.
+
+def hash_password(password: str) -> str:
+    """Argon2id PHC string, `m=64 MiB, t=3, p=1` (31-C5a §T4 ②).
+
+    Parameters travel inside the hash, so raising them later is a re-hash on the
+    next successful login (`password_needs_rehash`), never a migration window.
     """
-    salt = os.urandom(16)
-    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=32)
-    return f"scrypt${n}${r}${p}${base64.b64encode(salt).decode()}=${base64.b64encode(digest).decode()}"
+    return _hasher.hash(password)
 
 
-def verify_password(password: str, stored: str | None) -> bool:
+def password_needs_rehash(stored: str | None) -> bool:
+    """True for legacy `scrypt$…` material and for Argon2id below today's params."""
     if not stored:
         return False
+    if not stored.startswith("$argon2"):
+        return True
+    try:
+        return _hasher.check_needs_rehash(stored)
+    except (InvalidHashError, ValueError):
+        return True
+
+
+def _verify_legacy_scrypt(password: str, stored: str) -> bool:
+    """`scrypt$n$r$p$salt$digest` — the pre-Argon2id format, kept verify-only.
+
+    Existing `admin.json` files must keep working; they are upgraded in place by
+    `SetupService.rehash_password()` after the next successful login.
+    """
     try:
         algo, n_s, r_s, p_s, salt_b64, digest_b64 = stored.split("$")
         if algo != "scrypt":
             return False
         salt = base64.b64decode(salt_b64 + "=" * (-len(salt_b64) % 4))
         expected = base64.b64decode(digest_b64 + "=" * (-len(digest_b64) % 4))
-        actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=int(n_s), r=int(r_s), p=int(p_s), dklen=len(expected))
+        actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=int(n_s), r=int(r_s),
+                                p=int(p_s), dklen=len(expected))
     except (ValueError, TypeError, binascii.Error):
         return False
     return hmac.compare_digest(actual, expected)
+
+
+def verify_password(password: str, stored: str | None) -> bool:
+    """Argon2id, with legacy scrypt accepted so old hashes are not orphaned."""
+    if not stored:
+        return False
+    if stored.startswith("$argon2"):
+        try:
+            return _hasher.verify(stored, password)
+        except (VerificationError, InvalidHashError, ValueError):
+            return False
+    return _verify_legacy_scrypt(password, stored)
 
 
 # -------------------------------------------------------------------- challenges

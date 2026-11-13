@@ -22,5 +22,5 @@ class PolicyAdapter:
 
     #: C3's `approval/decide` handler calls this after authenticating the actor.
     async def decide(self, request_id: str, decision: str, scope: str = "once",
-                     by: str | None = None, *, actor_kind: str = "device_key") -> Any:
+                     by: str | None = None, *, actor_kind: str = "") -> Any:
         return await self.manager.decide(request_id, decision, scope, by, actor_kind=actor_kind)

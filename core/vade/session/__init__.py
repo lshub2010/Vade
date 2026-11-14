@@ -104,6 +104,7 @@ class _LazyBlobs:
 
 
 def install(app: Any) -> Any:
+    from ..loop.builtins import default_builtins
     from ..loop.context import BlobStore, CompactionConfig
     from ..loop.engine import LoopConfig, LoopEngine
     from ..loop.tools import build_snapshot
@@ -166,6 +167,11 @@ def install(app: Any) -> Any:
         history=_history_of(log),
         approval=approval,
         memory=memory,
+        # RFC-0008 §14: `ask_user` rides the input component's port; the
+        # provider is resolved per call, so install order (input < session)
+        # and a disabled input component both degrade to an immediate
+        # `UNAVAILABLE` tool result, never a hang.
+        builtins=default_builtins(lambda: getattr(app, "input_port", None)),
         prompt_hooks=lambda: getattr(app, "prompt_hooks", []),
         audit=getattr(app, "audit", None),
         config=LoopConfig(max_steps=int(cfg.get("policy.max_steps", 8)),

@@ -12,6 +12,30 @@
     "name_pattern": "^[a-z][a-z0-9-]{1,31}$",
     "required_sections": ["When to Use", "Procedure", "Pitfalls", "Verification"],
     "injection_order": ["persona", "tool_block", "skill_catalog", "skill_bodies", "session_memory", "context"],
+    "injection_order_note": "RFC-0003 §5.2: kept byte-identical. Its semantics degrade to 'the six legacy sections, ascending in the injection.orders table below (context -> runtime_facts)'; old readers keep working, new readers read the injection object.",
+    "injection": {
+      "schema_version": 2,
+      "stable": ["persona", "policy", "tool_block"],
+      "context": ["session_memory", "runtime_facts"],
+      "channels": {
+        "persona": "system.stable",
+        "policy": "system.stable",
+        "tool_block": "system.stable",
+        "skill_catalog": "history.user",
+        "skill_bodies": "tool_result",
+        "session_memory": "system.context",
+        "runtime_facts": "system.context"
+      },
+      "orders": {
+        "persona": 100,
+        "policy": 110,
+        "tool_block": 200,
+        "skill_catalog": 300,
+        "skill_bodies": 400,
+        "session_memory": 500,
+        "runtime_facts": 600
+      }
+    },
     "max_activated": 3,
     "body_max_chars": 8192,
     "body_max_lines": 200,

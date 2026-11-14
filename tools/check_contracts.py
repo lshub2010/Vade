@@ -837,6 +837,104 @@ def check_tasks(config: dict) -> None:
     )
 
 
+def check_prompt_layers(skill: dict, config: dict, rpc: dict, events: dict, declared_events: dict) -> None:
+    """RFC-0003 §4.4/§5: C-11 order table, C-18 keys, C-05 reserved names, C-06 appends."""
+    # ---------------------------------------------------------- C-11: orders
+    injection = (skill.get("x-vade") or {}).get("injection")
+    if not isinstance(injection, dict):
+        FAILURES.append("skill.schema.json: missing x-vade.injection (RFC-0003 §5.2)")
+        return
+    orders = injection.get("orders") or {}
+    check(bool(orders), "C-11: injection.orders missing")
+    check(injection.get("schema_version") == 2,
+          "C-11: injection.schema_version must be 2 (RFC-0003 §5.2)")
+    check(len(set(orders.values())) == len(orders), "C-11: SECTION_ORDERS has a duplicate number")
+    stable = list(injection.get("stable") or [])
+    context = list(injection.get("context") or [])
+    check(set(stable) | set(context) <= set(orders), "C-11: stable/context sections missing from the order table")
+    # Sections outside stable/context are the non-system channels; every order
+    # table entry must be exactly one of the three (the RFC's §4.4 sketch
+    # compared stable∪context to orders directly, which its own §5.2 table
+    # — orders also lists the history.user / tool_result channels — contradicts).
+    non_system = {name for name, channel in (injection.get("channels") or {}).items()
+                  if channel not in ("system.stable", "system.context")}
+    check(set(stable) | set(context) | non_system == set(orders) and not (non_system & (set(stable) | set(context))),
+          "C-11: section list and order table disagree")
+    if stable and context:
+        check(max(orders[s] for s in stable) < min(orders[s] for s in context),
+              "C-11: every context section must sort after every stable section")
+    channels = injection.get("channels") or {}
+    check(set(channels) == set(orders),
+          "C-11: injection.channels must cover exactly the order-table sections")
+    LEGACY = ["persona", "tool_block", "skill_catalog", "skill_bodies", "session_memory", "context"]
+    ALIAS = {"context": "runtime_facts"}
+    missing = [s for s in LEGACY if ALIAS.get(s, s) not in orders]
+    check(not missing, f"C-11: legacy sections missing from the order table: {missing}")
+    # Ascending by ORDER NUMBER, not by name: the legacy projection must never
+    # need a re-read of history to make sense (RFC-0003 §4.4 design point 1).
+    projected = [int(orders[ALIAS.get(s, s)]) for s in LEGACY]
+    check(projected == sorted(projected),
+          "C-11: the six legacy sections must stay ascending in the new order table")
+    check(list((skill.get("x-vade") or {}).get("injection_order") or []) == LEGACY,
+          "C-11: injection_order must stay byte-identical (legacy projection)")
+    check(orders.get("skill_catalog") == 300 and orders.get("skill_bodies") == 400,
+          "C-11: skill_catalog/skill_bodies keep their legacy order slots (300/400)")
+    for name, channel in (("skill_catalog", "history.user"), ("skill_bodies", "tool_result")):
+        check(channels.get(name) == channel,
+              f"C-11: {name} channel must be {channel} (RFC-0003 moves it out of system)")
+
+    # ---------------------------------------------------------- C-18: keys
+    leaves = dict(walk_leaves(config, ""))
+    for dotted, default, wanted in (
+        ("prompt.injection", "legacy", "restart"),
+        ("tools.hot", [], "restart"),
+        ("tools.hot_max", 12, "restart"),
+    ):
+        leaf = leaves.get(dotted) or {}
+        check(leaf.get("default") == default,
+              f"config.schema.json {dotted}: default {leaf.get('default')!r} != {default!r} (RFC-0003 §7)")
+        check((leaf.get("x-vade") or {}).get("apply") == wanted,
+              f"config.schema.json {dotted}: apply must be {wanted} (RFC-0003 §7: no hot switch)")
+    check((leaves.get("prompt.injection") or {}).get("enum") == ["legacy", "layered"],
+          "config.schema.json prompt.injection: enum must be ['legacy', 'layered']")
+
+    # ---------------------------------------------------------- C-05: reserved
+    reserved = (rpc.get("x-vade") or {}).get("core_reserved_tools") or {}
+    names = set(reserved.get("reserved") or [])
+    check({"skill_load", "tools_search", "tools/search"} <= names,
+          "rpc.json x-vade.core_reserved_tools: must register skill_load/tools_search/tools/search (RFC-0003 §5.4)")
+    check(reserved.get("doc") == "docs/rfc/RFC-0003-prompt-injection-layers.md",
+          "rpc.json core_reserved_tools: doc must point at RFC-0003")
+    for direction in (rpc.get("directions") or {}).values():
+        clash = names & set(direction or {})
+        check(not clash,
+              f"rpc.json: core-reserved tool names must not be registered as methods: {sorted(clash)}")
+
+    # ---------------------------------------------------------- C-06: appends
+    appends = (events.get("x-vade") or {}).get("appends") or []
+    block = next((b for b in appends if isinstance(b, dict)
+                  and "RFC-0003" in str(b.get("doc") or "")), None)
+    check(block is not None, "events.json: missing the x-vade.appends block for RFC-0003")
+    if block is not None:
+        check(set(block.get("adds") or []) == {"turn.skill_catalog", "turn.tool_discovered"},
+              "events.json: the RFC-0003 append block must add exactly the two RFC-0003 events")
+        check(block.get("rewrites") == "none",
+              "events.json: the RFC-0003 append block must not rewrite anything")
+    for name, required in (
+        ("turn.skill_catalog", ["turn_id", "digest"]),
+        ("turn.tool_discovered", ["turn_id", "tool", "tool_id"]),
+    ):
+        spec = declared_events.get(name) or {}
+        check(bool(spec), f"events.json: {name} is not declared (RFC-0003 §5.5)")
+        if isinstance(spec, dict):
+            check(list(spec.get("required") or []) == required,
+                  f"events.json {name}: required must be {required}")
+            check("state" not in (spec.get("required") or []),
+                  f"events.json {name}: payload-only event must not require `state`")
+    check(events.get("version") == "2.0.0",
+          "events.json: version must stay 2.0.0 (RFC-0003 appends no state)")
+
+
 def check_task_events(events: dict, declared_events: dict, schema_events: set[str]) -> None:
     """RFC-0007 §9.2: enum drift, the `task.state` trap, and the coalesce marker."""
     states = list(events.get("task_states") or [])
@@ -1457,6 +1555,9 @@ def main() -> int:
     check_session_meta(rpc, events)
     check_subagent_events(events, declared_events, schema_events, rpc)
 
+    # ---------------------------------------------------------------- RFC-0003
+    check_prompt_layers(load("skill.schema.json"), config, rpc, events, declared_events)
+
     # ---------------------------------------------------------------- RFC-0008
     # C-06 went 1.0.0 -> 2.0.0 because `turn_states` was WIDENED: an exhaustive
     # validator on the old side would silently drop the new state's events, so
@@ -1490,7 +1591,8 @@ def main() -> int:
             print(f"  - {failure}")
         return 1
     print("contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 34 error codes, config metadata complete, "
-          "RFC-0005 append green, RFC-0010 session metadata green, RFC-0012 subagent family green, event gate green)")
+          "RFC-0005 append green, RFC-0010 session metadata green, RFC-0012 subagent family green, "
+          "RFC-0003 layers green, event gate green)")
     return 0
 
 

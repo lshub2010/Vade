@@ -1,0 +1,234 @@
+{
+ "case_a": [
+  {
+   "content": "You are Vade.",
+   "created_at": 0,
+   "id": "prompt-0-persona",
+   "name": null,
+   "partial": false,
+   "parts": [
+    {
+     "text": "You are Vade.",
+     "type": "text"
+    }
+   ],
+   "role": "system",
+   "seq": 0,
+   "session_id": "",
+   "superseded_by": null,
+   "tool_call_id": null,
+   "turn_id": null
+  },
+  {
+   "content": "Available tools (call by exact name):\n- fs__read_file: read [risk=low]",
+   "created_at": 0,
+   "id": "prompt-1-tool_block",
+   "name": null,
+   "partial": false,
+   "parts": [
+    {
+     "text": "Available tools (call by exact name):\n- fs__read_file: read [risk=low]",
+     "type": "text"
+    }
+   ],
+   "role": "system",
+   "seq": 0,
+   "session_id": "",
+   "superseded_by": null,
+   "tool_call_id": null,
+   "turn_id": null
+  },
+  {
+   "content": "Skills (activate with @name):\n- kb-guide: rules",
+   "created_at": 0,
+   "id": "prompt-2-skill_catalog",
+   "name": null,
+   "partial": false,
+   "parts": [
+    {
+     "text": "Skills (activate with @name):\n- kb-guide: rules",
+     "type": "text"
+    }
+   ],
+   "role": "system",
+   "seq": 0,
+   "session_id": "",
+   "superseded_by": null,
+   "tool_call_id": null,
+   "turn_id": null
+  },
+  {
+   "content": "## skill: kb-guide\nbody text",
+   "created_at": 0,
+   "id": "prompt-3-skill_bodies",
+   "name": null,
+   "partial": false,
+   "parts": [
+    {
+     "text": "## skill: kb-guide\nbody text",
+     "type": "text"
+    }
+   ],
+   "role": "system",
+   "seq": 0,
+   "session_id": "",
+   "superseded_by": null,
+   "tool_call_id": null,
+   "turn_id": null
+  },
+  {
+   "content": "- user prefers terse answers",
+   "created_at": 0,
+   "id": "prompt-4-session_memory",
+   "name": null,
+   "partial": false,
+   "parts": [
+    {
+     "text": "- user prefers terse answers",
+     "type": "text"
+    }
+   ],
+   "role": "system",
+   "seq": 0,
+   "session_id": "",
+   "superseded_by": null,
+   "tool_call_id": null,
+   "turn_id": null
+  },
+  {
+   "content": "runtime: cwd=/tmp/x",
+   "created_at": 0,
+   "id": "prompt-5-context",
+   "name": null,
+   "partial": false,
+   "parts": [
+    {
+     "text": "runtime: cwd=/tmp/x",
+     "type": "text"
+    }
+   ],
+   "role": "system",
+   "seq": 0,
+   "session_id": "",
+   "superseded_by": null,
+   "tool_call_id": null,
+   "turn_id": null
+  }
+ ],
+ "case_a_llm": [
+  {
+   "content": "You are Vade.",
+   "role": "system"
+  },
+  {
+   "content": "Available tools (call by exact name):\n- fs__read_file: read [risk=low]",
+   "role": "system"
+  },
+  {
+   "content": "Skills (activate with @name):\n- kb-guide: rules",
+   "role": "system"
+  },
+  {
+   "content": "## skill: kb-guide\nbody text",
+   "role": "system"
+  },
+  {
+   "content": "- user prefers terse answers",
+   "role": "system"
+  },
+  {
+   "content": "runtime: cwd=/tmp/x",
+   "role": "system"
+  }
+ ],
+ "case_b": [
+  {
+   "content": "P",
+   "created_at": 0,
+   "id": "prompt-0-persona",
+   "name": null,
+   "partial": false,
+   "parts": [
+    {
+     "text": "P",
+     "type": "text"
+    }
+   ],
+   "role": "system",
+   "seq": 0,
+   "session_id": "",
+   "superseded_by": null,
+   "tool_call_id": null,
+   "turn_id": null
+  },
+  {
+   "content": "X",
+   "created_at": 0,
+   "id": "prompt-5-context",
+   "name": null,
+   "partial": false,
+   "parts": [
+    {
+     "text": "X",
+     "type": "text"
+    }
+   ],
+   "role": "system",
+   "seq": 0,
+   "session_id": "",
+   "superseded_by": null,
+   "tool_call_id": null,
+   "turn_id": null
+  }
+ ],
+ "case_c": {
+  "events": [
+   [
+    "turn.delta",
+    {
+     "kind": "text",
+     "part_index": 0,
+     "text": "done",
+     "turn_id": "t-golden"
+    }
+   ]
+  ],
+  "llm_calls": [
+   {
+    "messages": [
+     {
+      "content": "You are Vade, a local-first assistant. Use the available tools when needed. Never invent tool names; if a tool is missing, say so and continue.",
+      "role": "system"
+     },
+     {
+      "content": "Available tools (call by exact name):\n- fs__read_file: read a file [risk=low]",
+      "role": "system"
+     },
+     {
+      "content": "Skills (activate with @name):\n- kb-guide: rules",
+      "role": "system"
+     },
+     {
+      "content": "## skill: kb-guide\nbody text",
+      "role": "system"
+     }
+    ],
+    "model": null,
+    "stream": true,
+    "tools": [
+     {
+      "function": {
+       "description": "read a file",
+       "name": "fs__read_file",
+       "parameters": {
+        "properties": {},
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   }
+  ]
+ }
+}

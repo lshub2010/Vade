@@ -6,6 +6,14 @@
   "owner": "C2",
   "source_of_truth": "docs/design.md §2.5",
   "x-vade": {
+    "core_reserved_tools": {
+      "contract": "C-05",
+      "version": "1.2.0",
+      "owner": "C3",
+      "doc": "docs/rfc/RFC-0003-prompt-injection-layers.md",
+      "reserved": ["skill_load", "tools_search", "tools/search"],
+      "note": "RFC-0003 §5.4: model-visible core built-ins. They are handled inside core and never routed to a module, so they are NOT methods in `directions` — this table is the registration. No manifest may declare a tool with one of these names, and no module LLM name can collide with them: module names are `{prefix}__{tool}` (always a double underscore), core names never carry one. `tools/search` is the C-05/RPC spelling of the search capability; the model-visible name is `tools_search` because an LLM function name may not contain `/`."
+    },
     "appends": [
       {
         "contract": "C-05",

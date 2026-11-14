@@ -159,19 +159,43 @@ def install(app: Any) -> Any:
     log.set_usage_accounting(_build_usage(cfg, store, log, data_dir))
     approval = _LazyApproval(app)
     memory = _LazyMemory(app)
+
+    # RFC-0003 §7: the injection switch is a restart item, read once here.
+    # Layered wires the core tools + catalog port; legacy leaves both empty and
+    # every loop path stays the pre-RFC one (byte-identical, golden-pinned).
+    # `app.skill_loader` may not exist yet (session installs before skill), so
+    # both resolve it lazily, at call time.
+    injection = "layered" if str(cfg.get("prompt.injection", "legacy") or "").strip().lower() == "layered" else "legacy"
+    core_tools = None
+    catalog_port = None
+    if injection == "layered":
+        from ..loop.coretools import build_core_tools
+        from ..skill.port import LayeredCatalogPort
+
+        def _skill_loader():
+            return getattr(app, "skill_loader", None)
+
+        core_tools = build_core_tools(_skill_loader)
+        catalog_port = LayeredCatalogPort(_skill_loader)
+
     engine = LoopEngine(
         router, llm,
         lambda: build_snapshot(getattr(app, "registry", None)),
         log.emit,
-        history=_history_of(log),
+        history=_history_of(log, layered=(injection == "layered")),
         approval=approval,
         memory=memory,
         prompt_hooks=lambda: getattr(app, "prompt_hooks", []),
         audit=getattr(app, "audit", None),
         config=LoopConfig(max_steps=int(cfg.get("policy.max_steps", 8)),
-                          approval_timeout_s=int(cfg.get("policy.approval_timeout_s", 60))),
+                          approval_timeout_s=int(cfg.get("policy.approval_timeout_s", 60)),
+                          injection=injection,
+                          hot_tools=tuple(cfg.get("tools.hot") or ()),
+                          hot_max=int(cfg.get("tools.hot_max", 12))),
         compaction=compaction,
         blob_store=BlobStore(data_dir / "blobs"),
+        core_tools=core_tools,
+        catalog=catalog_port,
     )
     log.set_executor(engine.run_turn)
     log.set_cancel_hook(lambda turn_id: router.cancel_turn(turn_id) if router is not None else None)
@@ -237,7 +261,8 @@ def _build_usage(cfg: Any, store: Any, log: Any, data_dir: Path) -> Any:
     return UsageAccounting(config=cfg, store=store, audit_reader=reader, emit=log.emit)
 
 
-def _history_of(log: Any) -> Any:
+def _history_of(log: Any, *, layered: bool = False) -> Any:
+    from ..loop.catalog import is_catalog_message
     from ..loop.context import filter_superseded
 
     def history(session_id: str) -> tuple[Any, ...]:
@@ -245,7 +270,18 @@ def _history_of(log: Any) -> Any:
         if session is None:
             return ()
         # RFC-0006 §6.6: drop replaced versions before anything fits the window.
-        return tuple(filter_superseded(session.messages, session.turns))
+        kept = filter_superseded(session.messages, session.turns)
+        if layered:
+            # RFC-0003: the catalog message is part of the model's context.
+            return tuple(kept)
+        # RFC-0003 §7: a session that ran layered keeps its catalog messages in
+        # the log (seq and replay stay intact); legacy FILTERS them out of the
+        # model request instead of deleting them, so switching back never
+        # resurrects a durable reminder as user speech.
+        return tuple(
+            m for m in kept
+            if not (m.role == "user" and is_catalog_message(m.content))
+        )
 
     return history
 

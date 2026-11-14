@@ -657,6 +657,28 @@
       ],
       "notes": "RFC-0012 §5.2/§5.3. Exactly once per run; the record is written before this is broadcast. DESENSITIZATION RULE: the result text lives only in the child session's message stream — no `result_text`/`summary`/`output` key may appear here; consumers verify and reconcile by fingerprint. The FR-8.56 '≤500 字摘要' is the read-time `result_preview` projection of subagent/get, not a persisted or broadcast field."
     }
+,
+    "turn.skill_catalog": {
+      "payload": {
+        "turn_id": "string",
+        "digest": "string (sha256 hex over the catalog entries: name + clipped description + marker, name order)",
+        "entries": ["string (skill names, name order)"],
+        "empty": "boolean (true = the retirement entry: no skills are available this session)"
+      },
+      "required": ["turn_id", "digest"],
+      "notes": "RFC-0003 §4.2/§5.1 row 6. Rides next to the persisted user-role catalog message (the `<system-reminder>` envelope; role=user, own seq). Sent on a session's first layered turn, when the digest changes (full replacement, no diff), and for the empty retirement entry — never twice for the same digest. Q1 answer, option (a): a client may render the paired message as a system notice instead of a user bubble."
+    },
+    "turn.tool_discovered": {
+      "payload": {
+        "turn_id": "string",
+        "tool": "string (model-visible name)",
+        "tool_id": "string",
+        "query_digest": "string(12) (sha256 of the search query that surfaced it, empty when a skill's requires_tools enabled it)",
+        "total_matches": "int"
+      },
+      "required": ["turn_id", "tool", "tool_id"],
+      "notes": "RFC-0003 §4.3.3/§5.5: sent once when a tool first enters the schemas() of a later step in this turn (tools/search hit or loaded-skill requires_tools). The same turn never repeats it for the same tool; tools resident from the turn's start never fire it. Unknown events are ignored by clients (RFC-0008 rule)."
+    }
   },
   "x-vade": {
     "rfc0005_append": {
@@ -817,7 +839,22 @@
           "this block is an explicit deviation from the RFC-0006 §9.3 'never rewrite notes bytes' rule: the stale sentence had become harmful (clients implementing from the notes discarded the persisted partial message); the RFC-0006 overrides entry above stays as audit history"
         ],
         "rewrites": "turn.interrupted.notes only. No payload key, required array, rule, enum or turn_state changed. Top-level C-06 stays 2.0.0 (the enum bump is RFC-0008's); this block continues RFC-0006's 1.1.0 partial-pointer lineage at 1.2.0 — append-level, non-breaking."
+      },
+      {
+        "contract": "C-06",
+        "version": "1.1.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0003-prompt-injection-layers.md",
+        "adds": ["turn.skill_catalog", "turn.tool_discovered"],
+        "overrides": [
+          "turn.skill_catalog travels next to a persisted user-role `<system-reminder>` message (RFC-0003 §4.2); the message itself is an ordinary message row with its own seq, replayed like any other",
+          "turn.tool_discovered is payload-only: it never carries `state` and never changes the turn enum",
+          "RFC-0003 §5.5: unknown events are ignored by clients while last_seq advances (the RFC-0008 rule already covers this; restated here because both events land in one batch)",
+          "top-level `version` stays 2.0.0; `turn_states` / `task_states` untouched (RFC-0003 adds no state); both events are payload-only turn-stream writes emitted by core/vade/loop/engine.py in layered mode only"
+        ],
+        "rewrites": "none"
       }
+
     ]
   }
 }

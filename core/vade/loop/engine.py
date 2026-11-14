@@ -20,7 +20,7 @@ from ..errors import VadeError
 from ..router.dispatch import Router, ToolCallResult, digest_args
 from ..session.models import Message, Turn, new_id, now_ms
 from .builtins import BuiltinContext, BuiltinRegistry
-from .catalog import parse_catalog_digest
+from .catalog import is_catalog_message, parse_catalog_digest
 from .context import CompactionConfig, ContextBuilder
 from .coretools import STICKY_K, more_tools_line
 from .ports import ApprovalDecision, ApprovalPort, ApprovalRequest, AuditPort, MemoryPort, NullApprovalPort, NullAuditPort
@@ -185,7 +185,14 @@ class LoopEngine:
         history = list(self._history(turn.session_id))
         if layered and self._catalog is not None:
             history = await self._inject_catalog(turn, history)
-        fitted = self.context.fit(history, ctx_tokens=self.config.ctx_tokens, current_turn_id=turn.id)
+        # RFC-0003 Q5: the catalog reminder is semantically load-bearing, so it
+        # must survive fitting; in legacy no catalog message can be in history
+        # (the session wiring filters them out), so the predicate stays off and
+        # the legacy path is byte-identical to pre-Q5 behaviour.
+        fitted = self.context.fit(
+            history, ctx_tokens=self.config.ctx_tokens, current_turn_id=turn.id,
+            protect=self._catalog_keeper if layered else None,
+        )
         messages: list[dict[str, Any]] = [m.to_llm() for m in system_messages]
         messages.extend(m.to_llm() for m in fitted)
 
@@ -611,6 +618,23 @@ class LoopEngine:
         )
         history.append(message)
         return history
+
+    def _catalog_keeper(self, message: Message) -> bool:
+        """RFC-0003 Q5 (§4.2.2): which messages compaction must never lose.
+
+        The catalog reminder is an ordinary user-role message; once it sits
+        deeper than `protect_last_n` in the history, `fit()` would drop it from
+        the fitted view while `_inject_catalog`'s resend decision — made
+        against the RAW log, which still holds it — sees the digest as
+        unchanged and sends nothing. The model would then run with no visible
+        catalog until the digest next changes, and every turn in between is
+        broken. Protecting EVERY catalog message (not just the last) also
+        keeps the fitted bytes stable across turns: a drop anywhere shifts the
+        whole history after it, which a provider prefix cache would pay for.
+        The cost is bounded by how often digests change (install / uninstall /
+        enable / disable), not by session length.
+        """
+        return message.role == "user" and is_catalog_message(message.content)
 
     def _chat(
         self,

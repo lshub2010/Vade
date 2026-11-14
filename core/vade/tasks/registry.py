@@ -170,6 +170,7 @@ class TaskRegistry:
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], int] = now_ms,
         max_depth: int | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._log = log
         self.limits = limits or TaskLimits()
@@ -177,6 +178,11 @@ class TaskRegistry:
             self.limits = replace(self.limits, max_depth=int(max_depth))
         self._clock = clock
         self._wall = wall_clock
+        # The other half of the time source: windows are measured on `clock` and
+        # the trailing-edge timer waits on `sleep`. Those two are the whole time
+        # dependency of the throttle, so a test can own both and make coalescing
+        # deterministic instead of racing a real 500 ms window.
+        self._sleep = sleep or asyncio.sleep
         self._tasks: dict[str, Task] = {}
         self._logs: dict[str, RingLog] = {}
         self._tokens: dict[str, _CancelToken] = {}
@@ -868,7 +874,7 @@ class TaskRegistry:
 
     async def _flush_progress(self, task_id: str, remaining: float) -> None:
         if remaining > 0:
-            await asyncio.sleep(remaining)
+            await self._sleep(remaining)
         window = self._progress.get(task_id)
         if window is None or window.pending is None:
             return
@@ -883,7 +889,7 @@ class TaskRegistry:
 
     async def _flush_action(self, task_id: str, remaining: float) -> None:
         if remaining > 0:
-            await asyncio.sleep(remaining)
+            await self._sleep(remaining)
         window = self._actions.get(task_id)
         if window is None or window.pending is None:
             return

@@ -6,7 +6,7 @@
   "owner": "C2",
   "source_of_truth": "docs/agents/01-contracts.md §二",
   "protocol": "vade/v1",
-  "count": 33,
+  "count": 34,
   "note": "Modules may return ONLY these codes; a custom string is a protocol violation. `retriable` is a property of the code. `fatal` (must disconnect) is a property of the individual error and lives in C-01 §5, not here.",
   "codes": {
     "INVALID_ARGUMENT": {"retriable": false, "http": 400},
@@ -41,14 +41,16 @@
     "CONFIRM_REQUIRED": {"retriable": false, "http": 409},
     "UNKNOWN_CONFIG_KEY": {"retriable": false, "http": 400},
     "CODE_INVALID": {"retriable": false, "http": 400},
-    "CODE_EXPIRED": {"retriable": false, "http": 400}
+    "CODE_EXPIRED": {"retriable": false, "http": 400},
+    "BUDGET_EXCEEDED": {"retriable": false, "http": 402}
   },
   "rules": [
     "message <= 300 chars; never echo keys, tokens or raw exception text across the process boundary.",
     "FORBIDDEN is not a valid code (v1.1 task books used it); use PERMISSION_DENIED.",
     "New codes require an RFC against C-04; the Rust enum in protocol/core is compared against this file by tools/check_contracts.py.",
     "CODE_INVALID / CODE_EXPIRED never echo the submitted pair code.",
-    "AUTH_FAILED covers wrong password, unregistered key, bad signature and not-initialised alike (no oracle)."
+    "AUTH_FAILED covers wrong password, unregistered key, bad signature and not-initialised alike (no oracle).",
+    "BUDGET_EXCEEDED (RFC-0005): [usage].enforce=\"block\" and the session/day budget is exceeded with a trustworthy ledger. Not retriable — retrying spends more. `data` = {state, scope, used, limit}."
   ],
   "http_note": "HTTP statuses are for the admin plane (C5a) mapping. The WS data plane uses the code inside JSON-RPC error objects; `http` is advisory there."
 }

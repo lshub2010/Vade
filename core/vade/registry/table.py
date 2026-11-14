@@ -113,6 +113,13 @@ class Registry:
         self._close_connection = close_connection
         self._revoked: set[str] = set()
         self._risk_overrides: dict[tuple[str, str], str] = {}
+        #: RFC-0005 §4.4: core-process monotonic counter behind `model/list`'s
+        #: `revision`. Bumped by every mutation that can change the model list
+        #: (registration, capability update, disconnect/reject, health flip,
+        #: enable/disable, revoke). Restarting resets it to 0; clients must
+        #: treat "not equal" as "full refresh" and never assume it is monotonic
+        #: across processes.
+        self._revision = 0
         #: Sync listeners for `module.status` (C3 subscribes). Called with a
         #: C-06 payload; never awaited here because mutation may happen on the
         #: admin thread.
@@ -124,6 +131,14 @@ class Registry:
         with self._lock:
             if listener not in self._listeners:
                 self._listeners.append(listener)
+
+    def revision(self) -> int:
+        """Monotonic model-list revision (RFC-0005 §4.4)."""
+        with self._lock:
+            return self._revision
+
+    def _bump(self) -> None:
+        self._revision += 1
 
     def _record_status(self, record: NodeRecord) -> dict[str, Any]:
         return {
@@ -196,6 +211,7 @@ class Registry:
             self._cap_epoch[manifest.module_id] = self._cap_epoch.get(manifest.module_id, 0) + (
                 0 if existing else 1
             )
+            self._bump()
             registration = Registration(accepted=True, session_id=f"{manifest.module_id}#{manifest.instance_id}", tool_names=manifest.tool_names)
         self._publish_status(record)
         return registration
@@ -319,6 +335,7 @@ class Registry:
             self._records[key] = updated
             self._index = new_index
             self._cap_epoch[manifest.module_id] = self._cap_epoch.get(manifest.module_id, 0) + 1
+            self._bump()
             epoch = self._cap_epoch[manifest.module_id]
         # A new manifest version is a status change the admin surface must see.
         self._publish_status(updated)
@@ -371,6 +388,8 @@ class Registry:
             record = self._records.get(key)
             if record is None:
                 return
+            if record.health is not HealthState.ONLINE:
+                self._bump()  # availability flips back on: the list changed
             self._records[key] = replace(record, last_frame_at=self._clock(), rtt_ms=rtt_ms or record.rtt_ms, health=HealthState.ONLINE)
 
     def mark_disconnected(self, module_id: str, instance_id: str) -> None:
@@ -382,6 +401,7 @@ class Registry:
             # Record is retained so the topology can still draw a grey dotted line.
             gone = replace(record, connection_id=None, health=HealthState.OFFLINE)
             self._records[key] = gone
+            self._bump()
         self._publish_status(gone)
 
     def mark_rejected(self, module_id: str, instance_id: str, reason: str, *, fingerprint: str = "") -> NodeRecord:
@@ -401,6 +421,7 @@ class Registry:
                 rejected_reason=reason,
             )
             self._records[key] = record
+            self._bump()
         self._publish_status(record)
         return record
 
@@ -423,6 +444,8 @@ class Registry:
                     record = replace(record, health=state)
                     self._records[key] = record
                     changed.append(record)
+            if changed:
+                self._bump()
         if changed:
             self._publish_status(*changed)
 
@@ -445,6 +468,7 @@ class Registry:
             if not enabled:
                 updated = replace(updated, health=HealthState.OFFLINE, connection_id=None)
             self._records[key] = updated
+            self._bump()
             if not enabled:
                 # Re-index the whole table: filtering by module_id also removed
                 # the OTHER instances of a pooled module.
@@ -474,6 +498,8 @@ class Registry:
                     )
                     self._records[key] = revoked
                     changed.append(revoked)
+            if changed:
+                self._bump()
         if changed:
             self._publish_status(*changed)
         for connection_id in closed:

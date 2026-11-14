@@ -866,11 +866,26 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         if ctx.audit is not None:
             from ..audit.reader import AuditReader
 
-            rows = AuditReader(ctx.audit.path).query(kind="llm.call", limit=500)["items"]
-            for row in rows:
-                if time.strftime("%Y-%m-%d", time.gmtime(row["ts"])) != day:
-                    continue
-                tokens += int((row.get("extra") or {}).get("tokens") or 0)
+            reader = AuditReader(ctx.audit.path)
+            cursor = None
+            while True:
+                page = reader.query(kind="llm.call", limit=500, cursor=cursor)
+                for row in page["items"]:
+                    extra = row.get("extra") or {}
+                    # RFC-0005 §6.5 / A12: this budget gates SELF-EVOLUTION
+                    # only. Chat turns now write `llm.call` rows too
+                    # (`purpose="chat"`), so without this filter ordinary
+                    # conversation would silently eat the evolve budget.
+                    if extra.get("purpose") == "chat":
+                        continue
+                    if time.strftime("%Y-%m-%d", time.gmtime(row["ts"])) != day:
+                        continue
+                    tokens += int(extra.get("tokens") or 0)
+                # The reader clamps a page to 500 on purpose; a busy day of chat
+                # rows must not push the evolve rows out of view.
+                cursor = page.get("next_cursor")
+                if not cursor:
+                    break
         return JSONResponse({
             "day": day, "tokens_used": tokens,
             "tokens_budget": ctx._config_overrides.get("evolve.daily_token_budget",

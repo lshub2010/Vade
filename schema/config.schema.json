@@ -7,7 +7,7 @@
   "additionalProperties": false,
   "x-vade": {
     "contract": "C-18",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "status": "frozen",
     "frozen_at": "2026-11-13",
     "owner": "C2",
@@ -304,7 +304,24 @@
         "provider": {"type": "string", "default": "openai_compatible", "x-vade": {"apply": "restart", "owner": "C3"}},
         "base_url": {"type": "string", "default": "", "x-vade": {"apply": "restart", "owner": "C3"}},
         "model": {"type": "string", "default": "", "x-vade": {"apply": "hot", "owner": "C3"}},
-        "api_key_env": {"type": "string", "default": "", "x-vade": {"apply": "restart", "owner": "C3", "secret": "env-name-only"}}
+        "api_key_env": {"type": "string", "default": "", "x-vade": {"apply": "restart", "owner": "C3", "secret": "env-name-only"}},
+        "model_module": {"type": "string", "default": "", "x-vade": {"apply": "restart", "owner": "C3", "note": "RFC-0005 §7.5. Empty = any `chat` module may serve; non-empty = only that module_id (closes the PROGRESS technical debt where C3 read the key but C-18 rejected it)."}},
+        "fallback_to_builtin": {"type": "boolean", "default": true, "x-vade": {"apply": "restart", "owner": "C3", "note": "RFC-0005 §7.5. Module target offline -> fall back to the builtin provider. An explicit session choice ignores it: the user asked for B, never silently answer with A."}},
+        "default_model": {"type": "string", "default": "", "x-vade": {"apply": "hot", "owner": "C3", "note": "RFC-0005 §7.5. Global default as a full `<provider>/<model>` id; empty = manifest priority decides. Resolved per turn, so pointing at a not-yet-registered module is not a startup error."}},
+        "capabilities": {"type": "object", "default": {}, "additionalProperties": true, "x-vade": {"apply": "restart", "owner": "C3", "note": "RFC-0005 §4.3: builtin model capabilities. Accepted keys: display_name, input_modalities[text|image|audio|file], max_image_bytes, max_image_px (long edge), max_images_per_turn, context_window, supports_tools. Every key is optional; an omitted key is UNKNOWN (null), never false. Validated field-by-field at read time by `vade.llm.capabilities` (bad value -> null, not a startup failure)."}}
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "RFC-0005 §6.4 usage budgets. Deliberately separate from [evolve].daily_token_budget: that one only gates the self-evolution trigger and reads purpose=\"evolve\" rows; these gate chat turns and read purpose=\"chat\" (+ aux when include_aux). Both share the audit trail but never each other's filter.",
+      "properties": {
+        "enabled": {"type": "boolean", "default": true, "x-vade": {"apply": "hot", "owner": "C3", "note": "false = keep accounting, stop emitting usage.budget and stop refusing turns."}},
+        "session_tokens": {"type": "integer", "minimum": 0, "default": 0, "x-vade": {"apply": "hot", "owner": "C3", "note": "Per-session total token budget; 0 = off."}},
+        "daily_tokens": {"type": "integer", "minimum": 0, "default": 0, "x-vade": {"apply": "hot", "owner": "C3", "note": "Core-wide tokens per UTC day; 0 = off."}},
+        "warn_ratio": {"type": "number", "minimum": 0.1, "maximum": 1, "default": 0.8, "x-vade": {"apply": "hot", "owner": "C3", "note": "used >= limit * warn_ratio enters `warn`; used >= limit is `exceeded`."}},
+        "include_aux": {"type": "boolean", "default": true, "x-vade": {"apply": "hot", "owner": "C3", "note": "Count non-chat calls (compaction/memory/evolve) against the budget; false = chat only."}},
+        "enforce": {"type": "string", "enum": ["block", "warn"], "default": "block", "x-vade": {"apply": "hot", "owner": "C3", "note": "block = FR-8.49: an exceeded budget refuses `ui/submit` with BUDGET_EXCEEDED. It degrades to a warning (usage.budget.degraded=true) when the ledger is untrustworthy (source=none), so an unreliable number cannot swallow a message."}}
       }
     }
   }

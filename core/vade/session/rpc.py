@@ -71,6 +71,11 @@ class SessionRPC:
             "ui/interrupt": self.ui_interrupt,
             "ui/queue.cancel": self.ui_queue_cancel,
             "approval/decide": self.approval_decide,
+            # RFC-0005 (C-05 append): read-only model surface + usage views.
+            "model/list": self.model_list,
+            "session/model.get": self.session_model_get,
+            "session/model.set": self.session_model_set,
+            "session/usage.get": self.session_usage_get,
             # RFC-0006 §6.2/§6.3 (C-05 1.1.0). `session/fork` is deliberately
             # absent: an unregistered method answers JSON-RPC -32601, which is
             # more honest than defining it and returning UNSUPPORTED.
@@ -208,6 +213,79 @@ class SessionRPC:
             })
         return {"ok": bool(ok)}
 
+    # ------------------------------------------------------------------ models
+    async def model_list(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """RFC-0005 §4: what the current mode can actually route to."""
+        resolver = getattr(self.log, "models", None)
+        if resolver is None:
+            raise VadeError("UNAVAILABLE", "the model catalog is not wired")
+        if_revision = params.get("if_revision")
+        if if_revision is not None and (not isinstance(if_revision, int) or isinstance(if_revision, bool)):
+            raise VadeError("INVALID_ARGUMENT", "if_revision must be an integer or null")
+        catalog = resolver.catalog()
+        if if_revision is not None and if_revision == catalog.revision:
+            # §4.4: the client reuses its cache; it must NOT clear the badges.
+            return {"revision": catalog.revision, "not_modified": True, "models": None}
+        default = resolver.resolve(None, catalog)
+        return {
+            "revision": catalog.revision,
+            "not_modified": False,
+            "models": catalog.to_wire(),
+            "default": {"model_id": default.model_id, "source": default.source,
+                        "resolved": default.resolved},
+        }
+
+    async def session_model_get(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str):
+            raise VadeError("INVALID_ARGUMENT", "session_id is required")
+        selection = self.log.resolve_model(session_id)
+        if selection is None:
+            raise VadeError("UNAVAILABLE", "the model catalog is not wired")
+        return selection.to_wire()
+
+    async def session_model_set(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str):
+            raise VadeError("INVALID_ARGUMENT", "session_id is required")
+        if "model_id" not in params:
+            raise VadeError("INVALID_ARGUMENT", "model_id is required (null clears the override)")
+        model_id = params.get("model_id")
+        if model_id is not None and not isinstance(model_id, str):
+            raise VadeError("INVALID_ARGUMENT", "model_id must be a string or null")
+        resolver = getattr(self.log, "models", None)
+        if resolver is None:
+            raise VadeError("UNAVAILABLE", "the model catalog is not wired")
+        session = self.log.get_session(session_id)
+        if session is None:
+            raise VadeError("NOT_FOUND", f"session {session_id!r} does not exist")
+        if model_id is not None:
+            if session.state != "open":
+                raise VadeError("READ_ONLY_SESSION", "session is closed; its model cannot be changed")
+            if "/" not in model_id or model_id.startswith("/") or model_id.endswith("/"):
+                raise VadeError("INVALID_ARGUMENT", "model_id must be <provider>/<model>")
+            entry = resolver.catalog().get(model_id)
+            if entry is None:
+                raise VadeError("NOT_FOUND", f"unknown model {model_id!r}",
+                                data={"reason": "unknown_model"})
+            if not entry.available:
+                raise VadeError("UNAVAILABLE", f"model {model_id!r} has no healthy instance",
+                                data={"reason": "model_unavailable"})
+        selection = self.log.set_session_model(session_id, model_id)
+        return {"model_id": selection.model_id, "source": selection.source,
+                "effective_at": "next_turn"}
+
+    async def session_usage_get(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str):
+            raise VadeError("INVALID_ARGUMENT", "session_id is required")
+        session = self.log.get_session(session_id)
+        if session is None:
+            raise VadeError("NOT_FOUND", f"session {session_id!r} does not exist")
+        accounting = getattr(self.log, "usage", None)
+        if accounting is None:
+            raise VadeError("UNAVAILABLE", "usage accounting is not wired")
+        return accounting.report(session)
     # ------------------------------------------------------------------ input
     async def turn_input(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
         """`turn/input`: answer one pending question (RFC-0008 §7.1).

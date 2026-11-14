@@ -172,8 +172,10 @@ def install(app: Any) -> Any:
         lambda turn_id: router.clear_cancelled(turn_id) if router is not None else None
     )
     log.approval_port = approval
+    log.input_port = getattr(app, "input_port", None)
 
-    rpc = SessionRPC(log, approval=lambda: getattr(app, "approval_port", None))
+    rpc = SessionRPC(log, approval=lambda: getattr(app, "approval_port", None),
+                     input_port=lambda: getattr(app, "input_port", None))
     # `module.status` rides the same seq bus; the registry (C2) is the trigger.
     from .status import ModuleStatusPublisher
 

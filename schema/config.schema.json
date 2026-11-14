@@ -283,6 +283,19 @@
         "auto_approve": {"type": "boolean", "default": false, "x-vade": {"apply": "hot", "owner": "C3b", "note": "core-only setting; modules must not be able to set it."}}
       }
     },
+    "ask_user": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "RFC-0008 §8.1/§9.5. Every key is `hot`: it only affects requests made after the change, so no restart and no turn is retroactively re-judged.",
+      "properties": {
+        "default_timeout_s": {"type": "integer", "minimum": 5, "maximum": 600, "default": 120, "x-vade": {"apply": "hot", "owner": "C5a"}},
+        "max_timeout_s": {"type": "integer", "minimum": 5, "maximum": 3600, "default": 600, "x-vade": {"apply": "hot", "owner": "C5a"}},
+        "max_free_text_chars": {"type": "integer", "minimum": 1, "maximum": 8000, "default": 8000, "x-vade": {"apply": "hot", "owner": "C5a"}},
+        "max_multi_select": {"type": "integer", "minimum": 1, "maximum": 20, "default": 20, "x-vade": {"apply": "hot", "owner": "C5a"}},
+        "allow_subagents": {"type": "boolean", "default": false, "x-vade": {"apply": "hot", "owner": "C5a", "note": "默认关：一个被派出去的后台代理来审问用户本身就可疑；打开后弹层必须显示来源。"}},
+        "audit_value": {"type": "boolean", "default": false, "x-vade": {"apply": "hot", "owner": "C5a", "note": "保留键（Q5）：v1 即使为 true 也只把 sha256(value) 与长度写进审计，原值永不落库。"}}
+      }
+    },
     "llm": {
       "type": "object",
       "additionalProperties": false,

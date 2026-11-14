@@ -47,6 +47,14 @@
       },
       {
         "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0008-ask-user-input.md",
+        "adds": ["turn/input", "turn/input.cancel"],
+        "snapshot_note": "`ui/attach.result.snapshot` gains an additive `pending_inputs[]` key (input_id/turn_id/kind/prompt/detail/schema/options/timeout_s/expires_at/created_at). `snapshot` stays `object`; a client that does not know the key ignores it, exactly as RFC-0007 treats `tasks`.",
+        "rewrites": "none. No existing method, error code or field changes."
+      },
+      {
         "version": "1.2.0",
         "owner": "C2",
         "doc": "docs/rfc/RFC-0009-module-ui-pages.md",
@@ -177,7 +185,7 @@
         "params": {"session_id": "string|null", "last_seq": "int|null"},
         "result": {"session_id": "string", "from_seq": "int", "snapshot": "object|null"},
         "errors": ["NOT_FOUND", "PERMISSION_DENIED"],
-        "notes": "RFC-0004 §6.3: `snapshot.messages[]` carries `parts` — the minimal field set all three clients must render in the same order: `[{type:'text',text} | {type:'image',file_id,mime,name,size,width,height,sha256} | {type:'file',file_id,mime,name,size}]`. Rows written before parts existed are read back as a single `text` part synthesised from `content` (never rewritten on disk); `content` keeps carrying the text projection, so a client that ignores `parts` renders exactly as before. Attachments are referenced by `file_id` only — never a local URI (§2.3). RFC-0007 §5.6: `snapshot.tasks` is the authoritative starting point for the activity list (all non-terminal tasks, then the newest `tasks.snapshot_finished` terminals), with `snapshot.tasks_truncated=true` when older history exists (page it with `task/list`) and `pending_approvals[].task_id` naming the task that owns a prompt. A snapshot MISSING the `tasks` key means the core predates RFC-0007 — the client shows its static empty state and must not fabricate progress."
+        "notes": "RFC-0004 §6.3: `snapshot.messages[]` carries `parts` — the minimal field set all three clients must render in the same order: `[{type:'text',text} | {type:'image',file_id,mime,name,size,width,height,sha256} | {type:'file',file_id,mime,name,size}]`. Rows written before parts existed are read back as a single `text` part synthesised from `content` (never rewritten on disk); `content` keeps carrying the text projection, so a client that ignores `parts` renders exactly as before. Attachments are referenced by `file_id` only — never a local URI (§2.3). RFC-0008 §8.2: `snapshot.pending_inputs[]` lists unanswered input requests (the `turn.input_required` row shape minus `source`/`default`), so a client that missed the replay window can still rebuild the dialog; an `input_id` that is already resolved never appears there. RFC-0007 §5.6: `snapshot.tasks` is the authoritative starting point for the activity list (all non-terminal tasks, then the newest `tasks.snapshot_finished` terminals), with `snapshot.tasks_truncated=true` when older history exists (page it with `task/list`) and `pending_approvals[].task_id` naming the task that owns a prompt. A snapshot MISSING the `tasks` key means the core predates RFC-0007 — the client shows its static empty state and must not fabricate progress."
       },
       "ui/detach": {
         "params": {"session_id": "string"},
@@ -266,6 +274,18 @@
         "params": {"request_id": "string", "decision": "approve|deny", "scope": "once|session"},
         "result": {"ok": true},
         "errors": ["APPROVER_INVALID", "READ_ONLY_SESSION", "NOT_FOUND"]
+      },
+      "turn/input": {
+        "params": {"session_id": "string", "input_id": "string", "value": "string | string[] | bool"},
+        "result": {"ok": true, "turn_id": "string", "status": "submitted|timeout|cancelled", "value": "same as params.value | null", "duplicate": "bool"},
+        "errors": ["INVALID_ARGUMENT", "NOT_FOUND", "READ_ONLY_SESSION", "PAYLOAD_TOO_LARGE", "OVERLOADED"],
+        "notes": "RFC-0008 §7.1. `input_id` is core-issued and is the idempotency key: same value again -> duplicate:true with the first result and NO second event; a different value -> INVALID_ARGUMENT{reason:'already_resolved'}; already timed-out/cancelled -> ok:true with that status and value:null. A rejected value leaves the turn in `waiting_input` and emits nothing. The value is only handed to the model as a tool result — it is never executed or interpolated into a command (§9.1)."
+      },
+      "turn/input.cancel": {
+        "params": {"session_id": "string", "input_id": "string", "reason": "string<=200"},
+        "result": {"ok": true, "turn_id": "string", "status": "cancelled|submitted|timeout"},
+        "errors": ["NOT_FOUND", "READ_ONLY_SESSION", "INVALID_ARGUMENT"],
+        "notes": "RFC-0008 §7.2. Closes ONE dialog and keeps the turn running (the model receives CANCELLED and decides how to continue) — `ui/interrupt` is the one that ends the turn. Idempotent: an already-resolved id returns its current status and no second `turn.input_resolved`."
       },
       "turn/regenerate": {
         "params": {"session_id": "string", "turn_id": "string", "client_msg_id": "string"},

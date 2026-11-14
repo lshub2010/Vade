@@ -28,12 +28,16 @@ Role = str  # "system" | "user" | "assistant" | "tool"
 class TurnState(str, Enum):
     """Queue state machine (design §5, 22-C3 T2).
 
-    `waiting_approval` only blocks the head of the queue; later messages keep
-    queueing. Terminal states are never left again.
+    `waiting_approval` and `waiting_input` only block the head of the queue;
+    later messages keep queueing. They are mutually exclusive: one turn has at
+    most one blocking wait (RFC-0008 S1/S2). Terminal states are never left again.
     """
 
     QUEUED = "queued"
     WAITING_APPROVAL = "waiting_approval"
+    #: RFC-0008 §6.3. Appended right after `waiting_approval` so the schema arrays
+    #: and this enum stay in the same order (C-06 2.0.0 widened the enum).
+    WAITING_INPUT = "waiting_input"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"

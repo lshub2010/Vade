@@ -164,6 +164,10 @@ class SessionLog:
         self._blobs = blobs
         self.limits = limits or PartLimits()
         self.approval_port: Any = None
+        #: RFC-0008: the ask-user channel, resolved lazily because the `input`
+        #: component installs before `session` (alphabetical scan). `None` means
+        #: no channel: the snapshot simply has no `pending_inputs` rows.
+        self.input_port: Any = None
         #: RFC-0007: `TaskRegistry`, installed by `vade.tasks.install()`. Two
         #: things read it — `snapshot()` (tasks are reconnect truth) and
         #: `interrupt()` (a stopped turn cancels its subagents). `None` means
@@ -418,6 +422,15 @@ class SessionLog:
                 pending = list(self.approval_port.pending(session_id))
             except Exception:  # pragma: no cover - approval port is C5a's
                 pending = []
+        # RFC-0008 §8.2: a reconnecting client that fell outside the replay
+        # window only gets this snapshot, so a pending question MUST be here —
+        # otherwise the dialog exists on the phone and not on the desktop.
+        pending_inputs: list[dict[str, Any]] = []
+        if self.input_port is not None and hasattr(self.input_port, "pending"):
+            try:
+                pending_inputs = list(self.input_port.pending(session_id))
+            except Exception:  # pragma: no cover - input port is RFC-0008's
+                pending_inputs = []
         snapshot: dict[str, Any] = {
             "from_seq": self.store.last_seq(session_id),
             "session": {
@@ -433,6 +446,7 @@ class SessionLog:
             "turns": [turn.to_dict() for turn in session.turns],
             "queue": queue.state() if queue is not None else {"running": None, "pending": []},
             "pending_approvals": pending,
+            "pending_inputs": pending_inputs,
         }
         if self.tasks is not None:
             # RFC-0007 §5.6: `attach()` sends a snapshot *instead of* the events
@@ -458,6 +472,7 @@ class SessionLog:
                 cancel_hook=self._cancel_hook,
                 cancel_clear_hook=self._cancel_clear_hook,
                 max_pending=self._max_pending,
+                pre_terminal_hook=self._input_pre_terminal,
                 partial_provider=self.partial_text,
             )
             self._queues[session_id] = q
@@ -861,6 +876,45 @@ class SessionLog:
         if q is not None:
             await q.mark_state(turn_id, state)
 
+    def turn_state(self, session_id: str, turn_id: str) -> str | None:
+        """Live state of one turn for RFC-0008's single-slot gate (S2/S3/S6).
+
+        The queue knows running and queued turns; a finished turn is no longer in
+        it, so the persisted row answers "this turn is terminal" (S6) instead of
+        the probe going silent and letting a late request reopen a closed turn.
+        """
+        q = self._queues.get(session_id)
+        if q is not None:
+            state = q.state_of(turn_id)
+            if state is not None:
+                return state
+        session = self.store.load(session_id)
+        if session is not None:
+            for turn in session.turns:
+                if turn.id == turn_id:
+                    return turn.state.value
+        return None
+
+    async def _input_pre_terminal(self, turn_id: str, state: TurnState) -> None:
+        """RFC-0008 S5: close pending inputs before the terminal event is written.
+
+        `TurnQueue._finalize` awaits this first, so a dialog is never left open
+        behind a `turn.interrupted` (after which C-06 forbids any turn event).
+        """
+        port: Any = self.input_port
+        resolver: Any = getattr(port, "resolve_turn", None)
+        if not callable(resolver):
+            return
+        if state is TurnState.INTERRUPTED:
+            reason, target = "turn_interrupted", "interrupted"
+        elif state is TurnState.CANCELLED:
+            reason, target = "session_closed", "interrupted"
+        else:
+            # A turn cannot legitimately finish while a question is open; if it
+            # does (a crashed executor path), close the dialog rather than strand it.
+            reason, target = "superseded", state.value
+        await resolver(turn_id, reason=reason, state=target)
+
     async def wait_idle(self, session_id: str, timeout: float = 5.0) -> None:
         q = self._queues.get(session_id)
         if q is not None:
@@ -868,6 +922,16 @@ class SessionLog:
 
     async def close(self) -> None:
         self._closed = True
+        # RFC-0008 §5.3 "等待中会话关闭": close the dialogs while the sinks are
+        # still attached, so `turn.input_resolved{session_closed}` reaches them
+        # before `session.closed`/the socket goes away.
+        closer: Any = getattr(self.input_port, "on_session_end", None)
+        if callable(closer):
+            for session_id in list(self._queues):
+                try:
+                    await closer(session_id)
+                except Exception:  # pragma: no cover - closing must not raise
+                    pass
         for q in list(self._queues.values()):
             await q.shutdown()
         for session_id in list(self._sinks):

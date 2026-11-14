@@ -1,6 +1,6 @@
 {
   "id": "C-06",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "status": "frozen",
   "frozen_at": "2026-11-13",
   "owner": "C3",
@@ -18,11 +18,13 @@
     "Clients MUST de-duplicate by seq: a reconnect may deliver an overlapping segment.",
     "Every turn's STATE-CHANGE event carries `state` (see turn.state): turn.queued, turn.started, turn.completed, turn.failed, turn.interrupted, turn.cancelled and turn.approval_resolved. turn.delta / turn.tool_call / turn.tool_result are payload-only and never carry `state`; a UI keeps the last state event and applies these deltas on top of it.",
     "errors inside payloads use C-04 names only; no traceback ever appears in an event.",
-    "C3d may APPEND session.turn / session.closed (C-14); this file may not be rewritten by other batches."
+    "C3d may APPEND session.turn / session.closed (C-14); this file may not be rewritten by other batches.",
+    "RFC-0008 §6.4: a client that does not know an event type MUST ignore it and advance `last_seq` (never disconnect); a client that does not know a turn state MUST render it as `running`. `waiting_input` is the state this rule exists for (C-06 2.0.0 widened the enum)."
   ],
   "turn_states": [
     "queued",
     "waiting_approval",
+    "waiting_input",
     "running",
     "completed",
     "failed",
@@ -179,6 +181,57 @@
         "state"
       ],
       "notes": "The ONLY signal that closes dialogs on the other devices; must be broadcast even when the decision lost a first-wins race. When the resolved turn belongs to a subagent, `state` is the CHILD turn's state: a parent session that does not know that turn MUST ignore the state and close the card by `request_id` alone (RFC-0007 §7.2 rule 2)."
+    },
+    "turn.input_required": {
+      "payload": {
+        "input_id": "string (core-allocated, ULID-shaped; the idempotency key)",
+        "turn_id": "string",
+        "session_id": "string (the seq space this event is broadcast on)",
+        "state": "waiting_input",
+        "kind": "free_text|single_choice|multi_choice|confirm",
+        "prompt": "string 1..500 (model-authored, render as plain text)",
+        "detail": "string<=2000|null",
+        "schema": "object (fixed descriptor per kind; NEVER a form DSL)",
+        "options": "array of {id,label<=120,description<=240|null}; 2..20 for choice kinds, [] otherwise",
+        "timeout_s": "int 5..600",
+        "expires_at": "int (unix ms)",
+        "default": "string|string[]|bool|null (UI prefill ONLY; never applied on timeout)",
+        "source": "object {tool:'ask_user'|'module', module_id:string|null, depth:int}",
+        "created_at": "int (unix ms)"
+      },
+      "required": [
+        "input_id",
+        "turn_id",
+        "state",
+        "kind",
+        "prompt",
+        "schema",
+        "options",
+        "timeout_s",
+        "expires_at"
+      ],
+      "notes": "RFC-0008 §6.1. Broadcast to every attached UI with the same input_id and payload; it carries `state:waiting_input`, so it IS the state-change event for entering that state (rule 4). Timeout = cancel: `default` never becomes an answer. Nullable keys are still written with a null value so the event describes itself."
+    },
+    "turn.input_resolved": {
+      "payload": {
+        "input_id": "string",
+        "turn_id": "string",
+        "state": "turn.state (the state this resolution restores: running, or interrupted)",
+        "status": "submitted|cancelled|timeout",
+        "value": "string|string[]|bool|null (non-null iff status=submitted, already validated by core)",
+        "by": "device_id|user|system",
+        "reason": "user_cancel|turn_interrupted|session_closed|no_ui|superseded|timeout|submitted",
+        "duration_ms": "number (monotonic time from request to resolution)"
+      },
+      "required": [
+        "input_id",
+        "turn_id",
+        "state",
+        "status",
+        "value",
+        "by"
+      ],
+      "notes": "RFC-0008 §6.2. The ONLY signal that closes an ask-user dialog: exactly one per input_id (§7.3 idempotency matrix), and it MUST be emitted before the turn's terminal event (S5). `by:'system'`+`status:'timeout'` and `by:<device>`+`status:'cancelled'` are the wire source of FR-8.55's 'did it time out'."
     },
     "turn.completed": {
       "payload": {
@@ -366,6 +419,7 @@
       "enum": [
         "queued",
         "waiting_approval",
+        "waiting_input",
         "running",
         "completed",
         "failed",
@@ -550,6 +604,23 @@
           "unknown event types MUST be ignored while last_seq advances"
         ],
         "rewrites": "none"
+      },
+      {
+        "contract": "C-06",
+        "version": "2.0.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0008-ask-user-input.md",
+        "adds": ["turn.input_required", "turn.input_resolved"],
+        "enum_widen": {
+          "turn_states": ["waiting_input"],
+          "synced": ["events.turn.state.enum", "core/vade/session/models.py:TurnState"],
+          "breaking": "only for clients that validate every state against a frozen enum"
+        },
+        "overrides": [
+          "turn.input_resolved is the only signal that closes an ask-user dialog",
+          "turn.input_required carries state:waiting_input and is therefore a state-change event"
+        ],
+        "rewrites": "none. Every C-06 1.0.0 entry, rule and enum value above is unchanged; this batch only widens `turn_states` and appends two events (`version` moves to 2.0.0 because an enum widening is breaking for exhaustive validators)."
       }
     ]
   }

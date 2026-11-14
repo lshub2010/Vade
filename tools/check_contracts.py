@@ -53,6 +53,11 @@ PUSH_TRANSPORT = "events/deliver"
 STATE_CHANGE_EVENTS = {
     "turn.queued", "turn.started", "turn.completed", "turn.failed",
     "turn.interrupted", "turn.cancelled", "turn.approval_resolved",
+    # RFC-0008 §10.1 row 4: both carry `state` and are therefore state-change
+    # events. Entering `waiting_input` IS `turn.input_required`; leaving it is
+    # `turn.input_resolved` (state=running|interrupted). Not registering them
+    # would fail the C-06 rule-4 scan below.
+    "turn.input_required", "turn.input_resolved",
     # RFC-0007 §5.2/§5.3: the task family. `task.started` is a state-change
     # event too (state ∈ {queued, running}); `task.progress` is the opposite.
     "task.started", "task.status", "task.finished",
@@ -787,6 +792,11 @@ def main() -> int:
     methods = {
         "module/register", "module/capabilities.update", "module/heartbeat",
         "tools/call", "tools/cancel", "module/drain", "approval/decide", "ui/submit",
+        # RFC-0008 §7.1/§7.2
+        "turn/input", "turn/input.cancel",
+        # RFC-0006 §6.2/§6.3
+        "turn/regenerate", "message/edit_resubmit",
+        # RFC-0007 §6.1-§6.4
         "task/list", "task/log_tail", "task/cancel", "subagent/message",
         "ui/page.get", "ui/state.get", "ui/tool.call", "state/get", "page/get",
     }
@@ -840,6 +850,33 @@ def main() -> int:
     check_rfc0006(events, rpc, config)
     check_task_events(events, declared_events, schema_events)
     check_approval_attribution(declared_events)
+
+    # ---------------------------------------------------------------- RFC-0008
+    # C-06 went 1.0.0 -> 2.0.0 because `turn_states` was WIDENED: an exhaustive
+    # validator on the old side would silently drop the new state's events, so
+    # the version is the one place that can warn it. A future RFC that only
+    # appends fields must not quietly reuse 2.0.0 — this pins today's value.
+    check(events.get("version") == "2.0.0",
+          f"events.json: version must be 2.0.0 after the RFC-0008 enum widening (got {events.get('version')!r})")
+    appends = (events.get("x-vade") or {}).get("appends") or []
+    rfc0008 = next((block for block in appends if isinstance(block, dict)
+                    and "RFC-0008" in str(block.get("doc") or "")), None)
+    check(rfc0008 is not None, "events.json: missing the x-vade.appends block for RFC-0008")
+    if rfc0008 is not None:
+        check(rfc0008.get("version") == "2.0.0",
+              "events.json: the RFC-0008 append block must carry version 2.0.0")
+        widen = (rfc0008.get("enum_widen") or {}).get("turn_states") or []
+        check("waiting_input" in widen,
+              "events.json: the RFC-0008 append block must declare enum_widen.turn_states=['waiting_input']")
+        check(set(rfc0008.get("adds") or []) == {"turn.input_required", "turn.input_resolved"},
+              "events.json: the RFC-0008 append block must add exactly the two turn.input_* events")
+    for name in ("turn.input_required", "turn.input_resolved"):
+        spec = declared_events.get(name) or {}
+        check(bool(spec), f"events.json: {name} is not declared (RFC-0008 §6)")
+        check("state" in (spec.get("required") or []),
+              f"events.json {name}: a state-change event must require `state` (C-06 rule 4)")
+    check("waiting_input" in states,
+          "events.json: turn_states must contain `waiting_input` (RFC-0008 §6.3)")
 
     if FAILURES:
         print("contracts: FAIL")

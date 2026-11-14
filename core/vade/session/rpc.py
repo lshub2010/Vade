@@ -37,9 +37,13 @@ class ConnectionSink:
 
 
 class SessionRPC:
-    def __init__(self, log: SessionLog, approval: Callable[[], Any] | None = None) -> None:
+    def __init__(self, log: SessionLog, approval: Callable[[], Any] | None = None,
+                 input_port: Callable[[], Any] | None = None) -> None:
         self.log = log
         self._approval = approval or (lambda: None)
+        #: RFC-0008: resolved lazily for the same reason `approval` is — the
+        #: ask-user component may install before or after the session component.
+        self._input = input_port or (lambda: getattr(log, "input_port", None))
         self._sinks: dict[tuple[str, str], str] = {}
 
     # ------------------------------------------------------------------ dispatch
@@ -72,6 +76,8 @@ class SessionRPC:
             # more honest than defining it and returning UNSUPPORTED.
             "turn/regenerate": self.turn_regenerate,
             "message/edit_resubmit": self.message_edit_resubmit,
+            "turn/input": self.turn_input,
+            "turn/input.cancel": self.turn_input_cancel,
         }
 
     # ------------------------------------------------------------------ ui/*
@@ -201,6 +207,68 @@ class SessionRPC:
                 "scope": scope, "state": "running", **attribution,
             })
         return {"ok": bool(ok)}
+
+    # ------------------------------------------------------------------ input
+    async def turn_input(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """`turn/input`: answer one pending question (RFC-0008 §7.1).
+
+        `input_id` is the idempotency key and is core-issued; a value that fails
+        validation leaves the turn in `waiting_input` and emits nothing (§4.4).
+        """
+        session_id, input_id = self._input_ids(connection, params)
+        if "value" not in params:
+            raise VadeError("INVALID_ARGUMENT", "value is required",
+                            data={"field": "value"})
+        port: Any = self._input()
+        submit: Any = getattr(port, "submit", None) if port is not None else None
+        if not callable(submit):
+            raise VadeError("NOT_FOUND", "no ask-user channel is installed")
+        result: Any = submit(session_id=session_id, input_id=input_id,
+                             value=params.get("value"), by=self._who(connection))
+        if inspect.isawaitable(result):
+            result = await result
+        return {"ok": True, "turn_id": result["turn_id"], "status": result["status"],
+                "value": result.get("value"), "duplicate": bool(result.get("duplicate"))}
+
+    async def turn_input_cancel(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """`turn/input.cancel`: close one dialog, keep the turn running (§7.2)."""
+        session_id, input_id = self._input_ids(connection, params)
+        reason = params.get("reason", "user_cancel")
+        if reason is not None and (not isinstance(reason, str) or len(reason) > 200):
+            raise VadeError("INVALID_ARGUMENT", "reason must be a string of at most 200 characters",
+                            data={"field": "reason"})
+        port: Any = self._input()
+        cancel: Any = getattr(port, "cancel", None) if port is not None else None
+        if not callable(cancel):
+            raise VadeError("NOT_FOUND", "no ask-user channel is installed")
+        result: Any = cancel(session_id=session_id, input_id=input_id,
+                             by=self._who(connection), reason=reason or "user_cancel")
+        if inspect.isawaitable(result):
+            result = await result
+        return {"ok": True, "turn_id": result["turn_id"], "status": result["status"]}
+
+    def _input_ids(self, connection: Any, params: Mapping[str, Any]) -> tuple[str, str]:
+        """Shared guard: writable session, both ids present (§7.4)."""
+        session_id, input_id = params.get("session_id"), params.get("input_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        if not isinstance(input_id, str) or not input_id:
+            raise VadeError("INVALID_ARGUMENT", "input_id is required",
+                            data={"field": "input_id"})
+        if self._read_only(connection):
+            # AMEND-22 #14: only an EXPLICITLY read-only session is refused; a
+            # cookie session is writable (D100) and may answer like anyone else.
+            raise VadeError("READ_ONLY_SESSION",
+                            "this session is read-only; answering requires a writable session")
+        return session_id, input_id
+
+    @staticmethod
+    def _read_only(connection: Any) -> bool:
+        if bool(getattr(connection, "read_only", False)):
+            return True
+        principal = getattr(connection, "principal", None)
+        return bool(getattr(principal, "read_only", False))
 
     # ------------------------------------------------------------------ helpers
     @staticmethod

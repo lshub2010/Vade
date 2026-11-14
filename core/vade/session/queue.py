@@ -40,6 +40,7 @@ class TurnQueue:
         cancel_clear_hook: Callable[[str], None] | None = None,
         max_pending: int = 100,
         clock: Callable[[], int] = now_ms,
+        pre_terminal_hook: Callable[[str, TurnState], Awaitable[Any]] | None = None,
         partial_provider: Callable[[str], str] | None = None,
     ) -> None:
         self.session_id = session_id
@@ -48,6 +49,7 @@ class TurnQueue:
         self._save_turn = save_turn
         self._cancel_hook = cancel_hook
         self._cancel_clear_hook = cancel_clear_hook
+        self._pre_terminal_hook = pre_terminal_hook
         self._max_pending = max_pending
         self._clock = clock
         #: RFC-0006 §4.2: reads the text already streamed for a turn so an
@@ -105,6 +107,21 @@ class TurnQueue:
         payload = self.state()
         payload["session_id"] = self.session_id
         return payload
+
+    def state_of(self, turn_id: str) -> str | None:
+        """Live state of one turn (`running`, `waiting_input`, ...), or `None`.
+
+        RFC-0008 S2/S3 needs this: entering `waiting_input` requires the turn to
+        be `running`, and a turn already in `waiting_approval` must refuse a
+        second blocking wait. The queue is the only honest source for it.
+        """
+        item = self._running
+        if item is not None and item.turn_id == turn_id:
+            return item.turn.state.value
+        for queued in self._pending:
+            if queued.turn_id == turn_id:
+                return queued.turn.state.value
+        return None
 
     def is_idle(self) -> bool:
         return self._running is None and not self._pending and self._worker is None
@@ -219,6 +236,15 @@ class TurnQueue:
         if turn.id in self._finalized:
             return
         self._finalized.add(turn.id)
+        # RFC-0008 S5: a pending `turn.input_resolved` must be written BEFORE the
+        # turn's terminal event, or the dialog is left open forever (C-06 forbids
+        # any `turn.*` after `turn.interrupted`). This is the only place a turn
+        # ends, so the hook lives here rather than at each caller.
+        if self._pre_terminal_hook is not None:
+            try:
+                await self._pre_terminal_hook(turn.id, state)
+            except Exception:  # pragma: no cover - a hook must not block finalization
+                pass
         if state is not TurnState.COMPLETED or turn.state is not TurnState.COMPLETED:
             turn = turn.with_state(state, ended_at=turn.ended_at or self._clock())
         event_type = {

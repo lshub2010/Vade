@@ -8,6 +8,7 @@ interrupted client had already rendered.
 from __future__ import annotations
 
 import asyncio
+import re
 
 from vade.loop.engine import TurnOutcome
 from vade.session.manager import SessionLog
@@ -51,12 +52,14 @@ def test_interrupt_persists_the_partial_answer_and_points_at_it(tmp_path):
         assert len(terminal) == 1
         payload = terminal[0].payload
         assert payload["partial_chars"] == 5
-        assert payload["partial_message_id"]
+        # S4: one pointer convention (`msg:<hex>`, same as `result_ref`).
+        assert re.fullmatch(r"msg:[0-9a-f]{32}", payload["partial_message_id"])
         # The event is a pointer, never a second copy of the text (§4.1).
         assert "text" not in payload
 
         snapshot = log.snapshot(sess.id)
-        message = next(m for m in snapshot["messages"] if m["id"] == payload["partial_message_id"])
+        message_id = payload["partial_message_id"].split(":", 1)[1]
+        message = next(m for m in snapshot["messages"] if m["id"] == message_id)
         assert message["role"] == "assistant"
         assert message["partial"] is True
         assert message["content"] == "Hello"
@@ -128,6 +131,56 @@ def test_interrupt_before_the_first_delta_creates_no_empty_message(tmp_path):
         assert payload["partial_message_id"] is None
         assert payload["partial_chars"] == 0
         assert [m for m in log.snapshot(sess.id)["messages"] if m["role"] == "assistant"] == []
+
+    asyncio.run(scenario())
+
+
+def test_a_tombstoned_event_takes_its_messages_with_it(tmp_path):
+    """S2: a late event must not persist its messages either.
+
+    The tombstone used to `continue` past the event only: `messages` still went
+    to `store.append` with no event to anchor them, which wrote a `seq=0`
+    assistant bubble into a turn that had already closed.
+    """
+
+    async def scenario():
+        started = asyncio.Event()
+
+        async def executor(turn, content):
+            started.set()
+            await asyncio.sleep(30)
+            return TurnOutcome(assistant_text="never")
+
+        log = _log(tmp_path, executor)
+        sess = log.create_session()
+        turn, _ = await log.submit(sess.id, [{"type": "text", "text": "hi"}], "c5")
+        assert await wait_until(lambda: started.is_set(), 2.0)
+        await log.interrupt(sess.id, turn.id)
+
+        before_events = len(log.store.read_since(sess.id, 0))
+        before_messages = len(log.snapshot(sess.id)["messages"])
+
+        ghost = Message(id="late-ghost", session_id=sess.id, turn_id=turn.id,
+                        role="assistant", content="ghost")
+        assert await log.emit(
+            sess.id, "turn.delta", {"turn_id": turn.id, "text": "ghost"},
+            messages=[ghost],
+        ) is None
+        assert await log.emit(
+            sess.id, "turn.tool_call",
+            {"turn_id": turn.id, "call_id": "late", "tool": "fs__read_file",
+             "args_digest": "sha256:deadbeef"},
+            messages=[Message(id="late-ghost-2", session_id=sess.id, turn_id=turn.id,
+                              role="assistant", content="ghost")],
+        ) is None
+
+        assert len(log.store.read_since(sess.id, 0)) == before_events
+        messages = log.snapshot(sess.id)["messages"]
+        assert len(messages) == before_messages
+        assert [m["id"] for m in messages if m["id"].startswith("late-ghost")] == []
+        # No row can be written without an event: every stored message is anchored.
+        assert all(m["seq"] > 0 for m in messages)
+        assert all(m.seq > 0 for m in log.store.load(sess.id).messages)
 
     asyncio.run(scenario())
 

@@ -93,6 +93,7 @@ _APPENDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("superseded_reason", "TEXT"),
         ("user_message_id", "TEXT"),
         ("partial_message_id", "TEXT"),
+        ("user_parts", "TEXT"),
     ),
 }
 
@@ -202,8 +203,8 @@ class SQLiteStore(SessionStore):
             "INSERT INTO turns(id, session_id, state, started_at, ended_at, client_msg_id,"
             " user_text, stopped_reason, error_code, error_message, usage, tool_calls,"
             " root_turn_id, parent_turn_id, version, superseded_by, superseded_reason,"
-            " user_message_id, partial_message_id)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " user_message_id, partial_message_id, user_parts)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(id) DO UPDATE SET state=excluded.state,"
             " started_at=excluded.started_at, ended_at=excluded.ended_at,"
             " stopped_reason=excluded.stopped_reason, error_code=excluded.error_code,"
@@ -213,7 +214,8 @@ class SQLiteStore(SessionStore):
             " superseded_by=excluded.superseded_by,"
             " superseded_reason=excluded.superseded_reason,"
             " user_message_id=excluded.user_message_id,"
-            " partial_message_id=excluded.partial_message_id",
+            " partial_message_id=excluded.partial_message_id,"
+            " user_parts=excluded.user_parts",
             (
                 turn.id, sess_id, turn.state.value, turn.started_at, turn.ended_at,
                 turn.client_msg_id, turn.user_text, turn.stopped_reason, turn.error_code,
@@ -222,6 +224,7 @@ class SQLiteStore(SessionStore):
                 turn.root_turn_id, turn.parent_turn_id, int(turn.version or 1),
                 turn.superseded_by, turn.superseded_reason, turn.user_message_id,
                 turn.partial_message_id,
+                json.dumps(list(turn.user_parts), ensure_ascii=False),
             ),
         )
 
@@ -298,6 +301,7 @@ class SQLiteStore(SessionStore):
             superseded_reason=row["superseded_reason"],
             user_message_id=row["user_message_id"],
             partial_message_id=row["partial_message_id"],
+            user_parts=tuple(json.loads(row["user_parts"] or "[]")),
         )
 
     def find_turn_by_client_msg(self, sess_id: str, client_msg_id: str) -> Turn | None:

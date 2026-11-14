@@ -16,7 +16,7 @@ from typing import Any, Mapping
 
 __all__ = [
     "Message", "Role", "TurnState", "Turn", "Session", "QueueItem", "Event",
-    "TERMINAL_STATES", "new_id", "now_ms",
+    "TERMINAL_STATES", "new_id", "now_ms", "message_ref",
 ]
 
 Role = str  # "system" | "user" | "assistant" | "tool"
@@ -49,6 +49,17 @@ def new_id() -> str:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def message_ref(message: Message) -> str:
+    """`msg:<hex>` pointer to a persisted message (RFC-0006 §4.3/§5.1).
+
+    One convention for every pointer the core emits (`result_ref`,
+    `partial_message_id`): the message row keeps its bare `uuid4().hex` id, the
+    pointer carries the `msg:` scheme so a client can tell a pointer from an
+    opaque id. `split(":", 1)[1]` is the snapshot key.
+    """
+    return f"msg:{message.id}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +131,11 @@ class Turn:
     user_message_id: str | None = None
     #: RFC-0006 §4: the `partial=true` assistant message written on interrupt.
     partial_message_id: str | None = None
+    #: RFC-0006 §6.2: content part types (`image`, `file`, …) this turn was
+    #: queued with, other than `text`. Only `text` is persisted as a message,
+    #: so `regenerate` cannot rebuild the rest yet and must refuse instead of
+    #: silently dropping an attachment. Empty for a text-only turn.
+    user_parts: tuple[str, ...] = ()
 
     def with_state(self, state: TurnState, **changes: Any) -> "Turn":
         return replace(self, state=state, **changes)
@@ -150,6 +166,7 @@ class Turn:
             "superseded_reason": self.superseded_reason,
             "user_message_id": self.user_message_id,
             "partial_message_id": self.partial_message_id,
+            "user_parts": list(self.user_parts),
         }
 
 

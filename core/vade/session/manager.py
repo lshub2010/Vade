@@ -240,7 +240,12 @@ class SessionLog:
             if event_type in PAYLOAD_ONLY_EVENTS and body.get("turn_id") in self._terminal:
                 continue  # tombstone: the turn is closed, drop the late write
             kept.append((event_type, body))
-        if not kept and not messages and not turns and not message_updates:
+        if not kept:
+            # RFC-0006 §4.2: the tombstone drops the *write*, not just the
+            # event. A late `turn.tool_call`/`turn.delta` may carry the messages
+            # it meant to persist; appending them with no event to anchor them
+            # wrote a `seq=0` assistant bubble into a turn that had already
+            # closed. Nothing left to announce means nothing left to write.
             return []
 
         async with self._emit_lock(session_id):
@@ -441,7 +446,7 @@ class SessionLog:
             id=turn_id, session_id=session_id, state=TurnState.QUEUED,
             client_msg_id=client_msg_id, user_text=user_text,
             root_turn_id=turn_id, parent_turn_id=None, version=1,
-            user_message_id=message_id,
+            user_message_id=message_id, user_parts=_parts_of(blocks),
         )
         message = Message(
             id=message_id, session_id=session_id, turn_id=turn_id, role="user",
@@ -512,6 +517,17 @@ class SessionLog:
         user_message = self._user_message_of(session, old)
         if user_message is None:
             raise VadeError("INVALID_ARGUMENT", "turn has no user message to rebuild from")
+        if old.user_parts:
+            # RFC-0006 §6.2: RFC-0004 parts are not landed, so an attachment
+            # reference cannot be rebuilt (`text` is all a turn stores). The
+            # old code rebuilt the text and silently dropped the rest; refuse
+            # before any row/event is written instead.
+            raise VadeError(
+                "UNSUPPORTED",
+                "turn has non-text content parts that cannot be rebuilt yet",
+                data={"capability": "parts", "turn_id": old.id,
+                      "parts": list(old.user_parts)},
+            )
 
         new_turn_id = new_id()
         new_turn = Turn(
@@ -567,13 +583,26 @@ class SessionLog:
             raise VadeError("NOT_FOUND", f"message {message_id!r} does not exist")
         if message.role != "user":
             raise VadeError("INVALID_ARGUMENT", "only user messages can be edited")
-        old_turn = self._find_turn(session, message.turn_id) if message.turn_id else None
-        if old_turn is None:
+        born_in = self._find_turn(session, message.turn_id) if message.turn_id else None
+        if born_in is None:
             raise VadeError("NOT_FOUND", "message does not belong to a turn")
+        # RFC-0006 §6.3 + §6.2: `regenerate` reuses the user message but leaves
+        # its `turn_id` pointing at v1, so the turn an edit actually replaces is
+        # the head of that message's version chain. Reading `message.turn_id`
+        # directly made every edit after a regenerate fail `not_head` and the
+        # edit capability dead on a version chain.
+        old_turn = self._head_of(session, born_in)
+        if old_turn is None:  # pragma: no cover - a chain always has one head
+            raise VadeError("INVALID_ARGUMENT", "turn has no live head",
+                            data={"reason": "not_head", "head_turn_id": None})
 
         existing = self.store.find_turn_by_client_msg(session_id, client_msg_id)
         if existing is not None:
-            if existing.parent_turn_id != old_turn.id:
+            # Idempotency keys on the user-message chain (one root per message,
+            # unchanged by regenerate/edit), not on the head row: after a
+            # successful edit the head IS the turn this id created, and a retry
+            # must return it instead of `client_msg_id_conflict`.
+            if existing.root_id != born_in.root_id:
                 raise VadeError(
                     "INVALID_ARGUMENT",
                     "client_msg_id is already used by another turn",
@@ -608,6 +637,7 @@ class SessionLog:
             client_msg_id=client_msg_id, user_text=new_text,
             root_turn_id=old_turn.root_id, parent_turn_id=old_turn.id,
             version=(old_turn.version or 1) + 1, user_message_id=new_message_id,
+            user_parts=_parts_of(blocks),
         )
         superseded = replace(old_turn, superseded_by=new_turn_id,
                              superseded_reason=REASON_EDIT)
@@ -719,3 +749,18 @@ def _require_client_msg_id(client_msg_id: Any) -> None:
 
 def _text_of(blocks: Sequence[Mapping[str, Any]]) -> str:
     return content_text(blocks)
+
+
+def _parts_of(blocks: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    """Non-text content part types on a user message (RFC-0006 §6.2).
+
+    Only `text` becomes a stored `Message`, so the *types* of everything else
+    are remembered on the turn row: `regenerate` must refuse a turn whose
+    attachments it cannot rebuild rather than silently dropping them.
+    """
+    seen: list[str] = []
+    for block in blocks:
+        kind = str(block.get("type", "text"))
+        if kind != "text" and kind not in seen:
+            seen.append(kind)
+    return tuple(seen)

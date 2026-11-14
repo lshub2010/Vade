@@ -80,6 +80,53 @@ def test_regenerate_supersedes_the_old_turn_and_reuses_the_user_message(tmp_path
     asyncio.run(scenario())
 
 
+def test_regenerating_a_turn_with_non_text_parts_is_unsupported(tmp_path):
+    """S5: RFC §6.2 — parts are not rebuildable yet, so refuse, never drop.
+
+    Only `text` becomes a stored message, so the old code rebuilt the text and
+    silently lost the attachment. The turn row now remembers the part types and
+    `regenerate` answers `UNSUPPORTED` with `data.capability="parts"` before it
+    writes any row or event.
+    """
+
+    async def scenario():
+        log = _log(tmp_path)
+        sess = log.create_session()
+        first, _ = await log.submit(
+            sess.id,
+            [{"type": "text", "text": "look"}, {"type": "image", "file_id": "f_123"}],
+            "s1",
+        )
+        await log.wait_idle(sess.id)
+
+        row = next(t for t in log.snapshot(sess.id)["turns"] if t["id"] == first.id)
+        assert row["user_parts"] == ["image"]
+        events_before = len(log.store.read_since(sess.id, 0))
+        messages_before = len(log.snapshot(sess.id)["messages"])
+
+        with pytest.raises(VadeError) as caught:
+            await log.regenerate(sess.id, first.id, "r1")
+        assert caught.value.code == "UNSUPPORTED"
+        assert caught.value.data["capability"] == "parts"
+
+        snapshot = log.snapshot(sess.id)
+        assert len(snapshot["turns"]) == 1
+        assert len(snapshot["messages"]) == messages_before
+        assert len([m for m in snapshot["messages"] if m["role"] == "user"]) == 1
+        assert len(log.store.read_since(sess.id, 0)) == events_before
+
+        # The refusal is stored, not remembered: a restart answers the same.
+        await log.close()
+        reopened = SessionLog(SQLiteStore(tmp_path / "sessions.db"), replay=ReplayBuffer())
+        with pytest.raises(VadeError) as again:
+            await reopened.regenerate(sess.id, first.id, "r2")
+        assert again.value.code == "UNSUPPORTED"
+        assert again.value.data["capability"] == "parts"
+        await reopened.close()
+
+    asyncio.run(scenario())
+
+
 def test_the_same_client_msg_id_returns_the_same_new_turn(tmp_path):
     """A9: double click produces one version, not two."""
 

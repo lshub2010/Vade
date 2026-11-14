@@ -84,6 +84,68 @@ def test_edit_appends_a_message_and_points_the_old_one_at_it(tmp_path):
     asyncio.run(scenario())
 
 
+def test_editing_after_a_regenerate_builds_on_the_new_head(tmp_path):
+    """S3: v1 → regenerate v2 → edit must produce v3, not `not_head`.
+
+    `regenerate` reuses the user message but leaves `message.turn_id` pointing
+    at v1, so resolving the turn from that row read a superseded turn and killed
+    the edit path on any version chain.
+    """
+
+    async def scenario():
+        log = _log(tmp_path)
+        sess = log.create_session()
+        first, _ = await log.submit(sess.id, [{"type": "text", "text": "v1"}], "s1")
+        await log.wait_idle(sess.id)
+        second = await log.regenerate(sess.id, first.id, "r1")
+        await log.wait_idle(sess.id)
+        original = _user_messages(log, sess.id)[0]
+
+        result = await log.edit_resubmit(
+            sess.id, original["id"], [{"type": "text", "text": "v3"}], "e1"
+        )
+        assert result["supersedes_turn_id"] == second["turn_id"]
+        assert result["root_turn_id"] == first.id
+        assert result["version"] == 3
+        await log.wait_idle(sess.id)
+
+        turns = {t["id"]: t for t in log.snapshot(sess.id)["turns"]}
+        assert turns[first.id]["superseded_by"] == second["turn_id"]
+        assert turns[second["turn_id"]]["superseded_by"] == result["turn_id"]
+        assert turns[second["turn_id"]]["superseded_reason"] == "edit_resubmit"
+        head = turns[result["turn_id"]]
+        assert head["parent_turn_id"] == second["turn_id"]
+        assert head["superseded_by"] is None
+        assert head["version"] == 3
+        assert head["user_message_id"] == result["message_id"]
+        assert len([t for t in turns.values() if t["superseded_by"] is None]) == 1
+
+        users = _user_messages(log, sess.id)
+        assert len(users) == 2
+        new_message = next(m for m in users if m["id"] == result["message_id"])
+        assert new_message["content"] == "v3"
+        assert next(m for m in users if m["id"] == original["id"])["content"] == "v1"
+
+        events = log.store.read_since(sess.id, 0)
+        edited = [e for e in events if e.type == "message.edited"][-1]
+        superseded = [e for e in events if e.type == "turn.superseded"][-1]
+        queued = [e for e in events if e.type == "turn.queued"][-1]
+        assert edited.seq < superseded.seq < queued.seq
+        assert edited.payload["superseded_by_message_id"] == result["message_id"]
+        assert superseded.payload["turn_id"] == second["turn_id"]
+        assert queued.payload["version"] == 3
+
+        # Idempotency must survive the head moving forward: a retry of the same
+        # edit returns the turn it already created instead of a conflict.
+        retry = await log.edit_resubmit(
+            sess.id, original["id"], [{"type": "text", "text": "v3"}], "e1"
+        )
+        assert retry["turn_id"] == result["turn_id"]
+        assert len(_user_messages(log, sess.id)) == 2
+
+    asyncio.run(scenario())
+
+
 def test_only_the_last_user_message_is_editable(tmp_path):
     async def scenario():
         log = _log(tmp_path)

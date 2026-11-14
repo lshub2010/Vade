@@ -24,15 +24,28 @@ MAX_REDACTED_PATHS = 16
 
 _MASK = "***"
 
-#: `_`/`-`/`.` split, then whole-word match. Whole-word is why `author` does not
-#: match `auth`: the token has to be the entire segment.
-_SECRET_KEY = re.compile(
-    r"(?:pass(?:word|phrase)?|secret|token|api[_-]?key|access[_-]?key|"
-    r"private[_-]?key|credential|cookie|authorization|auth|session[_-]?id|dsn|"
-    r"connection[_-]?string)",
-    re.I,
+#: Key-name matching is two-stage, because the multi-word names below contain
+#: the separators the tokenizer removes:
+#:   1. normalize the WHOLE key (lowercase, separators dropped) and match the
+#:      compound alternatives — `api_key`, `api-key`, `X-Api-Key`,
+#:      `aws_secret_access_key` all collapse to a `…apikey` ending;
+#:   2. split into tokens and match them whole-word, which is what keeps
+#:      `author` out of `auth` and catches the `_token`/`_secret`/`_password`
+#:      suffixes (`refresh_token`, `client_secret`, `db_password`).
+#: Matching only the split tokens (the pre-fix behaviour) made every alternative
+#: carrying `[_-]?` dead code: a token can never contain `_` or `-`.
+_SECRET_KEY_WORD = re.compile(
+    r"(?:pass(?:word|phrase)?|secret|token|credential|cookie|authorization|auth|dsn)"
 )
-_KEY_SPLIT = re.compile(r"[_.\-]+")
+_SECRET_KEY_COMPOUND = (
+    "apikey", "accesskey", "privatekey", "sessionid", "connectionstring",
+)
+_KEY_SPLIT = re.compile(r"[_.\-\s]+")
+#: `apiKey`/`clientSecret` split before the token pass; cheap, and the compound
+#: pass already covers the leading-word forms.
+_CAMEL_BREAK = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
 
 #: Applied to every string value; a hit replaces the WHOLE value, not the match,
 #: so a re-scan of the finished preview cannot find the pattern again.
@@ -44,7 +57,10 @@ SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"Bearer\s+\S+"),
     re.compile(r"[A-Fa-f0-9]{32,}"),
-    re.compile(r"[A-Za-z0-9+/]{40,}={0,2}"),
+    #: RFC-0006 §5.2 step 3: >=32 characters (32 chars is the common shape of a
+    #: 24-byte random token). `-`/`_` are URL-safe base64, which the old
+    #: `{40,}` alphabet silently let through.
+    re.compile(r"[A-Za-z0-9+/_-]{32,}={0,2}"),
 )
 
 
@@ -56,8 +72,24 @@ def redact_value(value: str) -> str | None:
     return None
 
 
+def _normalize_key(key: str) -> str:
+    return _NON_ALNUM.sub("", key.lower())
+
+
+def _key_tokens(key: str) -> list[str]:
+    return [token for token in _KEY_SPLIT.split(_CAMEL_BREAK.sub("_", key)) if token]
+
+
 def _key_is_secret(key: str) -> bool:
-    return any(_SECRET_KEY.fullmatch(token) for token in _KEY_SPLIT.split(key) if token)
+    """Whole-key normalization first, then whole-token matching (see above)."""
+    normalized = _normalize_key(key)
+    if not normalized:
+        return False
+    if any(normalized.endswith(name) for name in _SECRET_KEY_COMPOUND):
+        return True
+    if _SECRET_KEY_WORD.fullmatch(normalized):
+        return True
+    return any(_SECRET_KEY_WORD.fullmatch(_normalize_key(token)) for token in _key_tokens(key))
 
 
 def _compress(value: Any, *, depth: int, redacted: list[str], path: str,

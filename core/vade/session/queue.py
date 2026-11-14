@@ -19,7 +19,7 @@ from collections import deque
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError
-from .models import Message, QueueItem, Turn, TurnState, new_id, now_ms
+from .models import Message, QueueItem, Turn, TurnState, message_ref, new_id, now_ms
 
 __all__ = ["TurnQueue"]
 
@@ -263,14 +263,18 @@ class TurnQueue:
     async def _finalize_interrupted(self, turn: Turn, *, by: str,
                                     task: asyncio.Task[Any] | None = None) -> None:
         text, message = self._partial_message(turn.id)
+        # RFC-0006 §4.3 + schema/events.json: `partial_message_id` is a
+        # `msg:<hex>` pointer, the same scheme as `result_ref` — a bare hex id
+        # made clients that split on ':' fail.
+        pointer = message_ref(message) if message is not None else None
         payload: dict[str, Any] = {
             "turn_id": turn.id, "by": by, "state": TurnState.INTERRUPTED.value,
             # RFC-0006 §4.3: the event carries a pointer, never the text.
-            "partial_message_id": message.id if message is not None else None,
+            "partial_message_id": pointer,
             "partial_chars": len(text),
         }
         if message is not None:
-            turn = turn.with_state(TurnState.INTERRUPTED, partial_message_id=message.id)
+            turn = turn.with_state(TurnState.INTERRUPTED, partial_message_id=pointer)
         await self._finalize(
             turn, TurnState.INTERRUPTED, payload,
             messages=[message] if message is not None else (), task=task,

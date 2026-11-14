@@ -20,6 +20,7 @@ from ..session.models import Message, Turn, new_id, now_ms
 from .context import CompactionConfig, ContextBuilder
 from .ports import ApprovalDecision, ApprovalPort, ApprovalRequest, AuditPort, MemoryPort, NullApprovalPort, NullAuditPort
 from .prompt import PromptParts, apply_hooks, assemble
+from .toolcard import build_args_preview
 from .tools import ToolSnapshot
 
 __all__ = ["LoopEngine", "LoopConfig", "TurnOutcome", "DEFAULT_PERSONA"]
@@ -45,6 +46,35 @@ class TurnOutcome:
     assistant_text: str = ""
     tool_calls: tuple[dict[str, Any], ...] = ()
     stopped_reason: str | None = None
+
+
+class _PartCursors:
+    """RFC-0006 §7: `part_index` allocation for `turn.delta`.
+
+    One segment per assistant text block: the first delta of a model step takes
+    the next index and every later delta of that step reuses it, so
+    "explain → call → explain" becomes 0,1,2 without a `turn.part.started`
+    event. A step that streams no text allocates none (indexes may skip).
+    """
+
+    def __init__(self) -> None:
+        self._next = 0
+        self._step: int | None = None
+
+    def begin_step(self) -> None:
+        self._step = None
+
+    def text(self) -> int:
+        if self._step is None:
+            self._step = self._next
+            self._next += 1
+        return self._step
+
+    def fresh(self) -> int:
+        self._step = None
+        index = self._next
+        self._next += 1
+        return index
 
 
 class LoopEngine:
@@ -85,7 +115,10 @@ class LoopEngine:
         snapshot = self._snapshot()
         if self.router is None or not snapshot:
             text = "No capabilities are available: no module is online, so I cannot run tools."
-            await self._turn_emit(turn, "turn.delta", {"turn_id": turn.id, "text": text})
+            await self._turn_emit(
+                turn, "turn.delta",
+                {"turn_id": turn.id, "text": text, "part_index": 0, "kind": "notice"},
+            )
             return TurnOutcome(assistant_text=text, stopped_reason="no_capability",
                                usage=_usage_record(turn.model_id, {}, reported=False, steps=0))
 
@@ -110,8 +143,10 @@ class LoopEngine:
         stopped_reason = "stop"
         reported = False
         llm_calls = 0
+        parts = _PartCursors()
 
         for step in range(self.config.max_steps):
+            parts.begin_step()
             text_parts: list[str] = []
             calls: dict[int, dict[str, str]] = {}
             call_usage: dict[str, int] = {}
@@ -129,7 +164,10 @@ class LoopEngine:
                     if delta.text:
                         text_parts.append(delta.text)
                         await self._turn_emit(
-                            turn, "turn.delta", {"turn_id": turn.id, "text": delta.text}
+                            turn, "turn.delta",
+                            {"turn_id": turn.id, "text": delta.text,
+                             # RFC-0006 §7: same index for every delta of this step.
+                             "part_index": parts.text(), "kind": "text"},
                         )
                     for fragment in delta.tool_calls:
                         slot = calls.setdefault(fragment.index, {"id": "", "name": "", "arguments": ""})
@@ -165,6 +203,9 @@ class LoopEngine:
                 tool_calls=tuple(_openai_call(c) for _, c in sorted(calls.items())),
             )
             messages.append(assistant.to_llm())
+            # RFC-0006 §5.3: one id per assistant model step. It means "same
+            # batch", never "parallel" — v1 awaits these calls one by one.
+            batch_id = "bat_" + new_id()[:16]
             first = True
             for index in sorted(calls):
                 call = calls[index]
@@ -172,9 +213,18 @@ class LoopEngine:
                 name = call["name"]
                 args = _parse_args(call["arguments"])
                 entry = snapshot.get(name)
+                # An unknown tool has no manifest, so no risk level was ever
+                # vetted for it: preview it as high (shape only) rather than
+                # guessing `low` and echoing arguments nobody approved.
+                risk = getattr(entry, "risk", None) or "high"
                 tool_call_payload = {
                     "turn_id": turn.id, "call_id": call_id, "tool": name,
+                    # The digest is untouched by RFC-0006: it stays the audit
+                    # and approval anchor, and `args_preview` never feeds it.
                     "args_digest": digest_args(args),
+                    "started_at": now_ms(),
+                    "batch_id": batch_id,
+                    **build_args_preview(args, risk),
                 }
                 # `turn.tool_call` is a write into the turn stream like any
                 # other, and it is the last one before the side effect: a
@@ -196,13 +246,17 @@ class LoopEngine:
                         + (", ".join(snapshot.names()) or "(none)")
                         + ". Continue without it."
                     )
+                    tool_message = Message(id=new_id(), session_id=turn.session_id,
+                                           turn_id=turn.id, role="tool", name=name,
+                                           tool_call_id=call_id, content=message)
                     await self._turn_emit(
                         turn, "turn.tool_result",
                         {"turn_id": turn.id, "call_id": call_id, "ok": False,
-                         "summary": f"unknown tool {name!r}"},
-                        messages=[Message(id=new_id(), session_id=turn.session_id, turn_id=turn.id,
-                                          role="tool", name=name, tool_call_id=call_id,
-                                          content=message)],
+                         "summary": f"unknown tool {name!r}",
+                         # Not executed, so no duration: `null`, never `0ms`.
+                         "duration_ms": None, "truncated": False,
+                         "result_ref": _result_ref(tool_message)},
+                        messages=[tool_message],
                     )
                     messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": message})
                     recorded.append({"tool": name, "args_digest": digest_args(args), "ok": False})
@@ -220,13 +274,16 @@ class LoopEngine:
                              "scope": decision.scope, "state": "running"},
                         )
                     messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": message})
+                    tool_message = Message(id=new_id(), session_id=turn.session_id,
+                                           turn_id=turn.id, role="tool", name=name,
+                                           tool_call_id=call_id, content=message)
                     await self._turn_emit(
                         turn, "turn.tool_result",
                         {"turn_id": turn.id, "call_id": call_id, "ok": False,
-                         "summary": "denied"},
-                        messages=[Message(id=new_id(), session_id=turn.session_id, turn_id=turn.id,
-                                          role="tool", name=name, tool_call_id=call_id,
-                                          content=message)],
+                         "summary": "denied",
+                         "duration_ms": None, "truncated": False,
+                         "result_ref": _result_ref(tool_message)},
+                        messages=[tool_message],
                     )
                     recorded.append({"tool": name, "args_digest": digest_args(args), "ok": False})
                     continue
@@ -248,16 +305,26 @@ class LoopEngine:
                 self._audit(audit_event)
                 if interrupted:
                     raise asyncio.CancelledError
-                summary = _summary(result)
-                payload = {"turn_id": turn.id, "call_id": call_id, "ok": result.ok, "summary": summary}
+                summary, summary_cut = _summary(result)
+                tool_content, content_cut = self._tool_content(entry, result)
+                tool_message = Message(id=new_id(), session_id=turn.session_id,
+                                       turn_id=turn.id, role="tool", name=name,
+                                       tool_call_id=call_id, content=tool_content)
+                payload = {
+                    "turn_id": turn.id, "call_id": call_id, "ok": result.ok,
+                    "summary": summary,
+                    # RFC-0006 §5.3: measured by the router at call return,
+                    # excluding approval wait and queueing.
+                    "duration_ms": int(getattr(result, "duration_ms", 0) or 0),
+                    # Either the 300-char summary window cut it, or the full
+                    # text overflowed to the blob store.
+                    "truncated": bool(summary_cut or content_cut),
+                    "result_ref": _result_ref(tool_message),
+                }
                 if not result.ok:
                     payload["code"] = result.code
-                tool_content = self._tool_content(entry, result)
                 await self._turn_emit(
-                    turn, "turn.tool_result", payload,
-                    messages=[Message(id=new_id(), session_id=turn.session_id, turn_id=turn.id,
-                                      role="tool", name=name, tool_call_id=call_id,
-                                      content=tool_content)],
+                    turn, "turn.tool_result", payload, messages=[tool_message],
                 )
                 messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": tool_content})
                 recorded.append({"tool": name, "args_digest": digest_args(args), "ok": result.ok})
@@ -271,7 +338,14 @@ class LoopEngine:
             notice = (f"Stopped after {self.config.max_steps} steps to avoid an endless tool loop. "
                       "Ask me to continue if you want me to keep going.")
             final_text = (final_text + "\n" + notice).strip()
-            await self._turn_emit(turn, "turn.delta", {"turn_id": turn.id, "text": notice})
+            # RFC-0006 §7.2: the notice is its own segment, so a client can
+            # render it as a system-ish line instead of appending it to the
+            # model's final answer.
+            await self._turn_emit(
+                turn, "turn.delta",
+                {"turn_id": turn.id, "text": notice,
+                 "part_index": parts.fresh(), "kind": "notice"},
+            )
 
         if self._is_interrupted(turn):
             # The stream ended (or the step budget ran out) after the user
@@ -428,18 +502,24 @@ class LoopEngine:
             return ""  # M4a absent must not block a turn
         return "\n".join(getattr(item, "text", "") for item in items if getattr(item, "text", ""))
 
-    def _tool_content(self, entry: Any, result: Any) -> str:
+    def _tool_content(self, entry: Any, result: Any) -> tuple[str, bool]:
+        """`(content, truncated)` — truncated means the full text left the message.
+
+        `ToolCallResult.to_tool_result()` reports `truncated=false` unconditionally
+        (it has no idea what the context window can hold), so the flag has to be
+        computed here, at the site that decides to write a blob (RFC-0006 §5.3).
+        """
         if not result.ok:
             return json.dumps({"ok": False, "error": {"code": result.code, "message": result.message}},
-                              ensure_ascii=False)
+                              ensure_ascii=False), False
         text = json.dumps(result.result, ensure_ascii=False, default=str)
         limit = self.context.config.max_tool_result_tokens * 4
         if len(text) <= limit:
-            return text
+            return text, False
         if self.context.blobs is not None:
             blob_id = self.context.blobs.put(text)
-            return f"[tool result too large; blob_id={blob_id}] " + text[:500]
-        return text[:limit]
+            return f"[tool result too large; blob_id={blob_id}] " + text[:500], True
+        return text[:limit], True
 
     def _audit(self, event: Mapping[str, Any]) -> None:
         try:
@@ -506,8 +586,15 @@ def _openai_call(call: Mapping[str, str]) -> dict[str, Any]:
     }
 
 
-def _summary(result: Any) -> str:
+def _summary(result: Any) -> tuple[str, bool]:
+    """`(summary, truncated)` — truncated when the 300-char window cut it."""
     if result.ok:
         text = json.dumps(result.result, ensure_ascii=False, default=str)
-        return text[:300]
-    return f"{result.code}: {result.message}"[:300]
+    else:
+        text = f"{result.code}: {result.message}"
+    return text[:300], len(text) > 300
+
+
+def _result_ref(message: Message) -> str:
+    """`msg:<hex>` pointer a UI can resolve in `snapshot.messages[]`."""
+    return f"msg:{message.id}"

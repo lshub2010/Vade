@@ -26,6 +26,7 @@ from typing import Any, Mapping
 from .._jsonschema import SchemaError, validate as js_validate
 from ..errors import VadeError
 from ..llm.capabilities import MAX_MODELS, ModelSpec, parse_models
+from .uipage import UIPage, validate_ui
 
 __all__ = [
     "Manifest",
@@ -39,6 +40,7 @@ __all__ = [
     "MAX_TOOLS_PER_MODULE",
     "MAX_TOOLS_GLOBAL",
     "MAX_FRAME_PLAINTEXT",
+    "UIPage",
 ]
 
 SCHEMA_PATH = Path(__file__).resolve().parents[3] / "schema" / "manifest.schema.json"
@@ -116,6 +118,11 @@ class Manifest:
     #: Empty = "declares nothing" -> core synthesises `<module_id>/*`, it is
     #: NOT "serves no model".
     models: tuple[ModelSpec, ...] = ()
+    #: C-19 append (RFC-0009 §4.2/§9.2). `()` means "this module has no pages" —
+    #: the entry rules (§8.2) turn that into "no entry at all", not an empty tab.
+    #: Pages that failed validation are absent, and `ui_warnings` says which.
+    ui_pages: tuple[UIPage, ...] = ()
+    ui_warnings: tuple[str, ...] = ()
 
     @property
     def protocol_major(self) -> int:
@@ -302,6 +309,16 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
             )
     models = parse_models(models_raw)
 
+    # C-19 append (RFC-0009 §7.1): pages are validated per page. A bad page is
+    # dropped with a warning instead of failing the registration — one UI typo
+    # must not take the module's tools down with it. `validate_ui` never raises:
+    # it returns (accepted, warnings), which is why this cannot turn into a
+    # partial accept.
+    ui_pages, ui_warnings = validate_ui(
+        raw.get("ui"),
+        module_tools=tuple(spec.name for spec in tools),
+    )
+
     digest = hashlib.sha256(
         json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
@@ -322,4 +339,6 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
         digest=digest,
         subscriptions=tuple(subscriptions),
         models=models,
+        ui_pages=ui_pages,
+        ui_warnings=ui_warnings,
     )

@@ -59,8 +59,76 @@ PUSH_TRANSPORT = "events/deliver"
 STATE_CHANGE_EVENTS = {
     "turn.queued", "turn.started", "turn.completed", "turn.failed",
     "turn.interrupted", "turn.cancelled", "turn.approval_resolved",
+    # RFC-0008 §10.1 row 4: both carry `state` and are therefore state-change
+    # events. Entering `waiting_input` IS `turn.input_required`; leaving it is
+    # `turn.input_resolved` (state=running|interrupted). Not registering them
+    # would fail the C-06 rule-4 scan below.
+    "turn.input_required", "turn.input_resolved",
+    # RFC-0007 §5.2/§5.3: the task family. `task.started` is a state-change
+    # event too (state ∈ {queued, running}); `task.progress` is the opposite.
+    "task.started", "task.status", "task.finished",
 }
-PAYLOAD_ONLY_EVENTS = {"turn.delta", "turn.tool_call", "turn.tool_result"}
+PAYLOAD_ONLY_EVENTS = {
+    "turn.delta", "turn.tool_call", "turn.tool_result",
+    "task.progress",
+}
+
+#: RFC-0007 §9.4: the frozen `[tasks]` key set, defaults and apply semantics.
+#: Kept here (not derived from the schema) so a silent default change goes red.
+TASKS_DEFAULTS: dict[str, object] = {
+    "tasks.max_concurrent": 8,
+    "tasks.max_depth": 4,
+    "tasks.ui_fold_depth": 3,
+    "tasks.history_limit": 50,
+    "tasks.snapshot_finished": 20,
+    "tasks.log_lines": 200,
+    "tasks.log_bytes": 65536,
+    "tasks.log_ring_lines": 2000,
+    "tasks.log_line_chars": 4096,
+    "tasks.progress_hz": 2,
+    "tasks.event_burst": 20,
+    "tasks.cancel_grace_ms": 2000,
+    "tasks.subagent_message": False,
+}
+TASKS_HOT = {
+    "tasks.max_concurrent",
+    "tasks.ui_fold_depth",
+    "tasks.history_limit",
+    "tasks.snapshot_finished",
+    "tasks.log_lines",
+    "tasks.log_bytes",
+    "tasks.log_line_chars",
+    "tasks.progress_hz",
+    "tasks.event_burst",
+    "tasks.cancel_grace_ms",
+}
+
+#: RFC-0007 §5.2: `task_states`, terminal three, and the two hard ceilings.
+TASK_TERMINAL_STATES = {"completed", "failed", "cancelled"}
+
+#: RFC-0006 §6.4: names emitted inside an `emit_batch([("name", {...}), ...])`.
+_BATCH_EVENT_LITERAL = re.compile(r"\(\s*[\"']([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)[\"']\s*,")
+
+#: RFC-0006 §9.1: the `required` arrays must be byte-identical to 1.0.0 —
+#: every field this RFC adds is optional. Hardcoded so a "helpful" promotion of
+#: a new field to required goes red instead of shipping a 1.1 break.
+RFC0006_REQUIRED = {
+    "turn.delta": ["turn_id", "text"],
+    "turn.tool_call": ["turn_id", "call_id", "tool", "args_digest"],
+    "turn.tool_result": ["turn_id", "call_id", "ok", "summary"],
+    "turn.interrupted": ["turn_id", "state", "by"],
+    "turn.queued": ["turn_id", "state"],
+}
+
+#: RFC-0006 §5.1/§7.1/§6.1: appended optional fields per event.
+RFC0006_FIELDS = {
+    "turn.delta": {"part_index", "kind"},
+    "turn.tool_call": {"args_preview", "args_preview_mode", "args_preview_redacted",
+                       "args_preview_truncated", "started_at", "batch_id"},
+    "turn.tool_result": {"duration_ms", "truncated", "result_ref"},
+    "turn.interrupted": {"partial_message_id", "partial_chars"},
+    "turn.queued": {"root_turn_id", "version", "parent_turn_id", "user_message_id", "reason"},
+}
 
 #: RFC-0004 §7.4: the frozen `[attach]` key set, defaults and apply semantics.
 #: Kept here (not derived from the schema) so a silent default change goes red.
@@ -139,6 +207,41 @@ MODEL_METHODS = {"model/list", "session/model.get", "session/model.set", "sessio
 #: RFC-0005 §4.3: a manifest must not become a second model directory.
 MAX_MANIFEST_MODELS = 16
 
+#: RFC-0009 §7.3: the frozen `[ui]` key set, defaults and apply semantics.
+UI_DEFAULTS: dict[str, object] = {
+    "ui.state_cache_s": 5,
+    "ui.page_cache_bytes": 65536,
+    "ui.module_cache_bytes": 524288,
+    "ui.pending_calls": 256,
+}
+UI_HOT = {
+    "ui.state_cache_s",
+    "ui.page_cache_bytes",
+    "ui.module_cache_bytes",
+    "ui.pending_calls",
+}
+
+#: RFC-0009 §4.5 rev 1: the seven component names, and the four host components
+#: that must never appear on a page (impersonation, not styling).
+UI_COMPONENTS = {
+    "Button", "TextField", "Card", "ListItem", "Switch", "ToolCallCard", "AttachmentChip",
+}
+UI_HOST_COMPONENTS = {"MessageBubble", "InputBar", "ApprovalDialog", "BottomBar"}
+#: RFC §6's three kinds plus the `open_url` required by the C-19 implementation
+#: brief (http/https only; it opens the user's browser, never loads a page).
+UI_ACTION_KINDS = {"navigate", "tools/call", "ui/submit", "open_url"}
+#: §7.3 / §4.2: page counts and byte budgets.
+UI_LIMITS = {
+    "pages_per_module": 8,
+    "ui_block_max_bytes": 49152,
+    "ui_inline_max_bytes": 8192,
+    "ui_ref_max_bytes": 65536,
+    "ui_nodes_per_page": 256,
+    "ui_depth_max": 8,
+}
+
+#: §10.1: the module-page render path may not contain these tokens at all.
+UI_FORBIDDEN_CODE = ("eval(", "Function(", "exec(", "WebView(", "loadUrl(", "<script")
 
 FAILURES: list[str] = []
 
@@ -180,7 +283,14 @@ def emitted_event_names() -> set[str]:
     pattern = re.compile(r"emit\(\s*[^,()]+,\s*[\"']([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)[\"']")
     names = set(DYNAMIC_EVENT_TYPES)
     for path in sorted(CORE.rglob("*.py")):
-        names |= set(pattern.findall(path.read_text(encoding="utf-8")))
+        source = path.read_text(encoding="utf-8")
+        names |= set(pattern.findall(source))
+        # Multi-event batches carry their names as tuple literals inside
+        # `emit_batch(...)` (RFC-0006 §6.4 needs several events in ONE
+        # transaction, so they cannot each be an `emit(` call).
+        for call in re.finditer(r"emit_batch\(", source):
+            chunk = source[call.end(): call.end() + 800]
+            names |= set(_BATCH_EVENT_LITERAL.findall(chunk))
     return names
 
 
@@ -231,6 +341,25 @@ def code_turn_states() -> set[str]:
         FAILURES.append("core/vade/session/models.py: cannot locate TurnState")
         return set()
     return set(re.findall(r"=\s*\"([a-z_]+)\"", block.group(1)))
+
+
+def code_task_states() -> set[str]:
+    """RFC-0007 §5.2: the schema's `task_states` and `TaskState` are one enum."""
+    text = (CORE / "tasks" / "models.py").read_text(encoding="utf-8")
+    block = re.search(r"class TaskState\(str, Enum\):(.*?)(?=\nclass |\Z)", text, re.S)
+    if not block:
+        FAILURES.append("core/vade/tasks/models.py: cannot locate TaskState")
+        return set()
+    return set(re.findall(r"=\s*\"([a-z_]+)\"", block.group(1)))
+
+
+def code_terminal_task_states() -> set[str]:
+    text = (CORE / "tasks" / "models.py").read_text(encoding="utf-8")
+    block = re.search(r"TERMINAL_TASK_STATES\s*=\s*frozenset\((.*?)\)", text, re.S)
+    if not block:
+        FAILURES.append("core/vade/tasks/models.py: cannot locate TERMINAL_TASK_STATES")
+        return set()
+    return {name.lower() for name in re.findall(r"TaskState\.([A-Z_]+)", block.group(1))}
 
 
 def walk_leaves(node: dict, prefix: str = ""):
@@ -460,6 +589,361 @@ def check_usage_budget_event(events: dict) -> None:
           f"events.json usage.budget.scope: must be session|day, got {scope!r}")
     check(state.startswith("warn") and "exceeded" in state,
           f"events.json usage.budget.state: must be warn|exceeded, got {state!r}")
+def check_rfc0006(events: dict, rpc: dict, config: dict) -> None:
+    """RFC-0006: append-only additions, frozen `required` arrays, two methods."""
+    appended = (events.get("x-vade") or {}).get("appends")
+    check(isinstance(appended, list) and bool(appended),
+          "events.json: x-vade.appends is missing (RFC-0006 §9.2)")
+    block = next((a for a in (appended or []) if a.get("contract") == "C-06"), {})
+    check(block.get("rewrites") == "none",
+          "events.json x-vade.appends[0]: rewrites must be 'none' (append-only)")
+    check(block.get("version") == "1.1.0",
+          "events.json x-vade.appends[0]: version must be 1.1.0")
+    check(set(block.get("adds") or []) == {"turn.superseded", "message.edited"},
+          "events.json x-vade.appends[0].adds: must be exactly the two RFC-0006 events")
+    declared_fields = {name: set(fields) for name, fields in (block.get("fields") or {}).items()}
+    check(declared_fields == RFC0006_FIELDS,
+          "events.json x-vade.appends[0].fields drift vs RFC-0006 §5.1/§6.1/§7.1")
+
+    declared = dict(events.get("events") or {})
+    for name, required in RFC0006_REQUIRED.items():
+        spec = declared.get(name) or {}
+        check(list(spec.get("required") or []) == required,
+              f"events.json {name}: required changed (RFC-0006 keeps 1.0.0 arrays byte-identical)")
+        missing = RFC0006_FIELDS[name] - set(spec.get("payload") or {})
+        check(not missing, f"events.json {name}: appended fields missing from payload: {sorted(missing)}")
+
+    for name, required in (
+        ("turn.superseded", ["turn_id", "superseded_by", "reason"]),
+        ("message.edited", ["message_id", "session_id", "superseded_by_message_id",
+                            "new_turn_id", "text", "edited_at"]),
+    ):
+        spec = declared.get(name)
+        check(isinstance(spec, dict), f"events.json: {name} is missing (RFC-0006 §6.4)")
+        if isinstance(spec, dict):
+            check(list(spec.get("required") or []) == required,
+                  f"events.json {name}: required must be {required}")
+            check("state" not in (spec.get("required") or []),
+                  f"events.json {name}: must not require `state` (it is not a state change)")
+
+    # §6.4 row 14: `superseded` is NOT a state.
+    check("superseded" not in (events.get("turn_states") or []),
+          "events.json turn_states: RFC-0006 adds no state value")
+
+    methods = set()
+    for direction in (rpc.get("directions") or {}).values():
+        methods |= set(direction)
+    for name in ("turn/regenerate", "message/edit_resubmit"):
+        check(name in methods, f"rpc.json: {name} is missing from ui_to_core (RFC-0006 §9.1)")
+    check("session/fork" not in methods,
+          "rpc.json: session/fork must NOT be registered in v1 (RFC-0006 §6.5)")
+    check(((rpc.get("x-vade") or {}).get("appends") or [{}])[0].get("rewrites") == "none",
+          "rpc.json x-vade.appends: rewrites must be 'none'")
+
+    # §8: the protocol constant and RFC-0004's configurable ceiling must agree.
+    try:
+        from vade.session.limits import TEXT_LIMIT
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        FAILURES.append(f"core/vade/session/limits.py: cannot import TEXT_LIMIT ({exc})")
+        return
+    attach_default = ((config.get("properties") or {}).get("attach") or {}).get("properties", {})
+    configured = (attach_default.get("text_max_chars") or {}).get("default")
+    check(TEXT_LIMIT == configured == 32000,
+          f"RFC-0006 §8: text limit drift (core={TEXT_LIMIT}, attach.text_max_chars={configured})")
+
+PART_TITLES = {"text", "image", "file", "audio"}
+PART_REQUIRED = {
+    "text": {"type", "text"},
+    "image": {"type", "file_id", "mime", "name", "size", "width", "height", "sha256"},
+    "file": {"type", "file_id", "mime", "name", "size"},
+    "audio": {"type", "file_id", "mime", "name", "size"},
+}
+
+
+def check_submit_parts(rpc: dict) -> None:
+    """RFC-0004 §6.1/§7.2: `ui/submit.content` is a typed part union, not `[object]`.
+
+    This is the one breaking change in the batch: a client that sends a block
+    nobody defined used to be silently ignored. The schema is the only place a
+    client author can see that, so its shape is asserted rather than trusted.
+    """
+    submit = ((rpc.get("directions") or {}).get("ui_to_core") or {}).get("ui/submit") or {}
+    content = ((submit.get("params") or {}).get("content")) or {}
+    if not isinstance(content, dict):
+        FAILURES.append("rpc.json ui/submit.content is not a typed array (RFC-0004 §7.2)")
+        return
+    check(content.get("type") == "array", "rpc.json ui/submit.content: type must be array")
+    check(content.get("minItems") == 1, "rpc.json ui/submit.content: minItems must be 1")
+    check(content.get("maxItems") == 20, "rpc.json ui/submit.content: maxItems must be 20 (hard cap)")
+    branches = list(((content.get("items") or {}).get("oneOf")) or [])
+    titles = [str((branch or {}).get("title")) for branch in branches]
+    check(
+        set(titles) == PART_TITLES,
+        f"rpc.json ui/submit.content.oneOf: part types {sorted(titles)} != {sorted(PART_TITLES)}",
+    )
+    for branch in branches:
+        title = str((branch or {}).get("title"))
+        props = (branch or {}).get("properties") or {}
+        const = (props.get("type") or {}).get("const")
+        check(const == title, f"rpc.json ui/submit.content[{title}]: type const {const!r} != {title!r}")
+        required = set((branch or {}).get("required") or [])
+        expected = PART_REQUIRED.get(title, set())
+        check(
+            required == expected,
+            f"rpc.json ui/submit.content[{title}]: required {sorted(required)} != {sorted(expected)}",
+        )
+        for name in expected:
+            check(name in props, f"rpc.json ui/submit.content[{title}]: {name} not declared")
+    image = next((b for b in branches if (b or {}).get("title") == "image"), {}) or {}
+    mimes = set(((image.get("properties") or {}).get("mime") or {}).get("enum") or [])
+    check(
+        mimes == {"image/jpeg", "image/png", "image/webp"},
+        f"rpc.json ui/submit.content[image].mime: {sorted(mimes)} is not the FR-8.38 whitelist",
+    )
+
+
+def check_http_endpoints(rpc: dict) -> None:
+    """RFC-0004 §7.3: `/ui/blob*` is declared next to the RPC table it is not part of."""
+    endpoints = rpc.get("http_endpoints")
+    if not isinstance(endpoints, dict):
+        FAILURES.append("rpc.json: missing http_endpoints (RFC-0004 §7.3)")
+        return
+    rows = endpoints.get("endpoints") or []
+    # The RFC's §4.1 table and this list must describe the same six routes; the
+    # published rows carry decorators (`?offset=N`, `[?v=thumb]`), so compare the
+    # bare path or `POST /ui/blob` would "match" everything under /ui/blob/upload.
+    declared = {
+        (str(row.get("method")), str(row.get("path") or "").split("?")[0].split("[")[0])
+        for row in rows
+        if isinstance(row, dict)
+    }
+    check(len(rows) == len(BLOB_ROUTES), f"rpc.json http_endpoints: {len(rows)} routes, RFC §4.1 has {len(BLOB_ROUTES)}")
+    check(
+        declared == BLOB_ROUTES,
+        "rpc.json http_endpoints drift vs RFC-0004 §4.1: "
+        f"missing={sorted(BLOB_ROUTES - declared)} extra={sorted(declared - BLOB_ROUTES)}",
+    )
+    check("listener" in endpoints, "rpc.json http_endpoints: listener missing")
+    check("auth" in endpoints, "rpc.json http_endpoints: auth missing")
+    check("body_max" in endpoints, "rpc.json http_endpoints: body_max missing")
+    check(
+        (endpoints.get("x-vade") or {}).get("appends") == "RFC-0004",
+        "rpc.json http_endpoints: x-vade.appends must name RFC-0004",
+    )
+
+
+def check_tasks(config: dict) -> None:
+    """RFC-0007 §9.4: exactly 13 keys, documented defaults, hot|restart."""
+    tasks = (config.get("properties") or {}).get("tasks")
+    if not isinstance(tasks, dict):
+        FAILURES.append("config.schema.json: missing [tasks] section (RFC-0007 §9.4)")
+        return
+    check(
+        tasks.get("additionalProperties") is False,
+        "config.schema.json: [tasks].additionalProperties must be false",
+    )
+    leaves = dict(walk_leaves(tasks, "tasks"))
+    missing = sorted(set(TASKS_DEFAULTS) - set(leaves))
+    extra = sorted(set(leaves) - set(TASKS_DEFAULTS))
+    check(not missing and not extra, f"config.schema.json [tasks] key drift: missing={missing} extra={extra}")
+    for dotted, expected in TASKS_DEFAULTS.items():
+        leaf = leaves.get(dotted) or {}
+        check(
+            leaf.get("default") == expected,
+            f"config.schema.json {dotted}: default {leaf.get('default')!r} != {expected!r} (RFC-0007 §9.4)",
+        )
+        wanted = "hot" if dotted in TASKS_HOT else "restart"
+        check(
+            (leaf.get("x-vade") or {}).get("apply") == wanted,
+            f"config.schema.json {dotted}: apply must be {wanted} (RFC-0007 §9.4)",
+        )
+    # §6.3: the cancel deadline is a ceiling, not a preference.
+    grace = leaves.get("tasks.cancel_grace_ms") or {}
+    check(
+        grace.get("maximum") == 3000,
+        "config.schema.json tasks.cancel_grace_ms: maximum must be 3000 (RFC-0007 §6.3)",
+    )
+
+
+def check_task_events(events: dict, declared_events: dict, schema_events: set[str]) -> None:
+    """RFC-0007 §9.2: enum drift, the `task.state` trap, and the coalesce marker."""
+    states = list(events.get("task_states") or [])
+    check(set(states) == code_task_states(), "events.json task_states drift vs core/vade/tasks/models.TaskState")
+    check(
+        code_terminal_task_states() == TASK_TERMINAL_STATES,
+        "core/vade/tasks/models.TERMINAL_TASK_STATES must be exactly "
+        f"{sorted(TASK_TERMINAL_STATES)}, has {sorted(code_terminal_task_states())}",
+    )
+    # §9.2: a `task.state` entry under `events` would be "declared but nobody
+    # emits" on day one — only `turn.state` is exempt from that gate.
+    check(
+        "task.state" not in declared_events,
+        "events.json: task_states is a TOP-LEVEL key; a `task.state` events entry is not allowed (RFC-0007 §9.2)",
+    )
+    check(
+        {"task.started", "task.status", "task.progress", "task.finished"} <= schema_events,
+        "events.json: the four RFC-0007 task.* events are missing",
+    )
+    progress = declared_events.get("task.progress") or {}
+    check(
+        (progress.get("x-vade") or {}).get("coalesce") is True,
+        "events.json task.progress: x-vade.coalesce must be true (RFC-0007 §5.5 R5 / §9.2)",
+    )
+    check(
+        "state" not in (progress.get("payload") or {}),
+        "events.json task.progress: must not declare `state` (payload-only class)",
+    )
+    # §5.3: these nullable keys are required-with-null so every event is
+    # self-describing; dropping one silently breaks client tree-building.
+    expected_required = {
+        "task.started": {
+            "task_id", "kind", "state", "session_id", "turn_id", "parent_id",
+            "depth", "name", "started_at", "retryable",
+        },
+        "task.status": {"task_id", "kind", "parent_id", "depth", "state", "elapsed_ms"},
+        "task.progress": {"task_id", "pct", "elapsed_ms"},
+        "task.finished": {
+            "task_id", "kind", "parent_id", "depth", "state", "duration_ms", "summary",
+        },
+    }
+    for name, wanted in expected_required.items():
+        actual = set((declared_events.get(name) or {}).get("required") or [])
+        check(actual == wanted, f"events.json {name}.required drift: {sorted(actual)} != {sorted(wanted)}")
+
+
+def check_approval_attribution(declared_events: dict) -> None:
+    """RFC-0007 §7.1: four OPTIONAL keys, and `required` must not have moved."""
+    for name in ("turn.approval_required", "turn.approval_resolved"):
+        spec = declared_events.get(name) or {}
+        payload = spec.get("payload") or {}
+        for key in ("session_id", "task_id", "task_name", "depth"):
+            check(key in payload, f"events.json {name}: RFC-0007 §7.1 field {key} is not declared")
+        required = set(spec.get("required") or [])
+        check(
+            not ({"session_id", "task_id", "task_name", "depth"} & required),
+            f"events.json {name}: RFC-0007 attribution fields must stay OPTIONAL (required is frozen)",
+        )
+
+
+def check_ui(config: dict, manifest: dict, rpc: dict) -> None:
+    """RFC-0009: the `[ui]` keys, the C-03 append, the C-05 methods, §10.1.
+
+    Three things are asserted that a review can miss by reading:
+
+    * the page block is the only `additionalProperties:false` subtree in C-03
+      (otherwise `on_click` would be forward-compatible, i.e. a script hook);
+    * the component whitelist and the action kinds in code are exactly the
+      contract's (a silently added 8th component is how phishing gets in);
+    * the module-page package contains no evaluator/browser token (§10.1).
+    """
+    section = (config.get("properties") or {}).get("ui")
+    if not isinstance(section, dict):
+        FAILURES.append("config.schema.json: missing [ui] section (RFC-0009 §7.3)")
+    else:
+        check(section.get("additionalProperties") is False, "config.schema.json: [ui].additionalProperties must be false")
+        leaves = dict(walk_leaves(section, "ui"))
+        missing = sorted(set(UI_DEFAULTS) - set(leaves))
+        extra = sorted(set(leaves) - set(UI_DEFAULTS))
+        check(not missing and not extra, f"config.schema.json [ui] key drift: missing={missing} extra={extra}")
+        for dotted, expected in UI_DEFAULTS.items():
+            leaf = leaves.get(dotted) or {}
+            check(leaf.get("default") == expected,
+                  f"config.schema.json {dotted}: default {leaf.get('default')!r} != {expected!r} (RFC-0009 §7.3)")
+            wanted = "hot" if dotted in UI_HOT else "restart"
+            check((leaf.get("x-vade") or {}).get("apply") == wanted,
+                  f"config.schema.json {dotted}: apply must be {wanted} (RFC-0009 §7.3)")
+
+    ui = (manifest.get("properties") or {}).get("ui") or {}
+    check(ui.get("additionalProperties") is False,
+          "manifest.schema.json: ui.additionalProperties must be false (C-19 is the strict subtree)")
+    check("^x-" in (ui.get("patternProperties") or {}),
+          "manifest.schema.json: ui needs the ^x- escape hatch and nothing else")
+    pages = (ui.get("properties") or {}).get("pages") or {}
+    check(pages.get("maxItems") == UI_LIMITS["pages_per_module"],
+          f"manifest.schema.json ui.pages.maxItems must be {UI_LIMITS['pages_per_module']}")
+    page = ((manifest.get("$defs") or {}).get("page")) or {}
+    check(page.get("additionalProperties") is False,
+          "manifest.schema.json $defs.page.additionalProperties must be false")
+    check(set(page.get("required") or []) == {"id", "title", "version", "schema"},
+          "manifest.schema.json $defs.page.required must be id/title/version/schema")
+    props = page.get("properties") or {}
+    check(set((props.get("icon") or {}).get("enum") or []) ==
+          {"list", "chart", "settings", "tool", "file", "none"},
+          "manifest.schema.json page.icon enum drifted from C-19 §4.2")
+    check(set((props.get("entry") or {}).get("enum") or []) == {"auto", "panel", "capabilities"},
+          "manifest.schema.json page.entry enum drifted from C-19 §4.2")
+    branches = list(((props.get("schema") or {}).get("oneOf")) or [])
+    check(len(branches) == 2,
+          "manifest.schema.json page.schema must be oneOf[inline tree, ref] — two disjoint branches")
+    limits = (manifest.get("x-vade") or {}).get("limits") or {}
+    for key, expected in UI_LIMITS.items():
+        check(limits.get(key) == expected,
+              f"manifest.schema.json x-vade.limits.{key} must be {expected} (RFC-0009 §7.3)")
+
+    if str(ROOT / "core") not in sys.path:
+        sys.path.insert(0, str(ROOT / "core"))
+    try:
+        from vade.registry import uipage
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        FAILURES.append(f"core/vade/registry/uipage.py: cannot import ({type(exc).__name__}: {exc})")
+    else:
+        check(set(uipage.COMPONENTS) == UI_COMPONENTS,
+              f"uipage.COMPONENTS {sorted(uipage.COMPONENTS)} != C-19 rev 1 {sorted(UI_COMPONENTS)}")
+        check(set(uipage.HOST_COMPONENTS) == UI_HOST_COMPONENTS,
+              f"uipage.HOST_COMPONENTS {sorted(uipage.HOST_COMPONENTS)} != {sorted(UI_HOST_COMPONENTS)}")
+        check(set(uipage.ACTION_KINDS) == UI_ACTION_KINDS,
+              f"uipage.ACTION_KINDS {sorted(uipage.ACTION_KINDS)} != {sorted(UI_ACTION_KINDS)}")
+        code_limits = {
+            "pages_per_module": uipage.MAX_PAGES,
+            "ui_block_max_bytes": uipage.MAX_UI_BLOCK_BYTES,
+            "ui_inline_max_bytes": uipage.MAX_INLINE_BYTES,
+            "ui_ref_max_bytes": uipage.MAX_REF_BYTES,
+            "ui_nodes_per_page": uipage.MAX_NODES,
+            "ui_depth_max": uipage.MAX_DEPTH,
+        }
+        check(code_limits == UI_LIMITS,
+              f"uipage limits {code_limits} != C-19 {UI_LIMITS}")
+        check(set(uipage.BINDING_ROOTS) == {"module.status", "page.state", "item"},
+              "uipage.BINDING_ROOTS must stay the three read-only roots (§5.1)")
+
+    page_dir = CORE / "modulepage"
+    if not page_dir.is_dir():
+        FAILURES.append("core/vade/modulepage: the C-19 serving package is missing")
+    else:
+        for path in sorted(page_dir.rglob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            for token in UI_FORBIDDEN_CODE:
+                check(token not in text,
+                      f"{path.relative_to(ROOT)}: contains {token!r} — §10.1 forbids any evaluator/browser on the page path")
+
+    ui_to_core = ((rpc.get("directions") or {}).get("ui_to_core")) or {}
+    core_to_module = ((rpc.get("directions") or {}).get("core_to_module")) or {}
+    for name in ("ui/page.get", "ui/state.get", "ui/tool.call"):
+        check(name in ui_to_core, f"rpc.json ui_to_core missing {name} (RFC-0009 §9.3)")
+    for name in ("state/get", "page/get"):
+        check(name in core_to_module, f"rpc.json core_to_module missing {name} (RFC-0009 §9.3)")
+    tool_call = ui_to_core.get("ui/tool.call") or {}
+    required = set((tool_call.get("params") or {}).keys())
+    check({"module_id", "instance_id", "page_id", "tool", "args", "client_call_id"} <= required,
+          f"rpc.json ui/tool.call params missing {sorted({'module_id','instance_id','page_id','tool','args','client_call_id'} - required)}")
+    result = tool_call.get("result") or {}
+    statuses = str(result.get("status") or "")
+    check(all(word in statuses for word in ("approval_required", "denied", "ok", "failed")),
+          "rpc.json ui/tool.call.result.status must name all four C-19 states")
+    page_get = ui_to_core.get("ui/page.get") or {}
+    check(set((page_get.get("result") or {}).keys()) == {"schema", "sha256"},
+          "rpc.json ui/page.get.result must be {schema, sha256}")
+    state_get = ui_to_core.get("ui/state.get") or {}
+    check(set((state_get.get("result") or {}).keys()) == {"rev", "state", "fetched_at"},
+          "rpc.json ui/state.get.result must be {rev, state, fetched_at}")
+
+    # C-06 is untouched by RFC-0009 (§9.1 #5): a page approval resolves through
+    # `approval/decide`, not through a new event family.
+    events_path = SCHEMA / "events.json"
+    if events_path.exists():
+        names = set((json.loads(events_path.read_text(encoding="utf-8")).get("events") or {}))
+        check(not {name for name in names if name.startswith("ui.")},
+              "events.json: RFC-0009 adds no ui.* event (page approvals are RPC-only, §9.4)")
 
 
 def main() -> int:
@@ -496,6 +980,7 @@ def main() -> int:
 
     required_sections = {
         "core", "tls", "policy", "audit", "server", "dev", "memory", "evolve", "compaction", "skills",
+        "tasks",
     }
     present = set(config.get("properties", {}))
     check(required_sections <= present, f"config.schema.json missing sections: {sorted(required_sections - present)}")
@@ -517,10 +1002,21 @@ def main() -> int:
     check_llm_append(config)
     check_blob_routes()
     check_manifest_models(manifest)
+    check_tasks(config)
+    check_ui(config, manifest, rpc)
+    check_submit_parts(rpc)
+    check_http_endpoints(rpc)
 
     methods = {
         "module/register", "module/capabilities.update", "module/heartbeat",
         "tools/call", "tools/cancel", "module/drain", "approval/decide", "ui/submit",
+        # RFC-0008 §7.1/§7.2
+        "turn/input", "turn/input.cancel",
+        # RFC-0006 §6.2/§6.3
+        "turn/regenerate", "message/edit_resubmit",
+        # RFC-0007 §6.1-§6.4
+        "task/list", "task/log_tail", "task/cancel", "subagent/message",
+        "ui/page.get", "ui/state.get", "ui/tool.call", "state/get", "page/get",
     }
     declared = set()
     for direction in rpc.get("directions", {}).values():
@@ -571,6 +1067,36 @@ def main() -> int:
     check(set(declared_events.get("turn.state", {}).get("enum") or []) == set(states),
           "events.json: turn.state enum disagrees with turn_states")
     check_usage_budget_event(events)
+    check_rfc0006(events, rpc, config)
+    check_task_events(events, declared_events, schema_events)
+    check_approval_attribution(declared_events)
+
+    # ---------------------------------------------------------------- RFC-0008
+    # C-06 went 1.0.0 -> 2.0.0 because `turn_states` was WIDENED: an exhaustive
+    # validator on the old side would silently drop the new state's events, so
+    # the version is the one place that can warn it. A future RFC that only
+    # appends fields must not quietly reuse 2.0.0 — this pins today's value.
+    check(events.get("version") == "2.0.0",
+          f"events.json: version must be 2.0.0 after the RFC-0008 enum widening (got {events.get('version')!r})")
+    appends = (events.get("x-vade") or {}).get("appends") or []
+    rfc0008 = next((block for block in appends if isinstance(block, dict)
+                    and "RFC-0008" in str(block.get("doc") or "")), None)
+    check(rfc0008 is not None, "events.json: missing the x-vade.appends block for RFC-0008")
+    if rfc0008 is not None:
+        check(rfc0008.get("version") == "2.0.0",
+              "events.json: the RFC-0008 append block must carry version 2.0.0")
+        widen = (rfc0008.get("enum_widen") or {}).get("turn_states") or []
+        check("waiting_input" in widen,
+              "events.json: the RFC-0008 append block must declare enum_widen.turn_states=['waiting_input']")
+        check(set(rfc0008.get("adds") or []) == {"turn.input_required", "turn.input_resolved"},
+              "events.json: the RFC-0008 append block must add exactly the two turn.input_* events")
+    for name in ("turn.input_required", "turn.input_resolved"):
+        spec = declared_events.get(name) or {}
+        check(bool(spec), f"events.json: {name} is not declared (RFC-0008 §6)")
+        check("state" in (spec.get("required") or []),
+              f"events.json {name}: a state-change event must require `state` (C-06 rule 4)")
+    check("waiting_input" in states,
+          "events.json: turn_states must contain `waiting_input` (RFC-0008 §6.3)")
 
     if FAILURES:
         print("contracts: FAIL")

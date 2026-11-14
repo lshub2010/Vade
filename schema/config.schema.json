@@ -145,6 +145,77 @@
         }
       }
     },
+    "tasks": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "RFC-0007 §9.4 — subagents and background jobs ([tasks]). Additive to C-18 1.0.0, following the [attach] precedent; the root stays additionalProperties:false, so a typo here is UNKNOWN_CONFIG_KEY at startup rather than a silent default. `max_depth` MUST be >= `ui_fold_depth + 1` (otherwise FR-8.57's four-level fold cannot be constructed) and `cancel_grace_ms` MAY NOT exceed 3000 (§6.3's measured ceiling) — both are refused at startup.",
+      "properties": {
+        "max_concurrent": {"type": "integer", "minimum": 1, "maximum": 64, "default": 8, "x-vade": {"apply": "hot", "owner": "C3", "note": "Per-session ceiling for subagents + jobs combined. The 9th live task is OVERLOADED with data.retry_after."}},
+        "max_depth": {"type": "integer", "minimum": 1, "maximum": 16, "default": 4, "x-vade": {"apply": "restart", "owner": "C3", "note": "Nesting ceiling; must be >= ui_fold_depth + 1. Deeper spawns are INVALID_ARGUMENT data.field=depth."}},
+        "ui_fold_depth": {"type": "integer", "minimum": 0, "maximum": 16, "default": 3, "x-vade": {"apply": "hot", "owner": "C3", "note": "Client fold threshold, served by core so all three clients fold at the same level."}},
+        "history_limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50, "x-vade": {"apply": "hot", "owner": "C3", "note": "FR-8.62 'most recent N' default for task/list."}},
+        "snapshot_finished": {"type": "integer", "minimum": 0, "maximum": 200, "default": 20, "x-vade": {"apply": "hot", "owner": "C3", "note": "How many terminal tasks ride in ui/attach's snapshot.tasks; the rest are paged with task/list (tasks_truncated=true)."}},
+        "log_lines": {"type": "integer", "minimum": 1, "maximum": 200, "default": 200, "x-vade": {"apply": "hot", "owner": "C3", "note": "Per-call row ceiling for task/log_tail (hard cap 200)."}},
+        "log_bytes": {"type": "integer", "minimum": 1024, "maximum": 65536, "default": 65536, "x-vade": {"apply": "hot", "owner": "C3", "note": "Per-call byte ceiling for task/log_tail (hard cap 65536)."}},
+        "log_ring_lines": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 2000, "x-vade": {"apply": "restart", "owner": "C3", "note": "In-memory ring per task; evicted rows make the next cursor answer lost=true. v1 keeps no on-disk log (Q3)."}},
+        "log_line_chars": {"type": "integer", "minimum": 64, "maximum": 65536, "default": 4096, "x-vade": {"apply": "hot", "owner": "C3", "note": "A longer line is stored truncated and reported as truncated='line'."}},
+        "progress_hz": {"type": "number", "minimum": 0.5, "maximum": 20, "default": 2, "x-vade": {"apply": "hot", "owner": "C3", "note": "FR-8.59: <=2 progress events per second per task, coalesced inside the window (last value wins)."}},
+        "event_burst": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 20, "x-vade": {"apply": "hot", "owner": "C3", "note": "Per-session task-event tap per second. Only task.progress may be dropped when it is hit; state events are never dropped."}},
+        "cancel_grace_ms": {"type": "integer", "minimum": 0, "maximum": 3000, "default": 2000, "x-vade": {"apply": "hot", "owner": "C3", "note": "Cooperative cancel grace before the forced terminal state (forced=true). Values above 3000 are refused at startup: '正在取消…' must not be a permanent UI state."}},
+        "subagent_message": {"type": "boolean", "default": false, "x-vade": {"apply": "restart", "owner": "C3", "note": "v1 is closed: subagent/message answers UNSUPPORTED (§6.4)."}}
+      }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "RFC-0009 §7.3/§9.3 — module page cache and call budget ([ui]). Additive to C-18 1.1.0, following the [attach]/[tasks] precedent; the root stays additionalProperties:false, so a typo here is UNKNOWN_CONFIG_KEY at startup. These are core-side serving limits, not page-schema limits: the schema's own caps (8 KiB inline / 64 KiB ref / 48 KiB block) live in C-03's x-vade.limits and are enforced by the C-19 validator.",
+      "properties": {
+        "state_cache_s": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60,
+          "default": 5,
+          "x-vade": {
+            "apply": "hot",
+            "owner": "C3",
+            "note": "RFC-0009 §9.3: `ui/state.get` serves a cached `page.state` for at most this long per (module, instance, page). 0 disables caching; a client that wants fresh data still cannot force a module round trip more often than this."
+          }
+        },
+        "page_cache_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65536,
+          "default": 65536,
+          "x-vade": {
+            "apply": "hot",
+            "owner": "C3",
+            "note": "RFC-0009 §7.3: per-page ceiling for a fetched `ref` body (<=64 KiB). Above it the page is MANIFEST_INVALID, never truncated."
+          }
+        },
+        "module_cache_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 524288,
+          "default": 524288,
+          "x-vade": {
+            "apply": "hot",
+            "owner": "C3",
+            "note": "RFC-0009 §7.3: per-module ceiling for cached page bodies (<=512 KiB). `ui/page.get` must not become a memory amplifier."
+          }
+        },
+        "pending_calls": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096,
+          "default": 256,
+          "x-vade": {
+            "apply": "hot",
+            "owner": "C3",
+            "note": "RFC-0009 §6.2: how many stage-one `ui/tool.call` approvals may be held per process. The oldest expired entry is reaped first; a full table refuses with OVERLOADED rather than growing."
+          }
+        }
+      }
+    },
     "dev": {
       "type": "object",
       "additionalProperties": false,
@@ -210,6 +281,19 @@
         "l0_token_budget": {"type": "integer", "minimum": 128, "default": 3000, "x-vade": {"apply": "hot", "owner": "C3b"}},
         "pending_ttl_days": {"type": "integer", "minimum": 1, "default": 7, "x-vade": {"apply": "restart", "owner": "C3b"}},
         "auto_approve": {"type": "boolean", "default": false, "x-vade": {"apply": "hot", "owner": "C3b", "note": "core-only setting; modules must not be able to set it."}}
+      }
+    },
+    "ask_user": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "RFC-0008 §8.1/§9.5. Every key is `hot`: it only affects requests made after the change, so no restart and no turn is retroactively re-judged.",
+      "properties": {
+        "default_timeout_s": {"type": "integer", "minimum": 5, "maximum": 600, "default": 120, "x-vade": {"apply": "hot", "owner": "C5a"}},
+        "max_timeout_s": {"type": "integer", "minimum": 5, "maximum": 3600, "default": 600, "x-vade": {"apply": "hot", "owner": "C5a"}},
+        "max_free_text_chars": {"type": "integer", "minimum": 1, "maximum": 8000, "default": 8000, "x-vade": {"apply": "hot", "owner": "C5a"}},
+        "max_multi_select": {"type": "integer", "minimum": 1, "maximum": 20, "default": 20, "x-vade": {"apply": "hot", "owner": "C5a"}},
+        "allow_subagents": {"type": "boolean", "default": false, "x-vade": {"apply": "hot", "owner": "C5a", "note": "默认关：一个被派出去的后台代理来审问用户本身就可疑；打开后弹层必须显示来源。"}},
+        "audit_value": {"type": "boolean", "default": false, "x-vade": {"apply": "hot", "owner": "C5a", "note": "保留键（Q5）：v1 即使为 true 也只把 sha256(value) 与长度写进审计，原值永不落库。"}}
       }
     },
     "llm": {

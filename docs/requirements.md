@@ -4,10 +4,10 @@
 |---|---|
 | 产品名 | **Vade Agent Runtime**（中文「偕行」），简称 **Vade** |
 | 文档编号 | REQ-001 |
-| 版本 | **v1.0 · 冻结基线** ＋ AMEND-01～22（AMEND-22 见 §8.22） |
+| 版本 | **v1.0 · 冻结基线** ＋ AMEND-01～23（AMEND-23 见 §8.23） |
 | 冻结时间 | 2026-11-07 07:05 (GMT+8) |
 | 状态 | 已冻结，接受修订（见 §9 变更规则） |
-| 决策条数 | **D1–D105，共 105 条**（见 §10 决策台账） |
+| 决策条数 | **D1–D110，共 110 条**（见 §10 决策台账） |
 | 验收条数 | **AC-1–AC-69，共 69 条**（见 §5 与各 AMEND 明细） |
 | 说明 | 本版为**待补充的基线**：已知需求全部冻结，后续补充以 AMEND 追加，不改写原文 |
 
@@ -202,6 +202,7 @@
 | AMEND-20 | 2026-11-12 | **文档修订**（无行为变更，纯一致性修正）：FR-13.19～13.21 撞号顺延为 13.25～13.27；AMEND-19 的 A62/A63 重号改 A67–A70；补 AMEND-10 明细；§8 小节号与 AMEND 号对齐；`session_id` 统一 `NOT NULL DEFAULT ''`；并发模型枚举统一；C-18 补 `[policy.tool_risk]`/`[server]`/`[dev]` 段；审批超时统一 60s；`fs` 补 `delete_file`；决策口径 78→86、契约 16→18、批次 24→23、F1 61→69；D11/D71 补覆盖标记；`nudge_interval` 二次确认条件 `<5` 改 `=5` | 全部 | 已合入，方案 v1.18 |
 | AMEND-21 | 2026-11-13 | **客户端功能全集**（UI 需求补全，无设计变更）：会话与消息、输入与附件、模型与运行时、工具/审批/agent 要求输入、子代理与后台任务、技能与记忆、设置/设备/安全、平台与无障碍；新增 **FR-8.26～8.77 共 52 条**（M 41 / S 11）；收敛 9 族协议缺口（R1–R9，**RFC 编号待编排者分配**）与 8 条待裁定，缺口一律写「需 RFC-NNNN（待编号）」，不改冻结契约 | FR-8 | 已合入，无设计变更（方案仍 v1.18）；待裁定 8 条 |
 | AMEND-22 | 2026-11-14 | **19 条 UI / 协议决策裁定**（`research/ui-decisions.md`）：一级目的地 4 个、手机会话详情、桌面双栏 + 可折叠右面板、消息形态、C-09 扩到 11 组件、工具卡三态、附件走 `POST /ui/blob`、只存压缩图、端上转写、真相 vs 可丢弃派生状态、原生技能页、Web 三端同源可写（**废止 D76**）、会话级模型优先、用量两口径并存、`waiting_input`、模块 UI 页面（C-19）；新增 **FR-8.78～8.79 共 2 条**（M 2），**修订 8 组**（FR-8.2 / 8.5 / 8.26 / 8.43 / 8.46～8.50 / 8.54～8.55 / 8.63 / 8.75），新增 **D87–D105** | FR-8 / FR-9 / FR-10 | 已合入，无设计变更（方案仍 v1.18）；方案层待同步项见 §8.22.6 |
+| AMEND-23 | 2026-11-14 | **RFC-0003～0009 批准与五条契约裁定**（`research/rfc-approvals.md`）：C-04 新增 `BUDGET_EXCEEDED`（33→34）；C-05 新增 `ui/tool.call`（`ui_to_core` 6→7，动作必须经审批、`risk` 只由 core 上调）；C-06 `turn_states` 追加 `waiting_input` 并升 **2.0.0**（旧客户端遇新状态卡住不报错，**接受**）；**追认 RFC-0009 的 fail-closed**，覆盖 FR-8.78 原文「未知节点降级为占位」→ 整页拒渲 + `MANIFEST_INVALID`，上线前用模块 lint 提前报错；七份 RFC（0003–0009）全部批准，实施顺序 **0004 → 0006 → 0005 → 0007/0008 → 0009 → 0003**；新增 **D106–D110** | FR-8 / FR-9 / C-04 / C-05 / C-06 | 已合入，无设计变更（方案仍 v1.19）；契约文件待各 RFC 实施时改（§8.23.5） |
 
 ### 8.1 AMEND-01 明细（2026-11-07）
 
@@ -1304,6 +1305,8 @@ D70 在 AMEND-17 里只有一段说明，没有可验收的 FR 编号，等于�
 - **判据**：触发 ask-user → 事件流出现 `waiting_input`（旧端渲染为运行中 + 降级提示，不崩、不空转）；提交后 turn 离开该状态且 `turn.input_resolved` 只出现一次；超时后按 core 策略转 `failed`/`canceled`，模型收到 `CANCELED` 而非空值。
 - **依赖**：**需 RFC-0008（待起草）**· C-06 枚举 + 事件对；审计字段（请求方、`input_id`、耗时、是否超时）同 FR-8.55。
 
+> （**旧端前向兼容一句已被 AMEND-23/D108 收紧**：不承诺把未知状态映射为 `running`，旧端会停在该状态**不前进、不报错**——已接受的取舍，见 §8.23.3 R3。）
+
 **R7 · FR-8.63（AMEND-22 修订）· 原生技能页定案，管理面强制 token**
 
 - **修订后**：技能管理**定案为客户端原生技能页**（不是 WebView 页面）；安装与更新**仍复用 FR-9.40 / FR-9.52 的 `preview → pending → approve` 三步**与全部校验规则（zip-slip / SSRF / 大小上限 / 安装期不执行脚本 / 7 天 TTL），**不另起一套**。原生页只调 admin API，不自建第二套权限模型。**配置页（WebView）连 admin 面时强制 token 鉴权**——必须持 **Bearer access token**（D69 口径），**不接受 cookie 会话**；原生技能页与 WebView 配置页**共用同一套 admin API**（C5a 的 `/admin/api/*`），能力集与错误码一致。
@@ -1325,6 +1328,8 @@ D70 在 AMEND-17 里只有一段说明，没有可验收的 FR 编号，等于�
 |---|---|---|---|
 | **FR-8.78 [M]** | **模块 UI 页面（原生声明式 schema）**：模块可在 manifest 的 **`ui.pages[]`** 声明页面（id、标题、入口、schema 引用）；客户端用**原生声明式 schema** 渲染，**不得执行任意脚本**（无 JS、无 `eval`、无 WebView、无内联事件）。**布局原语限 4 种**：`column` / `row` / `tabs` / `list`；**组件限 C-09 子集**（`Button` / `TextField` / `Card` / `ListItem` / `Switch`，以及 C-09 修订后 `ToolCallCard` / `AttachmentChip` 的只读形态；`MessageBubble` / `InputBar` / `ApprovalDialog` / `BottomBar` **不得**出现）；**动作限 3 类**：`navigate`（会话 / 设置 / 模块页面内跳转）、`tools/call`（经 core 路由，沿用既有权限与 `risk=high` 审批）、`ui/submit`（走现有提交通道）；**数据绑定只读模块自身状态**，不得绑定会话正文、审计或其他模块状态 | 提交含 `<script>` / `eval` / 未知动作的 schema → 客户端**拒绝渲染**并给 `MANIFEST_INVALID`（C-04 现有码），不执行任何代码；未知原语或组件 → 该节点降级为占位并告警，**页面其余部分仍可渲染**（前向兼容）；`tools/call` 动作调 `risk=high` 工具 → 必须走审批弹窗，未批不执行；绑定越界字段 → 显示空值 + 一次性告警，**不泄露** core 数据；模块断连时页面显示"模块离线"而非白屏 | **需新契约 C-19（待冻结）· 模块 UI 页面 schema**；**C-03 追加 `ui.pages[]`**（RFC-NNNN，待编号）；`tools/call` 复用 C-05、`ui/submit` 复用现有方法 |
 | **FR-8.79 [M]** | **模块页面的入口与位置**：**桌面**右面板可承载模块页面（面板样式可自定义，见 R3），入口列在右面板顶部；**手机**放在「能力」tab 内的「模块页面」入口（列表形式，每项 = 模块 + 页面标题）；**模块未声明页面时不显示任何入口**（不出现空 tab、空列表或占位页）；一级目的地仍为 4 个（FR-8.77 不变）；页面可深链，形态随 C-19 冻结确定 | 安装声明 2 个页面的模块 → 桌面右面板出现 2 个入口、手机"能力" tab 出现"模块页面"入口并列 2 项；卸载或换成无页面模块 → 入口消失且无残留空白页；从深链进入页面 → 三端落到同一模块同一页面；手机进入页面后返回，落回"能力" tab 且列表位置不变；模块页面渲染超时（>5s）→ 显示可重试卡片，**宿主不卡死** | **需新契约 C-19（待冻结）**；**C-03 追加 `ui.pages[]`**（与 FR-8.78 同一 RFC）；入口位置依赖 R3 的右面板 |
+
+> **FR-8.78 的两处替换（AMEND-23 · D109 / D107）**：①验收列「未知原语或组件 → 该节点降级为占位并告警，**页面其余部分仍可渲染**（前向兼容）」**已被 D109 覆盖**——替换文本见 §8.23.3 R1（整页拒渲 + `MANIFEST_INVALID`，上线前模块 lint 提前报错）；②动作限定里的 `tools/call` 在 UI→core 方向**不是** C-05 现有的 `core_to_module` 方法，替换为 `tool.call` → 协议方法 `ui/tool.call`，见 §8.23.3 R2。**原文保留不动**，冲突时以 §8.23.3 的替换文本为准。
 
 #### 8.22.4 C-09 修订（皮肤组件 7 → 11）
 
@@ -1382,6 +1387,127 @@ D70 在 AMEND-17 里只有一段说明，没有可验收的 FR 编号，等于�
 > 2. `docs/README.md` / `README.md` / `docs/OVERVIEW.md` / `overview.html` / `docs/agents/README.md` 的需求基线行同步为「AMEND-01～22」「105 条决策（D1–D105）」。
 > 3. 本节未改任何冻结契约文件（`schema/`、`docs/agents/01-contracts.md`）；§8.22.6 列的方案层偏差必须在方案阶段消化，不得"边做边改"。
 
+### 8.23 AMEND-23 明细（2026-11-14 · 七份 RFC 批准与五条裁定）
+
+> **背景**：AMEND-21/22 把客户端需求写全了，但协议缺口一律停在「需 RFC-NNNN（待编号）」。2026-11-14 七份 RFC（0003–0009）起草完毕并逐条裁定批准，权威记录见 `research/rfc-approvals.md`（**五条裁定**）。本节把五条裁定落成决策 **D106–D110**，并把与裁定冲突的需求原文按「替换文本」写法收口（原文保留，不删除）。
+>
+> **本节产出**：5 条决策（D106–D110）；**3 处契约变更登记**（C-04 / C-05 / C-06，字段级改动由对应 RFC 落地时改）；**3 处条款替换**（FR-8.78 两处、FR-8.54 一处）；**不新增 FR、不新增 AC**。
+>
+> **本节不改任何契约文件与 RFC 本体**：`schema/`、`docs/agents/01-contracts.md`、`docs/rfc/*` 均不动。C-04 的码表、C-05 的方法表、C-06 的枚举表在 RFC-0005 / RFC-0009 / RFC-0008 实施时改，本节只登记「裁定 + 连带项 + 判据」。
+>
+> **本节不新增 AC 编号**：`docs/check_docs.py` 的 C2 仍钉 `max == 69`，可测判据写在条款内。C1 常量随 D110 由 105 上调为 **110**。
+
+#### 8.23.1 决策落点（D106–D110）
+
+| # | 议题 | 裁定 | 落点 |
+|---|---|---|---|
+| 1 | RFC-0005 预算超限的错误码 | **新增 C-04 `BUDGET_EXCEEDED`**（33 → 34 个码）。预算超限时**拒该 turn**，不复用 `OVERLOADED`（队列压力）或 `PERMISSION_DENIED`（权限）——前者会让 UI 误判可重试、后者会让用户去查权限 | D106 · §8.23.2 C-04 |
+| 2 | RFC-0009 的 UI→core 工具调用 | **接受新增 C-05 `ui/tool.call`**（`ui_to_core` 6 → 7）。动作**必须经审批**；`risk` **只由 core 上调**，UI 与模块的申报不得下调 | D107 · §8.23.2 C-05、R2 |
+| 3 | RFC-0008 的 `turn_states` 枚举 | **按 C-06 2.0.0 升版**，`turn_states` 追加 `waiting_input`（7 → 8 值）。**接受**旧客户端遇新状态「卡住不报错」，不补兼容映射 | D108 · §8.23.2 C-06、R3 |
+| 4 | RFC-0009 对 FR-8.78 的收窄 | **追认 fail-closed**：未知节点 / 脚本字段 → **整页拒渲 + `MANIFEST_INVALID`**，覆盖原文「未知原语或组件降级为占位」；上线前用**模块 lint** 提前报错 | D109 · R1 |
+| 5 | 批准范围与实施顺序 | **七份全部批准**（0003–0009），实施顺序 **0004 → 0006 → 0005 → 0007/0008 → 0009 → 0003** | D110 · §8.23.4 |
+
+#### 8.23.2 契约变更登记（C-04 / C-05 / C-06）
+
+**C-04 · 错误码 33 → 34：新增 `BUDGET_EXCEEDED`（D106）**
+
+- **语义**：会话累计用量触达预算上限时，core **拒绝该 turn**（`ui/submit` 直接返回，不建 turn、不排队）。
+- **不得复用**：`OVERLOADED`（队列压力，可重试）与 `PERMISSION_DENIED`（权限不足）都不能表达「钱用完了」——前者让 UI 提示「稍后重试」，后者让用户去查权限，都是错误引导。
+- **连带**：`schema/errors.json` 的 `count` 33 → 34 与 `codes` 增键；`tools/check_contracts.py` 的 `33 error codes` 断言改 34；客户端错误文案表增一行。
+- **判据**：预算设 1000 token、实际用量 1200 后提交新 turn → 返回 `BUDGET_EXCEEDED`，会话里**不出现**新 turn（无 `turn.queued` / `turn.started`）；提高预算后同一请求重发 → 正常建 turn；审计有对应的拒绝记录。
+- **落点条款**：FR-8.49（「超限按 core 策略阻断并解释原因」——**码名由本节定死**，阻断行为不变）。
+
+**C-05 · `ui_to_core` 6 → 7：新增 `ui/tool.call`（D107）**
+
+- **语义**：UI 发起工具调用（模块页面的 `tool.call` 动作，以及后续 UI 侧直接触发工具的场景）。**由 core 路由**，UI 不直连模块。
+- **四条收口（缺一不得合并）**：
+  1. **同源校验**——`Origin` + `Sec-Fetch-Site` 双校验，与 D100 的 Web 写路径同一套（C-04 现成码 `ORIGIN_MISMATCH`）。
+  2. **风险上调**——`risk` 由 core 依 D47 裁决；UI 传入的任何 `risk` **一律忽略**，只允许上调、未登记按 `high`；下调一律 `RISK_DOWNGRADE_FORBIDDEN`。
+  3. **审批绑定 `args_digest`**——`risk=high` 必走审批，审批对象是**实际执行参数**的摘要；参数变了必须重批，不得「批一次、改参数再执行」。
+  4. **审计**——与 `ui/submit` 同一条可回放链（同一 `session_id` / `turn_id` 归因）。
+- **连带**：`schema/rpc.json` 的 `ui_to_core` 增方法 + `tools/check_contracts.py` 的方法数断言。**不得**把 `ui/tool.call` 加进 `core_to_module`（那里的 `tools/call` 是 core 调模块，方向相反）。
+- **判据**：UI 调 `risk=high` 工具 → 弹审批，未批不执行；批准后改一个参数重发 → **重新弹审批**（`args_digest` 变）；UI 传 `risk=low` 调登记为 `high` 的工具 → 实际按 `high` 走审批；无 `Origin` 的写请求 → `ORIGIN_MISMATCH`；审计里 `ui/tool.call` 与同 turn 的 `turn.tool_call` 可对上。
+
+**C-06 · `turn_states` 追加 `waiting_input`，版本 1.0.0 → 2.0.0（D108）**
+
+- **语义**：ask-user 的阻塞输入态（D103 / RFC-0008）。`turn_states` 7 → 8 值：`queued` / `waiting_approval` / **`waiting_input`** / `running` / `completed` / `failed` / `interrupted` / `cancelled`。
+- **为什么是主版本**：新增枚举值是**读侧破坏性**变更——旧客户端不认识该值。
+- **取舍已拍板**：旧客户端遇到 `waiting_input` 会**停在该状态、不前进、不报错**（既不降级提示，也不误判为完成），**接受**，不补兼容层。理由：①写路径都在 core，旧端只会「看起来在跑」，写不坏数据；②补映射（未知 → `running`）会让旧端把「等用户输入」渲染成「模型在生成」，比卡住更误导。
+- **连带**：`schema/events.json` 的 `turn_states` 与 `turn.state.enum`；`core/vade/session/models.py` 的 `TurnState`；`tests/test_schema_append.py` 的 7 值断言改 8；`tools/check_contracts.py` 的 `code_turn_states()` 与 `turn_states` 漂移检查随之通过。
+- **判据**：触发 ask-user → 事件流出现 `turn.state` = `waiting_input`；`turn_states` 与 `TurnState` 逐项相等（`check_contracts` 绿）；提交 / 取消 / 超时后离开该状态且 `turn.input_resolved` 只出现一次；用 7 值枚举的旧客户端接同一 core → 该 turn 停在「运行中」不前进、**无崩溃无错误日志**（这就是被接受的降级形态）。
+- **落点条款**：FR-8.54 / FR-8.55（D103 已写「需 RFC-0008」）；**旧端前向兼容句由 R3 替换**。
+
+#### 8.23.3 替换条款（原文保留不动，只写替换文本）
+
+**R1 · FR-8.78 的未知节点处理（AMEND-23 替换 · D109）· fail-closed**
+
+- **原文（保留不动）**：「未知原语或组件 → 该节点降级为占位并告警，**页面其余部分仍可渲染**（前向兼容）」。
+- **替换为**：「未知原语 / 未知组件 / 未知动作 / 任何脚本字段（`script`、`eval`、`on*`、`<script>`）→ **整页拒渲**，客户端返回 `MANIFEST_INVALID`（C-04 现有码）并显示可读原因（模块名 + 页面 id + 第一个非法节点的路径），**不渲染该页任何部分**、不执行任何代码。」
+- **为什么反向**：占位降级会让「半个页面能用」掩盖模块版本不匹配——用户看到缺块、模块作者收不到信号，问题长期潜伏。整页拒渲把失败变成**一次性、可定位、不可能被忽略**的事件。
+- **失败左移（必做）**：模块**上线前**用模块 lint 校验页面 schema——未知原语 / 组件 / 动作 / 脚本字段在 `preview → pending → approve`（FR-9.40）的 `preview` 阶段就报错并拒绝进 `pending`，不等到客户端渲染。lint 与客户端**共用同一份 C-19 白名单**，不得各写一套。
+- **判据**：schema 含 1 个未知组件 + 9 个合法节点 → **整页空白**且显示 `MANIFEST_INVALID` 原因（**不得**渲染那 9 个节点）；含 `script` 字段 → 同上，且抓包与日志无脚本执行；同一 schema 走模块 lint → `preview` 阶段被拒并指出节点路径；删掉未知组件后重装 → 正常渲染。
+
+**R2 · FR-8.78 的动作名（AMEND-23 替换 · D107）· `tools/call` → `tool.call` / `ui/tool.call`**
+
+- **原文（保留不动）**：「**动作限 3 类**：`navigate`（会话 / 设置 / 模块页面内跳转）、**`tools/call`**（经 core 路由，沿用既有权限与 `risk=high` 审批）、`ui/submit`（走现有提交通道）」。
+- **替换为**：「**动作限 3 类**：`navigate`、**`tool.call`**（协议方法为 **C-05 的 `ui/tool.call`**，UI→core 方向；**不是** `core_to_module` 的 `tools/call`）、`ui/submit`」。manifest 里的动作名与协议方法名不必逐字相同，但 manifest 的 `tool.call` 必须由客户端翻译为 `ui/tool.call` 发出，**不得**让模块页拿到 `core_to_module` 的调用通道。
+- **为什么必须写清**：C-05 现有的 `tools/call` **只在 `core_to_module` 方向**（core 调模块），UI 侧从来没有这条方法。原文只写 `tools/call` 会被读成「UI 能直接调模块的工具」，绕过 core 的 risk 裁决与审批。
+- **判据**：模块页点 `tool.call` → 抓包看到 `ui/tool.call`（**不是** `tools/call`）；同一次调用在审计里归属该 `session_id` / `turn_id`；客户端源码里搜不到 UI 直连模块的路径。
+
+**R3 · FR-8.54 的旧端前向兼容（AMEND-23 替换 · D108）**
+
+- **原文（保留不动）**：「旧端对未知状态按 `running` 渲染并给降级提示（前向兼容）」。
+- **替换为**：「C-06 已按 **2.0.0** 升版。**不承诺**旧端对 `waiting_input` 的兼容映射：旧端会停在该状态**不前进、不报错**——这是**已接受**的取舍（见 §8.23.2 C-06）。新版客户端必须完整实现 8 值枚举。」
+- **判据**：7 值枚举的旧客户端 attach 一个处于 `waiting_input` 的会话 → 无崩溃、无错误日志、该 turn 不显示完成；升级到新版后同一会话状态正确显示。
+
+#### 8.23.4 实施顺序（D110）
+
+| 序 | RFC | 主题 | 前置 | 门禁 |
+|---|---|---|---|---|
+| 1 | **0004** | 附件与多模态（`POST /ui/blob`、`ui/submit.content` 收紧、单 `file_id`） | 无（U1-b 的前置） | 独立 worktree + 两轮审查 + 三项门禁 |
+| 2 | **0006** | turn 语义（`partial=true` 消息、工具卡字段、`superseded_by`） | 0004（消息同走 `parts`） | 同上 |
+| 3 | **0005** | 模型 / 用量（`model/list`、会话级选择、两级用量、**`BUDGET_EXCEEDED`**） | 0004（附件能力字段） | 同上 |
+| 4 | **0007 / 0008** | 任务事件族 / ask-user（**同批**，一次升 C-06 2.0.0） | 0006（turn 语义） | 同上 |
+| 5 | **0009** | 模块 UI 页面（C-19、`ui.pages[]`、**`ui/tool.call`**、fail-closed） | 0004–0008（组件与工具链） | 同上 |
+| 6 | **0003** | prompt 注入分层 | 无硬依赖（不阻塞 UI） | 同上；**必须保留 `prompt.injection=legacy` 回退** |
+
+- **排序理由**：0004 与 0006 都在同一条消息模型上动手，先 0004 后 0006 可避免二次返工；0005 的 `model/list` 是「附件能力不白传」的判据来源，必须在 0004 之后；0007/0008 都改 `turn_states` 周边，同批做只需一次 2.0.0 升版；0009 依赖 C-09 组件与 `ui/tool.call`，放倒数第二；0003 影响面最大且不阻塞 UI，放最后。
+- **每批必跑**（与 `research/rfc-approvals.md` 一致）：`pytest core/tests -q`（基线 384 passed）、`tools/check_contracts.py`（`contracts: OK`）、`docs/check_docs.py`（12 项 0 失败）。
+- **RFC-0002 不在本次清单**，仍 `proposed`（`turn_completed` 技能触发，与本节五条裁定无关）。
+
+#### 8.23.5 契约与实施连带项（本节不改 `schema/`）
+
+| 契约点 | 改动 | 决策 | 落地 RFC | 连带文件（实施时改） |
+|---|---|---|---|---|
+| **C-04** | `codes` 33 → 34，增 `BUDGET_EXCEEDED` | D106（§8.23.2） | RFC-0005 | `schema/errors.json`（`count` + `codes`）、`tools/check_contracts.py` 的 `33 error codes` 断言、客户端错误文案表 |
+| **C-05** | `ui_to_core` 6 → 7，增 `ui/tool.call` | D107（§8.23.2） | RFC-0009 | `schema/rpc.json`、`tools/check_contracts.py` 的方法数断言、UI 侧调用层 |
+| **C-06** | `turn_states` 7 → 8（+`waiting_input`），版本 **2.0.0** | D108（§8.23.2） | RFC-0008（与 0007 同批） | `schema/events.json`（`turn_states` / `turn.state.enum`）、`core/vade/session/models.py`、`tests/test_schema_append.py`、`tools/check_contracts.py` |
+| **C-19** | 冻结（模块 UI 页面 schema） | D104 / D109 | RFC-0009 | 冻结时登记 `01-contracts.md` 契约表——**届时须同步 C5 常量 18 → 19**；本节不登记（登记会让 C5 变红） |
+| **C-03** | `manifest.ui.pages[]` | D104 / D109 | RFC-0009 | `schema/manifest.schema.json`（`additionalProperties:true` 已前向兼容，需补 examples） |
+| **C-11 / C-18** | 0003 的 `injection` 字段 / 0005 的 `[llm]` 键 | — | RFC-0003 / RFC-0005 | 各自实施批内改，本节不涉及 |
+
+#### 8.23.6 v1 明确不做（本节范围）
+
+- 旧端 `waiting_input` 兼容层（不映射为 `running`、不静默降级、不双发状态）。
+- UI 直连模块工具（一律经 `ui/tool.call` → core 裁决 risk → 审批）。
+- 未知节点的「降级为占位」（D109 已改为整页拒渲）。
+- 批准 RFC-0002（仍 `proposed`）。
+- 改 `schema/`、`docs/rfc/*` 或 RFC frontmatter（本节只写需求侧裁定）。
+
+#### 8.23.7 待确认（本节推断项）
+
+| # | 推断 | 为什么拿不准 | 若不接受怎么改 |
+|---|---|---|---|
+| 1 | manifest 动作名用 `tool.call`、协议方法用 `ui/tool.call`（两层不同名） | 裁定只给了协议方法名，没说 manifest 里的动作名要不要一起改；两层不同名会让模块作者困惑 | 若不接受，manifest 也统一叫 `ui/tool.call`（不好看但一字不差），或把协议方法改名 `ui/tools.call`（要重开 RFC-0009） |
+| 2 | C-06 的 2.0.0 是**整文件版本**还是只标 `turn_states` 的破坏性变更 | `schema/events.json` 现为 `version: 1.0.0`，升整文件版本会连带所有事件族的兼容声明 | 若只标枚举，RFC-0008 定稿时在 `turn_states` 旁加 `breaking_since` 注释，文件版本留 1.x |
+| 3 | 0007 与 0008 同批，但只有 0008 动 `turn_states` | 同批做只需一次升版，但两份 RFC 的审查会互相干扰 | 若分开做，0008 先落地（枚举变更）、0007 随后只追加事件，避免两次改同一枚举 |
+
+**AMEND-23 变更记录：新增决策 5 条（D106–D110），新增 0 条 FR，修订 3 处条款（FR-8.78 ×2、FR-8.54 ×1，均为替换文本，原文保留），契约变更登记 3 处（C-04 / C-05 / C-06）+ 2 处待冻结登记（C-19 / C-03），新增 0 条 AC；不改 `schema/` 与 RFC 本体；待确认 3 项（§8.23.7）。**
+
+> 口径一致性说明：
+> 1. `docs/check_docs.py`：C1 常量 105 → **110**（D106–D110），C3 上限 22 → **23**，C6 过期串增查「AMEND-01～22」；**C2 仍为 AC=69**（本节不新增 AC）。
+> 2. `docs/README.md` / `README.md` / `docs/OVERVIEW.md` / `overview.html` / `docs/agents/README.md` / `docs/agents/00-orchestration.md` 的需求基线行同步为「AMEND-01～23」「110 条决策（D1–D110）」。
+> 3. 本节未改任何冻结契约文件（`schema/`、`docs/agents/01-contracts.md`、`docs/rfc/*`）。
 
 ---
 
@@ -1503,6 +1629,11 @@ D70 在 AMEND-17 里只有一段说明，没有可验收的 FR 编号，等于�
 | D103 | ask-user 的 turn 状态 | 新增 **`waiting_input`**；C-06 `turn_states` 枚举需改，连同 `turn/input*` 事件与 RPC 走 **RFC-0008**（AMEND-22/§8.22.2 R6，#17） | 2026-11-14 |
 | D104 | 模块页面宿主 | 模块在 manifest 声明 `ui.pages[]`，客户端用**原生声明式 schema** 渲染，禁止任意脚本；**新契约 C-19（待冻结）**（AMEND-22/§8.22.3 FR-8.78，#18） | 2026-11-14 |
 | D105 | 手机模块页入口 | 「能力」tab 内的「模块页面」入口；模块无页面则不显示入口；一级目的地保持 4 个（AMEND-22/§8.22.3 FR-8.79，#19） | 2026-11-14 |
+| D106 | 预算超限错误码 | 新增 C-04 **`BUDGET_EXCEEDED`**（错误码 33 → 34）：预算超限**拒该 turn**，不复用 `OVERLOADED` / `PERMISSION_DENIED`（AMEND-23/§8.23.2 C-04，#1） | 2026-11-14 |
+| D107 | UI→core 工具调用 | 新增 C-05 **`ui/tool.call`**（`ui_to_core` 6 → 7）：UI 发起、core 路由；**动作必须经审批**、`risk` **只由 core 上调**、审批绑 `args_digest`、同源校验 + 审计（AMEND-23/§8.23.2 C-05，#2） | 2026-11-14 |
+| D108 | `turn_states` 升版 | `turn_states` 追加 **`waiting_input`**（7 → 8 值），C-06 升 **2.0.0**；旧客户端遇新状态**卡住不报错**，**接受**、不补兼容映射（AMEND-23/§8.23.2 C-06、R3，#3） | 2026-11-14 |
+| D109 | 模块页 fail-closed | **追认 RFC-0009 的 fail-closed**：未知节点 / 脚本字段**整页拒渲** + `MANIFEST_INVALID`，**覆盖 FR-8.78 原文「降级为占位」**；上线前用**模块 lint** 提前报错（AMEND-23/§8.23.3 R1，#4） | 2026-11-14 |
+| D110 | RFC 批准与实施顺序 | 七份 RFC（**0003–0009 全部批准**）；实施顺序 **0004 → 0006 → 0005 → 0007/0008 → 0009 → 0003**，每份独立 worktree + 两轮审查 + 门禁（AMEND-23/§8.23.4，#5） | 2026-11-14 |
 
 ---
 

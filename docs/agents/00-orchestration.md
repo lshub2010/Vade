@@ -5,7 +5,7 @@
 
 ## 一、开工前的四件事
 
-1. 确认 `docs/requirements.md` 与 `docs/design.md` 是最新版（当前 req v1.0+**AMEND-22**、design **v1.19**）。版本以 `docs/README.md` 的文档版本行为准。
+1. 确认 `docs/requirements.md` 与 `docs/design.md` 是最新版（当前 req v1.0+**AMEND-23**、design **v1.19**）。版本以 `docs/README.md` 的文档版本行为准。
 2. 建仓库骨架：`core/ protocol/ schema/ sdk/ admin-ui/ deploy/ tests/ docs/rfc/`，只放 `.gitkeep` 与 `README`。模块**不在主仓**：每个模块一个独立仓 `vade-module-<name>`，主仓 `modules/` 只放索引 README。**客户端同理**：Compose 多端客户端在 **`vade-client` 独立仓**（2026-11-14 迁出，主仓 `ui/` 只留指针 README）。`admin-ui/` 是 AgentCore 的附属产物（`design.md` 的「唯一内置 UI」），**不是模块**，仍在主仓。
 3. 把 `01-contracts.md` 的目录所有权表贴进 `CODEOWNERS`。
 4. 建 `docs/status.md`（台账），字段见第九节。

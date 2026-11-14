@@ -22,6 +22,7 @@ Risk = Literal["low", "medium", "high"]
 
 def _node_view(record: NodeRecord) -> dict[str, Any]:
     """Whitelist only. The manifest body is never forwarded (21-C2 §七)."""
+    manifest = record.manifest
     return {
         "node_id": record.node_id,
         "module_id": record.module_id,
@@ -34,9 +35,14 @@ def _node_view(record: NodeRecord) -> dict[str, Any]:
         "endpoint": record.endpoint,
         "rtt_ms": record.rtt_ms,
         "tool_count": record.tool_count,
-        "version": record.manifest.version if record.manifest else None,
+        "version": manifest.version if manifest else None,
         "fingerprint": record.fingerprint,
         "rejected_reason": record.rejected_reason,
+        # RFC-0009 §7.1: a page the C-19 validator dropped must be visible on
+        # the module card ("page X failed validation"), not silently missing.
+        # Counts and warnings only — page bodies never leave the manifest here.
+        "ui_page_count": len(manifest.ui_pages) if manifest is not None else 0,
+        "ui_page_warnings": list(manifest.ui_warnings) if manifest is not None else [],
     }
 
 

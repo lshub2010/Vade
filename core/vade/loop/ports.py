@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol, runtime_checkabl
 __all__ = [
     "ApprovalPort", "ApprovalRequest", "ApprovalDecision", "NullApprovalPort",
     "AuditPort", "NullAuditPort", "MemoryPort", "MemoryItem", "EventSink",
+    "InputPort", "InputPrompt", "InputAnswer", "NullInputPort",
 ]
 
 
@@ -26,6 +27,12 @@ class ApprovalRequest:
     #: Core-owned emit. The port uses it to publish `turn.approval_required`
     #: on the ONE seq stream; it must not open its own event channel.
     emit: Callable[[str, Mapping[str, Any]], Awaitable[Any]] | None = None
+    #: RFC-0007 §7.1 attribution. `task_id` is the task that raised the call
+    #: (`None` for a main-turn call), `depth` is its level in the task tree and
+    #: is what §7.2 rule 4 uses to refuse grant inheritance.
+    task_id: str | None = None
+    task_name: str | None = None
+    depth: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,3 +95,66 @@ class MemoryPort(Protocol):
 
 class EventSink(Protocol):
     async def send(self, event: Mapping[str, Any]) -> None: ...
+
+
+# ---------------------------------------------------------------- RFC-0008
+@dataclass(frozen=True, slots=True)
+class InputPrompt:
+    """What the loop hands the input port: one question, no form DSL.
+
+    `kind`, `options` and `schema` mirror `vade.input.models.InputRequest`; the
+    port does not import that package (C3 stays free of C5a's module), so the
+    two shapes are kept structurally compatible instead of nominally.
+    """
+
+    session_id: str
+    turn_id: str
+    kind: str
+    prompt: str
+    detail: str | None = None
+    options: tuple[Mapping[str, Any], ...] = ()
+    timeout_s: int | None = None
+    default: Any = None
+    max_length: int | None = None
+    source: Mapping[str, Any] = field(default_factory=dict)
+    emit: Callable[[str, Mapping[str, Any]], Awaitable[Any]] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InputAnswer:
+    """The model-visible outcome: a value, or `CANCELLED` with a reason.
+
+    `code` is never `TIMEOUT` on purpose (C-04 marks TIMEOUT retriable and an
+    implementation would auto-re-ask a question the user ignored).
+    """
+
+    ok: bool
+    value: Any = None
+    status: str = "cancelled"
+    input_id: str | None = None
+    code: str | None = None
+    reason: str = ""
+    message: str = ""
+
+
+class InputPort(Protocol):
+    async def ask(self, prompt: InputPrompt) -> InputAnswer: ...
+
+    async def on_session_end(self, session_id: str) -> None: ...
+
+
+class NullInputPort:
+    """No ask-user channel installed: every question is `CANCELLED{no_ui}`.
+
+    The same failure a headless turn gets — the model must handle "the user did
+    not answer" anyway, so there is nothing to special-case.
+    """
+
+    async def ask(self, prompt: InputPrompt) -> InputAnswer:
+        return InputAnswer(
+            ok=False, status="cancelled", code="CANCELLED", reason="no_ui",
+            message="no ask-user channel is installed",
+        )
+
+    async def on_session_end(self, session_id: str) -> None:
+        return None

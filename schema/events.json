@@ -1,6 +1,6 @@
 {
   "id": "C-06",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "status": "frozen",
   "frozen_at": "2026-11-13",
   "owner": "C3",
@@ -9,7 +9,8 @@
   "envelope": {
     "type": "string (domain.action, past tense)",
     "seq": "int >= 1, per session, allocated by core",
-    "payload": "object"
+    "payload": "object",
+    "x-vade": "optional `x-vade.coalesce: true` on the frame — the event is droppable/self-contained (RFC-0007 §5.5 R5); a client MUST NOT treat a seq gap made only of such events as a hole."
   },
   "rules": [
     "seq is allocated only by core, strictly +1 per session; clients never supply one.",
@@ -17,15 +18,26 @@
     "Clients MUST de-duplicate by seq: a reconnect may deliver an overlapping segment.",
     "Every turn's STATE-CHANGE event carries `state` (see turn.state): turn.queued, turn.started, turn.completed, turn.failed, turn.interrupted, turn.cancelled and turn.approval_resolved. turn.delta / turn.tool_call / turn.tool_result are payload-only and never carry `state`; a UI keeps the last state event and applies these deltas on top of it.",
     "errors inside payloads use C-04 names only; no traceback ever appears in an event.",
-    "C3d may APPEND session.turn / session.closed (C-14); this file may not be rewritten by other batches."
+    "C3d may APPEND session.turn / session.closed (C-14); this file may not be rewritten by other batches.",
+    "RFC-0008 §6.4: a client that does not know an event type MUST ignore it and advance `last_seq` (never disconnect); a client that does not know a turn state MUST render it as `running`. `waiting_input` is the state this rule exists for (C-06 2.0.0 widened the enum)."
   ],
   "turn_states": [
     "queued",
     "waiting_approval",
+    "waiting_input",
     "running",
     "completed",
     "failed",
     "interrupted",
+    "cancelled"
+  ],
+  "task_states": [
+    "queued",
+    "running",
+    "waiting_approval",
+    "cancelling",
+    "completed",
+    "failed",
     "cancelled"
   ],
   "events": {
@@ -49,7 +61,12 @@
       "payload": {
         "turn_id": "string",
         "state": "turn.state",
-        "client_msg_id": "string"
+        "client_msg_id": "string",
+        "root_turn_id": "string (version-chain root)",
+        "version": "int >= 1",
+        "parent_turn_id": "string|null (the turn this version replaces)",
+        "user_message_id": "string (submit|edit: the new message; regenerate: the reused one)",
+        "reason": "submit|regenerate|edit_resubmit"
       },
       "required": [
         "turn_id",
@@ -73,7 +90,9 @@
     "turn.delta": {
       "payload": {
         "turn_id": "string",
-        "text": "string (increment, not cumulative)"
+        "text": "string (increment, not cumulative)",
+        "part_index": "int >= 0, default 0 (RFC-0006 1.1.0; same value for every delta of one segment)",
+        "kind": "text|notice|reasoning|tool_args, default text (v1 core emits text|notice only)"
       },
       "required": [
         "turn_id",
@@ -86,7 +105,13 @@
         "turn_id": "string",
         "call_id": "string",
         "tool": "string (LLM-side name)",
-        "args_digest": "sha256:hex"
+        "args_digest": "sha256:hex",
+        "args_preview": "string, JSON text, <=512 UTF-8 bytes, redacted (RFC-0006 1.1.0)",
+        "args_preview_mode": "redacted|typed",
+        "args_preview_redacted": "string[], <=16 dot-paths",
+        "args_preview_truncated": "bool",
+        "started_at": "int (unix ms, when core EMITTED this event)",
+        "batch_id": "bat_[0-9a-f]{16}"
       },
       "required": [
         "turn_id",
@@ -102,7 +127,10 @@
         "call_id": "string",
         "ok": "bool",
         "summary": "string <=300",
-        "code": "C-04 name (only when ok=false)"
+        "code": "C-04 name (only when ok=false)",
+        "duration_ms": "int >= 0, or null when the tool did not actually run",
+        "truncated": "bool (summary window cut, or full text overflowed to the blob store)",
+        "result_ref": "msg:<hex>|null (persisted role=tool message id)"
       },
       "required": [
         "turn_id",
@@ -118,7 +146,11 @@
         "tool": "string",
         "args": "object (FULL arguments, not a digest)",
         "risk": "low|medium|high",
-        "expires_at": "int (unix ms)"
+        "expires_at": "int (unix ms)",
+        "session_id": "string (RFC-0007 §7.1: registered late — already on the wire)",
+        "task_id": "string|null (RFC-0007 §7.1: the task that raised the call; null = main turn)",
+        "task_name": "string <=80|null (redundant human-readable name, so a UI never shows a bare id)",
+        "depth": "int (0 = main turn, >0 = subagent level)"
       },
       "required": [
         "turn_id",
@@ -128,7 +160,7 @@
         "risk",
         "expires_at"
       ],
-      "notes": "Broadcast to every attached UI. timeout = deny (fail-closed)."
+      "notes": "Broadcast to every attached UI. timeout = deny (fail-closed). RFC-0007 §7.1: `session_id` / `task_id` / `task_name` / `depth` are OPTIONAL additions (required is unchanged, old clients ignore them). A subagent's approval is broadcast in the PARENT session's stream: `session_id` is the parent, `turn_id` is the child turn and `task_id` names the task — the child session never has to be attached."
     },
     "turn.approval_resolved": {
       "payload": {
@@ -137,7 +169,11 @@
         "decision": "approve|deny",
         "by": "device_id|admin",
         "scope": "once|session",
-        "state": "turn.state"
+        "state": "turn.state",
+        "session_id": "string (RFC-0007 §7.1: registered late)",
+        "task_id": "string|null (RFC-0007 §7.1)",
+        "task_name": "string <=80|null (RFC-0007 §7.1)",
+        "depth": "int (RFC-0007 §7.1: 0 = main turn)"
       },
       "required": [
         "turn_id",
@@ -147,7 +183,58 @@
         "scope",
         "state"
       ],
-      "notes": "The ONLY signal that closes dialogs on the other devices; must be broadcast even when the decision lost a first-wins race."
+      "notes": "The ONLY signal that closes dialogs on the other devices; must be broadcast even when the decision lost a first-wins race. When the resolved turn belongs to a subagent, `state` is the CHILD turn's state: a parent session that does not know that turn MUST ignore the state and close the card by `request_id` alone (RFC-0007 §7.2 rule 2)."
+    },
+    "turn.input_required": {
+      "payload": {
+        "input_id": "string (core-allocated, ULID-shaped; the idempotency key)",
+        "turn_id": "string",
+        "session_id": "string (the seq space this event is broadcast on)",
+        "state": "waiting_input",
+        "kind": "free_text|single_choice|multi_choice|confirm",
+        "prompt": "string 1..500 (model-authored, render as plain text)",
+        "detail": "string<=2000|null",
+        "schema": "object (fixed descriptor per kind; NEVER a form DSL)",
+        "options": "array of {id,label<=120,description<=240|null}; 2..20 for choice kinds, [] otherwise",
+        "timeout_s": "int 5..600",
+        "expires_at": "int (unix ms)",
+        "default": "string|string[]|bool|null (UI prefill ONLY; never applied on timeout)",
+        "source": "object {tool:'ask_user'|'module', module_id:string|null, depth:int}",
+        "created_at": "int (unix ms)"
+      },
+      "required": [
+        "input_id",
+        "turn_id",
+        "state",
+        "kind",
+        "prompt",
+        "schema",
+        "options",
+        "timeout_s",
+        "expires_at"
+      ],
+      "notes": "RFC-0008 §6.1. Broadcast to every attached UI with the same input_id and payload; it carries `state:waiting_input`, so it IS the state-change event for entering that state (rule 4). Timeout = cancel: `default` never becomes an answer. Nullable keys are still written with a null value so the event describes itself."
+    },
+    "turn.input_resolved": {
+      "payload": {
+        "input_id": "string",
+        "turn_id": "string",
+        "state": "turn.state (the state this resolution restores: running, or interrupted)",
+        "status": "submitted|cancelled|timeout",
+        "value": "string|string[]|bool|null (non-null iff status=submitted, already validated by core)",
+        "by": "device_id|user|system",
+        "reason": "user_cancel|turn_interrupted|session_closed|no_ui|superseded|timeout|submitted",
+        "duration_ms": "number (monotonic time from request to resolution)"
+      },
+      "required": [
+        "input_id",
+        "turn_id",
+        "state",
+        "status",
+        "value",
+        "by"
+      ],
+      "notes": "RFC-0008 §6.2. The ONLY signal that closes an ask-user dialog: exactly one per input_id (§7.3 idempotency matrix), and it MUST be emitted before the turn's terminal event (S5). `by:'system'`+`status:'timeout'` and `by:<device>`+`status:'cancelled'` are the wire source of FR-8.55's 'did it time out'."
     },
     "turn.completed": {
       "payload": {
@@ -185,7 +272,9 @@
         "turn_id": "string",
         "state": "turn.state",
         "by": "string",
-        "usage": "object (RFC-0005 append, optional)"
+        "usage": "object (RFC-0005 append, optional)",
+        "partial_message_id": "msg:<hex>|null (RFC-0006 1.1.0; the partial=true assistant message)",
+        "partial_chars": "int (code points already streamed)"
       },
       "required": [
         "turn_id",
@@ -242,10 +331,102 @@
       ],
       "notes": "Emitted from registry changes through the same seq bus (C3 consumes registry, C2 produces the change)."
     },
+    "task.started": {
+      "payload": {
+        "task_id": "string",
+        "kind": "subagent|job",
+        "state": "task.state (queued|running)",
+        "session_id": "string",
+        "turn_id": "string|null",
+        "parent_id": "string|null (parent TASK id, not a turn id)",
+        "depth": "int >=0",
+        "name": "string <=80",
+        "started_at": "int (unix ms)",
+        "retryable": "bool",
+        "child_session_id": "string|null (FR-8.58 jump target; null for kind=job)",
+        "child_turn_id": "string|null"
+      },
+      "required": [
+        "task_id",
+        "kind",
+        "state",
+        "session_id",
+        "turn_id",
+        "parent_id",
+        "depth",
+        "name",
+        "started_at",
+        "retryable"
+      ],
+      "notes": "RFC-0007 §5.3. Exactly once per task, and BEFORE the spawning tool's turn.tool_result, so the activity list gets a row before the tool card collapses. Nullable keys are declared and required-with-null on purpose: every event is self-describing, so a consumer never has to walk back to task.started to rebuild the tree (§5.3)."
+    },
+    "task.status": {
+      "payload": {
+        "task_id": "string",
+        "kind": "subagent|job",
+        "parent_id": "string|null",
+        "depth": "int >=0",
+        "state": "task.state",
+        "elapsed_ms": "int (core-computed; never derive it from the device clock)",
+        "action": "string <=120 (current action, e.g. 'reading docs/design.md')",
+        "pct": "int 0..100"
+      },
+      "required": [
+        "task_id",
+        "kind",
+        "parent_id",
+        "depth",
+        "state",
+        "elapsed_ms"
+      ],
+      "notes": "RFC-0007 §5.3. Every state transition emits one, unthrottled. An action-text-only change is coalesced to at most 1/s (latest wins); nothing may follow the terminal task.finished for that task."
+    },
+    "task.progress": {
+      "payload": {
+        "task_id": "string",
+        "pct": "int 0..100",
+        "elapsed_ms": "int",
+        "detail": "string (optional one-liner)"
+      },
+      "required": [
+        "task_id",
+        "pct",
+        "elapsed_ms"
+      ],
+      "x-vade": {"coalesce": true},
+      "notes": "RFC-0007 §5.3/§5.4. Absolute value, never an increment; MUST NOT carry `state` (payload-only class, rule 4). Throttled to tasks.progress_hz (2/s) per task, coalesced inside the window with the LAST value kept, only emitted while a UI is attached, and the only class the session burst budget may drop. `x-vade.coalesce` means replay coverage may skip it and a client MUST NOT treat a seq gap consisting only of such events as a hole (§5.5 R5): the event is persisted and read_since still returns it, it is simply not a continuity witness."
+    },
+    "task.finished": {
+      "payload": {
+        "task_id": "string",
+        "kind": "subagent|job",
+        "parent_id": "string|null",
+        "depth": "int >=0",
+        "state": "task.state (terminal only)",
+        "duration_ms": "int",
+        "summary": "string <=500 (subagent: final assistant text, truncated; job: result summary)",
+        "code": "C-04 name|null (required when state=failed)",
+        "message": "string <=300|null",
+        "forced": "bool (true = the grace period expired and core stopped waiting)",
+        "by": "user|parent|system",
+        "usage": "object"
+      },
+      "required": [
+        "task_id",
+        "kind",
+        "parent_id",
+        "depth",
+        "state",
+        "duration_ms",
+        "summary"
+      ],
+      "notes": "RFC-0007 §5.3. Exactly once per task; the record is written before this is broadcast (§5.5 R1), and a late task.status/task.progress is dropped rather than resurrecting it (R2). `failed` MUST carry `code`; a cancel that hit its deadline MUST carry forced=true. `by` says who ended it, which is what separates 'the user stopped it' from 'its parent finished'."
+    },
     "turn.state": {
       "enum": [
         "queued",
         "waiting_approval",
+        "waiting_input",
         "running",
         "completed",
         "failed",
@@ -355,6 +536,29 @@
         "degraded"
       ],
       "notes": "RFC-0005 append (§6.4/§7.4). A notification, not the truth: `session/usage.get.budget.state` remains authoritative. Emitted at most once per (scope, state, period) — period is the session id for scope=session and the UTC date for scope=day — so a UI MUST de-duplicate by that triple after a reconnect. `state` is only `warn` or `exceeded`; `ok`/`off` never notify. `degraded=true` means exactly one thing: the budget was exceeded and `enforce=\"block\"` would have refused the turn, but the ledger is untrustworthy (last measured turn had `usage.source=\"none\"`), so the refusal was downgraded to a warning — it is never true for `warn`. Carries no token breakdown and no per-session detail for other sessions."
+    },
+    "turn.superseded": {
+      "payload": {
+        "turn_id": "string (the turn that was replaced)",
+        "superseded_by": "string (the new turn)",
+        "reason": "regenerate|edit_resubmit (fork reserved, never emitted in v1)",
+        "root_turn_id": "string (version-chain root)",
+        "version": "int >= 2 (version of superseded_by)"
+      },
+      "required": ["turn_id", "superseded_by", "reason"],
+      "notes": "RFC-0006 1.1.0. Metadata edge, NOT a state: it carries no `state` and does not rewrite turn_states. Allowed to follow any terminal event for that turn (the terminal rule is exempted for this one event); clients de-duplicate by (turn_id, superseded_by) and ignore unknown types while advancing last_seq."
+    },
+    "message.edited": {
+      "payload": {
+        "message_id": "string (the replaced user message)",
+        "session_id": "string",
+        "superseded_by_message_id": "string (the new user message)",
+        "new_turn_id": "string",
+        "text": "string (new text projection, <=32000 code points)",
+        "edited_at": "int (unix ms)"
+      },
+      "required": ["message_id", "session_id", "superseded_by_message_id", "new_turn_id", "text", "edited_at"],
+      "notes": "RFC-0006 1.1.0. Named `edited` but messages are immutable: the old row is never UPDATEd, it only gains `superseded_by`. `text` lets an attached client update the bubble without a re-attach; clients de-duplicate by superseded_by_message_id."
     }
   },
   "x-vade": {
@@ -370,9 +574,16 @@
         "turn.interrupted": ["usage"]
       },
       "usage_keys_added": ["model_id", "provider", "source", "steps", "cached_tokens", "reasoning_tokens"],
-      "rewrites": "none. Top-level `version` stays 1.0.0 on purpose: core/tests/events/test_schema_append.py pins it, and RFC-0005 §7.4's proposed 1.1.0 bump is recorded here instead of by editing the frozen header. Every C-06 `required` list, rule, enum and turn_states entry is untouched; the only edits to existing entries are OPTIONAL payload keys plus notes. `usage.budget` is not a push topic (no `x-vade.push`), so the C-14 deliver gate ignores it.",
+      "rewrites": "none. Top-level `version` is NOT moved by this RFC (it reads 2.0.0 here because RFC-0008's enum widening owns that bump): core/tests/events/test_schema_append.py pins it, and RFC-0005 §7.4's proposed 1.1.0 bump is recorded here instead of by editing the frozen header. Every C-06 `required` list, rule, enum and turn_states entry is untouched; the only edits to existing entries are OPTIONAL payload keys plus notes. `usage.budget` is not a push topic (no `x-vade.push`), so the C-14 deliver gate ignores it.",
       "why_sibling_key": "A second append must not overwrite C-14's `x-vade.append` block; RFC-0006 uses `x-vade.appends[]`, RFC-0007 `x-vade.append_rfc0007`. This one is a named sibling so two RFCs can land in either order without a merge collision.",
-      "version_note": "RFC-0005 §7.4 proposed `version: 1.0.0 -> 1.1.0`. Not applied: the append test pins 1.0.0 and the field is the C-06 file's own, not the appender's. Recorded as a deliberate deviation in core/vade/llm/RESULT-rfc0005.md."
+      "version_note": "RFC-0005 §7.4 proposed `version: 1.0.0 -> 1.1.0`. Not applied: the append test pins the file's own version (now 2.0.0, owned by RFC-0008) and that field belongs to C-06, not to the appender. Recorded as a deliberate deviation in core/vade/llm/RESULT-rfc0005.md."
+    },
+    "append_rfc0007": {
+      "contract": "RFC-0007",
+      "owner": "C3",
+      "frozen": "2026-11-14",
+      "adds": ["task.started", "task.status", "task.progress", "task.finished"],
+      "rewrites": "none. Every pre-existing C-06 entry, rule and enum is unchanged; `turn.approval_required` / `turn.approval_resolved` gained four OPTIONAL payload keys (`session_id` / `task_id` / `task_name` / `depth`) and their `required` list did not move. `task_states` is a new TOP-LEVEL key, not an entry under `events` on purpose: only `turn.state` is exempt from the 'declared events nobody emits' gate, so a `task.state` entry would be red on day one (§9.2)."
     },
     "append": {
       "contract": "C-14",
@@ -413,6 +624,64 @@
       "full": "drop oldest and increment delivery_dropped; a slow evolve module must never stall a session",
       "send_timeout_s": 5,
       "on_failure": "delivery_failed, no retry (v1 is best-effort; reconnect + since_seq is the recovery path)"
-    }
+    },
+    "appends": [
+      {
+        "contract": "C-06",
+        "version": "1.1.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0006-turn-semantics.md",
+        "adds": ["turn.superseded", "message.edited"],
+        "fields": {
+          "turn.delta": ["part_index", "kind"],
+          "turn.tool_call": ["args_preview", "args_preview_mode", "args_preview_redacted",
+                             "args_preview_truncated", "started_at", "batch_id"],
+          "turn.tool_result": ["duration_ms", "truncated", "result_ref"],
+          "turn.interrupted": ["partial_message_id", "partial_chars"],
+          "turn.queued": ["root_turn_id", "version", "parent_turn_id", "user_message_id", "reason"]
+        },
+        "overrides": [
+          "turn.interrupted.notes: partial 同时落库为 partial=true 的 assistant 消息，turn.delta 不再是唯一来源",
+          "turn.tool_call.notes: 未脱敏完整参数仍只走 turn.approval_required；该事件另带脱敏预览",
+          "terminal rule: turn.superseded 允许跟在任一终态事件之后（元数据边，不是状态变化）",
+          "unknown event types MUST be ignored while last_seq advances"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-06",
+        "version": "2.0.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0008-ask-user-input.md",
+        "adds": ["turn.input_required", "turn.input_resolved"],
+        "enum_widen": {
+          "turn_states": ["waiting_input"],
+          "synced": ["events.turn.state.enum", "core/vade/session/models.py:TurnState"],
+          "breaking": "only for clients that validate every state against a frozen enum"
+        },
+        "overrides": [
+          "turn.input_resolved is the only signal that closes an ask-user dialog",
+          "turn.input_required carries state:waiting_input and is therefore a state-change event"
+        ],
+        "rewrites": "none. Every C-06 1.0.0 entry, rule and enum value above is unchanged; this batch only widens `turn_states` and appends two events (`version` moves to 2.0.0 because an enum widening is breaking for exhaustive validators)."
+      },
+      {
+        "contract": "C-06",
+        "version": "2.0.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0005-model-capabilities-usage.md",
+        "adds": ["usage.budget"],
+        "fields": {
+          "turn.started": ["model_id", "model_source"],
+          "turn.failed": ["usage", "data"],
+          "turn.interrupted": ["usage"]
+        },
+        "overrides": [
+          "turn.completed.usage: the OBJECT gains model_id/provider/source/steps/cached_tokens/reasoning_tokens; the three frozen keys stay",
+          "usage.budget is a session event, NOT a C-14 push topic (no x-vade.push marker)"
+        ],
+        "rewrites": "none. The top-level `version` stays 2.0.0 (RFC-0008's enum widening owns that bump; this batch appends no state). Every pre-existing `required` list, rule and enum is untouched — the only edits to existing entries are OPTIONAL payload keys plus notes. Recorded in full under `x-vade.rfc0005_append`."
+      }
+    ]
   }
 }

@@ -109,12 +109,20 @@ class Connection:
         on_rpc: Callable[["Connection", dict[str, Any]], Awaitable[Any]] | None = None,
         on_close: Callable[["Connection"], None] | None = None,
         browser_session: bool = False,
+        device_id: str | None = None,
+        on_established: Callable[["Connection"], None] | None = None,
     ) -> None:
         self.ws = ws
         self.crypto = crypto
         self.connection_id = connection_id
         self.state = ConnectionState.NEW
         self.browser_session = browser_session  # plain JSON, no Noise, e2e=false
+        #: The authenticated device this socket belongs to (RFC-0004 §6.4).
+        #: `None` is the fail-closed default: a submit carrying a `file_id`
+        #: cannot be attributed, so it is refused. It is set by the transport
+        #: from a credential it verified itself — never from a client claim.
+        self.device_id = device_id
+        self._on_established = on_established
         self._queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=max_queue)
         self._heartbeat_interval = heartbeat_interval_s
         self._handshake_timeout = handshake_timeout_s
@@ -145,6 +153,16 @@ class Connection:
                 self.state = ConnectionState.ESTABLISHED
             else:
                 await self._handshake_phase()
+            if self._on_established is not None:
+                try:
+                    self._on_established(self)
+                except Exception:
+                    # Identity binding is best-effort by contract: a resolver
+                    # bug must not kill a socket that already authenticated.
+                    # The connection simply keeps `device_id=None` (fail-closed)
+                    # instead of becoming an unattributable *and* broken one.
+                    log.warning("on_established hook failed", extra={
+                        "code": None, "connection_id": self.connection_id})
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name=f"hb-{self.connection_id}")
             await self._read_loop()
         except asyncio.TimeoutError:

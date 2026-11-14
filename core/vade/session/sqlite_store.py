@@ -8,6 +8,11 @@ fallback keeps the same guarantee inside an IMMEDIATE transaction.
 The turn table carries extra columns beyond the task skeleton (`client_msg_id`,
 `user_text`, `stopped_reason`, `error_code`, `usage`) because idempotency and
 replay need them; the skeleton's four columns are all present and unchanged.
+
+RFC-0006 appends columns (never rewrites the skeleton): `messages.partial`,
+`messages.superseded_by`, and the turn version-chain/partial pointers. Existing
+databases get them through `ALTER TABLE ... ADD COLUMN` on open, and old rows
+read as the documented defaults (`partial=0`, `version=1`, `root_turn_id=id`).
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 from ..errors import VadeError
 from .models import Event, Message, Session, Turn, TurnState
@@ -61,7 +66,8 @@ CREATE TABLE IF NOT EXISTS messages(
     seq INTEGER NOT NULL DEFAULT 0,
     name TEXT,
     tool_call_id TEXT,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    parts TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE TABLE IF NOT EXISTS events(
@@ -74,7 +80,64 @@ CREATE TABLE IF NOT EXISTS events(
 );
 """
 
+#: RFC-0006 §9.1 rows 12: appended columns, applied to pre-existing databases.
+#: The three ALTERs per table are additive; SQLite has no `ADD COLUMN IF NOT
+#: EXISTS`, so the presence check happens in `_ensure_columns`.
+_APPENDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "messages": (
+        ("partial", "INTEGER NOT NULL DEFAULT 0"),
+        ("superseded_by", "TEXT"),
+    ),
+    "turns": (
+        ("root_turn_id", "TEXT"),
+        ("parent_turn_id", "TEXT"),
+        ("version", "INTEGER NOT NULL DEFAULT 1"),
+        ("superseded_by", "TEXT"),
+        ("superseded_reason", "TEXT"),
+        ("user_message_id", "TEXT"),
+        ("partial_message_id", "TEXT"),
+        ("user_parts", "TEXT"),
+    ),
+}
+
 _SUPPORTS_RETURNING = sqlite3.sqlite_version_info >= (3, 35, 0)
+
+
+def _parts_json(message: Message) -> str | None:
+    """`parts` column: JSON array, or NULL for a legacy text-only message."""
+    if not message.parts:
+        return None
+    return json.dumps([dict(p) for p in message.parts], ensure_ascii=False)
+
+
+def _message_from_row(row: sqlite3.Row) -> Message:
+    """Decode one row, tolerating a database that predates `parts`.
+
+    `row.keys()` instead of `row["parts"]`: a store opened read-only against an
+    old file (or a caller poking a hand-built fixture) must not raise KeyError
+    just because the migration had nothing to write. The same probe covers the
+    RFC-0006 columns (`partial`, `superseded_by`): an old row reads as the
+    documented defaults instead of blowing up the load.
+    """
+    columns = row.keys()
+    parts: tuple[dict[str, Any], ...] = ()
+    raw = row["parts"] if "parts" in columns else None
+    if raw:
+        try:
+            decoded = json.loads(raw)
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, list):
+            parts = tuple(dict(p) for p in decoded if isinstance(p, dict))
+    return Message(
+        id=row["id"], session_id=row["session_id"], role=row["role"],
+        content=row["content"], turn_id=row["turn_id"], seq=row["seq"],
+        name=row["name"], tool_call_id=row["tool_call_id"], created_at=row["created_at"],
+        partial=bool(row["partial"]) if "partial" in columns else False,
+        superseded_by=row["superseded_by"] if "superseded_by" in columns else None,
+        parts=parts,
+    )
+
 
 
 class SQLiteStore(SessionStore):
@@ -94,6 +157,49 @@ class SQLiteStore(SessionStore):
             # the column is really missing). NULL = "no override".
             self._ensure_column("sessions", "model_id", "model_id TEXT")
             self._ensure_column("turns", "model_id", "model_id TEXT")
+            # RFC-0006: appended columns (`messages.partial`,
+            # `messages.superseded_by`, the turn version chain).
+            self._ensure_columns()
+            # RFC-0004 §6.2: `messages.parts` on a pre-parts database.
+            self._migrate()
+
+    def _ensure_columns(self) -> None:
+        for table, columns in _APPENDED_COLUMNS.items():
+            present = {
+                row["name"]
+                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, decl in columns:
+                if name not in present:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    # ------------------------------------------------------------- migration
+    def _migrate(self) -> None:
+        """RFC-0004 §6.2: add `messages.parts` to a pre-parts database.
+
+        Reentrant by construction: the `PRAGMA table_info` probe decides, so a
+        second open of an already-migrated file is a no-op, and a fresh file
+        (created by `_SCHEMA`) is a no-op too. The `except OperationalError`
+        straddles the one race the probe cannot close — two processes opening
+        the same file at once, where both see no column and the loser's ALTER
+        fails with "duplicate column name". If the column is there afterwards,
+        that is success, not an error.
+
+        Nothing is rewritten: `parts` stays NULL for old rows and reads
+        synthesise the text part (§6.3). Old binaries read the new file just
+        fine — they select the columns they know, and `content` is still there.
+        """
+        if "parts" in self._message_columns():
+            return
+        try:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN parts TEXT")
+        except sqlite3.OperationalError:
+            if "parts" not in self._message_columns():
+                raise
+
+    def _message_columns(self) -> set[str]:
+        rows = self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        return {str(row[1]) for row in rows}
 
     # ------------------------------------------------------------------ txn
     @contextmanager
@@ -127,19 +233,46 @@ class SQLiteStore(SessionStore):
                  session.model_id),
             )
 
-    def append(self, sess_id: str, msgs: Sequence[Message], events: Sequence[Event]) -> None:
-        if not msgs and not events:
+    def append(
+        self,
+        sess_id: str,
+        msgs: Sequence[Message],
+        events: Sequence[Event],
+        *,
+        turns: Sequence[Turn] = (),
+        message_updates: Sequence[tuple[str, str | None]] = (),
+    ) -> None:
+        """Persist one batch atomically, before broadcast.
+
+        RFC-0006 §4.2/§6.4 widen "one batch" to the turn row and the
+        `superseded_by` pointers as well: an interrupt must commit
+        `state=interrupted` + the partial message + `turn.interrupted` together,
+        and a regenerate must commit the old turn's pointer + the new turn + its
+        events together, or a crash in between leaves a state no client can
+        explain. `message_updates` is `[(message_id, superseded_by)]` — the only
+        mutation a message row ever accepts (its content stays immutable).
+        """
+        if not msgs and not events and not turns and not message_updates:
             return
         with self._transaction() as conn:
+            for turn in turns:
+                self._upsert_turn(conn, sess_id, turn)
             if msgs:
                 conn.executemany(
                     "INSERT INTO messages(id, session_id, turn_id, role, content, seq, name,"
-                    " tool_call_id, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    " tool_call_id, created_at, partial, superseded_by, parts)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     [
                         (m.id, m.session_id, m.turn_id, m.role, m.content, m.seq,
-                         m.name, m.tool_call_id, m.created_at)
+                         m.name, m.tool_call_id, m.created_at, int(bool(m.partial)),
+                         m.superseded_by, _parts_json(m))
                         for m in msgs
                     ],
+                )
+            for message_id, superseded_by in message_updates:
+                conn.execute(
+                    "UPDATE messages SET superseded_by=? WHERE session_id=? AND id=?",
+                    (superseded_by, sess_id, message_id),
                 )
             if events:
                 conn.executemany(
@@ -148,24 +281,40 @@ class SQLiteStore(SessionStore):
                       e.ts) for e in events],
                 )
 
+    def _upsert_turn(self, conn: sqlite3.Connection, sess_id: str, turn: Turn) -> None:
+        conn.execute(
+            "INSERT INTO turns(id, session_id, state, started_at, ended_at, client_msg_id,"
+            " user_text, stopped_reason, error_code, error_message, usage, tool_calls,"
+            " root_turn_id, parent_turn_id, version, superseded_by, superseded_reason,"
+            " user_message_id, partial_message_id, user_parts, model_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(id) DO UPDATE SET state=excluded.state,"
+            " started_at=excluded.started_at, ended_at=excluded.ended_at,"
+            " stopped_reason=excluded.stopped_reason, error_code=excluded.error_code,"
+            " error_message=excluded.error_message, usage=excluded.usage,"
+            " tool_calls=excluded.tool_calls, root_turn_id=excluded.root_turn_id,"
+            " parent_turn_id=excluded.parent_turn_id, version=excluded.version,"
+            " superseded_by=excluded.superseded_by,"
+            " superseded_reason=excluded.superseded_reason,"
+            " user_message_id=excluded.user_message_id,"
+            " partial_message_id=excluded.partial_message_id,"
+            " user_parts=excluded.user_parts, model_id=excluded.model_id",
+            (
+                turn.id, sess_id, turn.state.value, turn.started_at, turn.ended_at,
+                turn.client_msg_id, turn.user_text, turn.stopped_reason, turn.error_code,
+                turn.error_message, json.dumps(dict(turn.usage), ensure_ascii=False),
+                json.dumps(list(turn.tool_calls), ensure_ascii=False),
+                turn.root_turn_id, turn.parent_turn_id, int(turn.version or 1),
+                turn.superseded_by, turn.superseded_reason, turn.user_message_id,
+                turn.partial_message_id,
+                json.dumps(list(turn.user_parts), ensure_ascii=False),
+                turn.model_id,
+            ),
+        )
+
     def update_turn(self, sess_id: str, turn: Turn) -> None:
         with self._lock:
-            self._conn.execute(
-                "INSERT INTO turns(id, session_id, state, started_at, ended_at, client_msg_id,"
-                " user_text, stopped_reason, error_code, error_message, usage, tool_calls, model_id)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(id) DO UPDATE SET state=excluded.state,"
-                " started_at=excluded.started_at, ended_at=excluded.ended_at,"
-                " stopped_reason=excluded.stopped_reason, error_code=excluded.error_code,"
-                " error_message=excluded.error_message, usage=excluded.usage,"
-                " tool_calls=excluded.tool_calls, model_id=excluded.model_id",
-                (
-                    turn.id, sess_id, turn.state.value, turn.started_at, turn.ended_at,
-                    turn.client_msg_id, turn.user_text, turn.stopped_reason, turn.error_code,
-                    turn.error_message, json.dumps(dict(turn.usage), ensure_ascii=False),
-                    json.dumps(list(turn.tool_calls), ensure_ascii=False), turn.model_id,
-                ),
-            )
+            self._upsert_turn(self._conn, sess_id, turn)
 
     def next_seq(self, sess_id: str) -> int:
         with self._lock:
@@ -232,6 +381,19 @@ class SQLiteStore(SessionStore):
         return int(row[0]) if row else 0
 
     def _turn_from_row(self, row: sqlite3.Row) -> Turn:
+        """Decode one turn row, tolerating a database that predates an append.
+
+        `row.keys()` probes instead of `row[...]`: a store opened read-only
+        against an older file must read the documented default (`NULL` /
+        `1` / `()`) rather than raise KeyError on a column the migration never
+        had a chance to add. RFC-0005's `model_id` and RFC-0006's version chain
+        are both append-only, so "missing" always has a safe default.
+        """
+        columns = row.keys()
+
+        def optional(name: str, default: Any = None) -> Any:
+            return row[name] if name in columns else default
+
         return Turn(
             id=row["id"], session_id=row["session_id"], state=TurnState(row["state"]),
             client_msg_id=row["client_msg_id"], user_text=row["user_text"] or "",
@@ -240,7 +402,13 @@ class SQLiteStore(SessionStore):
             error_message=row["error_message"],
             usage=json.loads(row["usage"] or "{}"),
             tool_calls=tuple(json.loads(row["tool_calls"] or "[]")),
-            model_id=row["model_id"],
+            model_id=optional("model_id"),
+            root_turn_id=optional("root_turn_id"), parent_turn_id=optional("parent_turn_id"),
+            version=int(optional("version", 1) or 1), superseded_by=optional("superseded_by"),
+            superseded_reason=optional("superseded_reason"),
+            user_message_id=optional("user_message_id"),
+            partial_message_id=optional("partial_message_id"),
+            user_parts=tuple(json.loads(optional("user_parts") or "[]")),
         )
 
     def find_turn_by_client_msg(self, sess_id: str, client_msg_id: str) -> Turn | None:
@@ -272,14 +440,7 @@ class SQLiteStore(SessionStore):
         return Session(
             id=row["id"], created_at=row["created_at"], title=row["title"],
             seq_counter=row["seq_counter"], state=row["state"], model_id=row["model_id"],
-            messages=tuple(
-                Message(
-                    id=r["id"], session_id=r["session_id"], role=r["role"],
-                    content=r["content"], turn_id=r["turn_id"], seq=r["seq"],
-                    name=r["name"], tool_call_id=r["tool_call_id"], created_at=r["created_at"],
-                )
-                for r in msg_rows
-            ),
+            messages=tuple(_message_from_row(r) for r in msg_rows),
             turns=tuple(self._turn_from_row(r) for r in turn_rows),
         )
 

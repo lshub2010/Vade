@@ -65,6 +65,12 @@ def test_c06_is_untouched():
         assert data["events"][name]["required"] == required, name
     assert data["turn_states"] == ["queued", "waiting_approval", "waiting_input", "running",
                                    "completed", "failed", "interrupted", "cancelled"]
+    # RFC-0007 §5.2: `task_states` is a SEPARATE top-level enum, not a slice of
+    # `turn_states` — the two must coexist after a merge that touches both
+    # (RFC-0008 widened the turn enum, RFC-0007 added the task one). Pinned here
+    # so a conflict resolution that keeps one side's array cannot pass.
+    assert data["task_states"] == ["queued", "running", "waiting_approval", "cancelling",
+                                   "completed", "failed", "cancelled"]
     assert any("C3d may APPEND session.turn / session.closed" in rule for rule in data["rules"])
 
 

@@ -34,6 +34,12 @@ class ReplayBuffer:
         self._buf: dict[str, deque[tuple[int, float]]] = {}
 
     def add(self, event: Event) -> None:
+        if getattr(event, "coalesce", False):
+            # RFC-0007 §9.4: a coalescible event is not a continuity witness.
+            # It stays in `events` (read_since still returns it), but counting
+            # 1 200 `task.progress` rows against the 1 000-event window would
+            # turn every reconnect into a snapshot (§5.4).
+            return
         buf = self._buf.setdefault(event.session_id, deque(maxlen=self._maxlen))
         buf.append((event.seq, self._clock()))
 

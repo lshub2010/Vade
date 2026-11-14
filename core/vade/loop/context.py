@@ -19,7 +19,40 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ..session.models import Message
 
-__all__ = ["CompactionConfig", "BlobStore", "ContextBuilder", "estimate_tokens"]
+__all__ = ["CompactionConfig", "BlobStore", "ContextBuilder", "estimate_tokens",
+           "filter_superseded"]
+
+
+def filter_superseded(messages: Sequence[Message], turns: Sequence[Any]) -> list[Message]:
+    """History for a new turn must not contain content a version replaced.
+
+    RFC-0006 §6.6: without this, regenerating a turn shows the model its own
+    previous answer and a fresh tool result set, so it "continues" the rejected
+    attempt instead of answering again. Runs BEFORE `fit()` — fitting a history
+    that still holds replaced text would spend the budget on it and could drop
+    the live turn instead.
+
+    Rules: a user message is kept only while `superseded_by is None`; an
+    assistant/tool message is kept only while its turn is a head. A message
+    whose turn is unknown (pre-RFC data) is kept.
+    """
+    known = {turn.id for turn in turns}
+    heads = {turn.id for turn in turns if getattr(turn, "superseded_by", None) is None}
+    kept: list[Message] = []
+    for message in messages:
+        if getattr(message, "superseded_by", None) is not None:
+            continue
+        if message.role == "user":
+            # Rule ①: the user's words are kept while the message is current.
+            # Regenerate reuses the *same* message, whose turn is now superseded,
+            # so filtering users by turn would hide the prompt being answered.
+            kept.append(message)
+            continue
+        turn_id = message.turn_id
+        if turn_id is not None and turn_id in known and turn_id not in heads:
+            continue  # rule ②: an assistant/tool message of a replaced turn
+        kept.append(message)
+    return kept
 
 
 def estimate_tokens(text: str) -> int:

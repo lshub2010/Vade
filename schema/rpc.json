@@ -6,15 +6,55 @@
   "owner": "C2",
   "source_of_truth": "docs/design.md §2.5",
   "x-vade": {
-    "appends": "RFC-0004",
-    "append_rfc0008": {
-      "contract": "C-05",
-      "doc": "docs/rfc/RFC-0008-ask-user-input.md",
-      "adds": ["turn/input", "turn/input.cancel"],
-      "snapshot_note": "`ui/attach.result.snapshot` gains an additive `pending_inputs[]` key (input_id/turn_id/kind/prompt/detail/schema/options/timeout_s/expires_at/created_at). `snapshot` stays `object`; a client that does not know the key ignores it, exactly as RFC-0007 treats `tasks`.",
-      "rewrites": "none. No existing method, error code or field changes."
-    },
-    "notes": "1.1.0 is additive except one tightening: `ui/submit.content` goes from `[object]` to a typed part union (§6.1/§7.2), which only malformed clients notice — a legal old `[{\"type\":\"text\"}]` still passes. New top-level `http_endpoints` declares the `/ui/blob*` family that lives on the data-plane listener (§7.3). Nothing else changed; C-06 and C-04 are untouched by RFC-0004."
+    "appends": [
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0004-attachments-multimodal.md",
+        "adds": ["ui/submit.content typed part union", "http_endpoints"],
+        "notes": [
+          "ui/submit.content goes from `[object]` to a typed part union (§6.1/§7.2); a legal old `[{\"type\":\"text\"}]` still passes, only malformed clients notice",
+          "new top-level `http_endpoints` declares the `/ui/blob*` family that lives on the data-plane listener (§7.3)",
+          "C-06 and C-04 are untouched by RFC-0004"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0007-subagents-and-tasks.md",
+        "adds": ["task/list", "task/log_tail", "task/cancel", "subagent/message"],
+        "notes": [
+          "four observation/control methods and the four `task.*` names mirrored into `events_core_to_ui`; no existing method changed",
+          "a core that predates it answers `NOT_FOUND` (the documented UI degradation)"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0006-turn-semantics.md",
+        "adds": ["turn/regenerate", "message/edit_resubmit"],
+        "notes": [
+          "ui/attach: snapshot.turns[] and messages[].partial / messages[].superseded_by are appended keys; `snapshot` stays an object and old clients ignore them",
+          "session/fork is intentionally NOT registered in v1: clients get JSON-RPC -32601, not UNSUPPORTED",
+          "PAYLOAD_TOO_LARGE carries error.data = {field, limit, actual, unit} (RFC-0006 §8)"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0008-ask-user-input.md",
+        "adds": ["turn/input", "turn/input.cancel"],
+        "snapshot_note": "`ui/attach.result.snapshot` gains an additive `pending_inputs[]` key (input_id/turn_id/kind/prompt/detail/schema/options/timeout_s/expires_at/created_at). `snapshot` stays `object`; a client that does not know the key ignores it, exactly as RFC-0007 treats `tasks`.",
+        "rewrites": "none. No existing method, error code or field changes."
+      }
+    ]
   },
   "transport": "JSON-RPC 2.0 over a Noise transport frame (type 0x02) or over plain text frames on the browser_session channel",
   "envelope": {
@@ -103,7 +143,7 @@
         "params": {"session_id": "string|null", "last_seq": "int|null"},
         "result": {"session_id": "string", "from_seq": "int", "snapshot": "object|null"},
         "errors": ["NOT_FOUND", "PERMISSION_DENIED"],
-        "notes": "RFC-0004 §6.3: `snapshot.messages[]` carries `parts` — the minimal field set all three clients must render in the same order: `[{type:'text',text} | {type:'image',file_id,mime,name,size,width,height,sha256} | {type:'file',file_id,mime,name,size}]`. Rows written before parts existed are read back as a single `text` part synthesised from `content` (never rewritten on disk); `content` keeps carrying the text projection, so a client that ignores `parts` renders exactly as before. Attachments are referenced by `file_id` only — never a local URI (§2.3). RFC-0008 §8.2: `snapshot.pending_inputs[]` lists unanswered input requests (the `turn.input_required` row shape minus `source`/`default`), so a client that missed the replay window can still rebuild the dialog; an `input_id` that is already resolved never appears there."
+        "notes": "RFC-0004 §6.3: `snapshot.messages[]` carries `parts` — the minimal field set all three clients must render in the same order: `[{type:'text',text} | {type:'image',file_id,mime,name,size,width,height,sha256} | {type:'file',file_id,mime,name,size}]`. Rows written before parts existed are read back as a single `text` part synthesised from `content` (never rewritten on disk); `content` keeps carrying the text projection, so a client that ignores `parts` renders exactly as before. Attachments are referenced by `file_id` only — never a local URI (§2.3). RFC-0008 §8.2: `snapshot.pending_inputs[]` lists unanswered input requests (the `turn.input_required` row shape minus `source`/`default`), so a client that missed the replay window can still rebuild the dialog; an `input_id` that is already resolved never appears there. RFC-0007 §5.6: `snapshot.tasks` is the authoritative starting point for the activity list (all non-terminal tasks, then the newest `tasks.snapshot_finished` terminals), with `snapshot.tasks_truncated=true` when older history exists (page it with `task/list`) and `pending_approvals[].task_id` naming the task that owns a prompt. A snapshot MISSING the `tasks` key means the core predates RFC-0007 — the client shows its static empty state and must not fabricate progress."
       },
       "ui/detach": {
         "params": {"session_id": "string"},
@@ -204,7 +244,71 @@
         "result": {"ok": true, "turn_id": "string", "status": "cancelled|submitted|timeout"},
         "errors": ["NOT_FOUND", "READ_ONLY_SESSION", "INVALID_ARGUMENT"],
         "notes": "RFC-0008 §7.2. Closes ONE dialog and keeps the turn running (the model receives CANCELLED and decides how to continue) — `ui/interrupt` is the one that ends the turn. Idempotent: an already-resolved id returns its current status and no second `turn.input_resolved`."
+      },
+      "turn/regenerate": {
+        "params": {"session_id": "string", "turn_id": "string", "client_msg_id": "string"},
+        "result": {"turn_id": "string", "root_turn_id": "string", "version": "int",
+                   "supersedes_turn_id": "string", "queue_pos": "int"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "READ_ONLY_SESSION", "OVERLOADED", "UNSUPPORTED"],
+        "notes": "RFC-0006 1.1.0. New turn for the same user message; the old turn gets superseded_by and a turn.superseded event. `client_msg_id` is the idempotency key; data.reason is turn_active|not_tail|not_head|client_msg_id_conflict."
+      },
+      "message/edit_resubmit": {
+        "params": {"session_id": "string", "message_id": "string", "content": ["object"],
+                   "client_msg_id": "string"},
+        "result": {"turn_id": "string", "message_id": "string", "supersedes_turn_id": "string",
+                   "root_turn_id": "string", "version": "int", "queue_pos": "int"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "READ_ONLY_SESSION", "OVERLOADED", "PAYLOAD_TOO_LARGE"],
+        "notes": "RFC-0006 1.1.0. Appends a NEW user message and points the old one at it (messages are immutable); only the last user message is editable."
+      },
+      "task/list": {
+        "params": {
+          "session_id": "string|null (omitted = across sessions; NOT shared execution)",
+          "kinds": ["subagent|job"],
+          "states": ["task.state"],
+          "limit": "int 1..200 = 50",
+          "cursor": "string|null (opaque; clients MUST NOT parse it)"
+        },
+        "result": {
+          "tasks": "TaskView[] (RFC-0007 §5.1 fields + log_available)",
+          "next_cursor": "string|null",
+          "running_count": "int",
+          "limits": {"max_concurrent": "int", "max_depth": "int"}
+        },
+        "errors": ["INVALID_ARGUMENT"],
+        "notes": "RFC-0007 §6.1. Fixed order: non-terminal by started_at ascending first, then terminal by ended_at descending. FR-8.62's 'most recent 50' is states:[completed,failed,cancelled], limit:50 — no `order` parameter exists on purpose. `running_count` and `limits` are served so the client does not have to count tasks of sessions it never attached to. Read-only sessions may call it."
+      },
+      "task/log_tail": {
+        "params": {
+          "task_id": "string",
+          "lines": "int 1..200 = 200",
+          "max_bytes": "int 1..65536 = 65536",
+          "cursor": "string|null",
+          "follow": "bool = false",
+          "wait_ms": "int 0..30000 = 10000"
+        },
+        "result": {
+          "lines": "array of {ts:int, stream:stdout|stderr|core, text:string}",
+          "cursor": "string|null",
+          "eof": "bool",
+          "truncated": "head|line|null",
+          "lost": "bool"
+        },
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT"],
+        "notes": "RFC-0007 §6.2. `follow=true` is a bounded long-poll (no server push, no SSE): core may hold the call up to wait_ms, then the client immediately asks again. `eof` = the task is terminal AND the log is drained. Two caps, whichever hits first: lines <= 200 and the response payload <= 64 KiB; truncated='head' means older rows were dropped, 'line' means a single line was cut at tasks.log_line_chars. `lost=true` means the cursor is older than the ring's start (core restart or eviction) and the oldest available rows are returned instead — never pretend the log is complete. A task with log_available=false answers NOT_FOUND, not an empty list. Read-only sessions may call it."
+      },
+      "task/cancel": {
+        "params": {"task_id": "string", "reason": "string <=200"},
+        "result": {"ok": true, "state": "task.state", "forced": "bool"},
+        "errors": ["NOT_FOUND", "READ_ONLY_SESSION", "INVALID_ARGUMENT"],
+        "notes": "RFC-0007 §6.3. Idempotent: a terminal task returns its current terminal state, `ok:true`, and produces NO second task.finished. A live task moves to cancelling immediately; core asks cooperatively (child ui/interrupt, module tools/cancel) and forces `cancelled` with forced=true at tasks.cancel_grace_ms. The measured ceiling from this response to task.finished is 3 s (2 s default grace + scheduling). `forced` is what separates 'it really stopped' from 'we stopped waiting'."
+      },
+      "subagent/message": {
+        "params": {"task_id": "string", "text": "string 1..2000"},
+        "result": {"ok": true, "turn_id": "string|null", "delivery": "queued|steering"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "UNSUPPORTED", "READ_ONLY_SESSION", "OVERLOADED"],
+        "notes": "RFC-0007 §6.4. Only for kind=subagent with a non-null child_session_id, and only when tasks.subagent_message=true (default false → UNSUPPORTED, which is the v1 answer). delivery=queued means the child handles it as a new message after its current turn; steering (injecting a running turn) is reserved and answers UNSUPPORTED."
       }
+
     }
   },
   "http_endpoints": {
@@ -246,7 +350,13 @@
       "turn.failed",
       "turn.interrupted",
       "queue.updated",
-      "module.status"
+      "module.status",
+      "turn.superseded",
+      "message.edited",
+      "task.started",
+      "task.status",
+      "task.progress",
+      "task.finished"
     ],
     "owner": "C3"
   }

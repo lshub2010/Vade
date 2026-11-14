@@ -47,6 +47,7 @@
 | rfc-module | 已合并（文档） | `0652717`（merge，含 8dffd28） | 父验 pass（C-03 实为 `additionalProperties:true`、`ui_to_core` 只有 6 方法且 `tools/call` 仅在 `core_to_module`，两点已核） | **RFC-0009 449 行（C-19 提案）**：`ui.pages[]`（id/title/icon/entry/schema/version）；节点 = column/row/tabs/list + text + C-09 组件子集（7 白名单，4 个宿主组件出现即拒渲）；只读绑定三根；动作仅 navigate / `tools/call` / `ui/submit`，并提案 `ui/tool.call` 补 UI→core 缺口；未知 type/脚本 → 整页拒渲 + `MANIFEST_INVALID`；深度 8 / 节点 256 / 内联 8 KiB；入口（桌面右面板 / 手机能力 tab / 无页面无入口）；A1–A13、Q1–Q7 |
 | rfc-approve | 已批准 | 见 `approved` 字段 | 用户逐条裁定 5 条（记录：`research/rfc-approvals.md`） | RFC-0003～0009 **全部批准**，实施顺序 **0004 → 0006 → 0005 → 0007/0008 → 0009 → 0003**；三项契约扩充获批：C-04 `BUDGET_EXCEEDED`（33→34）、C-05 `ui/tool.call`（UI→core 6→7）、C-06 `turn_states` 升 2.0.0 加 `waiting_input`；RFC-0009 的 fail-closed 覆盖 FR-8.78“降级占位”原句 |
 | client-split | 已迁出 | （见提交） | 用户裁定：客户端也算模块、submodule 取契约、**admin-ui 是 AgentCore 附属产物不算模块** | `ui/` 迁至 `vade-client` 独立仓（43 文件，保留 UI 相关历史）；主仓 `ui/` 只留指针 README；`00-orchestration`/`01-contracts`/`50-52` 任务书加路径口径说明；`admin-ui/` 不动 |
+| rfc0004a | 已合并 | PR #15 squash `3163166`，回同步 `fcd28ea` | 安全审查两轮：首轮 fail（3 阻断）→ 返工 → 复审 **pass**（0 阻断 / 1 应修 / 8 建议） | **RFC-0004 前半**：`core/vade/blob/` 六路由、id `^(?:blb|upl)_…`、sha256 推导路径、设备 token + cookie 四道闸、`multipart` 先于鉴权 415、分片/续传/幂等、写盘前配额、**引用计数**跨设备去重、周期 sweeper（ASGI lifespan）、服务端复校 + PNG 有界解压；`[attach]` 17 键；**489 passed**（+105 blob 用例）；未做：`parts[]` / `ui/submit` 定型（0004b 进行中）、`ui/blob.token`、缩略图/扫描管线 |
 
 ## 里程碑
 

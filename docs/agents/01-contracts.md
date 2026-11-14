@@ -68,7 +68,8 @@
   "CONFIRM_REQUIRED":   {"retriable": false, "http": 409},
   "UNKNOWN_CONFIG_KEY": {"retriable": false, "http": 400},
   "CODE_INVALID":       {"retriable": false, "http": 400},
-  "CODE_EXPIRED":       {"retriable": false, "http": 400}
+  "CODE_EXPIRED":       {"retriable": false, "http": 400},
+  "BUDGET_EXCEEDED":    {"retriable": false, "http": 402}
 }
 ```
 
@@ -78,6 +79,7 @@
 - `UNKNOWN_CONFIG_KEY`：`core.toml` / `overrides` 出现未知键 → 拒绝启动或 400（C-18 全量 schema，拼写错误不静默用默认值）。
 - `CODE_INVALID` / `CODE_EXPIRED`：配对码校验失败（码错/已用）与超时（>180s）两种，供 UI 分提示，**均不回显码本身**。
 - `RISK_DOWNGRADE_FORBIDDEN`：`capabilities.update` 试图下调 risk（A37）。
+- `BUDGET_EXCEEDED`：RFC-0005 追加（33→34）。`[usage].enforce="block"` 且会话/当日 token 预算已超、账可信时，`ui/submit` 拒新 turn 并带 `data:{state:"exceeded", scope, used, limit}`；**不入队**。账不可信（本轮 `usage.source="none"`）时降级为告警，不返回此码。
 - `APPROVER_INVALID`：`approval/decide` 的调用方不具备批准权（浏览器 / 非批准设备，A38）。
 - `ORIGIN_MISMATCH`：管理面请求的 `Origin` 不在允许集合内，或 `Sec-Fetch-Site` 不是 `same-origin`（A42）。**只在管理面用**，不发给模块。
 - `READ_ONLY_SESSION`：已认证的 **cookie** 会话发起写操作。**Bearer 永远不会拿到这个码**；`login` / `login/challenge` / `logout` / `token/refresh` / `setup*` / `health` 豁免。

@@ -46,6 +46,13 @@
         "why": "C-03 shipped without the field C-14's manifest gate reads. `additionalProperties: true` let a module send it, but `Manifest` dropped it, so every real registration was rejected `not in manifest`."
       },
       {
+        "contract": "RFC-0005",
+        "version": "1.0.0",
+        "fields": ["capabilities.models"],
+        "doc": "docs/rfc/RFC-0005-model-capabilities-usage.md",
+        "why": "No capability declaration surface existed, so a UI could only guess whether a model reads images (RFC-0004 §9's unknown-capability path costs a full 5 MiB upload before UNSUPPORTED). Appended only: `capabilities.required` is still `['tools']`, and an old core ignores the unknown key with a warning, exactly as C-03 promises. `core/vade/registry/manifest.py` must keep parsing it into `Manifest.models` or the schema field becomes a silently dropped key — the same failure mode as the C-14 row above."
+      },
+      {
         "contract": "C-19",
         "version": "1.0.0",
         "fields": [
@@ -150,6 +157,12 @@
             "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
             "maxLength": 64
           }
+        },
+        "models": {
+          "type": "array",
+          "description": "RFC-0005 append (§4.3). Models this module serves, one entry each; `name` is what `model/list` puts after `<module_id>/`. OPTIONAL and additive: a module that declares nothing still appears as `<module_id>/*` with every capability null (an empty array is NOT 'serves no model'). Capped at 16 so a manifest cannot become a second model directory; more than 16 is MANIFEST_INVALID, while a single bad ENTRY is dropped with a warning so one typo cannot take the module offline. Omitted capability fields are UNKNOWN (null), never false/[].",
+          "maxItems": 16,
+          "items": {"$ref": "#/$defs/model"}
         }
       }
     },
@@ -279,6 +292,58 @@
         "output_schema": {
           "type": "object",
           "description": "Optional. Root type must also be `object` when present."
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "description": "One model a module serves (RFC-0005 §4.3). Only `name` is required; every capability is optional and an omitted one is UNKNOWN (null). `id`, `provider`, `priority` and `available` are DERIVED by core — `id` = `<module_id>/<name>`, `provider` = `module_id`, `priority` = the manifest's `priority`, `available` = at least one healthy instance — so a module cannot claim another module's namespace or invent an availability it does not have. Declaring `id`/`provider` here is ignored (additionalProperties is true by design).",
+      "required": ["name"],
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Model name as the provider knows it (e.g. `qwen2.5-vl-72b`). No `/` and no whitespace, because core splits `<provider>/<model>` at the FIRST `/` only and `parse_models` drops such an entry; a name that needs a vendor prefix must be flattened by the module. Unique within one manifest; a duplicate is dropped with a warning.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^/\\s]+$"
+        },
+        "display_name": {
+          "type": "string",
+          "description": "Shown in the model switcher; falls back to `name`.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "input_modalities": {
+          "type": "array",
+          "description": "Subset of text|image|audio|file. An unknown value is dropped with a warning; the whole field is null when nothing valid remains. null = UNKNOWN = the UI allows the pick but marks it unknown and core decides at submit (RFC-0004 §9) — it is NOT 'text only'.",
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {"type": "string", "enum": ["text", "image", "audio", "file"]}
+        },
+        "max_image_bytes": {
+          "type": "integer",
+          "description": "Post-compression per-image byte cap (RFC-0004 §9, min() with `attach.image.max_bytes`). Non-positive or non-integer -> field becomes null + warning; the manifest is still accepted.",
+          "minimum": 1
+        },
+        "max_image_px": {
+          "type": "integer",
+          "description": "LONG-EDGE pixel cap (Q6: min() with `attach.image.max_edge`, not total pixels). Non-positive -> null + warning.",
+          "minimum": 1
+        },
+        "max_images_per_turn": {
+          "type": "integer",
+          "description": "Images per turn (min() with `attach.max_per_turn`). Non-positive -> null + warning.",
+          "minimum": 1
+        },
+        "context_window": {
+          "type": "integer",
+          "description": "Context size in tokens; null = unknown, in which case the UI shows no percentage and compaction keeps using its own config.",
+          "minimum": 1
+        },
+        "supports_tools": {
+          "type": "boolean",
+          "description": "false = core does not send a `tools` array to this model. null = undeclared -> keep sending (status quo). Never inferred from the model name."
         }
       }
     },

@@ -85,8 +85,31 @@
           "`ui/tool.call` never executes in stage one when approval is required: stage two repeats the call with `call_id` + `approval_id` and the same `args` (a different body is PERMISSION_DENIED)"
         ],
         "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.2.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0005-model-capabilities-usage.md",
+        "adds": ["model/list", "session/model.get", "session/model.set", "session/usage.get"],
+        "notes": [
+          "four methods under `ui_to_core`: model/list, session/model.get, session/model.set, session/usage.get",
+          "`ui/attach` only gained a `notes` sentence describing the additive `snapshot.session.model` key; its params/result/errors are byte-identical",
+          "no existing method, direction or error list changed; a core without these answers -32601 and the UI degrades to a read-only badge (FR-8.46)"
+        ],
+        "rewrites": "none. Recorded in full under `x-vade.rfc0005_append`."
       }
-    ]
+    ],
+    "rfc0005_append": {
+      "contract": "RFC-0005",
+      "owner": "C3",
+      "frozen": "2026-11-14",
+      "doc": "docs/rfc/RFC-0005-model-capabilities-usage.md",
+      "adds": ["model/list", "session/model.get", "session/model.set", "session/usage.get"],
+      "namespaces": "`model/*` and `session/*` are new; nothing under `ui/*`, `module/*`, `tools/*`, `prompts/*` or `events/*` was renamed, moved or removed. `ui/attach` only gained a `notes` field describing the snapshot key — its params/result/errors are byte-identical to 1.0.0.",
+      "rewrites": "none. Every v1.0.0 method, direction and error list is untouched; the four new entries live under `ui_to_core` because all four are called by a device or an operator UI over the same browser_session channel, and adding a third direction would break the `for direction in directions.values()` consumers the C-05 gate relies on.",
+      "version_note": "RFC-0005 §7.1 row 1 proposes C-05 1.0.0 -> 1.1.0. The top-level `version` is NOT bumped by this RFC (it reads 1.2.0 here because RFC-0009 owns that bump): an appender may not make a frozen file claim a header it does not own, and no gate needs the bump. Recorded as a deviation in core/vade/llm/RESULT-rfc0005.md."
+    }
   },
   "transport": "JSON-RPC 2.0 over a Noise transport frame (type 0x02) or over plain text frames on the browser_session channel",
   "envelope": {
@@ -340,21 +363,11 @@
     },
     "ui_to_core": {
       "ui/attach": {
-        "params": {
-          "session_id": "string|null",
-          "last_seq": "int|null"
-        },
-        "result": {
-          "session_id": "string",
-          "from_seq": "int",
-          "snapshot": "object|null"
-        },
-        "errors": [
-          "NOT_FOUND",
-          "PERMISSION_DENIED"
-        ],
-        "notes": "RFC-0004 §6.3: `snapshot.messages[]` carries `parts` — the minimal field set all three clients must render in the same order: `[{type:'text',text} | {type:'image',file_id,mime,name,size,width,height,sha256} | {type:'file',file_id,mime,name,size}]`. Rows written before parts existed are read back as a single `text` part synthesised from `content` (never rewritten on disk); `content` keeps carrying the text projection, so a client that ignores `parts` renders exactly as before. Attachments are referenced by `file_id` only — never a local URI (§2.3). RFC-0008 §8.2: `snapshot.pending_inputs[]` lists unanswered input requests (the `turn.input_required` row shape minus `source`/`default`), so a client that missed the replay window can still rebuild the dialog; an `input_id` that is already resolved never appears there. RFC-0007 §5.6: `snapshot.tasks` is the authoritative starting point for the activity list (all non-terminal tasks, then the newest `tasks.snapshot_finished` terminals), with `snapshot.tasks_truncated=true` when older history exists (page it with `task/list`) and `pending_approvals[].task_id` naming the task that owns a prompt. A snapshot MISSING the `tasks` key means the core predates RFC-0007 — the client shows its static empty state and must not fabricate progress."
-      },
+        "params": {"session_id": "string|null", "last_seq": "int|null"},
+        "result": {"session_id": "string", "from_seq": "int", "snapshot": "object|null"},
+        "errors": ["NOT_FOUND", "PERMISSION_DENIED"],
+        "notes": "snapshot.session (RFC-0005 append): the session block gained `model: {model_id: string|null, source: \"session\"|\"global\"|\"priority\"|\"none\"}`, so a device that reconnects lights the FR-8.46 badge without calling session/model.get first. `snapshot` stays `object`; no key was renamed or removed. RFC-0004 §6.3: `snapshot.messages[]` carries `parts` — the minimal field set all three clients must render in the same order: `[{type:'text',text} | {type:'image',file_id,mime,name,size,width,height,sha256} | {type:'file',file_id,mime,name,size}]`. Rows written before parts existed are read back as a single `text` part synthesised from `content` (never rewritten on disk); `content` keeps carrying the text projection, so a client that ignores `parts` renders exactly as before. Attachments are referenced by `file_id` only — never a local URI (§2.3). RFC-0008 §8.2: `snapshot.pending_inputs[]` lists unanswered input requests (the `turn.input_required` row shape minus `source`/`default`), so a client that missed the replay window can still rebuild the dialog; an `input_id` that is already resolved never appears there. RFC-0007 §5.6: `snapshot.tasks` is the authoritative starting point for the activity list (all non-terminal tasks, then the newest `tasks.snapshot_finished` terminals), with `snapshot.tasks_truncated=true` when older history exists (page it with `task/list`) and `pending_approvals[].task_id` naming the task that owns a prompt. A snapshot MISSING the `tasks` key means the core predates RFC-0007 — the client shows its static empty state and must not fabricate progress."      },
+
       "ui/detach": {
         "params": {
           "session_id": "string"
@@ -575,6 +588,29 @@
           "NOT_FOUND"
         ]
       },
+      "model/list": {
+        "params": {"if_revision": "int|null (optional)"},
+        "result": {"revision": "int", "not_modified": "bool", "models": "[model]|null", "default": {"model_id": "string|null", "source": "session|global|priority|none", "resolved": "bool"}},
+        "errors": ["UNAVAILABLE"],
+        "notes": "RFC-0005 append (v1.0.0 -> 1.1.0). Read-only, no side effects, no reverse RPC to modules. `if_revision == revision` returns {revision, not_modified:true, models:null} and the client keeps its cache — a client MUST NOT clear capability badges on `not_modified`. `models` is empty (never 404) when the current mode can route to nothing. Entry: {id, provider, display_name, input_modalities|null, max_image_bytes|null, max_image_px|null, max_images_per_turn|null, context_window|null, supports_tools|null, priority, available}; `null` is UNKNOWN and is never interchangeable with false/[] (no inference from the model name). Offline entries stay with available:false. A core without this method answers -32601 and the UI degrades to a read-only badge (FR-8.46), never to an empty list."
+      },
+      "session/model.get": {
+        "params": {"session_id": "string"},
+        "result": {"model_id": "string|null", "source": "session|global|priority|none", "resolved": "bool", "effective": "object|null", "global_default": "string|null", "reason": "string|null"},
+        "errors": ["NOT_FOUND", "PERMISSION_DENIED", "UNAVAILABLE"],
+        "notes": "RFC-0005 append. Resolution order (D101): explicit session choice > [llm].default_model > manifest priority (ties: freshest heartbeat, then id). `source` names the layer that won so the UI never re-derives it; `none` means no usable candidate. `resolved=false` with `reason=\"model_unavailable\"` is a DANGLING explicit choice: the UI must show the banner and must not expect a silent fallback. `effective` = {id, provider, model, available}. UNAVAILABLE only when core has no model surface wired at all."
+      },
+      "session/model.set": {
+        "params": {"session_id": "string", "model_id": "string|null"},
+        "result": {"model_id": "string|null", "source": "session|global|priority|none", "effective_at": "next_turn"},
+        "errors": ["INVALID_ARGUMENT", "NOT_FOUND", "UNAVAILABLE", "READ_ONLY_SESSION"],
+        "notes": "RFC-0005 append. `model_id: null` clears the override and falls back to the global default / priority; the returned `source` is the source AFTER clearing. Validation: must appear in the current model/list and be available=true — malformed id -> INVALID_ARGUMENT, unknown id -> NOT_FOUND (data.reason=\"unknown_model\"), known but no healthy instance -> UNAVAILABLE (data.reason=\"model_unavailable\"). A write: an explicitly read-only session gets READ_ONLY_SESSION (get and list stay readable). Takes effect at the next turn's dequeue, so a queued turn that has not started uses the new model and a running turn finishes on the old one; it never touches the queue, never rebuilds the session."
+      },
+      "session/usage.get": {
+        "params": {"session_id": "string"},
+        "result": {"session_id": "string", "chat": {"prompt_tokens": "int", "completion_tokens": "int", "total_tokens": "int", "turns": "int", "partial_turns": "int"}, "aux": {"total_tokens": "int", "calls": "int"}, "total_tokens": "int", "by_model": [{"model_id": "string|null", "total_tokens": "int", "turns": "int"}], "day": {"day": "string (UTC YYYY-MM-DD)", "core_total_tokens": "int", "core_limit": "int", "session_tokens": "int", "state": "off|ok|warn|exceeded"}, "budget": {"scope": "session", "limit": "int", "used": "int", "ratio": "number|null", "state": "off|ok|warn|exceeded", "enforced": "bool"}},
+        "errors": ["NOT_FOUND", "PERMISSION_DENIED", "UNAVAILABLE"],
+        "notes": "RFC-0005 append. One dataset, two views (D102): `chat` sums the usage of every terminal turn (completed+failed+interrupted; `partial_turns` counts those whose source=\"none\"), `aux` comes from the audit llm.call rows with purpose != \"chat\". `total_tokens` = chat + aux and is what the budget judges. `day` is UTC (same boundary as audit/writer.day_key) and gives only an aggregate for other sessions — no cross-session detail. `budget.ratio` is null when limit=0 (state=\"off\"). Two attached devices must get identical numbers and an identical `budget.state`."},
       "turn/input": {
         "params": {
           "session_id": "string",
@@ -829,7 +865,7 @@
           "UNAVAILABLE",
           "READ_ONLY_SESSION"
         ],
-        "notes": "RFC-0009 §6.2/§9.3/§10.2. Two stages: stage one validates ownership + args against the module's `input_schema`, computes risk as max(declared, [policy.tool_risk]) and, when approval is required, mints an approval WITHOUT executing anything; it returns approval_required + the approval object. Stage two repeats the call with `call_id` + `approval_id` and exactly the same `args`. **Binding (B2):** the mint records the requesting `session_id` and `device_id`, and stage two compares both verbatim — a different session or device is PERMISSION_DENIED with `data.field` = `session_id`|`approver`, and a refused redemption does not consume the mint. **Caller authentication (B1):** the target module must be the caller's own; a browser may invoke a page tool but always through this approval flow. **Read-only (B3):** a read-only session is READ_ONLY_SESSION before anything is minted. A low-risk tool may answer `ok` in stage one. The client-supplied module_id locates the page and never authorises the call. No turn, no message, no model context."
+        "notes": "RFC-0009 §6.2/§9.3/§10.2. Two stages: stage one validates ownership + args against the module's `input_schema`, computes risk as max(declared, [policy.tool_risk]) and, when approval is required, mints an approval WITHOUT executing anything; it returns approval_required + the approval object. Stage two repeats the call with `call_id` + `approval_id` and exactly the same `args`; core compares the args digest (a different body is PERMISSION_DENIED), refuses an expired/pending/denied request, and only then dispatches through the SAME router path as `tools/call`. **Binding (B2):** the mint records the requesting `session_id` and `device_id`, and stage two compares both verbatim — a different session or device is PERMISSION_DENIED with `data.field` = `session_id`|`approver`, and a refused redemption does not consume the mint. **Caller authentication (B1):** the target module must be the caller's own; a browser may invoke a page tool but always through this approval flow. **Read-only (B3):** a read-only session is READ_ONLY_SESSION before anything is minted. A low-risk tool may answer `ok` in stage one. The client-supplied module_id locates the page and never authorises the call: ownership comes from the caller identity, risk and approval from core. No turn, no message, no model context."
       }
     }
   },
@@ -923,6 +959,7 @@
       "turn.interrupted",
       "queue.updated",
       "module.status",
+      "usage.budget",
       "turn.superseded",
       "message.edited",
       "task.started",

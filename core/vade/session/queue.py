@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from dataclasses import replace
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError
@@ -40,6 +41,7 @@ class TurnQueue:
         cancel_clear_hook: Callable[[str], None] | None = None,
         max_pending: int = 100,
         clock: Callable[[], int] = now_ms,
+        resolve_model: Callable[[Turn], tuple[str | None, str | None]] | None = None,
         pre_terminal_hook: Callable[[str, TurnState], Awaitable[Any]] | None = None,
         partial_provider: Callable[[str], str] | None = None,
     ) -> None:
@@ -52,6 +54,11 @@ class TurnQueue:
         self._pre_terminal_hook = pre_terminal_hook
         self._max_pending = max_pending
         self._clock = clock
+        #: RFC-0005 §5.3: resolved at dequeue (`QUEUED -> RUNNING`), never at
+        #: submit, so a switch during the queue applies to the next turn and a
+        #: running turn keeps the model it started with. `None` = no resolver
+        #: installed (unit tests and an unwired core keep the old behaviour).
+        self._resolve_model = resolve_model
         #: RFC-0006 §4.2: reads the text already streamed for a turn so an
         #: interrupt can persist it. A callable, not a back-reference to the
         #: engine, keeps the queue free of loop-level state.
@@ -156,10 +163,36 @@ class TurnQueue:
 
     async def _execute_one(self, item: QueueItem) -> None:
         turn = item.turn.with_state(TurnState.RUNNING, started_at=self._clock())
+        model_source: str | None = None
+        if self._resolve_model is not None:
+            try:
+                model_id, model_source = self._resolve_model(turn)
+            except VadeError as exc:
+                # A dangling explicit selection must fail loudly, never quietly
+                # fall back to another model (§5.2 row 1 / A11).
+                item = item.with_turn(turn)
+                self._running = item
+                reason = "model_unavailable" if exc.code == "UNAVAILABLE" else None
+                await self._finalize(
+                    turn.with_state(TurnState.RUNNING, error_code=exc.code, error_message=exc.message),
+                    TurnState.FAILED,
+                    {"turn_id": turn.id, "code": exc.code, "message": exc.message,
+                     "state": TurnState.FAILED.value},
+                    error_code=exc.code,
+                    error_message=exc.message,
+                    usage=_unmeasured_usage(turn.model_id),
+                    data={"reason": reason} if reason else None,
+                )
+                return
+            turn = turn.with_state(TurnState.RUNNING, model_id=model_id)
         item = item.with_turn(turn)
         self._running = item
         self._save_turn(self.session_id, turn)
-        await self._emit(self.session_id, "turn.started", {"turn_id": turn.id, "state": turn.state.value})
+        started: dict[str, Any] = {"turn_id": turn.id, "state": turn.state.value}
+        if turn.model_id is not None:
+            started["model_id"] = turn.model_id
+            started["model_source"] = model_source
+        await self._emit(self.session_id, "turn.started", started)
         await self._emit(self.session_id, "queue.updated", self.state_payload())
 
         finish = asyncio.Event()
@@ -195,6 +228,7 @@ class TurnQueue:
                 error_code=code,
                 error_message=message,
                 task=task,
+                usage=_unmeasured_usage(turn.model_id),
             )
             return
 
@@ -232,6 +266,8 @@ class TurnQueue:
         error_code: str | None = None,
         error_message: str | None = None,
         task: asyncio.Task[Any] | None = None,
+        usage: Mapping[str, Any] | None = None,
+        data: Mapping[str, Any] | None = None,
     ) -> None:
         if turn.id in self._finalized:
             return
@@ -247,6 +283,15 @@ class TurnQueue:
                 pass
         if state is not TurnState.COMPLETED or turn.state is not TurnState.COMPLETED:
             turn = turn.with_state(state, ended_at=turn.ended_at or self._clock())
+        if usage is not None:
+            # RFC-0005 §6.1: a failed/interrupted turn has burned tokens too.
+            # When the provider never reported them the honest value is
+            # `source="none"` with zero counts, not an estimate.
+            turn = replace(turn, usage=dict(usage))
+            payload = {**payload, "usage": dict(usage)}
+        if data is not None:
+            payload = {**payload, "data": dict(data)}
+        self._save_turn(self.session_id, turn)
         event_type = {
             TurnState.COMPLETED: "turn.completed",
             TurnState.FAILED: "turn.failed",
@@ -423,6 +468,19 @@ class TurnQueue:
         task.add_done_callback(self._orphans.discard)
         if not task.cancelled():
             task.exception()
+
+
+def _unmeasured_usage(model_id: str | None) -> dict[str, Any]:
+    """The usage of a turn whose provider never reported any (§6.1).
+
+    Zero counts with `source="none"` is the only honest answer: core does not
+    estimate tokens (N4/D102), and inventing a number would break the per-turn
+    reconciliation against the audit trail.
+    """
+    provider = model_id.split("/", 1)[0] if model_id else None
+    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "model_id": model_id, "provider": provider, "source": "none",
+            "steps": 0, "cached_tokens": 0, "reasoning_tokens": 0}
 
 
 def _error_of(exc: BaseException) -> tuple[str, str]:

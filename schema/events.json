@@ -288,7 +288,7 @@
         "state",
         "by"
       ],
-      "notes": "Emitted after tools/cancel is fired; core does not wait for the module. No turn.* event may follow this one for that turn; an interrupted assistant's partial text is reconstructable only from turn.delta events. RFC-0005 append: optional `usage`, usually `source=\"none\"` with zero counts because the provider had not sent a final usage yet — core does not estimate."
+      "notes": "Emitted after tools/cancel is fired; core does not wait for the module. No turn.* event may follow this one for that turn. RFC-0013: the interrupted assistant's partial text is persisted as a `partial=true` assistant message that `partial_message_id` points at, so a fresh `ui/attach` snapshot contains it — replaying `turn.delta` is no longer the only source (FR-8.35). RFC-0005 append: optional `usage`, usually `source=\"none\"` with zero counts because the provider had not sent a final usage yet — core does not estimate."
     },
     "turn.cancelled": {
       "payload": {
@@ -804,6 +804,19 @@
           "DESENSITIZATION: subagent.result carries sha256(result text) + length, never the text; no result_text/summary/output key may appear on any subagent.* event (RFC-0012 §5.3)"
         ],
         "rewrites": "none. Top-level `version` stays 2.0.0: no enum widening — `subagent_states` is a NEW top-level key and every pre-existing entry, rule and enum is unchanged. No x-vade.push on any of the three: all travel as session events through SessionLog.emit. Partially supersedes RFC-0007 §4.2's 'do not send subagent.*' for the subagent half (jobs keep task.*; see RFC-0012 §8)."
+      },
+      {
+        "contract": "C-06",
+                "version": "1.2.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0013-interrupt-persistence.md",
+        "adds": [],
+        "fields": {},
+        "overrides": [
+          "turn.interrupted.notes: the 'partial text is reconstructable only from turn.delta events' sentence was deleted in place — since RFC-0006 §4 the text is persisted as a partial=true assistant message and a fresh ui/attach snapshot contains it (RFC-0013 §6; FR-8.35/R9)",
+          "this block is an explicit deviation from the RFC-0006 §9.3 'never rewrite notes bytes' rule: the stale sentence had become harmful (clients implementing from the notes discarded the persisted partial message); the RFC-0006 overrides entry above stays as audit history"
+        ],
+        "rewrites": "turn.interrupted.notes only. No payload key, required array, rule, enum or turn_state changed. Top-level C-06 stays 2.0.0 (the enum bump is RFC-0008's); this block continues RFC-0006's 1.1.0 partial-pointer lineage at 1.2.0 — append-level, non-breaking."
       }
     ]
   }

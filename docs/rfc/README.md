@@ -15,3 +15,4 @@
 | RFC-0009 | 模块 UI 页面：原生声明式 schema（新契约 C-19）、只读数据绑定与三类动作 | approved（已批准，未实施） |
 | RFC-0010 | 会话元数据：分组（文件夹）/ 图标 / 颜色 / 置顶，与 `session/*` 十方法 | proposed（core 侧已实现：C-05 1.3.0 + C-06 两事件，见 `core/vade/session/RESULT-rfc0010.md`） |
 | RFC-0012 | 子代理事件族 R3：`subagent.spawned` / `subagent.status` / `subagent.result` 三事件与 `subagent/list` / `subagent/get` 两方法 | proposed（core 侧已实现：C-05 1.4.0 + C-06 三事件，见 `core/vade/subagents/RESULT-rfc0012.md`） |
+| RFC-0013 | 中断留痕落库（R9）：partial 消息进 snapshot、C-06「only from turn.delta」旧注记改写、C-05 `ui/attach` 声明 `partial` | proposed（落库复用 RFC-0006 §4 既有实现；契约修订 + 验收测试见 `core/vade/session/RESULT-rfc0013.md`） |

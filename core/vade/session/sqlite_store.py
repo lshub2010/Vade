@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS sessions(
     created_at INTEGER NOT NULL,
     title TEXT,
     seq_counter INTEGER NOT NULL DEFAULT 0,
-    state TEXT NOT NULL DEFAULT 'open'
+    state TEXT NOT NULL DEFAULT 'open',
+    model_id TEXT
 );
 CREATE TABLE IF NOT EXISTS turns(
     id TEXT PRIMARY KEY,
@@ -45,7 +46,8 @@ CREATE TABLE IF NOT EXISTS turns(
     error_code TEXT,
     error_message TEXT,
     usage TEXT NOT NULL DEFAULT '{}',
-    tool_calls TEXT NOT NULL DEFAULT '[]'
+    tool_calls TEXT NOT NULL DEFAULT '[]',
+    model_id TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_client
     ON turns(session_id, client_msg_id) WHERE client_msg_id IS NOT NULL;
@@ -87,6 +89,11 @@ class SQLiteStore(SessionStore):
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            # RFC-0005 §5.3: two nullable columns, added idempotently so an
+            # existing sessions.db keeps working (PRAGMA first, ALTER only when
+            # the column is really missing). NULL = "no override".
+            self._ensure_column("sessions", "model_id", "model_id TEXT")
+            self._ensure_column("turns", "model_id", "model_id TEXT")
 
     # ------------------------------------------------------------------ txn
     @contextmanager
@@ -101,6 +108,11 @@ class SQLiteStore(SessionStore):
             else:
                 self._conn.execute("COMMIT")
 
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -109,9 +121,10 @@ class SQLiteStore(SessionStore):
     def create_session(self, session: Session) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT OR IGNORE INTO sessions(id, created_at, title, seq_counter, state)"
-                " VALUES(?,?,?,?,?)",
-                (session.id, session.created_at, session.title, session.seq_counter, session.state),
+                "INSERT OR IGNORE INTO sessions(id, created_at, title, seq_counter, state, model_id)"
+                " VALUES(?,?,?,?,?,?)",
+                (session.id, session.created_at, session.title, session.seq_counter, session.state,
+                 session.model_id),
             )
 
     def append(self, sess_id: str, msgs: Sequence[Message], events: Sequence[Event]) -> None:
@@ -139,18 +152,18 @@ class SQLiteStore(SessionStore):
         with self._lock:
             self._conn.execute(
                 "INSERT INTO turns(id, session_id, state, started_at, ended_at, client_msg_id,"
-                " user_text, stopped_reason, error_code, error_message, usage, tool_calls)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+                " user_text, stopped_reason, error_code, error_message, usage, tool_calls, model_id)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(id) DO UPDATE SET state=excluded.state,"
                 " started_at=excluded.started_at, ended_at=excluded.ended_at,"
                 " stopped_reason=excluded.stopped_reason, error_code=excluded.error_code,"
                 " error_message=excluded.error_message, usage=excluded.usage,"
-                " tool_calls=excluded.tool_calls",
+                " tool_calls=excluded.tool_calls, model_id=excluded.model_id",
                 (
                     turn.id, sess_id, turn.state.value, turn.started_at, turn.ended_at,
                     turn.client_msg_id, turn.user_text, turn.stopped_reason, turn.error_code,
                     turn.error_message, json.dumps(dict(turn.usage), ensure_ascii=False),
-                    json.dumps(list(turn.tool_calls), ensure_ascii=False),
+                    json.dumps(list(turn.tool_calls), ensure_ascii=False), turn.model_id,
                 ),
             )
 
@@ -181,6 +194,15 @@ class SQLiteStore(SessionStore):
             if row is None:
                 raise VadeError("NOT_FOUND", f"session {sess_id!r} does not exist")
             return int(row[0])
+
+    def set_session_model(self, sess_id: str, model_id: str | None) -> None:
+        """Persist (or clear, with None) the session-level model override."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE sessions SET model_id=? WHERE id=?", (model_id, sess_id)
+            )
+            if cursor.rowcount == 0:
+                raise VadeError("NOT_FOUND", f"session {sess_id!r} does not exist")
 
     def close_session(self, sess_id: str) -> None:
         with self._lock:
@@ -218,6 +240,7 @@ class SQLiteStore(SessionStore):
             error_message=row["error_message"],
             usage=json.loads(row["usage"] or "{}"),
             tool_calls=tuple(json.loads(row["tool_calls"] or "[]")),
+            model_id=row["model_id"],
         )
 
     def find_turn_by_client_msg(self, sess_id: str, client_msg_id: str) -> Turn | None:
@@ -248,7 +271,7 @@ class SQLiteStore(SessionStore):
             ).fetchall()
         return Session(
             id=row["id"], created_at=row["created_at"], title=row["title"],
-            seq_counter=row["seq_counter"], state=row["state"],
+            seq_counter=row["seq_counter"], state=row["state"], model_id=row["model_id"],
             messages=tuple(
                 Message(
                     id=r["id"], session_id=r["session_id"], role=r["role"],

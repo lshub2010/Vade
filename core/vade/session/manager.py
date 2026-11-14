@@ -119,6 +119,11 @@ class SessionLog:
         self._max_pending = max_pending
         self._sink_queue = sink_queue
         self.approval_port: Any = None
+        #: RFC-0005 read models, wired by `install()`. `None` means "not
+        #: configured" (unit tests, a bare core): the session layer then keeps
+        #: its pre-RFC behaviour instead of refusing every turn.
+        self.models: Any = None
+        self.usage: Any = None
         self._closed = False
         #: Bound on the first async call; `status.ModuleStatusPublisher` needs
         #: to know which loop to hop onto when the registry (sync) changes.
@@ -153,6 +158,52 @@ class SessionLog:
 
     def get_session(self, session_id: str) -> Session | None:
         return self.store.load(session_id)
+
+    # ------------------------------------------------------------------ models
+    def set_model_resolver(self, resolver: Any) -> None:
+        self.models = resolver
+
+    def set_usage_accounting(self, accounting: Any) -> None:
+        self.usage = accounting
+
+    def resolve_model(self, session_id: str) -> Any:
+        """Selection for one session (§5.2), or `None` when unwired."""
+        session = self._require_session(session_id)
+        if self.models is None:
+            return None
+        return self.models.resolve(session.model_id)
+
+    def set_session_model(self, session_id: str, model_id: str | None) -> Any:
+        """Persist/clear the session override. Takes effect next turn (§5.3)."""
+        session = self._require_session(session_id)
+        if session.state != "open":
+            raise VadeError("READ_ONLY_SESSION", "session is closed; its model cannot be changed")
+        self.store.set_session_model(session_id, model_id)
+        return self.resolve_model(session_id)
+
+    def _resolve_turn_model(self, turn: Turn) -> tuple[str | None, str | None]:
+        """Turn-dequeue resolution hook (§5.3).
+
+        An explicit session choice that no longer resolves is an error, never a
+        quiet substitution: the user asked for B and must not get A. With no
+        explicit choice there is nothing to violate, so a core that has no
+        model configured keeps letting its provider raise the error it already
+        raises (`UNAVAILABLE: no LLM provider is configured`).
+        """
+        if self.models is None:
+            return None, None
+        session = self.store.load(turn.session_id)
+        explicit = session.model_id if session is not None else None
+        selection = self.models.resolve(explicit)
+        if not selection.resolved:
+            if explicit:
+                raise VadeError(
+                    "UNAVAILABLE",
+                    f"session model {explicit!r} is not available; switch models and retry",
+                    data={"reason": "model_unavailable"},
+                )
+            return None, selection.source
+        return selection.model_id, selection.source
 
     def _require_session(self, session_id: str) -> Session:
         session = self.store.load(session_id)
@@ -286,11 +337,21 @@ class SessionLog:
                 "title": session.title,
                 "state": session.state,
                 "seq_counter": session.seq_counter,
+                # §5.1: the badge is lit by attach alone; a reconnecting device
+                # must not have to call session/model.get first.
+                "model": self._model_block(session),
             },
             "messages": session.message_tree(),
             "queue": queue.state() if queue is not None else {"running": None, "pending": []},
             "pending_approvals": pending,
         }
+
+    def _model_block(self, session: Session) -> dict[str, Any]:
+        if self.models is None:
+            return {"model_id": session.model_id,
+                    "source": "session" if session.model_id else "none"}
+        selection = self.models.resolve(session.model_id)
+        return {"model_id": selection.model_id, "source": selection.source}
 
     # ------------------------------------------------------------------ turns
     def _queue(self, session_id: str) -> TurnQueue:
@@ -306,6 +367,7 @@ class SessionLog:
                 cancel_hook=self._cancel_hook,
                 cancel_clear_hook=self._cancel_clear_hook,
                 max_pending=self._max_pending,
+                resolve_model=self._resolve_turn_model if self.models is not None else None,
             )
             self._queues[session_id] = q
         return q
@@ -328,6 +390,18 @@ class SessionLog:
         if existing is not None:
             # Idempotent replay of the same submit: same turn, no new queue entry.
             return existing, self._queue(session_id).position(existing.id)
+
+        if self.usage is not None:
+            # RFC-0005 §6.4: a new turn is refused when the budget is exceeded
+            # and the ledger is trustworthy. Already-queued turns are never
+            # retracted (the refusal is for NEW submissions only).
+            decision = await self.usage.gate(self._require_session(session_id))
+            if not decision.get("allowed", True):
+                raise VadeError(
+                    decision.get("code") or "BUDGET_EXCEEDED",
+                    "the usage budget is exhausted; raise [usage] limits or start a new day",
+                    data=decision.get("data"),
+                )
 
         turn = Turn(
             id=new_id(), session_id=session_id, state=TurnState.QUEUED,

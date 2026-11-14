@@ -17,7 +17,7 @@ import os
 import random
 from typing import Any, AsyncIterator, Mapping, Sequence
 
-from .base import Delta, ToolCallDelta
+from .base import Delta, ToolCallDelta, flatten_usage
 
 __all__ = ["OpenAICompatProvider", "parse_chunk", "RETRIABLE_STATUS"]
 
@@ -28,9 +28,7 @@ def parse_chunk(chunk: Mapping[str, Any]) -> Delta:
     """Translate one SSE JSON object into a Delta (pure)."""
     choices = chunk.get("choices") or []
     usage = chunk.get("usage")
-    usage_map = None
-    if isinstance(usage, Mapping):
-        usage_map = {k: v for k, v in usage.items() if isinstance(v, int)}
+    usage_map = flatten_usage(usage) if isinstance(usage, Mapping) else None
     if not choices:
         return Delta(usage=usage_map)
     choice = choices[0] or {}
@@ -82,10 +80,16 @@ class OpenAICompatProvider:
         *,
         tools: Sequence[Mapping[str, Any]] | None = None,
         stream: bool = True,
+        model: str | None = None,
+        attribution: dict[str, Any] | None = None,
     ) -> AsyncIterator[Delta]:
         import httpx  # local import: the core must start without httpx
 
-        body: dict[str, Any] = {"model": self.model, "messages": list(messages), "stream": stream}
+        # RFC-0005: a turn may be pinned to `builtin/<name>`; strip the provider
+        # prefix before it reaches the wire. `attribution` stays empty: a
+        # builtin call has no module, which is exactly what `llm.call` records.
+        requested = model.split("/", 1)[1] if model and model.startswith("builtin/") else model
+        body: dict[str, Any] = {"model": requested or self.model, "messages": list(messages), "stream": stream}
         if tools:
             body["tools"] = list(tools)
         last_error: Exception | None = None

@@ -105,6 +105,12 @@ def install(app: Any) -> Any:
         compaction = CompactionConfig()
 
     llm = _build_llm(cfg, router=router, registry=getattr(app, "registry", None))
+    registry = getattr(app, "registry", None)
+    # RFC-0005: the catalog/resolver are read-only views over the registry +
+    # `[llm]`; the queue asks the resolver at dequeue (§5.3), never at submit.
+    resolver = _build_model_resolver(cfg, registry)
+    log.set_model_resolver(resolver)
+    log.set_usage_accounting(_build_usage(cfg, store, log, data_dir))
     approval = _LazyApproval(app)
     memory = _LazyMemory(app)
     engine = LoopEngine(
@@ -115,6 +121,7 @@ def install(app: Any) -> Any:
         approval=approval,
         memory=memory,
         prompt_hooks=lambda: getattr(app, "prompt_hooks", []),
+        audit=getattr(app, "audit", None),
         config=LoopConfig(max_steps=int(cfg.get("policy.max_steps", 8)),
                           approval_timeout_s=int(cfg.get("policy.approval_timeout_s", 60))),
         compaction=compaction,
@@ -141,6 +148,8 @@ def install(app: Any) -> Any:
     app.router = router
     app.loop = engine
     app.llm = llm
+    app.models = resolver
+    app.usage = log.usage
     app.session_rpc = rpc
     app.session_handlers = {
         name: (lambda conn, params, _name=name: rpc.dispatch(conn, _name, params))
@@ -154,6 +163,30 @@ def install(app: Any) -> Any:
         for name, handler in (provider() or {}).items():
             app.session_handlers.setdefault(name, handler)
     return app
+
+
+def _build_model_resolver(cfg: Any, registry: Any) -> Any:
+    from ..llm.catalog import ModelResolver
+
+    return ModelResolver(cfg, registry)
+
+
+def _build_usage(cfg: Any, store: Any, log: Any, data_dir: Path) -> Any:
+    from ..llm.usage import UsageAccounting
+
+    reader = getattr(log, "_audit_reader", None)
+    if reader is None:
+        try:
+            from ..audit.reader import AuditReader
+
+            # Constructed lazily by path (the reader returns [] when the file
+            # does not exist yet), so `session/usage.get` works on a core whose
+            # audit component is not installed instead of reporting 0 silently
+            # because it could not find one.
+            reader = AuditReader(data_dir / "audit" / "audit.db")
+        except Exception:  # pragma: no cover - audit package absent
+            reader = None
+    return UsageAccounting(config=cfg, store=store, audit_reader=reader, emit=log.emit)
 
 
 def _history_of(log: Any) -> Any:

@@ -25,11 +25,13 @@ from typing import Any, Mapping
 
 from .._jsonschema import SchemaError, validate as js_validate
 from ..errors import VadeError
+from ..llm.capabilities import MAX_MODELS, ModelSpec, parse_models
 
 __all__ = [
     "Manifest",
     "ManifestError",
     "ToolSpec",
+    "ModelSpec",
     "Limits",
     "load_schema",
     "validate_manifest",
@@ -110,6 +112,10 @@ class Manifest:
     #: C-14 append (RFC-0001). Trailing default so every existing construction
     #: still type-checks and a manifest that predates the field keeps working.
     subscriptions: tuple[str, ...] = ()
+    #: RFC-0005 append: models this module serves (`capabilities.models[]`).
+    #: Empty = "declares nothing" -> core synthesises `<module_id>/*`, it is
+    #: NOT "serves no model".
+    models: tuple[ModelSpec, ...] = ()
 
     @property
     def protocol_major(self) -> int:
@@ -278,6 +284,24 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
                 f"unknown injection source {inject!r}; v1 implements only 'session_id'",
             )
 
+    # RFC-0005 append (C-03): `capabilities.models[]`. The count is a manifest
+    # error (a manifest must not become a second model directory), while a bad
+    # single entry is dropped with a warning — a typo cannot take a module
+    # offline, which is C-03's existing tolerance for unknown capabilities.
+    models_raw = raw["capabilities"].get("models")
+    if models_raw is not None:
+        if not isinstance(models_raw, list):
+            raise ManifestError(
+                "/capabilities/models",
+                f"must be an array, got {type(models_raw).__name__}",
+            )
+        if len(models_raw) > MAX_MODELS:
+            raise ManifestError(
+                "/capabilities/models",
+                f"{len(models_raw)} models declared; the limit is {MAX_MODELS}",
+            )
+    models = parse_models(models_raw)
+
     digest = hashlib.sha256(
         json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
@@ -297,4 +321,5 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
         injects=tuple(str(i) for i in injects_raw),
         digest=digest,
         subscriptions=tuple(subscriptions),
+        models=models,
     )

@@ -102,6 +102,10 @@ class Turn:
     error_message: str | None = None
     usage: Mapping[str, Any] = field(default_factory=dict)
     tool_calls: tuple[dict[str, Any], ...] = ()
+    #: RFC-0005 §5.3: the model resolved at dequeue, pinned on the turn so a
+    #: later switch cannot rewrite which model produced this usage. Internal
+    #: column, not a C-06 field.
+    model_id: str | None = None
 
     def with_state(self, state: TurnState, **changes: Any) -> "Turn":
         return replace(self, state=state, **changes)
@@ -120,6 +124,7 @@ class Turn:
             "error_message": self.error_message,
             "usage": dict(self.usage),
             "tool_calls": list(self.tool_calls),
+            "model_id": self.model_id,
         }
 
 
@@ -132,6 +137,9 @@ class Session:
     state: str = "open"
     messages: tuple[Message, ...] = ()
     turns: tuple[Turn, ...] = ()
+    #: RFC-0005 §5.3: explicit per-session model override; `None` = no
+    #: override (fall through to `[llm].default_model`, then `priority`).
+    model_id: str | None = None
 
     def message_tree(self) -> list[dict[str, Any]]:
         return [m.to_dict() for m in self.messages]

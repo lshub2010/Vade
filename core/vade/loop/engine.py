@@ -8,7 +8,9 @@ The source-grep test in `core/tests/loop/test_engine.py` keeps it that way.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
@@ -84,7 +86,8 @@ class LoopEngine:
         if self.router is None or not snapshot:
             text = "No capabilities are available: no module is online, so I cannot run tools."
             await self._turn_emit(turn, "turn.delta", {"turn_id": turn.id, "text": text})
-            return TurnOutcome(assistant_text=text, stopped_reason="no_capability")
+            return TurnOutcome(assistant_text=text, stopped_reason="no_capability",
+                               usage=_usage_record(turn.model_id, {}, reported=False, steps=0))
 
         memory_text = await self._read_memory(turn.session_id)
         parts = PromptParts(
@@ -101,37 +104,54 @@ class LoopEngine:
         messages: list[dict[str, Any]] = [m.to_llm() for m in system_messages]
         messages.extend(m.to_llm() for m in fitted)
 
-        usage: dict[str, Any] = {}
+        usage: dict[str, int] = {}
         recorded: list[dict[str, Any]] = []
         final_text = ""
         stopped_reason = "stop"
+        reported = False
+        llm_calls = 0
 
         for step in range(self.config.max_steps):
             text_parts: list[str] = []
             calls: dict[int, dict[str, str]] = {}
-            async for delta in self.llm.chat(messages, tools=snapshot.schemas(), stream=True):
-                # A provider whose `chat()` swallows the cancellation (or answers
-                # after the stream was cancelled) must not append a delta to a
-                # turn the UI already closed. Checked on the write path, so the
-                # invariant does not depend on `llm.chat` re-raising.
-                self._raise_if_interrupted(turn)
-                if delta.text:
-                    text_parts.append(delta.text)
-                    await self._turn_emit(
-                        turn, "turn.delta", {"turn_id": turn.id, "text": delta.text}
-                    )
-                for fragment in delta.tool_calls:
-                    slot = calls.setdefault(fragment.index, {"id": "", "name": "", "arguments": ""})
-                    if fragment.id:
-                        slot["id"] = fragment.id
-                    if fragment.name:
-                        slot["name"] += fragment.name
-                    if fragment.arguments:
-                        slot["arguments"] += fragment.arguments
-                if delta.usage:
-                    for key, value in delta.usage.items():
-                        if isinstance(value, int):
-                            usage[key] = usage.get(key, 0) + value
+            call_usage: dict[str, int] = {}
+            attribution: dict[str, Any] = {}
+            llm_calls += 1
+            started = time.perf_counter()
+            stream = self._chat(messages, snapshot.schemas(), turn.model_id, attribution)
+            try:
+                async for delta in stream:
+                    # A provider whose `chat()` swallows the cancellation (or answers
+                    # after the stream was cancelled) must not append a delta to a
+                    # turn the UI already closed. Checked on the write path, so the
+                    # invariant does not depend on `llm.chat` re-raising.
+                    self._raise_if_interrupted(turn)
+                    if delta.text:
+                        text_parts.append(delta.text)
+                        await self._turn_emit(
+                            turn, "turn.delta", {"turn_id": turn.id, "text": delta.text}
+                        )
+                    for fragment in delta.tool_calls:
+                        slot = calls.setdefault(fragment.index, {"id": "", "name": "", "arguments": ""})
+                        if fragment.id:
+                            slot["id"] = fragment.id
+                        if fragment.name:
+                            slot["name"] += fragment.name
+                        if fragment.arguments:
+                            slot["arguments"] += fragment.arguments
+                    if delta.usage:
+                        reported = True
+                        for key, value in delta.usage.items():
+                            if isinstance(value, int):
+                                call_usage[key] = call_usage.get(key, 0) + value
+                                usage[key] = usage.get(key, 0) + value
+            except BaseException as exc:
+                # The audit is the only place an operator can see that tokens
+                # were spent on a call that then failed (§6.2).
+                self._audit_llm_call(turn, attribution, call_usage, started,
+                                     status="error", code=_error_code(exc))
+                raise
+            self._audit_llm_call(turn, attribution, call_usage, started, status="ok", code=None)
 
             text = "".join(text_parts)
             if text:
@@ -265,11 +285,80 @@ class LoopEngine:
         self._audit({"kind": "turn_completed", "session_id": turn.session_id, "turn_id": turn.id,
                      "stopped_reason": stopped_reason, "tool_calls": len(recorded)})
         return TurnOutcome(
-            usage=usage, assistant_text=final_text, tool_calls=tuple(recorded),
+            usage=_usage_record(turn.model_id, usage, reported=reported, steps=llm_calls),
+            assistant_text=final_text, tool_calls=tuple(recorded),
             stopped_reason=stopped_reason,
         )
 
     # ------------------------------------------------------------------ helpers
+    def _chat(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+        model_id: str | None,
+        attribution: dict[str, Any],
+    ) -> AsyncIterator[Any]:
+        """One provider call, with the RFC-0005 append applied by capability.
+
+        `chat(..., model=)` is the internal (non-contract) protocol change of
+        §7.1 row 9: it pins the model a turn resolved. A provider that predates
+        it — a test double, a third-party one — must keep working, so the kwarg
+        is passed only when the signature accepts it. `attribution` is filled by
+        a module provider with the target it actually used, which is what makes
+        `llm.call` attributable to exactly one module (§6.2).
+        """
+        fn = self.llm.chat
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):  # pragma: no cover - exotic callables
+            params = {}
+        kwargs: dict[str, Any] = {"tools": tools, "stream": True}
+        if "model" in params:
+            kwargs["model"] = model_id
+        if "attribution" in params:
+            kwargs["attribution"] = attribution
+        return fn(messages, **kwargs)
+
+    def _audit_llm_call(
+        self,
+        turn: Turn,
+        attribution: Mapping[str, Any],
+        call_usage: Mapping[str, int],
+        started: float,
+        *,
+        status: str,
+        code: str | None,
+    ) -> None:
+        """One `llm.call` row per core-initiated model call (§6.2).
+
+        Counts and model name only: no prompt, no completion, no upstream body,
+        no `base_url` (it can carry credentials, §10). `extra.tokens` is kept
+        because `admin/app.py` already reads it.
+        """
+        provider = turn.model_id.split("/", 1)[0] if turn.model_id else None
+        total = int(call_usage.get("total_tokens", 0) or 0)
+        self._audit({
+            "kind": "llm.call",
+            "session_id": turn.session_id,
+            "turn_id": turn.id,
+            "module_id": attribution.get("module_id"),
+            "instance_id": attribution.get("instance_id"),
+            "method": "chat",
+            "status": status,
+            "code": code,
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+            "extra": {
+                "model": turn.model_id,
+                "provider": provider,
+                "purpose": "chat",
+                "prompt_tokens": int(call_usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(call_usage.get("completion_tokens", 0) or 0),
+                "total_tokens": total,
+                "tokens": total,
+                "source": "provider" if call_usage else "none",
+            },
+        })
+
     def _is_interrupted(self, turn: Turn) -> bool:
         """True once `queue.interrupt` has flagged this turn on the router.
 
@@ -357,6 +446,46 @@ class LoopEngine:
             self.audit.record(event)
         except Exception:
             pass
+
+
+def _usage_record(
+    model_id: str | None,
+    usage: Mapping[str, Any],
+    *,
+    reported: bool,
+    steps: int,
+) -> dict[str, Any]:
+    """`turn.completed.usage` — the three frozen keys plus RFC-0005 §6.1.
+
+    The three existing keys keep their names, types and meaning; everything
+    else is appended. `source="none"` means "the provider never reported", in
+    which case every count is 0 — core does not estimate tokens.
+    """
+    provider = model_id.split("/", 1)[0] if model_id else None
+
+    def count(key: str) -> int:
+        if not reported:
+            return 0
+        value = usage.get(key, 0)
+        return int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    return {
+        "prompt_tokens": count("prompt_tokens"),
+        "completion_tokens": count("completion_tokens"),
+        "total_tokens": count("total_tokens"),
+        "model_id": model_id,
+        "provider": provider,
+        "source": "provider" if reported else "none",
+        "steps": int(steps),
+        "cached_tokens": count("cached_tokens"),
+        "reasoning_tokens": count("reasoning_tokens"),
+    }
+
+
+def _error_code(exc: BaseException) -> str:
+    if isinstance(exc, asyncio.CancelledError):
+        return "CANCELLED"
+    return getattr(exc, "code", None) or "INTERNAL"
 
 
 def _parse_args(raw: str) -> dict[str, Any]:

@@ -60,12 +60,15 @@
     "turn.started": {
       "payload": {
         "turn_id": "string",
-        "state": "turn.state"
+        "state": "turn.state",
+        "model_id": "string (RFC-0005 append, optional; the id resolved at dequeue)",
+        "model_source": "session|global|priority (RFC-0005 append, optional; absent when no resolver is wired)"
       },
       "required": [
         "turn_id",
         "state"
-      ]
+      ],
+      "notes": "RFC-0005 append: `model_id` / `model_source` are OPTIONAL additions, emitted only once the turn resolved a model (see x-vade.rfc0005_append). `required` is unchanged."
     },
     "turn.delta": {
       "payload": {
@@ -158,34 +161,38 @@
         "state",
         "usage"
       ],
-      "notes": "state is exactly 'completed' (never 'done')."
+      "notes": "state is exactly 'completed' (never 'done'). RFC-0005 append: the `usage` OBJECT gains `model_id` / `provider` / `source` / `steps` / `cached_tokens` / `reasoning_tokens`; the three frozen keys and the top-level `required` list are unchanged, so an old client that reads only prompt/completion/total keeps working."
     },
     "turn.failed": {
       "payload": {
         "turn_id": "string",
         "state": "turn.state",
         "code": "C-04 name",
-        "message": "string <=300"
+        "message": "string <=300",
+        "usage": "object (RFC-0005 append, optional)",
+        "data": "object|null (RFC-0005 append, optional; e.g. {reason:\"model_unavailable\"})"
       },
       "required": [
         "turn_id",
         "state",
         "code",
         "message"
-      ]
+      ],
+      "notes": "RFC-0005 append: `usage` (same keys as turn.completed.usage, `source=\"none\"` when the provider never reported) and `data` are OPTIONAL; `required` is unchanged. A failed turn has burned tokens too, so they are accounted instead of vanishing."
     },
     "turn.interrupted": {
       "payload": {
         "turn_id": "string",
         "state": "turn.state",
-        "by": "string"
+        "by": "string",
+        "usage": "object (RFC-0005 append, optional)"
       },
       "required": [
         "turn_id",
         "state",
         "by"
       ],
-      "notes": "Emitted after tools/cancel is fired; core does not wait for the module. No turn.* event may follow this one for that turn; an interrupted assistant's partial text is reconstructable only from turn.delta events."
+      "notes": "Emitted after tools/cancel is fired; core does not wait for the module. No turn.* event may follow this one for that turn; an interrupted assistant's partial text is reconstructable only from turn.delta events. RFC-0005 append: optional `usage`, usually `source=\"none\"` with zero counts because the provider had not sent a final usage yet — core does not estimate."
     },
     "turn.cancelled": {
       "payload": {
@@ -328,9 +335,45 @@
       ],
       "x-vade": {"push": "events/deliver"},
       "notes": "C-14 append. Metadata only: the body never travels here, otherwise a UI event would become a way to read unpublished skill text. Consumers: ui/admin front ends refreshing the pending list (C5a /skills). No session, so seq_from = seq_to = 0."
+    },
+    "usage.budget": {
+      "payload": {
+        "scope": "session|day",
+        "state": "warn|exceeded",
+        "used": "int >= 0",
+        "limit": "int > 0",
+        "ratio": "number (used/limit)",
+        "degraded": "bool (true only when the turn should have been refused but the ledger is untrustworthy)",
+        "session_id": "string|null (null for a core-wide day notification with no session context)"
+      },
+      "required": [
+        "scope",
+        "state",
+        "used",
+        "limit",
+        "ratio",
+        "degraded"
+      ],
+      "notes": "RFC-0005 append (§6.4/§7.4). A notification, not the truth: `session/usage.get.budget.state` remains authoritative. Emitted at most once per (scope, state, period) — period is the session id for scope=session and the UTC date for scope=day — so a UI MUST de-duplicate by that triple after a reconnect. `state` is only `warn` or `exceeded`; `ok`/`off` never notify. `degraded=true` means exactly one thing: the budget was exceeded and `enforce=\"block\"` would have refused the turn, but the ledger is untrustworthy (last measured turn had `usage.source=\"none\"`), so the refusal was downgraded to a warning — it is never true for `warn`. Carries no token breakdown and no per-session detail for other sessions."
     }
   },
   "x-vade": {
+    "rfc0005_append": {
+      "contract": "RFC-0005",
+      "owner": "C3",
+      "frozen": "2026-11-14",
+      "doc": "docs/rfc/RFC-0005-model-capabilities-usage.md",
+      "adds": ["usage.budget"],
+      "payload_keys_added": {
+        "turn.started": ["model_id", "model_source"],
+        "turn.failed": ["usage", "data"],
+        "turn.interrupted": ["usage"]
+      },
+      "usage_keys_added": ["model_id", "provider", "source", "steps", "cached_tokens", "reasoning_tokens"],
+      "rewrites": "none. Top-level `version` stays 1.0.0 on purpose: core/tests/events/test_schema_append.py pins it, and RFC-0005 §7.4's proposed 1.1.0 bump is recorded here instead of by editing the frozen header. Every C-06 `required` list, rule, enum and turn_states entry is untouched; the only edits to existing entries are OPTIONAL payload keys plus notes. `usage.budget` is not a push topic (no `x-vade.push`), so the C-14 deliver gate ignores it.",
+      "why_sibling_key": "A second append must not overwrite C-14's `x-vade.append` block; RFC-0006 uses `x-vade.appends[]`, RFC-0007 `x-vade.append_rfc0007`. This one is a named sibling so two RFCs can land in either order without a merge collision.",
+      "version_note": "RFC-0005 §7.4 proposed `version: 1.0.0 -> 1.1.0`. Not applied: the append test pins 1.0.0 and the field is the C-06 file's own, not the appender's. Recorded as a deliberate deviation in core/vade/llm/RESULT-rfc0005.md."
+    },
     "append": {
       "contract": "C-14",
       "version": "1.0.0",

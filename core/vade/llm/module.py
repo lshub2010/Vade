@@ -16,7 +16,7 @@ from typing import Any, AsyncIterator, Mapping, Sequence
 
 from ..errors import VadeError
 from ..router.dispatch import Router
-from .base import Delta, ToolCallDelta
+from .base import Delta, ToolCallDelta, flatten_usage
 
 __all__ = ["ModuleLLMProvider", "to_deltas"]
 
@@ -43,8 +43,14 @@ class ModuleLLMProvider:
         self.timeout_ms = timeout_ms
 
     # ------------------------------------------------------------------ selection
-    def select(self) -> Any | None:
-        """Highest-priority online model instance, or None."""
+    def select(self, model: str | None = None) -> Any | None:
+        """Highest-priority online model instance, or None.
+
+        RFC-0005 §5.3: `model` is the id a turn resolved at dequeue. When it is
+        a module id (`com/<name>` or `com/*`) only an instance that really
+        serves that model is eligible — a pin must never be served by a
+        neighbour, or a switch would silently answer with the old model.
+        """
         if self.registry is None:
             return None
         candidates = []
@@ -56,6 +62,14 @@ class ModuleLLMProvider:
                 continue
             if manifest.tool(MODEL_TOOL) is None:
                 continue
+            if model is not None:
+                provider, _, name = model.partition("/")
+                if provider and manifest.module_id != provider:
+                    continue
+                if name and name != "*":
+                    declared = tuple(getattr(manifest, "models", ()) or ())
+                    if not any(spec.name == name for spec in declared):
+                        continue
             health = getattr(record.health, "value", str(record.health))
             if health in ("offline", "rejected"):
                 continue
@@ -72,16 +86,35 @@ class ModuleLLMProvider:
         *,
         tools: Sequence[Mapping[str, Any]] | None = None,
         stream: bool = True,
+        model: str | None = None,
+        attribution: dict[str, Any] | None = None,
     ) -> AsyncIterator[Delta]:
-        record = self.select()
+        if model is not None and model.startswith("builtin/"):
+            # The resolver picked the builtin: this adapter is only a facade in
+            # module mode, so hand the call to the builtin provider it wraps.
+            if self.fallback is None:
+                raise VadeError("UNAVAILABLE", f"model {model!r} is not available")
+            async for delta in self.fallback.chat(messages, tools=tools, stream=stream, model=model):
+                yield delta
+            return
+
+        record = self.select(model)
         if record is None or self.router is None:
-            if self.fallback is not None:
+            if self.fallback is not None and model is None:
                 async for delta in self.fallback.chat(messages, tools=tools, stream=stream):
                     yield delta
                 return
             raise VadeError("UNAVAILABLE", "no model module is online")
+        if attribution is not None:
+            attribution.update({"module_id": record.manifest.module_id,
+                                "instance_id": record.instance_id})
 
         args: dict[str, Any] = {"messages": [dict(m) for m in messages]}
+        _, _, chosen = (model or "").partition("/")
+        if chosen and chosen != "*":
+            # §4.3: `/<module>/*` means "the module's own default", so the
+            # request body carries no `model` at all in that case.
+            args["model"] = chosen
         if tools:
             args["tools"] = list(tools)
         args["temperature"] = self.temperature
@@ -127,9 +160,7 @@ def to_deltas(payload: Any) -> tuple[Delta, ...]:
             )
         )
     usage_raw = payload.get("usage")
-    usage = None
-    if isinstance(usage_raw, Mapping):
-        usage = {k: v for k, v in usage_raw.items() if isinstance(v, int)}
+    usage = flatten_usage(usage_raw) if isinstance(usage_raw, Mapping) else None
     return (
         Delta(
             text=str(text or ""),

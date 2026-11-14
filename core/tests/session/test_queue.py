@@ -686,7 +686,10 @@ def test_cancel_clear_is_bound_to_its_own_turn_when_the_previous_task_is_an_orph
             flag_seen[turn.id] = turn.id in flags
             return TurnOutcome(assistant_text="done", stopped_reason="stop")
 
-        async def emit(session_id, event_type, payload=None, *, messages=()):
+        async def emit(session_id, event_type, payload=None, *, messages=(), turns=(),
+                       message_updates=()):
+            # Same keyword surface as `SessionLog.emit`: RFC-0006 makes the
+            # terminal turn row part of the event's transaction.
             payload = dict(payload or {})
             events.append((event_type, payload))
             if event_type == "turn.started" and next_turn is not None \

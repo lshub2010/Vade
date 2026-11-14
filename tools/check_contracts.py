@@ -95,6 +95,30 @@ TASKS_HOT = {
 #: RFC-0007 §5.2: `task_states`, terminal three, and the two hard ceilings.
 TASK_TERMINAL_STATES = {"completed", "failed", "cancelled"}
 
+#: RFC-0006 §6.4: names emitted inside an `emit_batch([("name", {...}), ...])`.
+_BATCH_EVENT_LITERAL = re.compile(r"\(\s*[\"']([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)[\"']\s*,")
+
+#: RFC-0006 §9.1: the `required` arrays must be byte-identical to 1.0.0 —
+#: every field this RFC adds is optional. Hardcoded so a "helpful" promotion of
+#: a new field to required goes red instead of shipping a 1.1 break.
+RFC0006_REQUIRED = {
+    "turn.delta": ["turn_id", "text"],
+    "turn.tool_call": ["turn_id", "call_id", "tool", "args_digest"],
+    "turn.tool_result": ["turn_id", "call_id", "ok", "summary"],
+    "turn.interrupted": ["turn_id", "state", "by"],
+    "turn.queued": ["turn_id", "state"],
+}
+
+#: RFC-0006 §5.1/§7.1/§6.1: appended optional fields per event.
+RFC0006_FIELDS = {
+    "turn.delta": {"part_index", "kind"},
+    "turn.tool_call": {"args_preview", "args_preview_mode", "args_preview_redacted",
+                       "args_preview_truncated", "started_at", "batch_id"},
+    "turn.tool_result": {"duration_ms", "truncated", "result_ref"},
+    "turn.interrupted": {"partial_message_id", "partial_chars"},
+    "turn.queued": {"root_turn_id", "version", "parent_turn_id", "user_message_id", "reason"},
+}
+
 #: RFC-0004 §7.4: the frozen `[attach]` key set, defaults and apply semantics.
 #: Kept here (not derived from the schema) so a silent default change goes red.
 ATTACH_DEFAULTS: dict[str, object] = {
@@ -213,7 +237,14 @@ def emitted_event_names() -> set[str]:
     pattern = re.compile(r"emit\(\s*[^,()]+,\s*[\"']([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)[\"']")
     names = set(DYNAMIC_EVENT_TYPES)
     for path in sorted(CORE.rglob("*.py")):
-        names |= set(pattern.findall(path.read_text(encoding="utf-8")))
+        source = path.read_text(encoding="utf-8")
+        names |= set(pattern.findall(source))
+        # Multi-event batches carry their names as tuple literals inside
+        # `emit_batch(...)` (RFC-0006 §6.4 needs several events in ONE
+        # transaction, so they cannot each be an `emit(` call).
+        for call in re.finditer(r"emit_batch\(", source):
+            chunk = source[call.end(): call.end() + 800]
+            names |= set(_BATCH_EVENT_LITERAL.findall(chunk))
     return names
 
 
@@ -337,6 +368,68 @@ def check_blob_routes() -> None:
         f"missing={sorted(BLOB_ROUTES - declared)} extra={sorted(declared - BLOB_ROUTES)}",
     )
 
+
+def check_rfc0006(events: dict, rpc: dict, config: dict) -> None:
+    """RFC-0006: append-only additions, frozen `required` arrays, two methods."""
+    appended = (events.get("x-vade") or {}).get("appends")
+    check(isinstance(appended, list) and bool(appended),
+          "events.json: x-vade.appends is missing (RFC-0006 §9.2)")
+    block = next((a for a in (appended or []) if a.get("contract") == "C-06"), {})
+    check(block.get("rewrites") == "none",
+          "events.json x-vade.appends[0]: rewrites must be 'none' (append-only)")
+    check(block.get("version") == "1.1.0",
+          "events.json x-vade.appends[0]: version must be 1.1.0")
+    check(set(block.get("adds") or []) == {"turn.superseded", "message.edited"},
+          "events.json x-vade.appends[0].adds: must be exactly the two RFC-0006 events")
+    declared_fields = {name: set(fields) for name, fields in (block.get("fields") or {}).items()}
+    check(declared_fields == RFC0006_FIELDS,
+          "events.json x-vade.appends[0].fields drift vs RFC-0006 §5.1/§6.1/§7.1")
+
+    declared = dict(events.get("events") or {})
+    for name, required in RFC0006_REQUIRED.items():
+        spec = declared.get(name) or {}
+        check(list(spec.get("required") or []) == required,
+              f"events.json {name}: required changed (RFC-0006 keeps 1.0.0 arrays byte-identical)")
+        missing = RFC0006_FIELDS[name] - set(spec.get("payload") or {})
+        check(not missing, f"events.json {name}: appended fields missing from payload: {sorted(missing)}")
+
+    for name, required in (
+        ("turn.superseded", ["turn_id", "superseded_by", "reason"]),
+        ("message.edited", ["message_id", "session_id", "superseded_by_message_id",
+                            "new_turn_id", "text", "edited_at"]),
+    ):
+        spec = declared.get(name)
+        check(isinstance(spec, dict), f"events.json: {name} is missing (RFC-0006 §6.4)")
+        if isinstance(spec, dict):
+            check(list(spec.get("required") or []) == required,
+                  f"events.json {name}: required must be {required}")
+            check("state" not in (spec.get("required") or []),
+                  f"events.json {name}: must not require `state` (it is not a state change)")
+
+    # §6.4 row 14: `superseded` is NOT a state.
+    check("superseded" not in (events.get("turn_states") or []),
+          "events.json turn_states: RFC-0006 adds no state value")
+
+    methods = set()
+    for direction in (rpc.get("directions") or {}).values():
+        methods |= set(direction)
+    for name in ("turn/regenerate", "message/edit_resubmit"):
+        check(name in methods, f"rpc.json: {name} is missing from ui_to_core (RFC-0006 §9.1)")
+    check("session/fork" not in methods,
+          "rpc.json: session/fork must NOT be registered in v1 (RFC-0006 §6.5)")
+    check(((rpc.get("x-vade") or {}).get("appends") or [{}])[0].get("rewrites") == "none",
+          "rpc.json x-vade.appends: rewrites must be 'none'")
+
+    # §8: the protocol constant and RFC-0004's configurable ceiling must agree.
+    try:
+        from vade.session.limits import TEXT_LIMIT
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        FAILURES.append(f"core/vade/session/limits.py: cannot import TEXT_LIMIT ({exc})")
+        return
+    attach_default = ((config.get("properties") or {}).get("attach") or {}).get("properties", {})
+    configured = (attach_default.get("text_max_chars") or {}).get("default")
+    check(TEXT_LIMIT == configured == 32000,
+          f"RFC-0006 §8: text limit drift (core={TEXT_LIMIT}, attach.text_max_chars={configured})")
 
 PART_TITLES = {"text", "image", "file", "audio"}
 PART_REQUIRED = {
@@ -744,6 +837,7 @@ def main() -> int:
     check(set(states) == code_turn_states(), "events.json turn_states drift vs core/vade/session/models.TurnState")
     check(set(declared_events.get("turn.state", {}).get("enum") or []) == set(states),
           "events.json: turn.state enum disagrees with turn_states")
+    check_rfc0006(events, rpc, config)
     check_task_events(events, declared_events, schema_events)
     check_approval_attribution(declared_events)
 

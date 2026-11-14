@@ -19,7 +19,7 @@ from collections import deque
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError
-from .models import Message, QueueItem, Turn, TurnState, new_id, now_ms
+from .models import Message, QueueItem, Turn, TurnState, message_ref, new_id, now_ms
 
 __all__ = ["TurnQueue"]
 
@@ -40,6 +40,7 @@ class TurnQueue:
         cancel_clear_hook: Callable[[str], None] | None = None,
         max_pending: int = 100,
         clock: Callable[[], int] = now_ms,
+        partial_provider: Callable[[str], str] | None = None,
     ) -> None:
         self.session_id = session_id
         self._executor = executor
@@ -49,6 +50,10 @@ class TurnQueue:
         self._cancel_clear_hook = cancel_clear_hook
         self._max_pending = max_pending
         self._clock = clock
+        #: RFC-0006 §4.2: reads the text already streamed for a turn so an
+        #: interrupt can persist it. A callable, not a back-reference to the
+        #: engine, keeps the queue free of loop-level state.
+        self._partial_provider = partial_provider
         self._pending: deque[QueueItem] = deque()
         self._running: QueueItem | None = None
         self._worker: asyncio.Task[None] | None = None
@@ -160,9 +165,7 @@ class TurnQueue:
         if turn.id in self._finalized:
             return  # interrupt/cancel already wrote the terminal state
         if task.cancelled():
-            await self._finalize(turn, TurnState.INTERRUPTED, {"turn_id": turn.id, "by": "external",
-                                                               "state": TurnState.INTERRUPTED.value},
-                                 task=task)
+            await self._finalize_interrupted(turn, by="external", task=task)
             return
         exc = task.exception()
         if exc is not None:
@@ -218,20 +221,64 @@ class TurnQueue:
         self._finalized.add(turn.id)
         if state is not TurnState.COMPLETED or turn.state is not TurnState.COMPLETED:
             turn = turn.with_state(state, ended_at=turn.ended_at or self._clock())
-        self._save_turn(self.session_id, turn)
         event_type = {
             TurnState.COMPLETED: "turn.completed",
             TurnState.FAILED: "turn.failed",
             TurnState.INTERRUPTED: "turn.interrupted",
             TurnState.CANCELLED: "turn.cancelled",
         }[state]
-        await self._emit(self.session_id, event_type, payload, messages=messages)
+        # RFC-0006 §4.2: the terminal turn row, the partial message and the
+        # terminal event commit in ONE transaction. `_save_turn` + `_emit` was
+        # two commits, and a crash between them left "state=interrupted" with no
+        # partial text — a state no client can explain or repair.
+        await self._emit(self.session_id, event_type, payload, messages=messages,
+                         turns=(turn,))
         if self._running is not None and self._running.turn_id == turn.id:
             self._running = None
         await self._emit(self.session_id, "queue.updated", self.state_payload())
         if self._finish is not None and not self._finish.is_set():
             self._finish.set()
         self._release_cancel(turn.id, task)
+
+    def _partial_message(self, turn_id: str) -> tuple[str, Message | None]:
+        """The already-streamed text for `turn_id` and its `partial=true` row.
+
+        Empty text means "interrupted before the first delta" (or during a tool
+        step with no text): no message is created, so an interrupt can never
+        leave an empty assistant bubble behind (RFC-0006 §4.2).
+        """
+        text = ""
+        if self._partial_provider is not None:
+            try:
+                text = self._partial_provider(turn_id) or ""
+            except Exception:  # pragma: no cover - a provider must never break a stop
+                text = ""
+        if not text:
+            return "", None
+        return text, Message(
+            id=new_id(), session_id=self.session_id, turn_id=turn_id,
+            role="assistant", content=text, partial=True,
+        )
+
+    async def _finalize_interrupted(self, turn: Turn, *, by: str,
+                                    task: asyncio.Task[Any] | None = None) -> None:
+        text, message = self._partial_message(turn.id)
+        # RFC-0006 §4.3 + schema/events.json: `partial_message_id` is a
+        # `msg:<hex>` pointer, the same scheme as `result_ref` — a bare hex id
+        # made clients that split on ':' fail.
+        pointer = message_ref(message) if message is not None else None
+        payload: dict[str, Any] = {
+            "turn_id": turn.id, "by": by, "state": TurnState.INTERRUPTED.value,
+            # RFC-0006 §4.3: the event carries a pointer, never the text.
+            "partial_message_id": pointer,
+            "partial_chars": len(text),
+        }
+        if message is not None:
+            turn = turn.with_state(TurnState.INTERRUPTED, partial_message_id=pointer)
+        await self._finalize(
+            turn, TurnState.INTERRUPTED, payload,
+            messages=[message] if message is not None else (), task=task,
+        )
 
     # ------------------------------------------------------------------ cancel flag
     def _release_cancel(self, turn_id: str, task: asyncio.Task[Any] | None) -> None:
@@ -291,11 +338,7 @@ class TurnQueue:
             task.cancel()
             task.add_done_callback(self._consume_orphan)
         # Release the queue NOW; do not await the in-flight module.
-        await self._finalize(
-            item.turn, TurnState.INTERRUPTED,
-            {"turn_id": turn_id, "by": by, "state": TurnState.INTERRUPTED.value},
-            task=task,
-        )
+        await self._finalize_interrupted(item.turn, by=by, task=task)
         return True
 
     async def cancel(self, turn_id: str, *, by: str = "user") -> bool:
@@ -304,10 +347,10 @@ class TurnQueue:
                 del self._pending[index]
                 turn = item.turn.with_state(TurnState.CANCELLED, ended_at=self._clock())
                 self._finalized.add(turn_id)
-                self._save_turn(self.session_id, turn)
                 await self._emit(
                     self.session_id, "turn.cancelled",
                     {"turn_id": turn_id, "by": by, "state": TurnState.CANCELLED.value},
+                    turns=(turn,),
                 )
                 await self._emit(self.session_id, "queue.updated", self.state_payload())
                 # A queued turn never reached the router, so there is no

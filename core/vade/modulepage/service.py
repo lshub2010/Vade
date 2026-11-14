@@ -30,6 +30,8 @@ from typing import Any, Callable, Mapping
 
 from ..errors import VadeError
 from ..loop.ports import ApprovalRequest
+from ..registry.health import HealthState
+from ..registry.manifest import MAX_FRAME_PLAINTEXT
 from ..registry.uipage import (
     MAX_MODULE_CACHE_BYTES,
     MAX_PAGE_CACHE_BYTES,
@@ -54,6 +56,7 @@ from .auth import (
     authorize_target,
     device_of,
     is_read_only,
+    require_caller,
     require_visible,
 )
 
@@ -207,6 +210,21 @@ class ModulePageService:
         no greyed row (§8.2).
         """
         record = self._record(module_id, instance_id)
+        return self._page_rows(record)
+
+    @staticmethod
+    def _page_rows(record: Any) -> tuple[dict[str, Any], ...]:
+        """The ONE page-row projection (`id`/`title`/`icon`/`entry`/`version`/
+        `requires`/`refresh_s`).
+
+        `pages()` and `list_modules()` both go through this: RFC-0015 §4.2's
+        foot-note is right that two hand-written projections drift apart, and
+        the drift would be invisible until a client showed a page that
+        `ui/page.get` then refused.
+        """
+        manifest = record.manifest
+        if manifest is None:
+            return ()
         return tuple(
             {
                 "id": page.page_id,
@@ -217,8 +235,75 @@ class ModulePageService:
                 "requires": ["session"] if page.requires_session else [],
                 "refresh_s": page.refresh_s,
             }
-            for page in record.manifest.ui_pages
+            for page in manifest.ui_pages
         )
+
+    # ---------------------------------------------------------------- ui/modules
+    def list_modules(self, connection: Any) -> dict[str, Any]:
+        """Whole module list with per-module page entries (RFC-0015 §4).
+
+        One pull, no paging: an entry list has to render on first paint, and a
+        page row is ~100 B while the frame ceiling is 65 519 B (§4.6). Page
+        BODIES never cross here — `ui/page.get` stays the only body channel.
+
+        Who sees what comes from the **connection** (`modulepage/auth.py`):
+        an unknown caller is `PERMISSION_DENIED`, a browser sees only ENABLED
+        modules, and a module peer sees only its own row. `params` is `{}` and
+        is never consulted — the module set is a process-level fact, not a
+        session view.
+
+        `revision` is the registry's own counter (`registry/table.py:135-141`),
+        the same one `model/list` reports: it is bumped next to every
+        `_publish_status(...)`, so "a `module.status` arrived" and "the revision
+        moved" are the same set and a re-pull after an event is a no-op when
+        nothing changed (§5).
+        """
+        caller = require_caller(connection)
+        registry = self._registry()
+        if registry is None:
+            raise VadeError("UNAVAILABLE", "the registry is not installed")
+
+        own = (caller.module_id, caller.instance_id)
+        modules: list[dict[str, Any]] = []
+        for record in registry.snapshot():
+            if record.manifest is None:
+                # §4.5: nothing to display; `pages()` refuses it for the same
+                # reason. A rejected node stays in the topology, not in the
+                # entry list.
+                continue
+            if caller.is_module and (record.module_id, record.instance_id) != own:
+                # Enumerating other modules buys a module nothing and is an
+                # information leak (B1's rule); the browser case is `enabled`.
+                continue
+            if not caller.is_module and not getattr(record, "enabled", True):
+                continue
+            modules.append(
+                {
+                    "module_id": record.module_id,
+                    "instance_id": record.instance_id,
+                    "display_name": _display_name(record.manifest),
+                    "version": record.manifest.version,
+                    # The exact predicate `module.status` publishes
+                    # (`registry/table.py:143-149`): one spelling, two readers.
+                    "online": (
+                        getattr(record, "health", None) is HealthState.ONLINE
+                        and record.connection_id is not None
+                    ),
+                    "pages": list(self._page_rows(record)),
+                }
+            )
+
+        payload: dict[str, Any] = {"revision": registry.revision(), "modules": modules}
+        size = len(serialize(payload))
+        if size > MAX_FRAME_PLAINTEXT:
+            # §4.6: refuse, never truncate — a truncated list would make "this
+            # module has no entry" unexplainable. `data` follows RFC-0006 §8.
+            raise VadeError(
+                "PAYLOAD_TOO_LARGE",
+                f"the module list is {size} bytes > the {MAX_FRAME_PLAINTEXT}-byte frame limit",
+                data={"field": "modules", "limit": MAX_FRAME_PLAINTEXT, "actual": size},
+            )
+        return payload
 
     # -------------------------------------------------------------- module calls
     async def _module_rpc(
@@ -782,6 +867,17 @@ class ModulePageService:
                 if name == event:
                     return action
         return None
+
+
+def _display_name(manifest: Any) -> str | None:
+    """C-03 `display_name` verbatim, or `None` (RFC-0015 §4.2's required-with-null).
+
+    Never substitutes `module_id`: the client's rule is "no display name → no
+    entry title" (`ModuleRegistry.isDeclared`), and inventing a title would put a
+    module card on screen that the manifest never declared.
+    """
+    value = getattr(manifest, "display_name", None)
+    return value if isinstance(value, str) else None
 
 
 def _string(params: Mapping[str, Any], field: str) -> str:

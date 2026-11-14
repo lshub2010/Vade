@@ -1,8 +1,8 @@
-"""`ui/page.get` / `ui/state.get` / `ui/tool.call` (RFC-0009 §9.3, C-05 append).
+"""`ui/page.get` / `ui/state.get` / `ui/tool.call` / `ui/modules` (RFC-0009 §9.3, RFC-0015, C-05 append).
 
 Same shape as `session/rpc.py` and `tasks/rpc.py`: `async handler(connection,
 params)` returning a plain dict, `VadeError` for refusals. `install()` merges the
-three names into `app.session_handlers`, the one table the dispatcher reads.
+four names into `app.session_handlers`, the one table the dispatcher reads.
 
 **The `connection` argument is load-bearing.** C2's dispatcher
 (`app.py::make_rpc_handler`) hands every `ui/*` method to whatever socket asked,
@@ -31,7 +31,23 @@ class ModulePageRPC:
             "ui/page.get": self.page_get,
             "ui/state.get": self.state_get,
             "ui/tool.call": self.tool_call,
+            # RFC-0015: the entry-list channel. `install()` publishes this same
+            # dict into `app.session_handlers`, which is the one table
+            # `app.make_rpc_handler` reads — so registering the name here IS the
+            # wire registration (a name that exists only in `rpc.json` answers
+            # -32601 on a real socket).
+            "ui/modules": self.modules,
         }
+
+    async def modules(self, connection: Any, params: Mapping[str, Any] | None) -> dict[str, Any]:
+        """`ui/modules` — `params` is `{}` and deliberately ignored (§4.1/§6).
+
+        Unknown keys are tolerated for forward compatibility, and no field here
+        is trusted for identity: `list_modules` reads the caller from the
+        connection, never from the params (review B1). `None` is accepted too —
+        a client may omit `params` entirely, exactly like an empty object.
+        """
+        return self.service.list_modules(connection)
 
     async def page_get(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
         module_id, instance_id, page_id = _ids(params)

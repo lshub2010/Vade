@@ -479,5 +479,9 @@ def test_rpc_json_documents_the_partial_field():
     assert block["contract"] == "C-05" and block["version"] == "1.2.0"
     assert block["adds"] == [] and "none" in block["rewrites"]
     # Frozen history untouched.
-    assert data["version"] == "1.3.0"
+    # Frozen history untouched: RFC-0013 itself never bumps the top-level version.
+    # 1.3.0 was RFC-0010's bump; RFC-0012 then appended subagent/list|get and owns
+    # 1.4.0. Assert against whoever last appended, so this test keeps guarding the
+    # real invariant ("RFC-0013 adds no top-level bump") instead of a stale number.
+    assert data["version"] == "1.4.0"
     assert data["x-vade"]["appends"][0]["rewrites"] == "none"

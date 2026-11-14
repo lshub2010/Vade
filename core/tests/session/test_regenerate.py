@@ -8,9 +8,15 @@ from the store, not from a client-side set).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import time
 
 import pytest
 
+from vade.blob.ids import new_blob_id
+from vade.blob.service import BlobService
+from vade.blob.settings import AttachSettings
+from vade.blob.store import BlobRecord
 from vade.errors import VadeError
 from vade.loop.engine import TurnOutcome
 from vade.session.manager import SessionLog
@@ -20,15 +26,44 @@ from vade.session.sqlite_store import SQLiteStore
 from .helpers import wait_until
 
 
-def _log(tmp_path, db="sessions.db", gate=None) -> SessionLog:
+def _log(tmp_path, db="sessions.db", gate=None, blobs=None) -> SessionLog:
     async def executor(turn, content):
         if gate is not None:
             await gate.wait()
         return TurnOutcome(assistant_text=f"answer:{turn.user_text}", stopped_reason="stop")
 
-    log = SessionLog(SQLiteStore(tmp_path / db), replay=ReplayBuffer(maxlen=500))
+    log = SessionLog(
+        SQLiteStore(tmp_path / db), replay=ReplayBuffer(maxlen=500), blobs=blobs,
+    )
     log.set_executor(executor)
     return log
+
+
+# ------------------------------------------------------------------ attachments
+#: RFC-0004 §6.4: `submit` validates parts (step 3) and every `file_id` (step 4)
+#: before it persists anything, so a turn that carries a non-text part needs a
+#: real blob behind it — rows inserted directly, `stat()` never reads the disk.
+def _service(tmp_path) -> BlobService:
+    return BlobService(tmp_path / "data", AttachSettings(scan_enabled=False))
+
+
+def _add_image(service: BlobService, *, device_id: str = "dev-1") -> BlobRecord:
+    digest = hashlib.sha256(new_blob_id().encode()).hexdigest()
+    record = BlobRecord(
+        file_id=new_blob_id(), device_id=device_id, sha256=digest, size=180_000,
+        mime="image/jpeg", name="IMG_0042.jpg", kind="image", width=800, height=600,
+        pinned=False, expires_at=time.time() + 3600, created_at=time.time(),
+        scan="clean", state="ok",
+    )
+    return service.store.add_blob(record)
+
+
+def _image_part(record: BlobRecord) -> dict:
+    return {
+        "type": "image", "file_id": record.file_id, "mime": record.mime,
+        "name": record.name, "size": record.size, "width": record.width or 800,
+        "height": record.height or 600, "sha256": record.sha256,
+    }
 
 
 def _types(events):
@@ -83,19 +118,26 @@ def test_regenerate_supersedes_the_old_turn_and_reuses_the_user_message(tmp_path
 def test_regenerating_a_turn_with_non_text_parts_is_unsupported(tmp_path):
     """S5: RFC §6.2 — parts are not rebuildable yet, so refuse, never drop.
 
-    Only `text` becomes a stored message, so the old code rebuilt the text and
-    silently lost the attachment. The turn row now remembers the part types and
+    Only `text` is rebuilt into the new turn, so the old code copied the text
+    and silently lost the attachment. The turn row remembers the part types and
     `regenerate` answers `UNSUPPORTED` with `data.capability="parts"` before it
     writes any row or event.
+
+    The submit half of this fixture has to be a *legal* RFC-0004 submit (§6.4
+    step 3 + step 4 run before anything is persisted), so the image part is
+    backed by a real `BlobService` record — same harness as `test_parts.py`.
     """
 
     async def scenario():
-        log = _log(tmp_path)
+        service = _service(tmp_path)
+        image = _add_image(service)
+        log = _log(tmp_path, blobs=service)
         sess = log.create_session()
         first, _ = await log.submit(
             sess.id,
-            [{"type": "text", "text": "look"}, {"type": "image", "file_id": "f_123"}],
+            [{"type": "text", "text": "look"}, _image_part(image)],
             "s1",
+            device_id="dev-1",
         )
         await log.wait_idle(sess.id)
 

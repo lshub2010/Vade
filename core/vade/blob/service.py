@@ -516,9 +516,11 @@ class BlobService:
             with open(target, "r+b") as handle:
                 handle.seek(offset)
                 handle.write(body)
-        except FileNotFoundError:
-            # Aborted between the check above and the open: same answer as a
-            # missing session, not a 500.
+        except OSError:
+            # Gone or unwritable between the check above and the open: an abort
+            # or an idle sweep can drop the file, and on Windows an external
+            # handle (AV, backup, indexer) turns the open into `PermissionError`.
+            # Both mean "this session cannot take the part", not a 500.
             raise VadeError("NOT_FOUND", "upload session expired", data={"field": "upload_id"}) from None
 
         ranges = chunks.add(upload.ranges, offset, offset + length)
@@ -717,6 +719,36 @@ class BlobService:
             state="ok",
         )
         stored = self.store.add_blob(record)
+        if stored.file_id != record.file_id:
+            # Dedupe hit: `add_blob` handed back the row already on file for
+            # this (device, digest, size). That row is not necessarily usable —
+            # `begin` only reuses rows in state `ok` with a clean scan, so a
+            # `missing` row (bytes were lost, `reconcile` marked it) or an
+            # `infected` one (scanner removed the content) lands here too.
+            #
+            # Returning such a row with a 201 hands the client a `file_id` that
+            # `GET` must refuse: the "re-upload to recover" path would silently
+            # fail. The bytes are on disk again (we just moved them), so either
+            # re-admit the row or refuse the upload outright.
+            if stored.scan == "infected":
+                # Quarantined content must not come back through a re-upload:
+                # drop the bytes we just put back and the session with them.
+                self._remove_blob_files(stored)
+                self.store.delete_upload(upload.upload_id)
+                self._record(
+                    "blob.complete", status="infected", device_id=upload.device_id,
+                    upload_id=upload.upload_id, sha256=actual_sha, mime=upload.mime,
+                )
+                raise VadeError(
+                    "PERMISSION_DENIED",
+                    "file contents were removed by the scanner",
+                    data={"field": "sha256", "reason": "infected"},
+                )
+            if stored.state != "ok":
+                # Revive: the re-upload re-validated the bytes (mime, edges,
+                # metadata strip) and the digest matched, so the row may take
+                # the fresh metadata and a new deadline.
+                stored = self.store.revive_blob(stored.file_id, record)
         self.store.delete_upload(upload.upload_id)
         self._record(
             "blob.complete", device_id=upload.device_id, upload_id=upload.upload_id,

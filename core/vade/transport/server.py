@@ -72,6 +72,7 @@ class CoreApp:
         registry: Any | None = None,
         make_crypto: Callable[[str], Any] | None = None,
         pairing: Any | None = None,
+        whitelist: Any | None = None,
         on_rpc: Callable[[Connection, dict[str, Any]], Awaitable[Any]] | None = None,
         close_connection: Callable[[str], None] | None = None,
         policy_mode: str = "default",
@@ -85,6 +86,10 @@ class CoreApp:
         self.registry = registry
         self._make_crypto = make_crypto
         self._pairing = pairing
+        #: Trusted-key table, used only to name the device behind a verified
+        #: Noise fingerprint. Optional: without it every native connection
+        #: keeps `device_id=None` (fail-closed, same as before).
+        self._whitelist = whitelist
         self._on_rpc = on_rpc
         self._close_connection = close_connection
         self._policy_mode = policy_mode
@@ -298,7 +303,17 @@ class CoreApp:
 
         headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
         token = self._cookie(headers.get("cookie", ""), "__Host-ac_ui")
-        browser = token is not None and token in self._sessions and not self._sessions[token]["revoked"]
+        session = self._sessions.get(token) if token is not None else None
+        if session is not None and session["revoked"]:
+            # A revoked row is no identity at all: the same `None` path as an
+            # unknown token, so nothing downstream has to special-case it.
+            session = None
+        browser = session is not None
+        # RFC-0004 §6.4: the device identity is the one `/ui/session` minted and
+        # stored server-side (`ui-…`), read back through the cookie — never a
+        # query parameter or header the client could type. An unknown or
+        # revoked token leaves it None, so a `file_id` submit stays fail-closed.
+        device_id = str(session["device_id"]) if session is not None else None
 
         if not browser and self._make_crypto is None:
             await send({"type": "websocket.close", "code": 1008})
@@ -327,10 +342,40 @@ class CoreApp:
             on_rpc=self._on_rpc,
             on_close=self._forget,
             browser_session=browser,
+            device_id=device_id,
+            # A native peer has no identity until the IK handshake proves which
+            # static key it holds; this hook runs exactly then.
+            on_established=None if browser else self._bind_device_identity,
         )
         connection.ui_token = token if browser else None  # type: ignore[attr-defined]
         self._connections[connection_id] = connection
         await connection.run()
+
+    def _bind_device_identity(self, connection: Connection) -> None:
+        """Name a Noise peer from the key the handshake just verified.
+
+        `CryptoSession.read_handshake` computes the fingerprint of the peer's
+        static key and refuses an unlisted one *before* msg2, so by the time
+        this hook runs the key is already trusted. The whitelist then says
+        which pairing owns it (`module_id#instance_id`).
+
+        No match, no whitelist, or a crypto object without a fingerprint all
+        leave `device_id=None`. That is deliberate and is the reason the
+        attribute defaults to `None`: an unattributable connection must not be
+        able to submit a `file_id`, and guessing an identity from anything the
+        peer sent over the wire (a query string, a header, an RPC field) would
+        turn a hint into a claim.
+        """
+        crypto = connection.crypto
+        fingerprint = getattr(crypto, "remote_fingerprint", None) if crypto is not None else None
+        if not fingerprint or self._whitelist is None:
+            return
+        resolver = getattr(self._whitelist, "device_for_fingerprint", None)
+        if not callable(resolver):
+            return
+        device_id = resolver(str(fingerprint))
+        if device_id:
+            connection.device_id = str(device_id)
 
     @staticmethod
     def _cookie(header: str, name: str) -> str | None:

@@ -1,10 +1,52 @@
 {
   "id": "C-05",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "status": "frozen",
-  "frozen_at": "2026-11-13",
+  "frozen_at": "2026-11-14",
   "owner": "C2",
   "source_of_truth": "docs/design.md §2.5",
+  "x-vade": {
+    "appends": [
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0004-attachments-multimodal.md",
+        "adds": ["ui/submit.content typed part union", "http_endpoints"],
+        "notes": [
+          "ui/submit.content goes from `[object]` to a typed part union (§6.1/§7.2); a legal old `[{\"type\":\"text\"}]` still passes, only malformed clients notice",
+          "new top-level `http_endpoints` declares the `/ui/blob*` family that lives on the data-plane listener (§7.3)",
+          "C-06 and C-04 are untouched by RFC-0004"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0007-subagents-and-tasks.md",
+        "adds": ["task/list", "task/log_tail", "task/cancel", "subagent/message"],
+        "notes": [
+          "four observation/control methods and the four `task.*` names mirrored into `events_core_to_ui`; no existing method changed",
+          "a core that predates it answers `NOT_FOUND` (the documented UI degradation)"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0006-turn-semantics.md",
+        "adds": ["turn/regenerate", "message/edit_resubmit"],
+        "notes": [
+          "ui/attach: snapshot.turns[] and messages[].partial / messages[].superseded_by are appended keys; `snapshot` stays an object and old clients ignore them",
+          "session/fork is intentionally NOT registered in v1: clients get JSON-RPC -32601, not UNSUPPORTED",
+          "PAYLOAD_TOO_LARGE carries error.data = {field, limit, actual, unit} (RFC-0006 §8)"
+        ],
+        "rewrites": "none"
+      }
+    ]
+  },
   "transport": "JSON-RPC 2.0 over a Noise transport frame (type 0x02) or over plain text frames on the browser_session channel",
   "envelope": {
     "request": {"jsonrpc": "2.0", "id": "int|string", "method": "string", "params": "object"},
@@ -91,7 +133,8 @@
       "ui/attach": {
         "params": {"session_id": "string|null", "last_seq": "int|null"},
         "result": {"session_id": "string", "from_seq": "int", "snapshot": "object|null"},
-        "errors": ["NOT_FOUND", "PERMISSION_DENIED"]
+        "errors": ["NOT_FOUND", "PERMISSION_DENIED"],
+        "notes": "RFC-0004 §6.3: `snapshot.messages[]` carries `parts` — the minimal field set all three clients must render in the same order: `[{type:'text',text} | {type:'image',file_id,mime,name,size,width,height,sha256} | {type:'file',file_id,mime,name,size}]`. Rows written before parts existed are read back as a single `text` part synthesised from `content` (never rewritten on disk); `content` keeps carrying the text projection, so a client that ignores `parts` renders exactly as before. Attachments are referenced by `file_id` only — never a local URI (§2.3). RFC-0007 §5.6: `snapshot.tasks` is the authoritative starting point for the activity list (all non-terminal tasks, then the newest `tasks.snapshot_finished` terminals), with `snapshot.tasks_truncated=true` when older history exists (page it with `task/list`) and `pending_approvals[].task_id` naming the task that owns a prompt. A snapshot MISSING the `tasks` key means the core predates RFC-0007 — the client shows its static empty state and must not fabricate progress."
       },
       "ui/detach": {
         "params": {"session_id": "string"},
@@ -99,9 +142,72 @@
         "errors": ["NOT_FOUND"]
       },
       "ui/submit": {
-        "params": {"session_id": "string", "content": ["object"], "client_msg_id": "string"},
+        "params": {
+          "session_id": "string",
+          "client_msg_id": "string (non-empty; the idempotency key)",
+          "content": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "description": "RFC-0004 §6.1: ordered content parts. The order is the display order and the server must not reorder it. A message with no text part but at least one image/file part is legal (pure-image turn); `attach.max_per_turn` is the soft ceiling, 20 the frozen hard cap.",
+            "items": {
+              "oneOf": [
+                {
+                  "title": "text",
+                  "type": "object",
+                  "required": ["type", "text"],
+                  "properties": {
+                    "type": {"const": "text"},
+                    "text": {"type": "string", "minLength": 1, "maxLength": 32000}
+                  }
+                },
+                {
+                  "title": "image",
+                  "type": "object",
+                  "required": ["type", "file_id", "mime", "name", "size", "width", "height", "sha256"],
+                  "properties": {
+                    "type": {"const": "image"},
+                    "file_id": {"type": "string", "pattern": "^blb_[0-9a-z]{26}$"},
+                    "mime": {"type": "string", "enum": ["image/jpeg", "image/png", "image/webp"]},
+                    "name": {"type": "string", "minLength": 1, "maxLength": 255},
+                    "size": {"type": "integer", "minimum": 1},
+                    "width": {"type": "integer", "minimum": 1, "maximum": 2048},
+                    "height": {"type": "integer", "minimum": 1, "maximum": 2048},
+                    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                  }
+                },
+                {
+                  "title": "file",
+                  "type": "object",
+                  "required": ["type", "file_id", "mime", "name", "size"],
+                  "properties": {
+                    "type": {"const": "file"},
+                    "file_id": {"type": "string", "pattern": "^blb_[0-9a-z]{26}$"},
+                    "mime": {"type": "string", "minLength": 3, "maxLength": 255},
+                    "name": {"type": "string", "minLength": 1, "maxLength": 255},
+                    "size": {"type": "integer", "minimum": 1}
+                  }
+                },
+                {
+                  "title": "audio",
+                  "type": "object",
+                  "description": "Reserved on purpose (§7.2 / D97): the type stays in the union so FR-8.42 is not narrowed, but v1 answers 501 UNSUPPORTED data.reason='audio_disabled'. Enabling it is a core predicate change, not a schema change.",
+                  "required": ["type", "file_id", "mime", "name", "size"],
+                  "properties": {
+                    "type": {"const": "audio"},
+                    "file_id": {"type": "string", "pattern": "^blb_[0-9a-z]{26}$"},
+                    "mime": {"type": "string", "minLength": 3, "maxLength": 255},
+                    "name": {"type": "string", "minLength": 1, "maxLength": 255},
+                    "size": {"type": "integer", "minimum": 1}
+                  }
+                }
+              ]
+            }
+          }
+        },
         "result": {"turn_id": "string", "queue_pos": "int"},
-        "errors": ["INVALID_ARGUMENT", "READ_ONLY_SESSION", "OVERLOADED"]
+        "errors": ["INVALID_ARGUMENT", "NOT_FOUND", "PAYLOAD_TOO_LARGE", "UNSUPPORTED", "READ_ONLY_SESSION", "OVERLOADED"],
+        "notes": "RFC-0004 §6.4 — the validation ORDER is contractual: (1) shape, (2) idempotency by client_msg_id, (3) part types/required fields/text budget, (4) every file_id exists + visible + owned + unexpired, (5) `attach.*` byte/pixel ceilings, (6) at least one renderable part, (7) persist + pin. A refusal carries `error.data.field` pointing at the offending part (`content[i].<key>`); `content has no renderable part` is the new wording for the old `content has no text block`, same INVALID_ARGUMENT code."
       },
       "ui/interrupt": {
         "params": {"session_id": "string", "turn_id": "string"},
@@ -132,9 +238,81 @@
                    "root_turn_id": "string", "version": "int", "queue_pos": "int"},
         "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "READ_ONLY_SESSION", "OVERLOADED", "PAYLOAD_TOO_LARGE"],
         "notes": "RFC-0006 1.1.0. Appends a NEW user message and points the old one at it (messages are immutable); only the last user message is editable."
+      },
+      "task/list": {
+        "params": {
+          "session_id": "string|null (omitted = across sessions; NOT shared execution)",
+          "kinds": ["subagent|job"],
+          "states": ["task.state"],
+          "limit": "int 1..200 = 50",
+          "cursor": "string|null (opaque; clients MUST NOT parse it)"
+        },
+        "result": {
+          "tasks": "TaskView[] (RFC-0007 §5.1 fields + log_available)",
+          "next_cursor": "string|null",
+          "running_count": "int",
+          "limits": {"max_concurrent": "int", "max_depth": "int"}
+        },
+        "errors": ["INVALID_ARGUMENT"],
+        "notes": "RFC-0007 §6.1. Fixed order: non-terminal by started_at ascending first, then terminal by ended_at descending. FR-8.62's 'most recent 50' is states:[completed,failed,cancelled], limit:50 — no `order` parameter exists on purpose. `running_count` and `limits` are served so the client does not have to count tasks of sessions it never attached to. Read-only sessions may call it."
+      },
+      "task/log_tail": {
+        "params": {
+          "task_id": "string",
+          "lines": "int 1..200 = 200",
+          "max_bytes": "int 1..65536 = 65536",
+          "cursor": "string|null",
+          "follow": "bool = false",
+          "wait_ms": "int 0..30000 = 10000"
+        },
+        "result": {
+          "lines": "array of {ts:int, stream:stdout|stderr|core, text:string}",
+          "cursor": "string|null",
+          "eof": "bool",
+          "truncated": "head|line|null",
+          "lost": "bool"
+        },
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT"],
+        "notes": "RFC-0007 §6.2. `follow=true` is a bounded long-poll (no server push, no SSE): core may hold the call up to wait_ms, then the client immediately asks again. `eof` = the task is terminal AND the log is drained. Two caps, whichever hits first: lines <= 200 and the response payload <= 64 KiB; truncated='head' means older rows were dropped, 'line' means a single line was cut at tasks.log_line_chars. `lost=true` means the cursor is older than the ring's start (core restart or eviction) and the oldest available rows are returned instead — never pretend the log is complete. A task with log_available=false answers NOT_FOUND, not an empty list. Read-only sessions may call it."
+      },
+      "task/cancel": {
+        "params": {"task_id": "string", "reason": "string <=200"},
+        "result": {"ok": true, "state": "task.state", "forced": "bool"},
+        "errors": ["NOT_FOUND", "READ_ONLY_SESSION", "INVALID_ARGUMENT"],
+        "notes": "RFC-0007 §6.3. Idempotent: a terminal task returns its current terminal state, `ok:true`, and produces NO second task.finished. A live task moves to cancelling immediately; core asks cooperatively (child ui/interrupt, module tools/cancel) and forces `cancelled` with forced=true at tasks.cancel_grace_ms. The measured ceiling from this response to task.finished is 3 s (2 s default grace + scheduling). `forced` is what separates 'it really stopped' from 'we stopped waiting'."
+      },
+      "subagent/message": {
+        "params": {"task_id": "string", "text": "string 1..2000"},
+        "result": {"ok": true, "turn_id": "string|null", "delivery": "queued|steering"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "UNSUPPORTED", "READ_ONLY_SESSION", "OVERLOADED"],
+        "notes": "RFC-0007 §6.4. Only for kind=subagent with a non-null child_session_id, and only when tasks.subagent_message=true (default false → UNSUPPORTED, which is the v1 answer). delivery=queued means the child handles it as a new message after its current turn; steering (injecting a running turn) is reserved and answers UNSUPPORTED."
       }
 
     }
+  },
+  "http_endpoints": {
+    "note": "RFC-0004 §7.3: the attachment channel is HTTP on the core's own listener, not JSON-RPC. A 5 MiB image is ~107x the 65 519-byte transport frame (§2.1), so bytes have to enter core outside the ws control plane. Listed here because an undocumented second entry point is how 'how do I upload' gets re-invented per client.",
+    "listener": "data plane (core.listen) — same process as /ws and /ui/session; /admin* is deliberately 404 here",
+    "auth": {
+      "device": "Authorization: Bearer <token minted over the already-authenticated device channel>",
+      "browser": "__Host-ac_ui cookie + x-vade-csrf (double submit) + exact Origin allowlist + Sec-Fetch-Site: same-origin",
+      "read_only": "explicitly read-only sessions are 403 READ_ONLY_SESSION on writes only; reads stay allowed so history images render"
+    },
+    "body_max": {"begin": 65536, "part": "attach.part_size + 1024"},
+    "content_types": {
+      "begin_complete": ["application/json"],
+      "part": ["application/octet-stream"],
+      "rejected": ["multipart/form-data", "application/x-www-form-urlencoded", "text/plain"]
+    },
+    "endpoints": [
+      {"method": "POST", "path": "/ui/blob", "semantics": "begin: declare sha256/size/mime/dimensions", "idempotency": "(device_id, sha256, size)", "body_max": 65536},
+      {"method": "PUT", "path": "/ui/blob/upload/{upload_id}?offset=N", "semantics": "write one part (raw bytes, offset on a part_size boundary)", "idempotency": "(upload_id, offset)", "body_max": "attach.part_size + 1024"},
+      {"method": "HEAD", "path": "/ui/blob/upload/{upload_id}", "semantics": "received ranges / offset_next / expires_at (the resume anchor)", "idempotency": "read", "body_max": 0},
+      {"method": "POST", "path": "/ui/blob/upload/{upload_id}/complete", "semantics": "recompute size+sha256, emit file_id", "idempotency": "(upload_id)", "body_max": 65536},
+      {"method": "DELETE", "path": "/ui/blob/upload/{upload_id}", "semantics": "abort the upload session; never deletes a committed blob (204, idempotent)", "idempotency": "(upload_id)", "body_max": 0},
+      {"method": "GET|HEAD", "path": "/ui/blob/{file_id}[?v=thumb]", "semantics": "fetch bytes (single Range, immutable) / metadata + scan; ?v=thumb is the same file_id", "idempotency": "read", "body_max": 0}
+    ],
+    "x-vade": {"appends": "RFC-0004", "fr_exception": "FR-8.2 (AMEND-22 R1) 的唯一例外"}
   },
   "events_core_to_ui": {
     "note": "C-06 owns this table (schema/events.json). Listed here only so method-table consumers know the names referenced by ui/*.",
@@ -153,25 +331,12 @@
       "queue.updated",
       "module.status",
       "turn.superseded",
-      "message.edited"
+      "message.edited",
+      "task.started",
+      "task.status",
+      "task.progress",
+      "task.finished"
     ],
     "owner": "C3"
-  },
-  "x-vade": {
-    "appends": [
-      {
-        "contract": "C-05",
-        "version": "1.1.0",
-        "owner": "C2",
-        "doc": "docs/rfc/RFC-0006-turn-semantics.md",
-        "adds": ["turn/regenerate", "message/edit_resubmit"],
-        "notes": [
-          "ui/attach: snapshot.turns[] and messages[].partial / messages[].superseded_by are appended keys; `snapshot` stays an object and old clients ignore them",
-          "session/fork is intentionally NOT registered in v1: clients get JSON-RPC -32601, not UNSUPPORTED",
-          "PAYLOAD_TOO_LARGE carries error.data = {field, limit, actual, unit} (RFC-0006 §8)"
-        ],
-        "rewrites": "none"
-      }
-    ]
   }
 }

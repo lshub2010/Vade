@@ -9,7 +9,8 @@
   "envelope": {
     "type": "string (domain.action, past tense)",
     "seq": "int >= 1, per session, allocated by core",
-    "payload": "object"
+    "payload": "object",
+    "x-vade": "optional `x-vade.coalesce: true` on the frame — the event is droppable/self-contained (RFC-0007 §5.5 R5); a client MUST NOT treat a seq gap made only of such events as a hole."
   },
   "rules": [
     "seq is allocated only by core, strictly +1 per session; clients never supply one.",
@@ -26,6 +27,15 @@
     "completed",
     "failed",
     "interrupted",
+    "cancelled"
+  ],
+  "task_states": [
+    "queued",
+    "running",
+    "waiting_approval",
+    "cancelling",
+    "completed",
+    "failed",
     "cancelled"
   ],
   "events": {
@@ -131,7 +141,11 @@
         "tool": "string",
         "args": "object (FULL arguments, not a digest)",
         "risk": "low|medium|high",
-        "expires_at": "int (unix ms)"
+        "expires_at": "int (unix ms)",
+        "session_id": "string (RFC-0007 §7.1: registered late — already on the wire)",
+        "task_id": "string|null (RFC-0007 §7.1: the task that raised the call; null = main turn)",
+        "task_name": "string <=80|null (redundant human-readable name, so a UI never shows a bare id)",
+        "depth": "int (0 = main turn, >0 = subagent level)"
       },
       "required": [
         "turn_id",
@@ -141,7 +155,7 @@
         "risk",
         "expires_at"
       ],
-      "notes": "Broadcast to every attached UI. timeout = deny (fail-closed)."
+      "notes": "Broadcast to every attached UI. timeout = deny (fail-closed). RFC-0007 §7.1: `session_id` / `task_id` / `task_name` / `depth` are OPTIONAL additions (required is unchanged, old clients ignore them). A subagent's approval is broadcast in the PARENT session's stream: `session_id` is the parent, `turn_id` is the child turn and `task_id` names the task — the child session never has to be attached."
     },
     "turn.approval_resolved": {
       "payload": {
@@ -150,7 +164,11 @@
         "decision": "approve|deny",
         "by": "device_id|admin",
         "scope": "once|session",
-        "state": "turn.state"
+        "state": "turn.state",
+        "session_id": "string (RFC-0007 §7.1: registered late)",
+        "task_id": "string|null (RFC-0007 §7.1)",
+        "task_name": "string <=80|null (RFC-0007 §7.1)",
+        "depth": "int (RFC-0007 §7.1: 0 = main turn)"
       },
       "required": [
         "turn_id",
@@ -160,7 +178,7 @@
         "scope",
         "state"
       ],
-      "notes": "The ONLY signal that closes dialogs on the other devices; must be broadcast even when the decision lost a first-wins race."
+      "notes": "The ONLY signal that closes dialogs on the other devices; must be broadcast even when the decision lost a first-wins race. When the resolved turn belongs to a subagent, `state` is the CHILD turn's state: a parent session that does not know that turn MUST ignore the state and close the card by `request_id` alone (RFC-0007 §7.2 rule 2)."
     },
     "turn.completed": {
       "payload": {
@@ -252,6 +270,97 @@
         "online"
       ],
       "notes": "Emitted from registry changes through the same seq bus (C3 consumes registry, C2 produces the change)."
+    },
+    "task.started": {
+      "payload": {
+        "task_id": "string",
+        "kind": "subagent|job",
+        "state": "task.state (queued|running)",
+        "session_id": "string",
+        "turn_id": "string|null",
+        "parent_id": "string|null (parent TASK id, not a turn id)",
+        "depth": "int >=0",
+        "name": "string <=80",
+        "started_at": "int (unix ms)",
+        "retryable": "bool",
+        "child_session_id": "string|null (FR-8.58 jump target; null for kind=job)",
+        "child_turn_id": "string|null"
+      },
+      "required": [
+        "task_id",
+        "kind",
+        "state",
+        "session_id",
+        "turn_id",
+        "parent_id",
+        "depth",
+        "name",
+        "started_at",
+        "retryable"
+      ],
+      "notes": "RFC-0007 §5.3. Exactly once per task, and BEFORE the spawning tool's turn.tool_result, so the activity list gets a row before the tool card collapses. Nullable keys are declared and required-with-null on purpose: every event is self-describing, so a consumer never has to walk back to task.started to rebuild the tree (§5.3)."
+    },
+    "task.status": {
+      "payload": {
+        "task_id": "string",
+        "kind": "subagent|job",
+        "parent_id": "string|null",
+        "depth": "int >=0",
+        "state": "task.state",
+        "elapsed_ms": "int (core-computed; never derive it from the device clock)",
+        "action": "string <=120 (current action, e.g. 'reading docs/design.md')",
+        "pct": "int 0..100"
+      },
+      "required": [
+        "task_id",
+        "kind",
+        "parent_id",
+        "depth",
+        "state",
+        "elapsed_ms"
+      ],
+      "notes": "RFC-0007 §5.3. Every state transition emits one, unthrottled. An action-text-only change is coalesced to at most 1/s (latest wins); nothing may follow the terminal task.finished for that task."
+    },
+    "task.progress": {
+      "payload": {
+        "task_id": "string",
+        "pct": "int 0..100",
+        "elapsed_ms": "int",
+        "detail": "string (optional one-liner)"
+      },
+      "required": [
+        "task_id",
+        "pct",
+        "elapsed_ms"
+      ],
+      "x-vade": {"coalesce": true},
+      "notes": "RFC-0007 §5.3/§5.4. Absolute value, never an increment; MUST NOT carry `state` (payload-only class, rule 4). Throttled to tasks.progress_hz (2/s) per task, coalesced inside the window with the LAST value kept, only emitted while a UI is attached, and the only class the session burst budget may drop. `x-vade.coalesce` means replay coverage may skip it and a client MUST NOT treat a seq gap consisting only of such events as a hole (§5.5 R5): the event is persisted and read_since still returns it, it is simply not a continuity witness."
+    },
+    "task.finished": {
+      "payload": {
+        "task_id": "string",
+        "kind": "subagent|job",
+        "parent_id": "string|null",
+        "depth": "int >=0",
+        "state": "task.state (terminal only)",
+        "duration_ms": "int",
+        "summary": "string <=500 (subagent: final assistant text, truncated; job: result summary)",
+        "code": "C-04 name|null (required when state=failed)",
+        "message": "string <=300|null",
+        "forced": "bool (true = the grace period expired and core stopped waiting)",
+        "by": "user|parent|system",
+        "usage": "object"
+      },
+      "required": [
+        "task_id",
+        "kind",
+        "parent_id",
+        "depth",
+        "state",
+        "duration_ms",
+        "summary"
+      ],
+      "notes": "RFC-0007 §5.3. Exactly once per task; the record is written before this is broadcast (§5.5 R1), and a late task.status/task.progress is dropped rather than resurrecting it (R2). `failed` MUST carry `code`; a cancel that hit its deadline MUST carry forced=true. `by` says who ended it, which is what separates 'the user stopped it' from 'its parent finished'."
     },
     "turn.state": {
       "enum": [
@@ -372,6 +481,13 @@
     }
   },
   "x-vade": {
+    "append_rfc0007": {
+      "contract": "RFC-0007",
+      "owner": "C3",
+      "frozen": "2026-11-14",
+      "adds": ["task.started", "task.status", "task.progress", "task.finished"],
+      "rewrites": "none. Every pre-existing C-06 entry, rule and enum is unchanged; `turn.approval_required` / `turn.approval_resolved` gained four OPTIONAL payload keys (`session_id` / `task_id` / `task_name` / `depth`) and their `required` list did not move. `task_states` is a new TOP-LEVEL key, not an entry under `events` on purpose: only `turn.state` is exempt from the 'declared events nobody emits' gate, so a `task.state` entry would be red on day one (§9.2)."
+    },
     "append": {
       "contract": "C-14",
       "version": "1.0.0",

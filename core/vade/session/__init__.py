@@ -37,6 +37,23 @@ class _LazyApproval:
     async def check(self, request: Any) -> Any:
         return await self._port().check(request)
 
+    def pending(self, session_id: str) -> list[dict[str, Any]]:
+        """RFC-0007 §5.6: `snapshot.pending_approvals[]` carries `task_id`.
+
+        The port's public list is `pending_requests()` (all sessions, for the
+        admin surface); the snapshot wants this session's rows. Without this
+        delegation `hasattr(port, "pending")` is false and the snapshot is
+        always empty, so the attribution never reaches a reconnecting client.
+        """
+        port = getattr(self._app, "approval_port", None)
+        getter = getattr(port, "pending_requests", None)
+        if not callable(getter):
+            return []
+        try:
+            return [row for row in getter() if row.get("session_id") == session_id]
+        except Exception:  # pragma: no cover - approval port is C5a's
+            return []
+
     async def on_session_end(self, session_id: str) -> None:
         port = getattr(self._app, "approval_port", None)
         if port is not None and hasattr(port, "on_session_end"):
@@ -66,12 +83,33 @@ class _LazyMemory:
         return getattr(port, name)
 
 
+class _LazyBlobs:
+    """Resolves `app.blob` at submit time (RFC-0004 §6.4 step 4).
+
+    Component install order is alphabetical (`blob` < `session`), but relying on
+    that would break the moment a facade is rebuilt or the upload channel is
+    disabled: the session component must install either way. `None` is a real
+    answer — image/file parts are then refused with UNSUPPORTED, not silently
+    accepted with an unverifiable id.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self._app = app
+
+    def __call__(self) -> Any:
+        blob = getattr(self._app, "blob", None)
+        if blob is None:
+            return None
+        return getattr(blob, "service", blob)
+
+
 def install(app: Any) -> Any:
     from ..loop.context import BlobStore, CompactionConfig
     from ..loop.engine import LoopConfig, LoopEngine
     from ..loop.tools import build_snapshot
     from ..router.dispatch import Router
     from ..session.manager import SessionLog
+    from ..session.parts import PartLimits
     from ..session.replay import ReplayBuffer
     from ..session.rpc import SessionRPC
     from ..session.sqlite_store import SQLiteStore
@@ -80,7 +118,15 @@ def install(app: Any) -> Any:
     data_dir = Path(str(cfg.get("core.data_dir", "./data")))
     store = SQLiteStore(data_dir / "sessions.db")
     replay = ReplayBuffer()
-    log = SessionLog(store, replay=replay)
+    log = SessionLog(
+        store,
+        replay=replay,
+        # RFC-0004: `ui/submit` judges parts against `[attach]` and verifies
+        # `file_id`s against the upload channel; both are resolved lazily so the
+        # two components can be installed in either order (and disabled).
+        blobs=_LazyBlobs(app),
+        limits=PartLimits.from_config(cfg),
+    )
 
     router = None
     caller = getattr(app, "module_caller", None)

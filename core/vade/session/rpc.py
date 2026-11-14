@@ -50,9 +50,11 @@ class SessionRPC:
         try:
             return await handler(connection, dict(params or {}))
         except VadeError as exc:
-            # `data` carries the field-level detail a client must show verbatim
-            # (RFC-0006 §8: PAYLOAD_TOO_LARGE → {field, limit, actual, unit}).
-            return RpcError(exc.code, exc.message, exc.data)
+            # `data` is part of C-04's envelope (`error.data.field`); dropping
+            # it here used to erase every field pointer between the check and
+            # the client (§6.4 / G7). RFC-0006 §8 rides on the same key:
+            # PAYLOAD_TOO_LARGE carries {field, limit, actual, unit} verbatim.
+            return RpcError(exc.code, exc.message, dict(exc.data) if exc.data else None)
         except Exception:
             # C-04: message only, never a traceback across the boundary.
             return RpcError("INTERNAL", "session RPC failed")
@@ -100,12 +102,21 @@ class SessionRPC:
         content = params.get("content")
         client_msg_id = params.get("client_msg_id")
         if not isinstance(session_id, str):
-            raise VadeError("INVALID_ARGUMENT", "session_id is required")
-        if not isinstance(content, list):
-            raise VadeError("INVALID_ARGUMENT", "content must be an array of blocks")
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
         if not isinstance(client_msg_id, str) or not client_msg_id:
-            raise VadeError("INVALID_ARGUMENT", "client_msg_id is required")
-        turn, pos = await self.log.submit(session_id, content, client_msg_id)
+            raise VadeError("INVALID_ARGUMENT", "client_msg_id is required",
+                            data={"field": "client_msg_id"})
+        # RFC-0004 §6.4: shape (array, 1..20 parts) is checked once, in
+        # `SessionLog.submit`, so a direct caller and the RPC surface answer the
+        # same `data.field`. Only the identity of the submitting device is
+        # resolved here — it is what §6.4 step 4 compares `file_id` ownership to.
+        turn, pos = await self.log.submit(
+            session_id,
+            content,  # type: ignore[arg-type]
+            client_msg_id,
+            device_id=getattr(connection, "device_id", None) or None,
+        )
         return {"turn_id": turn.id, "queue_pos": pos}
 
     async def ui_interrupt(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -174,13 +185,20 @@ class SessionRPC:
             ok, resolved = resolved
         session_id = getattr(resolved, "session_id", None)
         turn_id = getattr(resolved, "turn_id", None)
+        attribution: dict[str, Any] = {}
+        if isinstance(resolved, Mapping):
+            # RFC-0007 §7.1: `decide()` returns the attribution it resolved, so
+            # the event that closes the dialog names the same task the prompt did.
+            for key in ("task_id", "task_name", "depth"):
+                if key in resolved:
+                    attribution[key] = resolved[key]
         if session_id and turn_id:
             # Always close the dialog on every attached UI, even on a failed
             # first-wins race — otherwise the other devices spin forever.
             await self.log.emit(session_id, "turn.approval_resolved", {
                 "turn_id": turn_id, "request_id": request_id, "decision": decision,
                 "by": getattr(connection, "device_id", None) or "admin",
-                "scope": scope, "state": "running",
+                "scope": scope, "state": "running", **attribution,
             })
         return {"ok": bool(ok)}
 

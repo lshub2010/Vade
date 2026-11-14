@@ -53,8 +53,47 @@ PUSH_TRANSPORT = "events/deliver"
 STATE_CHANGE_EVENTS = {
     "turn.queued", "turn.started", "turn.completed", "turn.failed",
     "turn.interrupted", "turn.cancelled", "turn.approval_resolved",
+    # RFC-0007 §5.2/§5.3: the task family. `task.started` is a state-change
+    # event too (state ∈ {queued, running}); `task.progress` is the opposite.
+    "task.started", "task.status", "task.finished",
 }
-PAYLOAD_ONLY_EVENTS = {"turn.delta", "turn.tool_call", "turn.tool_result"}
+PAYLOAD_ONLY_EVENTS = {
+    "turn.delta", "turn.tool_call", "turn.tool_result",
+    "task.progress",
+}
+
+#: RFC-0007 §9.4: the frozen `[tasks]` key set, defaults and apply semantics.
+#: Kept here (not derived from the schema) so a silent default change goes red.
+TASKS_DEFAULTS: dict[str, object] = {
+    "tasks.max_concurrent": 8,
+    "tasks.max_depth": 4,
+    "tasks.ui_fold_depth": 3,
+    "tasks.history_limit": 50,
+    "tasks.snapshot_finished": 20,
+    "tasks.log_lines": 200,
+    "tasks.log_bytes": 65536,
+    "tasks.log_ring_lines": 2000,
+    "tasks.log_line_chars": 4096,
+    "tasks.progress_hz": 2,
+    "tasks.event_burst": 20,
+    "tasks.cancel_grace_ms": 2000,
+    "tasks.subagent_message": False,
+}
+TASKS_HOT = {
+    "tasks.max_concurrent",
+    "tasks.ui_fold_depth",
+    "tasks.history_limit",
+    "tasks.snapshot_finished",
+    "tasks.log_lines",
+    "tasks.log_bytes",
+    "tasks.log_line_chars",
+    "tasks.progress_hz",
+    "tasks.event_burst",
+    "tasks.cancel_grace_ms",
+}
+
+#: RFC-0007 §5.2: `task_states`, terminal three, and the two hard ceilings.
+TASK_TERMINAL_STATES = {"completed", "failed", "cancelled"}
 
 #: RFC-0006 §6.4: names emitted inside an `emit_batch([("name", {...}), ...])`.
 _BATCH_EVENT_LITERAL = re.compile(r"\(\s*[\"']([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)[\"']\s*,")
@@ -222,6 +261,25 @@ def code_turn_states() -> set[str]:
     return set(re.findall(r"=\s*\"([a-z_]+)\"", block.group(1)))
 
 
+def code_task_states() -> set[str]:
+    """RFC-0007 §5.2: the schema's `task_states` and `TaskState` are one enum."""
+    text = (CORE / "tasks" / "models.py").read_text(encoding="utf-8")
+    block = re.search(r"class TaskState\(str, Enum\):(.*?)(?=\nclass |\Z)", text, re.S)
+    if not block:
+        FAILURES.append("core/vade/tasks/models.py: cannot locate TaskState")
+        return set()
+    return set(re.findall(r"=\s*\"([a-z_]+)\"", block.group(1)))
+
+
+def code_terminal_task_states() -> set[str]:
+    text = (CORE / "tasks" / "models.py").read_text(encoding="utf-8")
+    block = re.search(r"TERMINAL_TASK_STATES\s*=\s*frozenset\((.*?)\)", text, re.S)
+    if not block:
+        FAILURES.append("core/vade/tasks/models.py: cannot locate TERMINAL_TASK_STATES")
+        return set()
+    return {name.lower() for name in re.findall(r"TaskState\.([A-Z_]+)", block.group(1))}
+
+
 def walk_leaves(node: dict, prefix: str = ""):
     for key, sub in (node.get("properties") or {}).items():
         dotted = f"{prefix}.{key}" if prefix else key
@@ -337,6 +395,179 @@ def check_rfc0006(events: dict, rpc: dict, config: dict) -> None:
     check(TEXT_LIMIT == configured == 32000,
           f"RFC-0006 §8: text limit drift (core={TEXT_LIMIT}, attach.text_max_chars={configured})")
 
+PART_TITLES = {"text", "image", "file", "audio"}
+PART_REQUIRED = {
+    "text": {"type", "text"},
+    "image": {"type", "file_id", "mime", "name", "size", "width", "height", "sha256"},
+    "file": {"type", "file_id", "mime", "name", "size"},
+    "audio": {"type", "file_id", "mime", "name", "size"},
+}
+
+
+def check_submit_parts(rpc: dict) -> None:
+    """RFC-0004 §6.1/§7.2: `ui/submit.content` is a typed part union, not `[object]`.
+
+    This is the one breaking change in the batch: a client that sends a block
+    nobody defined used to be silently ignored. The schema is the only place a
+    client author can see that, so its shape is asserted rather than trusted.
+    """
+    submit = ((rpc.get("directions") or {}).get("ui_to_core") or {}).get("ui/submit") or {}
+    content = ((submit.get("params") or {}).get("content")) or {}
+    if not isinstance(content, dict):
+        FAILURES.append("rpc.json ui/submit.content is not a typed array (RFC-0004 §7.2)")
+        return
+    check(content.get("type") == "array", "rpc.json ui/submit.content: type must be array")
+    check(content.get("minItems") == 1, "rpc.json ui/submit.content: minItems must be 1")
+    check(content.get("maxItems") == 20, "rpc.json ui/submit.content: maxItems must be 20 (hard cap)")
+    branches = list(((content.get("items") or {}).get("oneOf")) or [])
+    titles = [str((branch or {}).get("title")) for branch in branches]
+    check(
+        set(titles) == PART_TITLES,
+        f"rpc.json ui/submit.content.oneOf: part types {sorted(titles)} != {sorted(PART_TITLES)}",
+    )
+    for branch in branches:
+        title = str((branch or {}).get("title"))
+        props = (branch or {}).get("properties") or {}
+        const = (props.get("type") or {}).get("const")
+        check(const == title, f"rpc.json ui/submit.content[{title}]: type const {const!r} != {title!r}")
+        required = set((branch or {}).get("required") or [])
+        expected = PART_REQUIRED.get(title, set())
+        check(
+            required == expected,
+            f"rpc.json ui/submit.content[{title}]: required {sorted(required)} != {sorted(expected)}",
+        )
+        for name in expected:
+            check(name in props, f"rpc.json ui/submit.content[{title}]: {name} not declared")
+    image = next((b for b in branches if (b or {}).get("title") == "image"), {}) or {}
+    mimes = set(((image.get("properties") or {}).get("mime") or {}).get("enum") or [])
+    check(
+        mimes == {"image/jpeg", "image/png", "image/webp"},
+        f"rpc.json ui/submit.content[image].mime: {sorted(mimes)} is not the FR-8.38 whitelist",
+    )
+
+
+def check_http_endpoints(rpc: dict) -> None:
+    """RFC-0004 §7.3: `/ui/blob*` is declared next to the RPC table it is not part of."""
+    endpoints = rpc.get("http_endpoints")
+    if not isinstance(endpoints, dict):
+        FAILURES.append("rpc.json: missing http_endpoints (RFC-0004 §7.3)")
+        return
+    rows = endpoints.get("endpoints") or []
+    # The RFC's §4.1 table and this list must describe the same six routes; the
+    # published rows carry decorators (`?offset=N`, `[?v=thumb]`), so compare the
+    # bare path or `POST /ui/blob` would "match" everything under /ui/blob/upload.
+    declared = {
+        (str(row.get("method")), str(row.get("path") or "").split("?")[0].split("[")[0])
+        for row in rows
+        if isinstance(row, dict)
+    }
+    check(len(rows) == len(BLOB_ROUTES), f"rpc.json http_endpoints: {len(rows)} routes, RFC §4.1 has {len(BLOB_ROUTES)}")
+    check(
+        declared == BLOB_ROUTES,
+        "rpc.json http_endpoints drift vs RFC-0004 §4.1: "
+        f"missing={sorted(BLOB_ROUTES - declared)} extra={sorted(declared - BLOB_ROUTES)}",
+    )
+    check("listener" in endpoints, "rpc.json http_endpoints: listener missing")
+    check("auth" in endpoints, "rpc.json http_endpoints: auth missing")
+    check("body_max" in endpoints, "rpc.json http_endpoints: body_max missing")
+    check(
+        (endpoints.get("x-vade") or {}).get("appends") == "RFC-0004",
+        "rpc.json http_endpoints: x-vade.appends must name RFC-0004",
+    )
+
+
+def check_tasks(config: dict) -> None:
+    """RFC-0007 §9.4: exactly 13 keys, documented defaults, hot|restart."""
+    tasks = (config.get("properties") or {}).get("tasks")
+    if not isinstance(tasks, dict):
+        FAILURES.append("config.schema.json: missing [tasks] section (RFC-0007 §9.4)")
+        return
+    check(
+        tasks.get("additionalProperties") is False,
+        "config.schema.json: [tasks].additionalProperties must be false",
+    )
+    leaves = dict(walk_leaves(tasks, "tasks"))
+    missing = sorted(set(TASKS_DEFAULTS) - set(leaves))
+    extra = sorted(set(leaves) - set(TASKS_DEFAULTS))
+    check(not missing and not extra, f"config.schema.json [tasks] key drift: missing={missing} extra={extra}")
+    for dotted, expected in TASKS_DEFAULTS.items():
+        leaf = leaves.get(dotted) or {}
+        check(
+            leaf.get("default") == expected,
+            f"config.schema.json {dotted}: default {leaf.get('default')!r} != {expected!r} (RFC-0007 §9.4)",
+        )
+        wanted = "hot" if dotted in TASKS_HOT else "restart"
+        check(
+            (leaf.get("x-vade") or {}).get("apply") == wanted,
+            f"config.schema.json {dotted}: apply must be {wanted} (RFC-0007 §9.4)",
+        )
+    # §6.3: the cancel deadline is a ceiling, not a preference.
+    grace = leaves.get("tasks.cancel_grace_ms") or {}
+    check(
+        grace.get("maximum") == 3000,
+        "config.schema.json tasks.cancel_grace_ms: maximum must be 3000 (RFC-0007 §6.3)",
+    )
+
+
+def check_task_events(events: dict, declared_events: dict, schema_events: set[str]) -> None:
+    """RFC-0007 §9.2: enum drift, the `task.state` trap, and the coalesce marker."""
+    states = list(events.get("task_states") or [])
+    check(set(states) == code_task_states(), "events.json task_states drift vs core/vade/tasks/models.TaskState")
+    check(
+        code_terminal_task_states() == TASK_TERMINAL_STATES,
+        "core/vade/tasks/models.TERMINAL_TASK_STATES must be exactly "
+        f"{sorted(TASK_TERMINAL_STATES)}, has {sorted(code_terminal_task_states())}",
+    )
+    # §9.2: a `task.state` entry under `events` would be "declared but nobody
+    # emits" on day one — only `turn.state` is exempt from that gate.
+    check(
+        "task.state" not in declared_events,
+        "events.json: task_states is a TOP-LEVEL key; a `task.state` events entry is not allowed (RFC-0007 §9.2)",
+    )
+    check(
+        {"task.started", "task.status", "task.progress", "task.finished"} <= schema_events,
+        "events.json: the four RFC-0007 task.* events are missing",
+    )
+    progress = declared_events.get("task.progress") or {}
+    check(
+        (progress.get("x-vade") or {}).get("coalesce") is True,
+        "events.json task.progress: x-vade.coalesce must be true (RFC-0007 §5.5 R5 / §9.2)",
+    )
+    check(
+        "state" not in (progress.get("payload") or {}),
+        "events.json task.progress: must not declare `state` (payload-only class)",
+    )
+    # §5.3: these nullable keys are required-with-null so every event is
+    # self-describing; dropping one silently breaks client tree-building.
+    expected_required = {
+        "task.started": {
+            "task_id", "kind", "state", "session_id", "turn_id", "parent_id",
+            "depth", "name", "started_at", "retryable",
+        },
+        "task.status": {"task_id", "kind", "parent_id", "depth", "state", "elapsed_ms"},
+        "task.progress": {"task_id", "pct", "elapsed_ms"},
+        "task.finished": {
+            "task_id", "kind", "parent_id", "depth", "state", "duration_ms", "summary",
+        },
+    }
+    for name, wanted in expected_required.items():
+        actual = set((declared_events.get(name) or {}).get("required") or [])
+        check(actual == wanted, f"events.json {name}.required drift: {sorted(actual)} != {sorted(wanted)}")
+
+
+def check_approval_attribution(declared_events: dict) -> None:
+    """RFC-0007 §7.1: four OPTIONAL keys, and `required` must not have moved."""
+    for name in ("turn.approval_required", "turn.approval_resolved"):
+        spec = declared_events.get(name) or {}
+        payload = spec.get("payload") or {}
+        for key in ("session_id", "task_id", "task_name", "depth"):
+            check(key in payload, f"events.json {name}: RFC-0007 §7.1 field {key} is not declared")
+        required = set(spec.get("required") or [])
+        check(
+            not ({"session_id", "task_id", "task_name", "depth"} & required),
+            f"events.json {name}: RFC-0007 attribution fields must stay OPTIONAL (required is frozen)",
+        )
+
 
 def main() -> int:
     manifest = load("manifest.schema.json")
@@ -372,6 +603,7 @@ def main() -> int:
 
     required_sections = {
         "core", "tls", "policy", "audit", "server", "dev", "memory", "evolve", "compaction", "skills",
+        "tasks",
     }
     present = set(config.get("properties", {}))
     check(required_sections <= present, f"config.schema.json missing sections: {sorted(required_sections - present)}")
@@ -389,11 +621,15 @@ def main() -> int:
             check("default" in leaf, f"config key {dotted}: default missing")
 
     check_attach(config)
+    check_tasks(config)
     check_blob_routes()
+    check_submit_parts(rpc)
+    check_http_endpoints(rpc)
 
     methods = {
         "module/register", "module/capabilities.update", "module/heartbeat",
         "tools/call", "tools/cancel", "module/drain", "approval/decide", "ui/submit",
+        "task/list", "task/log_tail", "task/cancel", "subagent/message",
     }
     declared = set()
     for direction in rpc.get("directions", {}).values():
@@ -443,6 +679,8 @@ def main() -> int:
     check(set(declared_events.get("turn.state", {}).get("enum") or []) == set(states),
           "events.json: turn.state enum disagrees with turn_states")
     check_rfc0006(events, rpc, config)
+    check_task_events(events, declared_events, schema_events)
+    check_approval_attribution(declared_events)
 
     if FAILURES:
         print("contracts: FAIL")

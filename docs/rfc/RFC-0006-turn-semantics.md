@@ -8,7 +8,7 @@ proposer: 编排（依据 `docs/requirements.md` §8.21 FR-8.30/8.31/8.32/8.35/8
 affects: C-06 `schema/events.json`（5 组字段追加 + 2 个新事件 + 注记级澄清）、C-05 `schema/rpc.json`（新增 `turn/regenerate`、`message/edit_resubmit`，`ui/attach` 的 snapshot 注记）、消息/turn 模型（`core/vade/session/models.py`、`sqlite_store.py` 追加列）、`core/vade/session/queue.py`（中断落库）、`core/vade/loop/engine.py`（工具卡字段与分段）、`core/vade/loop/context.py`（superseded 过滤）
 related: RFC-0004（content parts、单 part 32k、`attach.text_max_chars`）；RFC-0003（章节与元信息风格来源）；AMEND-21 §8.21.2 R7/R8/R9；AMEND-22 §8.22.2 R6/R8、§8.22.5；RFC-0008（ask-user，编号已由 AMEND-22 预留，与本文件无字段重叠）
 type: 契约追加（C-05/C-06）为主 + 存储列追加；所有新字段对旧客户端均为可选，`required` 数组一律不变
-stage: 草稿，未实现；不新增 C-04 错误码，不新增 `turn_states` 枚举值，不做消息树与 `session/fork`
+stage: 已实现并合并
 ---
 
 # RFC-0006 · turn 语义补充

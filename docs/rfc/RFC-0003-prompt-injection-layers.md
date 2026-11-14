@@ -8,7 +8,7 @@ proposer: 编排（借 dsh / Claude Code 的注入做法；依据 `research/agen
 affects: C-11 `schema/skill.schema.json`、C3b `core/vade/skill/*`、C-05 `schema/rpc.json`、C-06 `schema/events.json`（只追加）、C-18 `schema/config.schema.json`（附带）
 related: RFC-0001（已实施）；RFC-0002（待合入，在 `tmp/debt-a` 分支）
 type: 行为破坏性（C3b 注入位置、C-11 顺序语义）；文件层面以追加为主
-stage: 草稿，未实现；默认开关 legacy，U1-0 验收后才切 layered
+stage: 已实现并合并
 ---
 
 # RFC-0003 · 提示词注入分层：技能目录消息化、工具渐进披露与 stable/context 分段

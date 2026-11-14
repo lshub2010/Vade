@@ -8,7 +8,7 @@ proposer: 编排（依据 `research/ui-decisions.md` #15 / #16、`research/ui-02
 affects: C-05 `schema/rpc.json`（追加 `model/list`、`session/model.get|set`、`session/usage.get` 与 `ui/attach` snapshot 注记）、C-03 `schema/manifest.schema.json`（`capabilities.models[]`，追加）、C-06 `schema/events.json`（只追加）、C-18 `schema/config.schema.json`（`[llm]` 4 键 + `[usage]` 6 键）；内部 `core/vade/llm/*`、`core/vade/session/*`、`core/vade/admin/app.py`
 related: RFC-0004（附件与多模态；§9 的四个能力字段是本提案的硬依赖）；AMEND-22 §8.22.2 R5；FR-6.3、FR-8.46～8.50、FR-10.3；D96（只存压缩图）、D101（会话级优先）、D102（用量两口径）
 type: 契约追加（C-03 / C-05 / C-06 / C-18）；`LLMProvider.chat` 的 Python 协议变更属 core 内部破坏性
-stage: 草稿，未实现；不与 RFC-0004 同时实现时，能力字段全 `null`，降级路径见 §9
+stage: 已实现并合并
 ---
 
 # RFC-0005 · 模型能力查询与用量

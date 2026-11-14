@@ -46,7 +46,7 @@
         "why": "C-03 shipped without the field C-14's manifest gate reads. `additionalProperties: true` let a module send it, but `Manifest` dropped it, so every real registration was rejected `not in manifest`."
       },
       {
-        "contract": "RFC-0005",
+        "contract": "C-03",
         "version": "1.0.0",
         "fields": ["capabilities.models"],
         "doc": "docs/rfc/RFC-0005-model-capabilities-usage.md",

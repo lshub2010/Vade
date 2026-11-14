@@ -1,6 +1,6 @@
 {
   "id": "C-05",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "status": "frozen",
   "frozen_at": "2026-11-14",
   "owner": "C2",
@@ -13,23 +13,6 @@
       "doc": "docs/rfc/RFC-0003-prompt-injection-layers.md",
       "reserved": ["skill_load", "tools_search", "tools/search"],
       "note": "RFC-0003 §5.4: model-visible core built-ins. They are handled inside core and never routed to a module, so they are NOT methods in `directions` — this table is the registration. No manifest may declare a tool with one of these names, and no module LLM name can collide with them: module names are `{prefix}__{tool}` (always a double underscore), core names never carry one. `tools/search` is the C-05/RPC spelling of the search capability; the model-visible name is `tools_search` because an LLM function name may not contain `/`."
-    },
-    "rfc0015_pending": {
-      "contract": "C-05",
-      "version": "1.6.0",
-      "owner": "C3",
-      "doc": "docs/rfc/RFC-0015-ui-modules.md",
-      "adds": [
-        "ui/modules"
-      ],
-      "status": "implemented in core — still NOT an append registration (header pinned at 1.5.0)",
-      "notes": [
-        "This block is still kept OUT of `x-vade.appends`. `tools/check_ledger.py:203-208` treats any append block as 'core already implements it' AND, for an RFC with no append block, only accepts impl_state 未实施 / 客户端仓；the append registration and the ledger's 已实现 therefore have to land together, in the commit allowed to raise the version pins below. Core-side the method IS implemented as of this branch: `ModulePageService.list_modules()` (`core/vade/modulepage/service.py`) + the `ui/modules` handler in `core/vade/modulepage/rpc.py`, registered through the same `app.session_handlers` path as the three C-19 methods, with 19 tests (incl. a real WS end-to-end).",
-        "The top-level `version` stays 1.5.0. Re-measured WITH the implementation in place: bumping it to 1.6.0 makes `tools/check_contracts.py` fail in the same three places it always did (check_session_meta:1356, check_subagent_events:1096, check_session_search:1480), because those are hard version pins, not implementation checks — a header bump is only legal in a commit that may raise them, and this branch may not edit `tools/check_*.py`. 1.6.0 remains the version this block carries when it moves into `appends`.",
-        "`ui/modules` is declared in `directions.ui_to_core` with its four parts and its `notes` now says SERVED instead of PROPOSED; the technical half of that note (params empty, page key is `id`, no bodies, ordering, callers, revision semantics) is unchanged."
-      ],
-      "rewrites": "none. One read-only ui_to_core method appended; no existing method, direction, error list or field changes. C-06 untouched (no event), C-04 untouched (34 codes), C-03 untouched.",
-      "landing": "In the commit that implements core: (1) delete this block; (2) append the same contract/version/owner/doc/adds/notes/rewrites to the END of `x-vade.appends` (array append — the existing 10 blocks stay byte-identical); (3) bump the top-level `version` 1.5.0 -> 1.6.0; (4) raise the three version pins in `tools/check_contracts.py` in the same commit (a header bump without them is a red gate, by design); (5) flip the LEDGER row for RFC-0015 from 未实施 to 已实现 and sync aggregate.appends_rpc 10 -> 11."
     },
     "appends": [
       {
@@ -171,6 +154,20 @@
           "a core without it answers -32601 (the documented degradation: FR-8.27's local-cached-only search with the '范围：已缓存' badge stays until the client upgrades)"
         ],
         "rewrites": "none. One ui_to_core method appended (FR-8.27); C-05 version 1.4.0 -> 1.5.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one). Recorded in core/vade/session/RESULT-rfc0014.md."
+      },
+      {
+        "contract": "C-05",
+        "version": "1.6.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0015-ui-modules.md",
+        "adds": ["ui/modules"],
+        "notes": [
+          "one READ-ONLY list method under ui_to_core: ui/modules — the module entry list (modules -> pages) in one pull; no existing method, error code, direction or field changed",
+          "`params` is `{}` and never gains `session_id`: the module set is a process-level fact (Registry.snapshot() takes no session) and authorization comes from the connection (`modulepage/auth.py`), never from a param the caller controls; a browser session sees ENABLED modules only, a module peer sees itself, an unresolvable caller is PERMISSION_DENIED",
+          "page BODIES never cross the wire (`ui/page.get` stays the only body channel); ordering is registry order for modules and `manifest.ui.pages[]` order for pages; `revision` is the Registry revision, bumped next to every `_publish_status(...)` call, so `module.status` is the invalidation edge",
+          "no event is added (C-06 stays 34 entries) and no error code is added (C-04 stays 34); a core that predates it answers -32601 — the documented degradation: the client renders the empty entry block instead of erroring"
+        ],
+        "rewrites": "none. One ui_to_core method appended (A3 module entry list); C-05 version 1.5.0 -> 1.6.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one, 1.6.0 one). C-06 untouched (no event), C-04 untouched (34 codes), C-03 untouched. Recorded in docs/rfc/LEDGER.md; evidence in shots/s-rfc0015-register/RESULT.md."
       }
     ],
     "rfc0005_append": {
@@ -1209,7 +1206,7 @@
           "UNAVAILABLE",
           "PAYLOAD_TOO_LARGE"
         ],
-        "notes": "RFC-0015 §4. **SERVED** — core implements it in `ModulePageService.list_modules()` (`core/vade/modulepage/service.py`) behind the `ui/modules` handler in `core/vade/modulepage/rpc.py`; the CONTRACT registration is still pending in `x-vade.rfc0015_pending` (§9.2), so a core that predates it answers JSON-RPC -32601 (NOT a C-04 code) and the client must degrade to the empty entry block instead of erroring (§7.1). ONE pull returns the WHOLE list because an entry list has to render on first paint. `params` is `{}` and never gains `session_id`: the module set is a process-level fact (`Registry.snapshot()` takes no session) and authorization comes from the connection (`modulepage/auth.py`, review B1), never from a param the caller controls. `pages` is `ModulePageService.pages()` verbatim (`modulepage/service.py:202-221`) — the key is `id`, because C-03 `$defs.page` and the client decoder both call it `id`; renaming it here would create a second spelling. Page BODIES never cross the wire: `ui/page.get` stays the only body channel (ref pages keep their sha256 check there). Ordering: registry order for modules, `manifest.ui.pages[]` order for pages. Callers: a browser session (`ui-...`) sees ENABLED modules only; a module peer sees only itself; an unresolvable caller is PERMISSION_DENIED. `revision` is the Registry revision (`registry/table.py:135-141`) which is bumped next to every `_publish_status(...)` call, so 'a module.status arrived' and 'the revision moved' are the same set — the client invalidates on `module.status` and re-pulls here (§5). No event is added (C-06 stays 34 entries), no error code is added (C-04 stays 34)."
+        "notes": "RFC-0015 §4. **SERVED and REGISTERED** — core implements it in `ModulePageService.list_modules()` (`core/vade/modulepage/service.py`) behind the `ui/modules` handler in `core/vade/modulepage/rpc.py`, and the contract registration is the C-05 1.6.0 append block (`x-vade.appends`, §9.2); a core that predates it answers JSON-RPC -32601 (NOT a C-04 code) and the client must degrade to the empty entry block instead of erroring (§7.1). ONE pull returns the WHOLE list because an entry list has to render on first paint. `params` is `{}` and never gains `session_id`: the module set is a process-level fact (`Registry.snapshot()` takes no session) and authorization comes from the connection (`modulepage/auth.py`, review B1), never from a param the caller controls. `pages` is `ModulePageService.pages()` verbatim (`modulepage/service.py:202-221`) — the key is `id`, because C-03 `$defs.page` and the client decoder both call it `id`; renaming it here would create a second spelling. Page BODIES never cross the wire: `ui/page.get` stays the only body channel (ref pages keep their sha256 check there). Ordering: registry order for modules, `manifest.ui.pages[]` order for pages. Callers: a browser session (`ui-...`) sees ENABLED modules only; a module peer sees only itself; an unresolvable caller is PERMISSION_DENIED. `revision` is the Registry revision (`registry/table.py:135-141`) which is bumped next to every `_publish_status(...)` call, so 'a module.status arrived' and 'the revision moved' are the same set — the client invalidates on `module.status` and re-pulls here (§5). No event is added (C-06 stays 34 entries), no error code is added (C-04 stays 34)."
       }
     }
   },

@@ -1093,8 +1093,8 @@ def check_subagent_events(events: dict, declared_events: dict, schema_events: se
         & (set(directions.get("module_to_core") or {}) | set(directions.get("core_to_module") or {}))
     )
     check(not elsewhere, f"rpc.json: RFC-0012 methods must not be module-facing: {elsewhere}")
-    check(rpc.get("version") in ("1.4.0", "1.5.0"),
-          f"rpc.json: version must be 1.4.0 (RFC-0012) or 1.5.0 (RFC-0014, the current head) (got {rpc.get('version')!r})")
+    check(rpc.get("version") in ("1.4.0", "1.5.0", "1.6.0"),
+          f"rpc.json: version must be 1.4.0 (RFC-0012), 1.5.0 (RFC-0014) or 1.6.0 (RFC-0015, the current head) (got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0012" in str(b.get("doc") or "")), None)
     check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0012")
@@ -1353,8 +1353,8 @@ def check_session_meta(rpc: dict, events: dict) -> None:
             check(field in entry, f"rpc.json {name}: missing {field}")
         unknown = sorted(set(entry.get("errors") or []) - codes)
         check(not unknown, f"rpc.json {name}: errors not declared in C-04: {unknown}")
-    check(rpc.get("version") in ("1.3.0", "1.4.0", "1.5.0"),
-          f"rpc.json: version must be 1.3.0 (RFC-0010), 1.4.0 (RFC-0012) or 1.5.0 (RFC-0014, the current head) (got {rpc.get('version')!r})")
+    check(rpc.get("version") in ("1.3.0", "1.4.0", "1.5.0", "1.6.0"),
+          f"rpc.json: version must be 1.3.0 (RFC-0010), 1.4.0 (RFC-0012), 1.5.0 (RFC-0014) or 1.6.0 (RFC-0015, the current head) (got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0010" in str(b.get("doc") or "")), None)
     check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0010")
@@ -1477,8 +1477,8 @@ def check_session_search(rpc: dict) -> None:
                   f"rpc.json session/search hit-row shape drifted: {sorted(set(rows[0]) ^ SESSION_SEARCH_HIT_KEYS)}")
         else:
             check(False, "rpc.json session/search.result.results: must declare the hit-row shape (one object)")
-    check(rpc.get("version") == "1.5.0",
-          f"rpc.json: version must be 1.5.0 after the RFC-0014 append (got {rpc.get('version')!r})")
+    check(rpc.get("version") in ("1.5.0", "1.6.0"),
+          f"rpc.json: version must be 1.5.0 (RFC-0014) or 1.6.0 (RFC-0015, the current head) after the RFC-0014 append (got {rpc.get('version')!r})")
 
     if str(ROOT / "core") not in sys.path:
         sys.path.insert(0, str(ROOT / "core"))

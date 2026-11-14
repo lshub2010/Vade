@@ -4,10 +4,10 @@ title: 模块清单通道：`ui/modules`（一次拉全量模块与页面入口�
 status: proposed
 date: 2026-11-14
 proposer: 编排（依据 A3 缺口：客户端 `RealModulePageSource.declarations()` 只能返回空列表；core 内 `modulepage/service.py:202 pages()` 已有数据却没有任何 wire 出口；`ui/attach` 快照与 34 个 `ui_to_core` 方法均无模块清单）
-affects: C-05 `schema/rpc.json` 的 `ui_to_core` **追加 1 个只读方法** `ui/modules`（声明在 `directions` 内，登记块写进 `x-vade.rfc0015_pending`，**顶部 version 仍 1.5.0**，落地时转 `x-vade.appends` 并升 1.6.0，见 §9）；落地时要动 `core/vade/modulepage/service.py`（加 `list_modules()`）与 `core/vade/modulepage/rpc.py`（加一个 handler）；**不改** C-06（无新事件）、**不改** C-04（无新错误码，仍 34）、**不改** C-03（`manifest.schema.json` 一行不动：`display_name` 与 `ui.pages[]` 早在 RFC-0001/0009 里就齐了）
+affects: C-05 `schema/rpc.json` 的 `ui_to_core` **追加 1 个只读方法** `ui/modules`（声明在 `directions` 内；登记块已由 `s-rfc0015-register` 转正进 `x-vade.appends` 第 11 块、块版本 **1.6.0**，顶部 version 1.5.0 → **1.6.0**，见 §9.6）；落地时要动 `core/vade/modulepage/service.py`（加 `list_modules()`）与 `core/vade/modulepage/rpc.py`（加一个 handler）；**不改** C-06（无新事件）、**不改** C-04（无新错误码，仍 34）、**不改** C-03（`manifest.schema.json` 一行不动：`display_name` 与 `ui.pages[]` 早在 RFC-0001/0009 里就齐了）
 related: RFC-0009（C-19 的 `ui.pages[]` 声明、`ui/page.get` / `ui/state.get` 的三坐标、§9.4「页面审批不新增事件」的同一条纪律）；RFC-0005（`model/list` 的 `revision` 语义、`if_revision` 的 `not_modified` 坑「客户端不得清缓存」）；RFC-0010（`session/list` 的「轻行 + 拉取式」形态：列表归列表、正文归正文）；RFC-0012（required-with-null 的自描述写法，本 RFC 的 `display_name` / `version` 沿用）
 type: C-05 追加（1 个只读方法）；不改 C-04 错误码、不改 C-06 事件族、不改 C-03 manifest、无破坏性改名、无客户端强制升级
-stage: 提案（本 worktree 只落 RFC 与契约声明；core 与客户端**均未实现**，落地清单见 §14）
+stage: 提案（core 与契约登记**均已落地**：`s-modules-impl` 实现 core，`s-rfc0015-register` 登记契约；客户端未接线，见 §9.6）
 ---
 
 # RFC-0015 · 模块清单通道
@@ -306,8 +306,8 @@ val entryIndex = remember(pageSource) { ModulePageEntryRules.build(pageSource.de
 | # | 契约 | 变更 | 类型 |
 |---|---|---|---|
 | 1 | C-05 `ui_to_core` | 追加 `ui/modules`（`params`/`result`/`errors`/`notes` 四件齐全） | 追加 |
-| 2 | C-05 `x-vade.rfc0015_pending` | 登记块（`contract`/`version 1.6.0`/`adds`/`notes`/`rewrites`/`landing`） | **pending，不是 append** |
-| 3 | C-05 顶部 `version` | **保持 1.5.0**（理由见 §9.2） | 不动 |
+| 2 | C-05 `x-vade.rfc0015_pending` | 登记块（`contract`/`version 1.6.0`/`adds`/`notes`/`rewrites`/`landing`） | **pending，不是 append**（**已被 `s-rfc0015-register` 取代：块转正进 `x-vade.appends` 第 11 块，见 §9.6**） |
+| 3 | C-05 顶部 `version` | **保持 1.5.0**（理由见 §9.2） | 不动（**已被 `s-rfc0015-register` 取代：1.5.0 → 1.6.0，见 §9.6**） |
 | 4 | C-06 | **不动**（无新事件，事件数仍 34） | — |
 | 5 | C-04 | **不动**（错误码仍 34） | — |
 | 6 | C-03 `manifest.schema.json` | **不动**（`display_name` 与 `ui.pages[]` 已存在） | — |
@@ -370,6 +370,19 @@ check(not missing_handlers, "events.json: declared events nobody emits: …")
 ### 9.5 不动 `manifest.schema.json`
 
 `display_name`（`minLength:1,maxLength:64`，可选）与 `ui.pages[]`（≤8，`$defs.page`）都在 C-03 里，`Manifest` dataclass 也承接了它们。本 RFC 只是**读**，不需要任何 schema 追加——**再加一个字段只会制造第二个真相源**。
+
+### 9.6 登记已落地（`s-rfc0015-register`）
+
+§9.1 第 2/3 行、§9.2、§9.4 ③④⑤ 描述的是**提案那一棒**的状态（core 未写、门禁不许动，故 1.6.0 只能记在 `x-vade.rfc0015_pending` 里）。本节记录收口事实，上述各节保留原文作为历史：
+
+| 动作 | 结果 |
+|---|---|
+| `x-vade.rfc0015_pending` → `x-vade.appends` | 块已转正为 `appends` **第 11 块**（`contract: C-05`、`version: 1.6.0`、`owner: C3`、`doc` 指向本文件、`adds: ["ui/modules"]`、`notes` 4 条、`rewrites: none`）；既有 10 块**逐字未动**；占位键已删除 |
+| C-05 顶部 `version` | 1.5.0 → **1.6.0** |
+| `tools/check_contracts.py` 三处版本钉 | **追加** 1.6.0（`check_subagent_events` / `check_session_meta` / `check_session_search`）；1.3.0/1.4.0/1.5.0 **全部保留**。咬合证据：把顶部临时改成 **1.7.0** 后 `check_contracts` 仍 FAIL 三条（原文见 `shots/s-rfc0015-register/RESULT.md` §5） |
+| `docs/rfc/LEDGER.md` | RFC-0015 行 `impl_state` 未实施 → **已实现**；填 `ui/modules`、`append_versions={"rpc.json":"1.6.0"}`、impl 路径；`aggregate.appends_rpc` 10 → **11**；三方向方法数仍 **48**（`ui/modules` 早已计入 `directions`） |
+| `core/tests` 头部版本断言 | 三处（`test_meta.py` / `test_rfc0013_partial_persistence.py` / `test_rfc0014_search.py`）随顶部版本同步为 `1.6.0`，与 RFC-0014 的 `6b568b9` 同一做法：只改版本号与相邻「谁拥有 C-05 head」注释，断言仍是**精确相等**（不是放宽成集合） |
+| `schema/events.json` | **逐字节未变**（本 RFC 无事件） |
 
 ## 10. 安全与授权
 

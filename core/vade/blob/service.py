@@ -22,6 +22,7 @@ Design rules that are easy to get wrong and expensive to discover later:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import shutil
@@ -84,6 +85,8 @@ class BlobService:
         self._audit = audit
         self.store = BlobStore(self.data_dir / "blob.sqlite3")
         self._inflight: dict[str, int] = {}
+        self._gc_task: asyncio.Task[None] | None = None
+        self._closed = False
         self._prepare()
 
     # ------------------------------------------------------------------ plumbing
@@ -95,7 +98,65 @@ class BlobService:
         return float(self._wall())
 
     def close(self) -> None:
-        self.store.close()
+        """Sync teardown: stop the sweeper best-effort, then release sqlite."""
+        task = self._gc_task
+        self._gc_task = None
+        if task is not None and not task.done():
+            # `aclose()` awaits the cancellation; this path is the sync last
+            # resort (a fixture teardown, a crash-handler). Swallow the result
+            # so an un-awaited task never logs "exception was never retrieved".
+            task.add_done_callback(lambda done: done.cancelled() or done.exception())
+            task.cancel()
+        if not self._closed:
+            self._closed = True
+            self.store.close()
+
+    async def aclose(self) -> None:
+        await self.stop_sweeper()
+        self.close()
+
+    # ------------------------------------------------------------------ sweeper
+    def ensure_sweeper(self) -> None:
+        """Create the periodic GC task on the *current* running loop.
+
+        Sync on purpose: `install()` must be able to start it without awaiting
+        an extra hop (a pending `start_sweeper()` coroutine would be destroyed
+        with the loop).
+        """
+        if self._gc_task is not None and not self._gc_task.done():
+            return
+        self._gc_task = asyncio.create_task(self._sweep_forever(), name="vade.blob.gc")
+
+    async def start_sweeper(self) -> None:
+        """Start the periodic GC task on the running loop (idempotent)."""
+        self.ensure_sweeper()
+
+    async def stop_sweeper(self) -> None:
+        """Cancel and *await* the GC task: no pending task may outlive shutdown."""
+        task, self._gc_task = self._gc_task, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # pragma: no cover - a sweep must never kill shutdown
+            pass
+
+    async def _sweep_forever(self) -> None:
+        interval = max(0.01, float(self.settings.gc_interval_s))
+        while True:
+            try:
+                # sqlite + unlink in a worker thread: a quota-driven sweep on a
+                # busy store must not stall `/ws`.
+                await asyncio.to_thread(self.sweep)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - keep collecting next tick
+                pass
+            await asyncio.sleep(interval)
+
 
     def _record(self, kind: str, *, status: str = "ok", code: str | None = None, **extra: Any) -> None:
         if self._audit is None:
@@ -170,8 +231,7 @@ class BlobService:
             # Lazy TTL: the sweeper runs every gc_interval_s, and handing out a
             # row that is already past its expiry would produce a 404 right
             # after a successful begin.
-            self._remove_blob_files(existing)
-            self.store.delete_blob(existing.file_id)
+            self._release(existing)
             existing = None
         if existing is not None and existing.state == "ok" and existing.scan != "infected":
             self._record(
@@ -244,6 +304,20 @@ class BlobService:
 
         sha256 = normalize_sha256(payload.get("sha256"))
 
+        mime = str(payload.get("mime") or "").strip().lower()
+        if kind == "image" and mime not in IMAGE_MIMES:
+            raise VadeError(
+                "UNSUPPORTED",
+                "image mime must be image/jpeg, image/png or image/webp",
+                data={"field": "mime"},
+            )
+        if kind == "file" and not mime:
+            mime = "application/octet-stream"
+        # §5.1: `kind` is a hint, the *mime* decides which gate runs. Sending
+        # `kind:"file"` with `image/png` must not skip the image ceilings or
+        # the metadata strip at `complete`.
+        image = kind == "image" or mime in IMAGE_MIMES
+
         size_raw = payload.get("size")
         if isinstance(size_raw, bool) or not isinstance(size_raw, int) or size_raw <= 0:
             raise VadeError("INVALID_ARGUMENT", "size must be a positive integer", data={"field": "size"})
@@ -254,27 +328,16 @@ class BlobService:
                 "file exceeds the configured hard limit",
                 data={"field": "size", "limit": self.settings.max_bytes, "actual": size},
             )
-        if kind == "image" and size > self.settings.image_max_bytes:
+        if image and size > self.settings.image_max_bytes:
             raise VadeError(
                 "PAYLOAD_TOO_LARGE",
                 "image exceeds the configured limit (compress before uploading)",
                 data={"field": "size", "limit": self.settings.image_max_bytes, "actual": size, "kind": "image"},
             )
 
-        mime = str(payload.get("mime") or "").strip().lower()
-        if kind == "image":
-            if mime not in IMAGE_MIMES:
-                raise VadeError(
-                    "UNSUPPORTED",
-                    "image mime must be image/jpeg, image/png or image/webp",
-                    data={"field": "mime"},
-                )
-        elif not mime:
-            mime = "application/octet-stream"
-
         width = payload.get("width")
         height = payload.get("height")
-        if kind == "image":
+        if image:
             width = self._positive_int(width, "width")
             height = self._positive_int(height, "height")
             long_edge = max(width, height)
@@ -311,14 +374,17 @@ class BlobService:
         return int(value)
 
     def _check_quota(self, device_id: str, size: int, now: float) -> None:
-        used = self.store.usage(device_id, now)
+        # Must stay *before* the temp file is created: a refusal here leaves no
+        # orphan `.part` behind that no sweep would ever reclaim (§4.6).
+        idle = self.settings.idle_seconds
+        used = self.store.usage(device_id, now, idle_s=idle)
         if used + size > self.settings.quota_bytes:
             raise VadeError(
                 "PAYLOAD_TOO_LARGE",
                 "device storage quota would be exceeded",
                 data={"field": "size", "reason": "quota", "limit": self.settings.quota_bytes, "used": used},
             )
-        tmp_used = self.store.tmp_usage(device_id)
+        tmp_used = self.store.tmp_usage(device_id, now, idle_s=idle)
         if tmp_used + size > self.settings.tmp_quota_bytes:
             raise VadeError(
                 "PAYLOAD_TOO_LARGE",
@@ -446,9 +512,14 @@ class BlobService:
         target = tmp_path(self.root, upload.upload_id)
         if not target.exists():
             raise VadeError("NOT_FOUND", "upload session has no temporary file", data={"field": "upload_id"})
-        with open(target, "r+b") as handle:
-            handle.seek(offset)
-            handle.write(body)
+        try:
+            with open(target, "r+b") as handle:
+                handle.seek(offset)
+                handle.write(body)
+        except FileNotFoundError:
+            # Aborted between the check above and the open: same answer as a
+            # missing session, not a 500.
+            raise VadeError("NOT_FOUND", "upload session expired", data={"field": "upload_id"}) from None
 
         ranges = chunks.add(upload.ranges, offset, offset + length)
         # File first, row second: a crash between them only loses the record of
@@ -520,7 +591,11 @@ class BlobService:
         target = tmp_path(self.root, upload.upload_id)
         try:
             target.unlink()
-        except FileNotFoundError:
+        except OSError:
+            # Windows refuses to unlink a file a part-writer still holds open;
+            # POSIX unlinks it under the writer's feet. Either way the row goes,
+            # and `reconcile` collects a temp file whose upload id no longer
+            # exists (§4.4: abort is always 204).
             pass
         self.store.delete_upload(upload.upload_id)
         self._record(
@@ -529,6 +604,17 @@ class BlobService:
         )
 
     # ------------------------------------------------------------------ complete
+    async def acomplete(
+        self, principal: Any, upload_id: str, payload: Mapping[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        """`complete` on a worker thread: re-hashing and header parsing are the
+        only CPU-bound work on this channel and they must not stall `/ws`.
+
+        The store is opened with `check_same_thread=False` and every mutation
+        takes its own `RLock`, so running the sync path off-loop is safe.
+        """
+        return await asyncio.to_thread(self.complete, principal, upload_id, payload)
+
     def complete(
         self, principal: Any, upload_id: str, payload: Mapping[str, Any]
     ) -> tuple[int, dict[str, Any]]:
@@ -582,7 +668,9 @@ class BlobService:
             )
 
         head = self._read_head(source, 64)
-        if upload.kind == "image":
+        # `kind` is a client hint; an image mime is revalidated as an image even
+        # when it arrived as `kind:"file"` (no metadata bypass, §5.1).
+        if upload.mime in IMAGE_MIMES:
             data = source.read_bytes()
             info = validate_image(
                 data,
@@ -758,7 +846,11 @@ class BlobService:
         for file_id in file_ids:
             blob = self.store.get_blob(str(file_id))
             if blob is not None:
-                self.store.set_pinned(blob.file_id, False)
+                # Unpinning restarts the clock: `expires_at=NULL` would make the
+                # row immortal and the bytes uncollectable in practice.
+                self.store.set_pinned(
+                    blob.file_id, False, expires_at=self.now() + self.settings.blob_ttl_seconds
+                )
 
     # ----------------------------------------------------------------------- gc
     def sweep(self, now: float | None = None) -> dict[str, int]:
@@ -773,10 +865,14 @@ class BlobService:
 
             for upload in self.store.open_uploads():
                 scanned += 1
+                if upload.upload_id in self._inflight:
+                    # A part is being written right now: unlinking under it is a
+                    # 500 on Windows and silent byte loss on POSIX.
+                    continue
                 if moment - upload.updated_at >= self.settings.idle_seconds:
                     try:
                         tmp_path(self.root, upload.upload_id).unlink()
-                    except FileNotFoundError:
+                    except OSError:
                         pass
                     self.store.delete_upload(upload.upload_id)
                     deleted += 1
@@ -788,10 +884,10 @@ class BlobService:
 
             for blob in self.store.expired_blobs(moment):
                 scanned += 1
-                self._remove_blob_files(blob)
-                self.store.delete_blob(blob.file_id)
+                # Only the last row for a digest may take the bytes with it.
+                if self._release(blob):
+                    freed += blob.size
                 deleted += 1
-                freed += blob.size
                 self._record(
                     "blob.gc", status="expired_blob", device_id=blob.device_id,
                     file_id=blob.file_id, bytes=blob.size,
@@ -838,6 +934,8 @@ class BlobService:
                 self.store.set_state(blob.file_id, "missing")
                 missing += 1
 
+        self._collect_stray_temp_files()
+
         # Orphans are kept 24 h for postmortems, then dropped.
         for leftover in orphan_dir(self.root).glob("*"):
             try:
@@ -846,6 +944,29 @@ class BlobService:
             except OSError:  # pragma: no cover
                 pass
         return orphans, missing
+
+    def _collect_stray_temp_files(self) -> int:
+        """Delete `.part` files whose upload row is gone.
+
+        An abort or an idle expiry that could not unlink (Windows, handle held
+        by the writer) leaves a temp file nothing else looks at: `sweep` walks
+        rows and the orphan pass skips `tmp/`. Age-gating on the *real* mtime
+        keeps a `begin` that has created its file but not yet its row safe.
+        """
+        known = self.store.upload_ids()
+        cutoff = time.time() - self.settings.idle_seconds
+        removed = 0
+        for path in (self.root / "tmp").glob("*.part"):
+            if path.name[: -len(".part")] in known:
+                continue
+            try:
+                if path.stat().st_mtime > cutoff:
+                    continue
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+        return removed
 
     def _iter_blob_files(self):
         for path in self.root.rglob("*"):
@@ -886,11 +1007,23 @@ class BlobService:
             done += 1
         return done
 
+    def _release(self, blob: BlobRecord) -> bool:
+        """Drop one row reference; delete the bytes only when the last one goes.
+
+        Returns True when the file was removed (the row was the last owner).
+        """
+        if not self.store.release_blob(blob.file_id):
+            return False
+        self._remove_blob_files(blob)
+        return True
+
     def _remove_blob_files(self, blob: BlobRecord) -> None:
         for path in (blob_path(self.root, blob.sha256), thumb_path(self.root, blob.sha256)):
             try:
                 path.unlink()
-            except FileNotFoundError:
+            except OSError:
+                # Windows: a reader still holds a handle. POSIX: already gone.
+                # Neither may turn a sweep or a scan into a 500.
                 pass
 
     def _mark_missing(self, blob: BlobRecord) -> None:
@@ -909,9 +1042,12 @@ class BlobService:
             return True
         if now - upload.updated_at < self.settings.idle_seconds:
             return False
+        if upload.upload_id in self._inflight:
+            # Another part is mid-write on this very session: not expired yet.
+            return False
         try:
             tmp_path(self.root, upload.upload_id).unlink()
-        except FileNotFoundError:
+        except OSError:
             pass
         self.store.delete_upload(upload.upload_id)
         self._record(

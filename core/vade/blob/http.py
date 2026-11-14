@@ -104,6 +104,15 @@ class BlobApp:
     def close(self) -> None:
         self.service.close()
 
+    # ---------------------------------------------------------------- lifecycle
+    async def start(self) -> None:
+        """Start the periodic GC task (called from the ASGI lifespan)."""
+        await self.service.start_sweeper()
+
+    async def stop(self) -> None:
+        """Cancel the GC task and *await* it, then release the store."""
+        await self.service.aclose()
+
     # --------------------------------------------------------------------- ASGI
     async def __call__(self, scope: Mapping[str, Any], receive: Receive, send: Send) -> None:
         if scope.get("type") != "http":
@@ -210,7 +219,7 @@ class BlobApp:
         principal = self._auth.authenticate(headers)
         body = await self._read_body(receive, BEGIN_BODY_MAX)
         payload = self._json_body(body)
-        status, result = self.service.complete(principal, upload_id, payload)
+        status, result = await self.service.acomplete(principal, upload_id, payload)
         await self._json(send, status, result, cors)
 
     async def _abort(self, upload_id, headers, cors, send) -> None:

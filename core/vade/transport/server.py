@@ -18,6 +18,7 @@ By default any client could send a fresh XFF on every request and reset the
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import secrets
 import time
@@ -107,8 +108,43 @@ class CoreApp:
             await self._http(scope, receive, send)
         elif kind == "websocket":
             await self._ws(scope, receive, send)
-        else:  # lifespan is handled by the server runner
+        elif kind == "lifespan":
+            await self._lifespan(receive, send)
+        else:
             return
+
+    async def _lifespan(self, receive: Callable[[], Awaitable[dict[str, Any]]], send: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+        """Minimal ASGI lifespan: it exists so background work owns a loop.
+
+        RFC-0004's sweeper is a periodic task; without a startup/shutdown
+        contract there is no long-lived loop to create it on (the component
+        scan runs outside one). Anything that matters to a sub-app with a
+        `start`/`stop` pair is delegated here, in order.
+        """
+        blob = self._blob
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                try:
+                    starter = getattr(blob, "start", None)
+                    if callable(starter):
+                        result = starter()
+                        if inspect.isawaitable(result):
+                            await result
+                except Exception:  # pragma: no cover - fail closed, no silent serve
+                    await send({"type": "lifespan.startup.failed", "message": "blob channel failed to start"})
+                    return
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                try:
+                    stopper = getattr(blob, "stop", None)
+                    if callable(stopper):
+                        result = stopper()
+                        if inspect.isawaitable(result):
+                            await result
+                finally:
+                    await send({"type": "lifespan.shutdown.complete"})
+                return
 
     # ------------------------------------------------------------------ http
     async def _http(self, scope: Mapping[str, Any], receive: Callable[[], Awaitable[dict[str, Any]]], send: Callable[[dict[str, Any]], Awaitable[None]]) -> None:

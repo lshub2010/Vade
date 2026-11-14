@@ -33,7 +33,7 @@
 
 ## 3. 测试
 
-`core/tests/blob/`：**9 个文件、96 个用例**（不是 mock：每个用例直接驱动
+`core/tests/blob/`：**10 个文件、105 个用例**（不是 mock：每个用例直接驱动
 `BlobApp.__call__` / `CoreApp.__call__` 的 ASGI scope，时钟由 `Clock` 注入，
 所以 TTL/GC 是确定性的而不是 `sleep(3600)`）。
 
@@ -48,15 +48,16 @@
 | `test_quota.py` | 3 | 单文件超 `max_bytes` 413；tmp 区（1/4）先命中 `tmp_quota`；已提交字节计入 `quota` |
 | `test_gc.py` | 3 | TTL 到期 sweep 清文件+行；孤儿文件 reconcile 移入 `orphan/`；空闲上传过期清临时文件（推进时钟后重发 token） |
 | `test_mount.py` | 3 | `install()` 后六路由经 `CoreApp` 全可达；`attach.enabled=false` → 六路由 404；cookie 闸读的是 live session 表 |
+| `test_review_fixes.py` | 9 | 审查返工回归：跨设备引用计数、GC 调度、配额顺序、image mime 不绕过、Windows 删除、有界解压（见 §6） |
 
 ## 4. 门禁原始输出（本机，2026-11-14）
 
 ```
 $ .venv/Scripts/python.exe -m pytest core/tests/blob -q
-96 passed in 1.45s
+105 passed in 1.79s
 
 $ .venv/Scripts/python.exe -m pytest core/tests -q
-480 passed, 5 warnings in 24.72s          # 384 基线 + 96 新增，0 failed/error
+489 passed, 5 warnings in 24.12s         # 384 基线 + 105 blob，0 failed/error
 
 $ .venv/Scripts/python.exe tools/check_contracts.py
 contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 33 error codes, config metadata complete, event gate green)
@@ -83,3 +84,21 @@ $ .venv/Scripts/python.exe docs/check_docs.py
 5. **扫描管线**：`attach.scan.*` 默认关闭；`run_pending_scans()` 有实现但无测试
    （单用户自托管默认不开，留到启用扫描的批次）。
 6. **客户端 / UI**：Compose、Web 壳、上传 UI 全部不在本批。
+
+## 6. 审查返工（B1/B2/B3 + 应4/应5/应6）
+
+回归用例全部在 `core/tests/blob/test_review_fixes.py`（9 个）。每条都先红后绿：
+先对着旧实现写断言，确认它抓住的是真症状，再改实现。
+
+| 项 | 症状 | 修法 | 用例 | 验证 |
+|---|---|---|---|---|
+| **B1** 跨设备引用计数 | 两台设备持同一摘要（去重只按设备，所以是两行），一行到期就 `unlink` 文件，另一台的 `GET` 变 410/404 —— 数据被别人的 TTL 删掉 | 新增 `blob_bytes(sha256,size,ref_count)` 表；`add_blob` 只在**新行**时 +1（去重分支不加，否则泄漏）；`release_blob` 删行、-1，返回「是否最后一个引用」；`sweep` 只有最后一个引用才 `_remove_blob_files`；`_rebuild_refcounts()` 做迁移与自愈；`unpin` 重起 TTL 而不是写 `NULL`（`NULL` = 永生，字节永远收不回） | `test_two_devices_sharing_a_digest_keep_the_bytes_until_the_last_row_goes`（pin dev2 → 推 1 h → sweep → 文件在、dev2 GET 200；都 unpin 再过期 → sweep → 文件消失、`ref_count==0`） | 手工把 `release_blob` 改回无条件 `unlink` → 该用例红（dev2 GET 变 404） |
+| **B2** GC 没人调度 | `sweep()` 只有测试调用；生产里 TTL 永不触发，磁盘只增不减 | `ensure_sweeper/start_sweeper/stop_sweeper/aclose`：`ensure_sweeper` 同步建任务（`install()` 不能 await）；`_sweep_forever` 用 `asyncio.to_thread(self.sweep)`，周期 = `max(0.01, gc_interval_s)`；`install()` 启动时先 `reconcile()` + 一次 `sweep()`；`CoreApp._lifespan` 把 startup/shutdown 转给 blob；`stop_sweeper()` await 取消后的任务，不留悬挂 task；`usage()` 排除已过期行（否则「配额满」只能靠手动 sweep 解除） | `test_the_periodic_sweeper_collects_and_stop_leaves_no_task`（`gc_interval_s=0.05`，不调 `sweep()`，等 ~3 个周期后行与字节都消失；`stop_sweeper()` 后 `task.done()` 且 `_gc_task is None`） | 删掉 `ensure_sweeper` 里的 `create_task` → 红（行不消失） |
+| **B3** 配额检查顺序 | `_check_quota` 在稀疏文件之后：拒绝路径留下一只没人认领的 `.part`（sweep 走行、orphan 走已提交路径，都不看它） | `_check_quota(device, size, now)` 移到 `truncate` **之前**；`sweep` 之外的 `_collect_stray_temp_files()` 按真实 mtime 兜底（见应5） | `test_a_refused_begin_never_leaves_a_part_file_behind`（`max_bytes` / `quota` / `tmp_quota` 三条拒绝路径，`tmp/` 目录必须为空） | **变异自证**：把 `_check_quota` 移到 `truncate` 之后 → `1 failed, 8 passed`，红在 `assert list((quota.service.root/"tmp").iterdir()) == []` → `Left contains one more item: ...upl_....part`。改回后 `9 passed`，`service.py` sha256 与变异前一致（`f789881d…`） |
+| **应4** `kind:"file"` 绕过图片闸 | 图片只按 `kind` 判定，客户端声明 `kind:"file"` 就能跳过 `image_max_bytes`、边长/像素预算和 EXIF 剥离 | §5.1「kind 是提示、mime 是判据」：`image = kind == "image" or mime in IMAGE_MIMES`，begin 的字节/尺寸闸与 `complete` 的复校都按这个布尔走 | `test_a_six_mib_png_sent_as_kind_file_still_hits_the_image_ceiling`（6 MiB `image/png` + `kind:file` → 413，`limit == image_max_bytes`，无会话残留）；`test_an_exif_png_sent_as_kind_file_is_still_refused`（带 `eXIf` 的 PNG + `kind:file` → 501 `data.field=="exif"`） | 把 `image` 改回 `kind == "image"` → 两条都红（分别 201 / 501 变 201） |
+| **应5** Windows 删除 | `unlink` 在 Windows 上遇到仍被打开的文件句柄抛 `OSError` → `abort()` 500、`sweep()` 整趟失败；并发写的分片会被 sweep 从写者脚下删掉 | `abort` / `sweep` / `_remove_blob_files` / `_expire_if_idle` 一律捕 `OSError` 并只删行；`sweep` 跳过 `_inflight` 中的上传；新增 `_collect_stray_temp_files()`（真实 mtime 年龄闸门，避免误删刚 `begin` 还没落行的文件） | `test_an_open_temp_handle_does_not_turn_sweep_or_abort_into_a_500`（持句柄时 abort 仍 204、sweep 不抛且行已清）；`test_an_upload_with_a_part_in_flight_is_not_swept_from_under_the_writer`（`_inflight` 里时行与临时文件都还在，移出后才可回收） | 去掉 `except OSError` → 首条红（`PermissionError` 冒到 ASGI）；去掉 `_inflight` 跳过 → 第二条红 |
+| **应6** PNG 有界解压 | 只解容器头：IHDR 合法、IDAT 是垃圾/炸弹也 201（JPEG/WebP 仍是这样，见下） | PNG 走 `_bounded_decompress`（2 s 墙钟 + `pixels*4+64KiB` 输出上限 + `eof` 检查）；**返工中发现并修掉的真 bug**：`_bounded_decompress` 抛的 `_Malformed` 在 `validate_image` 里没人接，直接冲出 ASGI 栈（服务端 500，而不是 501）→ 在调用点捕成 `UNSUPPORTED / field=mime` | `test_a_png_with_a_good_header_and_garbage_idat_is_refused`（IHDR 合法 + IDAT 全 `0xff` → 501、`field=="mime"`、`store.all_blobs()==[]`） | 去掉 `except _Malformed` → 红（`vade.blob.validate._Malformed` 冒到测试，证明正是该 bug） |
+| （附）`acomplete` | — | `complete` 的重算摘要/解头是这条通道上唯一的 CPU 活，`acomplete` 走 `asyncio.to_thread`，不堵 `/ws` | `test_acomplete_answers_exactly_like_complete`（同一批字段、同状态、同尺寸结论） | 无变异（等价性用例） |
+
+仍未覆盖：JPEG/WebP 只有头部解析（RFC §5.3 的有界解码在 core 无 codec 的前提下只对 PNG 成立），
+已在 §5 第 4 条记为已知缺口。

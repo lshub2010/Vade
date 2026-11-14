@@ -8,6 +8,7 @@ not "exist but refuse" — a disabled feature should not be an oracle.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -62,8 +63,25 @@ def install(app: Any) -> None:
     blob = BlobApp(service, origins=origins)
     # Startup reconciliation (§4.7): files without rows go to `blobs/orphan/`,
     # rows without files become `missing` so GET can answer 410 instead of 404.
+    # `sweep()` immediately after it is what turns a crash-left TTL backlog into
+    # free quota — otherwise the first pass waits a full `gc_interval_s`.
     try:
         service.reconcile()
     except Exception:  # pragma: no cover - a broken store must not abort startup
         pass
+    try:
+        service.sweep()
+    except Exception:  # pragma: no cover
+        pass
     app.blob = blob
+
+    # The periodic sweeper needs a *long-lived* loop. `install()` runs from the
+    # component scan, which is not inside one (`asyncio.run(app.startup())` has
+    # already returned), so the real server starts it from the ASGI lifespan
+    # (`BlobApp.start`). An install that happens inside a running loop — tests,
+    # an embedded server — starts it right here.
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    service.ensure_sweeper()

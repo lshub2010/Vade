@@ -12,6 +12,8 @@ All failures are field-level (`data.field`) and use existing C-04 codes only.
 
 from __future__ import annotations
 
+import time
+import zlib
 from dataclasses import dataclass
 
 from ..errors import VadeError
@@ -199,6 +201,55 @@ def _webp(data: bytes) -> ImageInfo:
 
 _PARSERS = {"image/jpeg": _jpeg, "image/png": _png, "image/webp": _webp}
 
+#: §5.3 bounded decode: a header can be perfect while the compressed payload is
+#: garbage or a bomb, so the bytes are actually inflated — under a wall-clock
+#: budget and a hard output ceiling. Core ships no codec (§5.4), so only PNG's
+#: zlib stream can be decoded here; JPEG/WebP stay header-only (threat: a
+#: valid-header/garbage-scan JPEG is still accepted, see RESULT.md).
+_BOUNDED_DECODE_SECONDS = 2.0
+_BOUNDED_DECODE_SLACK = 1 << 16
+
+
+def _png_idat(data: bytes) -> list[bytes]:
+    """Collect the IDAT payloads of a PNG whose chunk walk already succeeded."""
+    chunks: list[bytes] = []
+    i = 8
+    while i + 12 <= len(data):
+        size = int.from_bytes(data[i : i + 4], "big")
+        kind = data[i + 4 : i + 8]
+        end = i + 12 + size
+        if end > len(data):
+            raise _Malformed("truncated PNG chunk")
+        if kind == b"IDAT":
+            chunks.append(data[i + 8 : i + 8 + size])
+        if kind == b"IEND":
+            break
+        i = end
+    return chunks
+
+
+def _bounded_decompress(chunks: list[bytes], cap: int) -> int:
+    """Inflate with a deadline and an output ceiling; returns bytes produced."""
+    if not chunks:
+        raise _Malformed("no compressed image data")
+    engine = zlib.decompressobj()
+    deadline = time.monotonic() + _BOUNDED_DECODE_SECONDS
+    total = 0
+    try:
+        for chunk in chunks:
+            for start in range(0, len(chunk), 65536):
+                if time.monotonic() > deadline:
+                    raise _Malformed("image decoding exceeded its time budget")
+                out = engine.decompress(chunk[start : start + 65536], max(1, cap - total))
+                total += len(out)
+                if total >= cap or engine.unconsumed_tail:
+                    raise _Malformed("decoded image exceeds the pixel budget")
+        if not engine.eof:
+            raise _Malformed("truncated compressed stream")
+    except zlib.error as exc:
+        raise _Malformed(f"compressed data does not decode ({exc})") from None
+    return total
+
 
 def inspect_image(data: bytes, mime: str) -> ImageInfo:
     """Parse container headers. Raises 501 `data.field=mime` when malformed."""
@@ -249,6 +300,19 @@ def validate_image(
     pixels = info.width * info.height
     if pixels > max_pixels:
         raise _fail("PAYLOAD_TOO_LARGE", "image exceeds the configured pixel budget", field="pixels", limit=max_pixels, actual=pixels)
+
+    if info.mime == "image/png":
+        # A real, bounded decode (§5.3): header-only parsing accepts a PNG whose
+        # IDAT is pure noise. The cap is the pixel budget in RGBA bytes plus a
+        # scanline-header allowance; the deadline is wall-clock, not size-based,
+        # so a slow bomb is refused the same way a large one is.
+        cap = pixels * 4 + _BOUNDED_DECODE_SLACK
+        try:
+            _bounded_decompress(_png_idat(data), cap)
+        except _Malformed as exc:
+            # `_Malformed` is internal: it must leave as the same 501 the header
+            # parser produces, not as an uncaught exception off the ASGI stack.
+            raise _fail("UNSUPPORTED", f"malformed or unsupported image: {exc}", field="mime") from None
 
     if info.exif:
         raise _fail("UNSUPPORTED", "image still carries EXIF metadata; strip it on the client", field="exif")

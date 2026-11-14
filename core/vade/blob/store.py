@@ -68,6 +68,11 @@ CREATE TABLE IF NOT EXISTS blobs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS blobs_content
     ON blobs (device_id, sha256, size);
+CREATE TABLE IF NOT EXISTS blob_bytes (
+    sha256    TEXT PRIMARY KEY,
+    size      INTEGER NOT NULL,
+    ref_count INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS blob_tokens (
     token_hash TEXT PRIMARY KEY,
     device_id  TEXT NOT NULL,
@@ -191,6 +196,21 @@ class BlobStore:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.execute("INSERT OR IGNORE INTO blob_gc (id, locked_until) VALUES (1, 0)")
+            self._rebuild_refcounts()
+
+    def _rebuild_refcounts(self) -> None:
+        """Migration + self-heal: `blob_bytes` is derived from `blobs`.
+
+        Byte ownership is per digest, row ownership is per (device, digest).
+        Recomputing at open means an upgrade from the pre-refcount schema (or a
+        hand-edited database) starts from truth instead of from a guess.
+        """
+        with self._tx() as db:
+            db.execute("DELETE FROM blob_bytes")
+            db.execute(
+                "INSERT INTO blob_bytes (sha256, size, ref_count)"
+                " SELECT sha256, MAX(size), COUNT(*) FROM blobs GROUP BY sha256"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -271,7 +291,12 @@ class BlobStore:
 
     # -------------------------------------------------------------------- blobs
     def add_blob(self, record: BlobRecord) -> BlobRecord:
-        """Insert, or return the existing row for (device, sha256, size)."""
+        """Insert, or return the existing row for (device, sha256, size).
+
+        A new row takes one reference on the shared bytes. The dedupe branch
+        (unique index hit) takes none: it returns a row that already holds one,
+        and double-counting there would leak the file forever.
+        """
         with self._tx() as db:
             try:
                 db.execute(
@@ -282,6 +307,11 @@ class BlobStore:
                         record.kind, record.width, record.height, int(record.pinned), record.expires_at,
                         record.created_at, record.scan, record.state,
                     ),
+                )
+                db.execute(
+                    "INSERT INTO blob_bytes (sha256, size, ref_count) VALUES (?,?,1)"
+                    " ON CONFLICT(sha256) DO UPDATE SET ref_count = ref_count + 1",
+                    (record.sha256, record.size),
                 )
                 return record
             except sqlite3.IntegrityError:
@@ -305,14 +335,44 @@ class BlobStore:
             row = self._db.execute("SELECT * FROM blobs WHERE file_id=?", (file_id,)).fetchone()
         return _blob(row) if row else None
 
-    def delete_blob(self, file_id: str) -> None:
-        with self._lock:
-            self._db.execute("DELETE FROM blobs WHERE file_id=?", (file_id,))
+    def release_blob(self, file_id: str) -> bool:
+        """Delete the row and drop one reference on its bytes.
 
-    def set_pinned(self, file_id: str, pinned: bool) -> None:
+        Returns True only when that was the last reference — the caller may
+        delete the file then, and must not before: two devices may own the same
+        digest, and one of them expiring says nothing about the other.
+        """
+        with self._tx() as db:
+            row = db.execute("SELECT sha256 FROM blobs WHERE file_id=?", (file_id,)).fetchone()
+            if row is None:
+                return False
+            sha = str(row["sha256"])
+            db.execute("DELETE FROM blobs WHERE file_id=?", (file_id,))
+            db.execute("UPDATE blob_bytes SET ref_count = ref_count - 1 WHERE sha256=?", (sha,))
+            left = db.execute("SELECT ref_count FROM blob_bytes WHERE sha256=?", (sha,)).fetchone()
+            if left is None or int(left["ref_count"]) <= 0:
+                db.execute("DELETE FROM blob_bytes WHERE sha256=?", (sha,))
+                return True
+            return False
+
+    def delete_blob(self, file_id: str) -> bool:
+        """Back-compat name for `release_blob` (refcounted, never blind)."""
+        return self.release_blob(file_id)
+
+    def ref_count(self, sha256: str) -> int:
+        """Live row references for one digest (0 when no row points at it)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT ref_count FROM blob_bytes WHERE sha256=?", (sha256,)
+            ).fetchone()
+        return int(row["ref_count"]) if row else 0
+
+    def set_pinned(self, file_id: str, pinned: bool, *, expires_at: float | None = None) -> None:
+        """Pin clears the deadline; unpin starts a fresh TTL from `expires_at`."""
         with self._lock:
             self._db.execute(
-                "UPDATE blobs SET pinned=?, expires_at=NULL WHERE file_id=?", (int(pinned), file_id)
+                "UPDATE blobs SET pinned=?, expires_at=? WHERE file_id=?",
+                (int(pinned), None if pinned else expires_at, file_id),
             )
 
     def set_scan(self, file_id: str, status: str) -> None:
@@ -341,26 +401,49 @@ class BlobStore:
         return [_blob(row) for row in rows]
 
     # ------------------------------------------------------------------- quotas
-    def usage(self, device_id: str, now: float) -> int:
-        """Committed bytes + bytes reserved by open uploads (§4.6)."""
+    def usage(self, device_id: str, now: float, *, idle_s: float | None = None) -> int:
+        """Committed bytes that still count + bytes reserved by live uploads (§4.6).
+
+        A row past its deadline is *already gone* as far as the device is
+        concerned — the sweeper just has not reached it yet. Counting it would
+        turn "quota full" into a state only a manual `sweep()` can leave, so the
+        query applies the same predicate the sweeper uses. Pinned rows have no
+        deadline and always count.
+        """
+        upload_sql = (
+            "SELECT COALESCE(SUM(size), 0) AS total FROM blob_uploads"
+            " WHERE device_id=? AND state='open'"
+        )
+        upload_args: tuple[Any, ...] = (device_id,)
+        if idle_s is not None:
+            upload_sql += " AND updated_at > ?"
+            upload_args += (now - float(idle_s),)
         with self._lock:
             blob_bytes = self._db.execute(
-                "SELECT COALESCE(SUM(size), 0) AS total FROM blobs WHERE device_id=?", (device_id,)
+                "SELECT COALESCE(SUM(size), 0) AS total FROM blobs WHERE device_id=?"
+                " AND (pinned=1 OR expires_at IS NULL OR expires_at > ?)",
+                (device_id, now),
             ).fetchone()["total"]
-            upload_bytes = self._db.execute(
-                "SELECT COALESCE(SUM(size), 0) AS total FROM blob_uploads WHERE device_id=? AND state='open'",
-                (device_id,),
-            ).fetchone()["total"]
-        _ = now
+            upload_bytes = self._db.execute(upload_sql, upload_args).fetchone()["total"]
         return int(blob_bytes) + int(upload_bytes)
 
-    def tmp_usage(self, device_id: str) -> int:
+    def tmp_usage(self, device_id: str, now: float | None = None, *, idle_s: float | None = None) -> int:
+        """Bytes reserved in `blobs/tmp/`; idle-expired sessions do not count."""
+        sql = "SELECT COALESCE(SUM(size), 0) AS total FROM blob_uploads WHERE device_id=? AND state='open'"
+        args: tuple[Any, ...] = (device_id,)
+        if idle_s is not None and now is not None:
+            sql += " AND updated_at > ?"
+            args += (float(now) - float(idle_s),)
         with self._lock:
-            row = self._db.execute(
-                "SELECT COALESCE(SUM(size), 0) AS total FROM blob_uploads WHERE device_id=? AND state='open'",
-                (device_id,),
-            ).fetchone()
+            row = self._db.execute(sql, args).fetchone()
         return int(row["total"])
+
+    def upload_ids(self) -> set[str]:
+        """Every upload id with a row (used to spot temp files nobody owns)."""
+        with self._lock:
+            rows = self._db.execute("SELECT upload_id FROM blob_uploads").fetchall()
+        return {str(row["upload_id"]) for row in rows}
+
 
     # ------------------------------------------------------------------- tokens
     def add_token(self, token_hash: str, record: TokenRecord) -> None:

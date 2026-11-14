@@ -14,6 +14,7 @@ The four slots C3 owns are created by `slots.install_slots(app)`.
 from __future__ import annotations
 
 import importlib
+import inspect
 import pkgutil
 from pathlib import Path
 from typing import Any
@@ -103,6 +104,17 @@ class App:
     async def shutdown(self) -> None:
         if self.pairing is not None:
             self.pairing.close()
+        # RFC-0004: the blob store holds a sqlite handle *and* a GC task; close
+        # both with the app so a restart does not depend on process exit. The
+        # async closer is preferred because it awaits the cancelled sweeper
+        # instead of leaving a pending task behind.
+        blob = getattr(self, "blob", None)
+        if blob is not None:
+            closer = getattr(blob, "aclose", None) or getattr(blob, "close", None)
+            if callable(closer):
+                result = closer()
+                if inspect.isawaitable(result):
+                    await result
         self.started = False
 
     # ------------------------------------------------------------------ hooks

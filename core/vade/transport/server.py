@@ -17,10 +17,12 @@ By default any client could send a fresh XFF on every request and reset the
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import secrets
 import time
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError, http_status
 from .connection import Connection
@@ -76,6 +78,7 @@ class CoreApp:
         version: str = CORE_VERSION,
         trust_forwarded_for: bool = False,
         connections: dict[str, Connection] | None = None,
+        blob: Any | None = None,
     ) -> None:
         self.config = config
         self.identity = identity
@@ -91,6 +94,12 @@ class CoreApp:
         self._listen_hosts = tuple(config.get("server.listen_hosts", []) or [])
         self._sessions: dict[str, dict[str, Any]] = {}
         self._connections: dict[str, Connection] = CONNECTIONS if connections is None else connections
+        #: RFC-0004 `/ui/blob*` sub-app, installed by `vade.blob.install(app)`.
+        #: The cookie gate needs the *live* session table, so it is handed over
+        #: by reference instead of being rebuilt per request.
+        self._blob = blob
+        if blob is not None and hasattr(blob, "bind_sessions"):
+            blob.bind_sessions(self._sessions)
 
     # ------------------------------------------------------------------ ASGI
     async def __call__(self, scope: Mapping[str, Any], receive: Callable[[], Awaitable[dict[str, Any]]], send: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
@@ -99,8 +108,43 @@ class CoreApp:
             await self._http(scope, receive, send)
         elif kind == "websocket":
             await self._ws(scope, receive, send)
-        else:  # lifespan is handled by the server runner
+        elif kind == "lifespan":
+            await self._lifespan(receive, send)
+        else:
             return
+
+    async def _lifespan(self, receive: Callable[[], Awaitable[dict[str, Any]]], send: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+        """Minimal ASGI lifespan: it exists so background work owns a loop.
+
+        RFC-0004's sweeper is a periodic task; without a startup/shutdown
+        contract there is no long-lived loop to create it on (the component
+        scan runs outside one). Anything that matters to a sub-app with a
+        `start`/`stop` pair is delegated here, in order.
+        """
+        blob = self._blob
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                try:
+                    starter = getattr(blob, "start", None)
+                    if callable(starter):
+                        result = starter()
+                        if inspect.isawaitable(result):
+                            await result
+                except Exception:  # pragma: no cover - fail closed, no silent serve
+                    await send({"type": "lifespan.startup.failed", "message": "blob channel failed to start"})
+                    return
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                try:
+                    stopper = getattr(blob, "stop", None)
+                    if callable(stopper):
+                        result = stopper()
+                        if inspect.isawaitable(result):
+                            await result
+                finally:
+                    await send({"type": "lifespan.shutdown.complete"})
+                return
 
     # ------------------------------------------------------------------ http
     async def _http(self, scope: Mapping[str, Any], receive: Callable[[], Awaitable[dict[str, Any]]], send: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
@@ -121,6 +165,15 @@ class CoreApp:
                 await self._json(send, 405, {"code": "INVALID_ARGUMENT", "message": "method not allowed"})
                 return
             await self._ui_session(scope, receive, send, headers)
+            return
+
+        if path == "/ui/blob" or path.startswith("/ui/blob/"):
+            # RFC-0004: the upload channel shares this listener but not this
+            # module's credentials model — it owns its own auth and body limits.
+            if self._blob is None:
+                await self._json(send, 404, {"code": "NOT_FOUND", "message": "not found"})
+                return
+            await self._blob(scope, receive, send)
             return
 
         if path == "/admin" or path.startswith("/admin/"):
@@ -163,11 +216,25 @@ class CoreApp:
 
         device_id = f"ui-{secrets.token_hex(8)}"
         token = secrets.token_urlsafe(32)
-        self._sessions[token] = {"device_id": device_id, "client_name": client_name, "created_at": time.time(), "revoked": False}
+        csrf = secrets.token_urlsafe(24)
+        self._sessions[token] = {
+            "device_id": device_id,
+            "client_name": client_name,
+            "created_at": time.time(),
+            "revoked": False,
+            "read_only": False,
+            # RFC-0004 §8.2: the CSRF token is a double-submit value bound to
+            # this session. Only its digest is stored, and a new login rotates
+            # it because the row is new.
+            "csrf_hash": hashlib.sha256(csrf.encode("utf-8")).hexdigest(),
+        }
         cookie = (
             f"__Host-ac_ui={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={30 * 24 * 3600}"
         )
-        extra = {"Set-Cookie": cookie}
+        # Readable by the page on purpose (double-submit requires JS to echo it
+        # in `x-vade-csrf`); it is useless without the session cookie.
+        csrf_cookie = f"__Host-ac_csrf={csrf}; Path=/; Secure; SameSite=Lax; Max-Age={30 * 24 * 3600}"
+        extra = {"Set-Cookie": [cookie, csrf_cookie]}
         await self._json(send, 200, {"device_id": device_id}, cors, extra)
         _ = record
 
@@ -208,13 +275,17 @@ class CoreApp:
         return b"".join(chunks)
 
     @staticmethod
-    async def _json(send: Callable[[dict[str, Any]], Awaitable[None]], status: int, payload: Mapping[str, Any], cors: Mapping[str, str] | None = None, extra: Mapping[str, str] | None = None) -> None:
+    async def _json(send: Callable[[dict[str, Any]], Awaitable[None]], status: int, payload: Mapping[str, Any], cors: Mapping[str, str] | None = None, extra: Mapping[str, str | Sequence[str]] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = [(b"content-type", b"application/json; charset=utf-8"), (b"cache-control", b"no-store")]
         for key, value in (cors or {}).items():
             headers.append((key.lower().encode(), value.encode()))
         for key, value in (extra or {}).items():
-            headers.append((key.lower().encode(), value.encode()))
+            # `Set-Cookie` may repeat: one header line per cookie. Joining them
+            # with a comma is not valid for cookies that carry attributes.
+            values = value if isinstance(value, (list, tuple)) else (value,)
+            for item in values:
+                headers.append((key.lower().encode(), str(item).encode()))
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 

@@ -14,3 +14,4 @@
 | RFC-0008 | agent 要求输入：`waiting_input` 状态、`turn.input_*` 事件对与 `turn/input` 取值通道 | approved（已批准，未实施） |
 | RFC-0009 | 模块 UI 页面：原生声明式 schema（新契约 C-19）、只读数据绑定与三类动作 | approved（已批准，未实施） |
 | RFC-0010 | 会话元数据：分组（文件夹）/ 图标 / 颜色 / 置顶，与 `session/*` 十方法 | proposed（core 侧已实现：C-05 1.3.0 + C-06 两事件，见 `core/vade/session/RESULT-rfc0010.md`） |
+| RFC-0012 | 子代理事件族 R3：`subagent.spawned` / `subagent.status` / `subagent.result` 三事件与 `subagent/list` / `subagent/get` 两方法 | proposed（core 侧已实现：C-05 1.4.0 + C-06 三事件，见 `core/vade/subagents/RESULT-rfc0012.md`） |

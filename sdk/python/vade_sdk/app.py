@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import functools
 import inspect
 import json
@@ -37,6 +38,11 @@ VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0
 CONCURRENCY = ("exclusive", "pooled", "mirrored")
 ROLES = ("tool", "evolve", "ui")
 CAPABILITY_TYPES = ("tools",)
+#: C-03 `$defs.page` id pattern (same string core's `uipage.PAGE_ID_RE` uses).
+PAGE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+#: The four keys C-03 marks `required` in `$defs.page`. Nothing else is checked
+#: here — see `_check_ui_pages` for why the rest belongs to core.
+PAGE_REQUIRED_KEYS = ("id", "title", "version", "schema")
 
 _RESULT_TYPES = (dict, list, str, int, float, bool, type(None))
 
@@ -47,7 +53,21 @@ class ModuleApp:
     Frozen keyword surface (0.1.x): module_id, version, concurrency,
     display_name, priority, capabilities. The rest are optional and additive:
     instance_id, role, max_concurrency, max_payload, protocol, logger,
-    env_prefix.
+    env_prefix, ui_pages.
+
+    `ui_pages` declares C-19 pages (RFC-0009 §9.2) — the manifest entry that
+    makes a module visible in `ui/modules` at all. The SDK checks only the
+    shape every page must have to be addressable: the four keys C-03 marks
+    `required` (`id`, `title`, `version`, `schema`) plus `id` matching
+    ``^[a-z][a-z0-9_-]{0,31}$``. A typo therefore fails in your own
+    constructor, loudly and naming the page, instead of in core's log.
+
+    Everything else is deliberately NOT re-implemented here: the `icon` enum,
+    the closed node tree / `uiProps` set, `x-` escape hatches, the page count
+    and cross-page `navigate` targets are judged by core's `validate_ui()`,
+    which *drops* a bad page into `Manifest.ui_warnings` and registers the
+    module's tools anyway (RFC-0009 §7.1). A page this constructor accepts can
+    still be dropped by core; that asymmetry is the point — one owner per rule.
     """
 
     def __init__(
@@ -66,6 +86,7 @@ class ModuleApp:
         protocol: str = PROTOCOL,
         logger: JsonLogger | None = None,
         env_prefix: str | None = None,
+        ui_pages: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         if MODULE_ID_RE.match(module_id) is None:
             raise ValueError(
@@ -91,6 +112,7 @@ class ModuleApp:
             raise ValueError(
                 f"unsupported capability types {unknown}; vade-sdk 0.1 can only declare ['tools']"
             )
+        checked_ui_pages = _check_ui_pages(ui_pages)
 
         self.module_id = module_id
         self.version = version
@@ -108,6 +130,9 @@ class ModuleApp:
         self.env_prefix = self._env_prefix
         self.log = logger or JsonLogger(module_id, self.instance_id)
         self._tools: dict[str, ToolSpec] = {}
+        #: C-19 pages, already shape-checked and deep-copied: a caller that
+        #: mutates its own dict after construction must not rewrite the manifest.
+        self._ui_pages: tuple[dict[str, Any], ...] = checked_ui_pages
         self._transport: Any = None  # set by transport.serve()
         self._draining = False
         self._inflight = 0
@@ -201,6 +226,12 @@ class ModuleApp:
         }
         if self.display_name:
             payload["display_name"] = self.display_name
+        if self._ui_pages:
+            # Only when non-empty. FR-8.79 §8.2: a module without a `ui` block
+            # has no entry ANYWHERE — no empty tab, no greyed row — so an empty
+            # declaration must leave the payload byte-for-byte as it was before
+            # `ui_pages` existed (hence: no `"ui": {"pages": []}`).
+            payload["ui"] = {"pages": [copy.deepcopy(page) for page in self._ui_pages]}
         return payload
 
     def manifest_json(self) -> str:
@@ -423,6 +454,42 @@ def _check_result(tool: str, result: Any) -> None:
         json.dumps(result, ensure_ascii=False)
     except (TypeError, ValueError) as exc:
         raise ToolError("INTERNAL", f"tool {tool!r} returned a non-JSON value: {exc}") from None
+
+
+def _check_ui_pages(pages: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """Minimal C-19 page shape check; core's `validate_ui` stays the judge.
+
+    Only what makes a page addressable is checked: the four keys C-03
+    `$defs.page` marks `required`, and the page-id pattern. Everything else —
+    the `icon` enum, the closed node tree and `uiProps` set, the 8-page /
+    8 KiB budgets, duplicate ids, `navigate` targets — is validated by core,
+    which DROPS a bad page into `Manifest.ui_warnings` instead of raising. That
+    division is deliberate: a second copy of `manifest.schema.json` here would
+    drift, and "the SDK accepted it" is not "core accepted it".
+
+    Failures are loud and name the page. Silent dropping is exactly what this
+    check exists to prevent: core drops with a warning the author never reads,
+    and the symptom on screen is a module with no entry at all.
+    """
+    checked: list[dict[str, Any]] = []
+    for index, raw in enumerate(pages):
+        where = f"ui_pages[{index}]"
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{where}: page must be a mapping, got {type(raw).__name__}")
+        page = dict(raw)
+        page_id = page.get("id")
+        if isinstance(page_id, str) and page_id:
+            where = f"{where} (page id {page_id!r})"
+        missing = [key for key in PAGE_REQUIRED_KEYS if key not in page]
+        if missing:
+            raise ValueError(
+                f"{where}: missing required key(s) {missing}; "
+                f"C-03 $defs.page requires {list(PAGE_REQUIRED_KEYS)}"
+            )
+        if not isinstance(page_id, str) or PAGE_ID_RE.match(page_id) is None:
+            raise ValueError(f"{where}: page id {page_id!r} violates ^[a-z][a-z0-9_-]{{0,31}}$")
+        checked.append(copy.deepcopy(page))
+    return tuple(checked)
 
 
 def _build_parser(app: ModuleApp) -> argparse.ArgumentParser:

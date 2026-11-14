@@ -51,6 +51,10 @@ ERROR_CODES: dict[str, bool] = {
     "UNKNOWN_CONFIG_KEY": False,
     "CODE_INVALID": False,
     "CODE_EXPIRED": False,
+    # RFC-0005 (f108060) appended this to schema/errors.json but this frozen copy
+    # was never updated, so every `import vade_sdk` from the repo layout died in
+    # `_check_against_schema`. Trailing position matches the schema's own order.
+    "BUDGET_EXCEEDED": False,
 }
 
 RETRIABLE = {code for code, retriable in ERROR_CODES.items() if retriable}

@@ -33,6 +33,13 @@ Checks (each one has broken at least once in review):
      (icon whitelist + pattern, `#RRGGBB`, name limits) live in
      `core/vade/session/manager.py`, and the two C-06 metadata events exist
      with their frozen `required` arrays and no `state` / push pollution.
+ 12. RFC-0012: the three `subagent.*` events are declared (C-06, top-level
+     `subagent_states` == `SubagentState`) with their frozen `required`
+     arrays, `subagent.spawned` is payload-only / the other two are
+     state-change events, no result-text key exists on any of them, the two
+     read-only methods are declared (C-05 1.4.0) and registered in
+     `SubagentRPC.handlers()`, and `ALLOWED_TRANSITIONS` (the §7.2 gate)
+     refuses exactly the twelve transitions the RFC says it must.
 
 Run:  python3 tools/check_contracts.py      (exit 0 = green)
 """
@@ -72,11 +79,38 @@ STATE_CHANGE_EVENTS = {
     # RFC-0007 §5.2/§5.3: the task family. `task.started` is a state-change
     # event too (state ∈ {queued, running}); `task.progress` is the opposite.
     "task.started", "task.status", "task.finished",
+    # RFC-0012 §5.2: the subagent family. `subagent.status` / `subagent.result`
+    # carry `state`; `subagent.spawned` does not (creation IS the event name).
+    "subagent.status", "subagent.result",
 }
 PAYLOAD_ONLY_EVENTS = {
     "turn.delta", "turn.tool_call", "turn.tool_result",
     "task.progress",
+    "subagent.spawned",
 }
+
+#: RFC-0012 §4.3: the frozen `subagent_states` set and its terminal three.
+#: Kept here (not derived from the schema) so a silent enum change goes red.
+SUBAGENT_STATES = {"spawned", "running", "completed", "failed", "cancelled"}
+SUBAGENT_TERMINAL_STATES = {"completed", "failed", "cancelled"}
+
+#: RFC-0012 §5.2: the three `required` arrays must be byte-identical —
+#: required-with-null is the self-describing rule, and dropping a key silently
+#: breaks client tree-building (RFC-0007 §9.2 precedent).
+RFC0012_REQUIRED = {
+    "subagent.spawned": [
+        "run_id", "session_id", "parent_session_id", "parent_turn_id",
+        "child_session_id", "label", "at",
+    ],
+    "subagent.status": ["run_id", "session_id", "state", "at"],
+    "subagent.result": [
+        "run_id", "session_id", "state", "result_digest", "result_chars",
+        "finished_at",
+    ],
+}
+
+#: RFC-0012 §5.3: no subagent.* event may carry the result text under any name.
+RFC0012_FORBIDDEN_PAYLOAD_KEYS = {"result_text", "summary", "output", "text"}
 
 #: RFC-0007 §9.4: the frozen `[tasks]` key set, defaults and apply semantics.
 #: Kept here (not derived from the schema) so a silent default change goes red.
@@ -379,6 +413,25 @@ def code_terminal_task_states() -> set[str]:
         FAILURES.append("core/vade/tasks/models.py: cannot locate TERMINAL_TASK_STATES")
         return set()
     return {name.lower() for name in re.findall(r"TaskState\.([A-Z_]+)", block.group(1))}
+
+
+def code_subagent_states() -> set[str]:
+    """RFC-0012 §4.3: the schema's `subagent_states` and `SubagentState` are one enum."""
+    text = (CORE / "session" / "models.py").read_text(encoding="utf-8")
+    block = re.search(r"class SubagentState\(str, Enum\):(.*?)(?=\nclass |\n@dataclass|\Z)", text, re.S)
+    if not block:
+        FAILURES.append("core/vade/session/models.py: cannot locate SubagentState")
+        return set()
+    return set(re.findall(r"=\s*\"([a-z_]+)\"", block.group(1)))
+
+
+def code_terminal_subagent_states() -> set[str]:
+    text = (CORE / "session" / "models.py").read_text(encoding="utf-8")
+    block = re.search(r"SUBAGENT_TERMINAL_STATES\s*=\s*frozenset\((.*?)\)", text, re.S)
+    if not block:
+        FAILURES.append("core/vade/session/models.py: cannot locate SUBAGENT_TERMINAL_STATES")
+        return set()
+    return {name.lower() for name in re.findall(r"SubagentState\.([A-Z_]+)", block.group(1))}
 
 
 def walk_leaves(node: dict, prefix: str = ""):
@@ -844,6 +897,159 @@ def check_approval_attribution(declared_events: dict) -> None:
         )
 
 
+def check_subagent_events(events: dict, declared_events: dict, schema_events: set[str], rpc: dict) -> None:
+    """RFC-0012: the three-event family, the enum, the gate, and C-05 1.4.0.
+
+    Things a review can miss by reading:
+
+    * `subagent.spawned` is payload-only while the other two are state-change
+      events — getting either backwards breaks the C-06 rule-4 scan;
+    * the result text must NEVER cross the event boundary (only its sha-256
+      fingerprint and length do) — a "helpful" `summary` key is a leak;
+    * the transition gate in `core/vade/subagents/manager.py` is the contract:
+      a widened gate lets a run leave a terminal state and nobody would notice.
+    """
+    # §4.3: the enum is a TOP-LEVEL key (task_states precedent) and agrees
+    # with the code enum; the terminal three agree on both sides.
+    states = list(events.get("subagent_states") or [])
+    check(set(states) == SUBAGENT_STATES,
+          "events.json subagent_states drift vs the frozen RFC-0012 set")
+    check(set(states) == code_subagent_states(),
+          "events.json subagent_states drift vs core/vade/session/models.SubagentState")
+    check(code_terminal_subagent_states() == SUBAGENT_TERMINAL_STATES,
+          "core/vade/session/models.SUBAGENT_TERMINAL_STATES must be exactly "
+          f"{sorted(SUBAGENT_TERMINAL_STATES)}, has {sorted(code_terminal_subagent_states())}")
+    # §4.3: a `subagent.state` entry under `events` would be "declared but
+    # nobody emits" on day one (RFC-0007 §9.2's same trap).
+    check("subagent.state" not in declared_events,
+          "events.json: subagent_states is a TOP-LEVEL key; a `subagent.state` events entry is not allowed (RFC-0012 §4.3)")
+    # §5.2: the three events exist with their frozen required arrays.
+    for name, required in RFC0012_REQUIRED.items():
+        spec = declared_events.get(name)
+        check(isinstance(spec, dict), f"events.json: {name} is missing (RFC-0012 §5.2)")
+        if isinstance(spec, dict):
+            actual = list(spec.get("required") or [])
+            check(actual == required,
+                  f"events.json {name}.required drift: {actual} != {required} (RFC-0012 §5.2)")
+            payload = spec.get("payload") or {}
+            undeclared = [field for field in required if field not in payload]
+            check(not undeclared,
+                  f"events.json {name}: required fields not declared in payload: {undeclared}")
+            forbidden = RFC0012_FORBIDDEN_PAYLOAD_KEYS & set(payload)
+            check(not forbidden,
+                  f"events.json {name}: result-text keys {sorted(forbidden)} are forbidden "
+                  "(RFC-0012 §5.3: digest, not the text)")
+            check((spec.get("x-vade") or {}).get("push") is None,
+                  f"events.json {name}: must not be a C-14 push topic (session event)")
+    # §5.3: the digest is a fingerprint — the schema says so, in these words.
+    result_payload = (declared_events.get("subagent.result") or {}).get("payload") or {}
+    digest_decl = str(result_payload.get("result_digest") or "")
+    check("sha-256" in digest_decl,
+          "events.json subagent.result: result_digest must declare the sha-256 fingerprint rule")
+    # §5.1: the stream key rule is pinned in the spawned payload.
+    spawned_payload = (declared_events.get("subagent.spawned") or {}).get("payload") or {}
+    check("parent_session_id" in spawned_payload and "session_id" in spawned_payload,
+          "events.json subagent.spawned: both session_id (stream key) and parent_session_id must be declared")
+
+    # C-06 append block.
+    appends = (events.get("x-vade") or {}).get("appends") or []
+    eblock = next((b for b in appends if "RFC-0012" in str(b.get("doc") or "")), None)
+    check(eblock is not None, "events.json: missing the x-vade.appends block for RFC-0012")
+    if eblock is not None:
+        check(set(eblock.get("adds") or []) == set(RFC0012_REQUIRED),
+              "events.json: the RFC-0012 append block must add exactly the three subagent.* events")
+        check("none" in str(eblock.get("rewrites") or ""),
+              "events.json: the RFC-0012 append must be rewrite-free")
+        check(eblock.get("version") == "2.0.0",
+              "events.json: the RFC-0012 append must NOT claim a version bump (top-level stays 2.0.0)")
+        check("subagent_states" in str(eblock.get("overrides") or ""),
+              "events.json: the RFC-0012 append must mention the new top-level subagent_states key")
+
+    # C-05: two read-only methods, version 1.4.0.
+    directions = rpc.get("directions") or {}
+    ui_to_core = directions.get("ui_to_core") or {}
+    for name in ("subagent/list", "subagent/get"):
+        check(name in ui_to_core, f"rpc.json ui_to_core missing {name} (RFC-0012 §6)")
+        entry = ui_to_core.get(name) or {}
+        for field in ("params", "result", "errors"):
+            check(field in entry, f"rpc.json {name}: missing {field}")
+        unknown = sorted(set(entry.get("errors") or []) - set(load("errors.json").get("codes") or {}))
+        check(not unknown, f"rpc.json {name}: errors not declared in C-04: {unknown}")
+    elsewhere = sorted(
+        {"subagent/list", "subagent/get"}
+        & (set(directions.get("module_to_core") or {}) | set(directions.get("core_to_module") or {}))
+    )
+    check(not elsewhere, f"rpc.json: RFC-0012 methods must not be module-facing: {elsewhere}")
+    check(rpc.get("version") == "1.4.0",
+          f"rpc.json: version must be 1.4.0 after the RFC-0012 append (got {rpc.get('version')!r})")
+    rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
+    rblock = next((b for b in rpc_appends if "RFC-0012" in str(b.get("doc") or "")), None)
+    check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0012")
+    if rblock is not None:
+        check(set(rblock.get("adds") or []) == {"subagent/list", "subagent/get"},
+              "rpc.json: the RFC-0012 append block must add exactly the two subagent/* methods")
+        check(rblock.get("version") == "1.4.0",
+              "rpc.json: the RFC-0012 append block must carry version 1.4.0")
+        check("none" in str(rblock.get("rewrites") or ""),
+              "rpc.json: the RFC-0012 append must be rewrite-free")
+
+    # The handlers must actually be registered, and the gate must be intact.
+    if str(ROOT / "core") not in sys.path:
+        sys.path.insert(0, str(ROOT / "core"))
+    try:
+        from vade.session.models import new_run_id
+        from vade.subagents.manager import (
+            ALLOWED_TRANSITIONS, LABEL_MAX, RUN_ID_PATTERN, SubagentManager,
+        )
+        from vade.subagents.rpc import SubagentRPC
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        FAILURES.append(f"core/vade/subagents: cannot import for RFC-0012 checks "
+                        f"({type(exc).__name__}: {exc})")
+        return
+    registered = set(SubagentRPC(None).handlers())
+    absent = sorted({"subagent/list", "subagent/get"} - registered)
+    check(not absent, f"SubagentRPC.handlers() missing RFC-0012 methods: {absent}")
+    check(LABEL_MAX == 64, f"subagents.manager.LABEL_MAX must be 64, is {LABEL_MAX}")
+    check(str(RUN_ID_PATTERN.pattern) == r"^run_[0-9a-f]{32}$",
+          "manager.RUN_ID_PATTERN drifted from RFC-0012 §7.1")
+    check(bool(RUN_ID_PATTERN.match(new_run_id())),
+          "manager.RUN_ID_PATTERN must match a freshly minted run_id")
+    expected_gate = {
+        "spawned": {"running", "cancelled"},
+        "running": {"running", "completed", "failed", "cancelled"},
+        "completed": set(),
+        "failed": set(),
+        "cancelled": set(),
+    }
+    actual_gate = {
+        state.value: {target.value for target in targets}
+        for state, targets in ALLOWED_TRANSITIONS.items()
+    }
+    check(actual_gate == expected_gate,
+          f"subagents.manager.ALLOWED_TRANSITIONS drifted from RFC-0012 §7.2: {actual_gate}")
+    for probe, expect_ok in (
+        (("spawned", "running"), True),
+        (("spawned", "cancelled"), True),
+        (("running", "completed"), True),
+        (("running", "failed"), True),
+        (("running", "cancelled"), True),
+        (("running", "running"), True),
+        (("spawned", "completed"), False),
+        (("spawned", "failed"), False),
+        (("running", "spawned"), False),
+        (("completed", "running"), False),
+        (("failed", "cancelled"), False),
+        (("cancelled", "completed"), False),
+    ):
+        frm, to = probe
+        allowed = to in actual_gate.get(frm, set())
+        check(allowed == expect_ok,
+              f"gate {frm} -> {to} must be {'legal' if expect_ok else 'refused'} (§7.2)")
+    # The digest helper is really a sha-256 fingerprint of the text.
+    check(hasattr(SubagentManager, "finish") and hasattr(SubagentManager, "cancel_for_turn"),
+          "SubagentManager must expose finish() and cancel_for_turn() (RFC-0012 §5.2/§7.3)")
+
+
 def check_ui(config: dict, manifest: dict, rpc: dict) -> None:
     """RFC-0009: the `[ui]` keys, the C-03 append, the C-05 methods, §10.1.
 
@@ -1034,8 +1240,8 @@ def check_session_meta(rpc: dict, events: dict) -> None:
             check(field in entry, f"rpc.json {name}: missing {field}")
         unknown = sorted(set(entry.get("errors") or []) - codes)
         check(not unknown, f"rpc.json {name}: errors not declared in C-04: {unknown}")
-    check(rpc.get("version") == "1.3.0",
-          f"rpc.json: version must be 1.3.0 after the RFC-0010 append (got {rpc.get('version')!r})")
+    check(rpc.get("version") in ("1.3.0", "1.4.0"),
+          f"rpc.json: version must be 1.3.0 (RFC-0010) or 1.4.0 (RFC-0012, the current head) (got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0010" in str(b.get("doc") or "")), None)
     check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0010")
@@ -1192,6 +1398,8 @@ def main() -> int:
         "turn/regenerate", "message/edit_resubmit",
         # RFC-0007 §6.1-§6.4
         "task/list", "task/log_tail", "task/cancel", "subagent/message",
+        # RFC-0012 §6.1/§6.2
+        "subagent/list", "subagent/get",
         "ui/page.get", "ui/state.get", "ui/tool.call", "state/get", "page/get",
     }
     declared = set()
@@ -1247,6 +1455,7 @@ def main() -> int:
     check_task_events(events, declared_events, schema_events)
     check_approval_attribution(declared_events)
     check_session_meta(rpc, events)
+    check_subagent_events(events, declared_events, schema_events, rpc)
 
     # ---------------------------------------------------------------- RFC-0008
     # C-06 went 1.0.0 -> 2.0.0 because `turn_states` was WIDENED: an exhaustive
@@ -1281,7 +1490,7 @@ def main() -> int:
             print(f"  - {failure}")
         return 1
     print("contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 34 error codes, config metadata complete, "
-          "RFC-0005 append green, RFC-0010 session metadata green, event gate green)")
+          "RFC-0005 append green, RFC-0010 session metadata green, RFC-0012 subagent family green, event gate green)")
     return 0
 
 

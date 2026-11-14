@@ -242,7 +242,7 @@ spawned ──▶ running ──▶ completed
 
 - `spawned → completed/failed` 被拒：一个从未开跑的循环没有「结果」，直接报终态只可能是实现 bug——宁可让派生方显式走 `running`。
 - `running → running` 允许：`subagent.status` 在运行期携带 `step`/`tool_name` 更新，`state` 不变；这不是迁移，但**是**一次合法的状态事件（不更新 `created_at`）。
-- 非法转移：`INVALID_ARGUMENT`，**记录不动、事件不发**（§11 A5）。终态幂等：对已终态 run 再 `finish` 返回现记录、不产生第二个 `subagent.result`。
+- 非法转移：`INVALID_ARGUMENT`，**记录不动、事件不发**（§11 A5）。终态的出口只有两条，且都是只读语义：以**同一终态**重放 `finish` 是幂等 no-op（与 RFC-0007 §5.5 R1 的「记录即真相」同源，不产生第二个 `subagent.result`）；以**不同终态**为目标是非法转移，拒绝。终态 run 的 `set_running` 一律拒绝——终态不可复活。
 
 ### 7.3 父 turn 收口
 

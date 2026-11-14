@@ -63,6 +63,12 @@ class Message:
     tool_call_id: str | None = None
     tool_calls: tuple[dict[str, Any], ...] = ()
     created_at: int = field(default_factory=now_ms)
+    #: RFC-0006 §4: an assistant message written by `interrupt`, holding the
+    #: text that had already been streamed. Never re-emitted as a delta.
+    partial: bool = False
+    #: RFC-0006 §6.3: the message that replaced this one (edit_resubmit). The
+    #: row itself is immutable — only this pointer is ever written.
+    superseded_by: str | None = None
 
     def to_llm(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"role": self.role, "content": self.content}
@@ -85,6 +91,8 @@ class Message:
             "name": self.name,
             "tool_call_id": self.tool_call_id,
             "created_at": self.created_at,
+            "partial": self.partial,
+            "superseded_by": self.superseded_by,
         }
 
 
@@ -102,9 +110,24 @@ class Turn:
     error_message: str | None = None
     usage: Mapping[str, Any] = field(default_factory=dict)
     tool_calls: tuple[dict[str, Any], ...] = ()
+    # --- RFC-0006 §6.1: linear version chain (all optional, old rows read as
+    # defaults; `root_turn_id`/`version` coalesce to id/1 on read).
+    root_turn_id: str | None = None
+    parent_turn_id: str | None = None
+    version: int = 1
+    superseded_by: str | None = None
+    superseded_reason: str | None = None
+    user_message_id: str | None = None
+    #: RFC-0006 §4: the `partial=true` assistant message written on interrupt.
+    partial_message_id: str | None = None
 
     def with_state(self, state: TurnState, **changes: Any) -> "Turn":
         return replace(self, state=state, **changes)
+
+    @property
+    def root_id(self) -> str:
+        """Coalesced root: a turn created before RFC-0006 is its own root."""
+        return self.root_turn_id or self.id
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -120,6 +143,13 @@ class Turn:
             "error_message": self.error_message,
             "usage": dict(self.usage),
             "tool_calls": list(self.tool_calls),
+            "root_turn_id": self.root_id,
+            "parent_turn_id": self.parent_turn_id,
+            "version": self.version or 1,
+            "superseded_by": self.superseded_by,
+            "superseded_reason": self.superseded_reason,
+            "user_message_id": self.user_message_id,
+            "partial_message_id": self.partial_message_id,
         }
 
 

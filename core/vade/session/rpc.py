@@ -50,7 +50,9 @@ class SessionRPC:
         try:
             return await handler(connection, dict(params or {}))
         except VadeError as exc:
-            return RpcError(exc.code, exc.message)
+            # `data` carries the field-level detail a client must show verbatim
+            # (RFC-0006 §8: PAYLOAD_TOO_LARGE → {field, limit, actual, unit}).
+            return RpcError(exc.code, exc.message, exc.data)
         except Exception:
             # C-04: message only, never a traceback across the boundary.
             return RpcError("INTERNAL", "session RPC failed")
@@ -63,6 +65,11 @@ class SessionRPC:
             "ui/interrupt": self.ui_interrupt,
             "ui/queue.cancel": self.ui_queue_cancel,
             "approval/decide": self.approval_decide,
+            # RFC-0006 §6.2/§6.3 (C-05 1.1.0). `session/fork` is deliberately
+            # absent: an unregistered method answers JSON-RPC -32601, which is
+            # more honest than defining it and returning UNSUPPORTED.
+            "turn/regenerate": self.turn_regenerate,
+            "message/edit_resubmit": self.message_edit_resubmit,
         }
 
     # ------------------------------------------------------------------ ui/*
@@ -112,6 +119,31 @@ class SessionRPC:
         if not await self.log.cancel(session_id, turn_id, by=self._who(connection)):
             raise VadeError("NOT_FOUND", "no queued turn with that id")
         return {"ok": True}
+
+    # ------------------------------------------------------------------ versions
+    async def turn_regenerate(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """RFC-0006 §6.2: new turn for the same user message, old one superseded."""
+        session_id, turn_id = self._ids(params)
+        client_msg_id = params.get("client_msg_id")
+        if not isinstance(client_msg_id, str) or not client_msg_id:
+            raise VadeError("INVALID_ARGUMENT", "client_msg_id is required")
+        return await self.log.regenerate(session_id, turn_id, client_msg_id)
+
+    async def message_edit_resubmit(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """RFC-0006 §6.3: append a new user message, point the old one at it."""
+        session_id = params.get("session_id")
+        message_id = params.get("message_id")
+        content = params.get("content")
+        client_msg_id = params.get("client_msg_id")
+        if not isinstance(session_id, str):
+            raise VadeError("INVALID_ARGUMENT", "session_id is required")
+        if not isinstance(message_id, str) or not message_id:
+            raise VadeError("INVALID_ARGUMENT", "message_id is required")
+        if not isinstance(content, list):
+            raise VadeError("INVALID_ARGUMENT", "content must be an array of blocks")
+        if not isinstance(client_msg_id, str) or not client_msg_id:
+            raise VadeError("INVALID_ARGUMENT", "client_msg_id is required")
+        return await self.log.edit_resubmit(session_id, message_id, content, client_msg_id)
 
     # ------------------------------------------------------------------ approval
     async def approval_decide(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:

@@ -49,7 +49,12 @@
       "payload": {
         "turn_id": "string",
         "state": "turn.state",
-        "client_msg_id": "string"
+        "client_msg_id": "string",
+        "root_turn_id": "string (version-chain root)",
+        "version": "int >= 1",
+        "parent_turn_id": "string|null (the turn this version replaces)",
+        "user_message_id": "string (submit|edit: the new message; regenerate: the reused one)",
+        "reason": "submit|regenerate|edit_resubmit"
       },
       "required": [
         "turn_id",
@@ -70,7 +75,9 @@
     "turn.delta": {
       "payload": {
         "turn_id": "string",
-        "text": "string (increment, not cumulative)"
+        "text": "string (increment, not cumulative)",
+        "part_index": "int >= 0, default 0 (RFC-0006 1.1.0; same value for every delta of one segment)",
+        "kind": "text|notice|reasoning|tool_args, default text (v1 core emits text|notice only)"
       },
       "required": [
         "turn_id",
@@ -83,7 +90,13 @@
         "turn_id": "string",
         "call_id": "string",
         "tool": "string (LLM-side name)",
-        "args_digest": "sha256:hex"
+        "args_digest": "sha256:hex",
+        "args_preview": "string, JSON text, <=512 UTF-8 bytes, redacted (RFC-0006 1.1.0)",
+        "args_preview_mode": "redacted|typed",
+        "args_preview_redacted": "string[], <=16 dot-paths",
+        "args_preview_truncated": "bool",
+        "started_at": "int (unix ms, when core EMITTED this event)",
+        "batch_id": "bat_[0-9a-f]{16}"
       },
       "required": [
         "turn_id",
@@ -99,7 +112,10 @@
         "call_id": "string",
         "ok": "bool",
         "summary": "string <=300",
-        "code": "C-04 name (only when ok=false)"
+        "code": "C-04 name (only when ok=false)",
+        "duration_ms": "int >= 0, or null when the tool did not actually run",
+        "truncated": "bool (summary window cut, or full text overflowed to the blob store)",
+        "result_ref": "msg:<hex>|null (persisted role=tool message id)"
       },
       "required": [
         "turn_id",
@@ -178,7 +194,9 @@
       "payload": {
         "turn_id": "string",
         "state": "turn.state",
-        "by": "string"
+        "by": "string",
+        "partial_message_id": "msg:<hex>|null (RFC-0006 1.1.0; the partial=true assistant message)",
+        "partial_chars": "int (code points already streamed)"
       },
       "required": [
         "turn_id",
@@ -328,6 +346,29 @@
       ],
       "x-vade": {"push": "events/deliver"},
       "notes": "C-14 append. Metadata only: the body never travels here, otherwise a UI event would become a way to read unpublished skill text. Consumers: ui/admin front ends refreshing the pending list (C5a /skills). No session, so seq_from = seq_to = 0."
+    },
+    "turn.superseded": {
+      "payload": {
+        "turn_id": "string (the turn that was replaced)",
+        "superseded_by": "string (the new turn)",
+        "reason": "regenerate|edit_resubmit (fork reserved, never emitted in v1)",
+        "root_turn_id": "string (version-chain root)",
+        "version": "int >= 2 (version of superseded_by)"
+      },
+      "required": ["turn_id", "superseded_by", "reason"],
+      "notes": "RFC-0006 1.1.0. Metadata edge, NOT a state: it carries no `state` and does not rewrite turn_states. Allowed to follow any terminal event for that turn (the terminal rule is exempted for this one event); clients de-duplicate by (turn_id, superseded_by) and ignore unknown types while advancing last_seq."
+    },
+    "message.edited": {
+      "payload": {
+        "message_id": "string (the replaced user message)",
+        "session_id": "string",
+        "superseded_by_message_id": "string (the new user message)",
+        "new_turn_id": "string",
+        "text": "string (new text projection, <=32000 code points)",
+        "edited_at": "int (unix ms)"
+      },
+      "required": ["message_id", "session_id", "superseded_by_message_id", "new_turn_id", "text", "edited_at"],
+      "notes": "RFC-0006 1.1.0. Named `edited` but messages are immutable: the old row is never UPDATEd, it only gains `superseded_by`. `text` lets an attached client update the bubble without a re-attach; clients de-duplicate by superseded_by_message_id."
     }
   },
   "x-vade": {
@@ -370,6 +411,30 @@
       "full": "drop oldest and increment delivery_dropped; a slow evolve module must never stall a session",
       "send_timeout_s": 5,
       "on_failure": "delivery_failed, no retry (v1 is best-effort; reconnect + since_seq is the recovery path)"
-    }
+    },
+    "appends": [
+      {
+        "contract": "C-06",
+        "version": "1.1.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0006-turn-semantics.md",
+        "adds": ["turn.superseded", "message.edited"],
+        "fields": {
+          "turn.delta": ["part_index", "kind"],
+          "turn.tool_call": ["args_preview", "args_preview_mode", "args_preview_redacted",
+                             "args_preview_truncated", "started_at", "batch_id"],
+          "turn.tool_result": ["duration_ms", "truncated", "result_ref"],
+          "turn.interrupted": ["partial_message_id", "partial_chars"],
+          "turn.queued": ["root_turn_id", "version", "parent_turn_id", "user_message_id", "reason"]
+        },
+        "overrides": [
+          "turn.interrupted.notes: partial 同时落库为 partial=true 的 assistant 消息，turn.delta 不再是唯一来源",
+          "turn.tool_call.notes: 未脱敏完整参数仍只走 turn.approval_required；该事件另带脱敏预览",
+          "terminal rule: turn.superseded 允许跟在任一终态事件之后（元数据边，不是状态变化）",
+          "unknown event types MUST be ignored while last_seq advances"
+        ],
+        "rewrites": "none"
+      }
+    ]
   }
 }

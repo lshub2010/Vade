@@ -157,9 +157,14 @@ def install(app: Any) -> Any:
 
 
 def _history_of(log: Any) -> Any:
+    from ..loop.context import filter_superseded
+
     def history(session_id: str) -> tuple[Any, ...]:
         session = log.get_session(session_id)
-        return session.messages if session is not None else ()
+        if session is None:
+            return ()
+        # RFC-0006 §6.6: drop replaced versions before anything fits the window.
+        return tuple(filter_superseded(session.messages, session.turns))
 
     return history
 

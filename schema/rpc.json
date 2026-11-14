@@ -117,7 +117,23 @@
         "params": {"request_id": "string", "decision": "approve|deny", "scope": "once|session"},
         "result": {"ok": true},
         "errors": ["APPROVER_INVALID", "READ_ONLY_SESSION", "NOT_FOUND"]
+      },
+      "turn/regenerate": {
+        "params": {"session_id": "string", "turn_id": "string", "client_msg_id": "string"},
+        "result": {"turn_id": "string", "root_turn_id": "string", "version": "int",
+                   "supersedes_turn_id": "string", "queue_pos": "int"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "READ_ONLY_SESSION", "OVERLOADED", "UNSUPPORTED"],
+        "notes": "RFC-0006 1.1.0. New turn for the same user message; the old turn gets superseded_by and a turn.superseded event. `client_msg_id` is the idempotency key; data.reason is turn_active|not_tail|not_head|client_msg_id_conflict."
+      },
+      "message/edit_resubmit": {
+        "params": {"session_id": "string", "message_id": "string", "content": ["object"],
+                   "client_msg_id": "string"},
+        "result": {"turn_id": "string", "message_id": "string", "supersedes_turn_id": "string",
+                   "root_turn_id": "string", "version": "int", "queue_pos": "int"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "READ_ONLY_SESSION", "OVERLOADED", "PAYLOAD_TOO_LARGE"],
+        "notes": "RFC-0006 1.1.0. Appends a NEW user message and points the old one at it (messages are immutable); only the last user message is editable."
       }
+
     }
   },
   "events_core_to_ui": {
@@ -135,8 +151,27 @@
       "turn.failed",
       "turn.interrupted",
       "queue.updated",
-      "module.status"
+      "module.status",
+      "turn.superseded",
+      "message.edited"
     ],
     "owner": "C3"
+  },
+  "x-vade": {
+    "appends": [
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0006-turn-semantics.md",
+        "adds": ["turn/regenerate", "message/edit_resubmit"],
+        "notes": [
+          "ui/attach: snapshot.turns[] and messages[].partial / messages[].superseded_by are appended keys; `snapshot` stays an object and old clients ignore them",
+          "session/fork is intentionally NOT registered in v1: clients get JSON-RPC -32601, not UNSUPPORTED",
+          "PAYLOAD_TOO_LARGE carries error.data = {field, limit, actual, unit} (RFC-0006 §8)"
+        ],
+        "rewrites": "none"
+      }
+    ]
   }
 }

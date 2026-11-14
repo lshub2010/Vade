@@ -172,13 +172,13 @@ footer{margin-top:70px; padding-top:18px; border-top:1px solid var(--line);
 <aside>
   <div class="brand">VADEMECUM</div>
   <div class="bn">开发概览<br><span style="font-size:12px;color:var(--muted);font-weight:400">求求 + 方案 汇总视图</span></div>
-  <nav><a href="#s0">一、这个系统是什么</a><a href="#s1">二、已经冻结的 105 条决策</a><a href="#s2">三、求求骨架</a><a href="#s3">四、技术方案要点</a><a href="#s4">五、开发组织</a><a href="#s5">六、批次与里程碑</a><a href="#s6">七、风险清单</a><a href="#s7">八、下一步</a></nav>
+  <nav><a href="#s0">一、这个系统是什么</a><a href="#s1">二、已经冻结的 110 条决策</a><a href="#s2">三、求求骨架</a><a href="#s3">四、技术方案要点</a><a href="#s4">五、开发组织</a><a href="#s5">六、批次与里程碑</a><a href="#s6">七、风险清单</a><a href="#s7">八、下一步</a></nav>
 </aside>
 <main>
 <h1>Vademecum（Vade）开发概览</h1>
 <blockquote>
 <p>全称 <strong>Vademecum</strong>（拉丁 <code>vade mecum</code>，「走，与我一起」），中文「偕行」；简称 <strong>Vade</strong>。正文统一用简称。</p>
-<p>本文是 <code>requirements.md</code>（求求基线 v1.0 + AMEND-01～22）与 <code>design.md</code>（方案 v1.18）的汇总视图。
+<p>本文是 <code>requirements.md</code>（求求基线 v1.0 + AMEND-01～23）与 <code>design.md</code>（方案 v1.19）的汇总视图。
 两份原文为准，本文只做导览。</p>
 </blockquote>
 <table>
@@ -192,7 +192,7 @@ footer{margin-top:70px; padding-top:18px; border-top:1px solid var(--line);
 <tbody>
 <tr>
 <td><code>requirements.md</code></td>
-<td>求求冻结基线、105 条决策台账、工程约定（§11）</td>
+<td>求求冻结基线、110 条决策台账、工程约定（§11）</td>
 <td>对求求有疑问、要改求求时</td>
 </tr>
 <tr>
@@ -244,7 +244,7 @@ footer{margin-top:70px; padding-top:18px; border-top:1px solid var(--line);
 <p>三个面<strong>不同源</strong>：数据面 <code>:8443</code>、管理面 <code>:8444</code>（<strong>默认回环，可显式对外</strong>）、模块 app 由 <code>ui</code> 模块自己 serve。同源会让模块的一个 XSS 直接读走管理 API——<code>HttpOnly</code> 只防读 cookie，不防借用 cookie 发请求。</p>
 <p><strong>一条不可破的判据</strong>：core 源码里搜不到任何具体模块的 <code>id</code> / 名称 / 路径；删掉所有模块，core 仍能启动。这条会写成会失败的测试，不是口号。</p>
 <hr />
-<h2 id="s1">二、已经冻结的 105 条决策</h2>
+<h2 id="s1">二、已经冻结的 110 条决策</h2>
 <table>
 <thead>
 <tr>
@@ -778,6 +778,31 @@ footer{margin-top:70px; padding-top:18px; border-top:1px solid var(--line);
 <td>D105</td>
 <td>手机模块页入口</td>
 <td>「能力」tab 内「模块页面」；模块无页面则不显示</td>
+</tr>
+<tr>
+<td>D106</td>
+<td>预算超限错误码</td>
+<td>新增 C-04 <code>BUDGET_EXCEEDED</code>（33→34）；预算超限拒 turn</td>
+</tr>
+<tr>
+<td>D107</td>
+<td>UI→core 工具调用</td>
+<td>新增 C-05 <code>ui/tool.call</code>（<code>ui_to_core</code> 6→7）；动作必须经审批，<code>risk</code> 只由 core 上调</td>
+</tr>
+<tr>
+<td>D108</td>
+<td><code>turn_states</code> 升版</td>
+<td>追加 <code>waiting_input</code>，C-06 升 2.0.0；旧端遇新状态卡住不报错（接受）</td>
+</tr>
+<tr>
+<td>D109</td>
+<td>模块页 fail-closed</td>
+<td>追认 RFC-0009：未知节点整页拒渲 + <code>MANIFEST_INVALID</code>，覆盖 FR-8.78「降级为占位」</td>
+</tr>
+<tr>
+<td>D110</td>
+<td>RFC 批准与顺序</td>
+<td>七份（0003–0009）全部批准；0004→0006→0005→0007/0008→0009→0003</td>
 </tr>
 </tbody>
 </table>
@@ -1500,5 +1525,5 @@ footer{margin-top:70px; padding-top:18px; border-top:1px solid var(--line);
 </ol>
 <p>各自产出一份「可行 / 不可行 + 降级路径」的结论，不写业务代码。</p>
 <p>模块组（M1–M6）要等 <strong>C4 的 SDK 冻结</strong>才开工——这是唯一能让 6 个子代理同时干活而不互相踩的前提。进度与阻塞记在 <code>docs/status.md</code>。</p>
-<footer><span>Vademecum（Vade） · 方案 v1.18 · 求求基线 AMEND-20</span><span>2026-11-10</span></footer>
+<footer><span>Vademecum（Vade） · 方案 v1.19 · 求求基线 AMEND-23</span><span>2026-11-14</span></footer>
 </main></div></body></html>

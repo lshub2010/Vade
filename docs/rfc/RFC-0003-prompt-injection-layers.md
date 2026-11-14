@@ -1,7 +1,8 @@
 ---
 rfc: RFC-0003
 title: 提示词注入分层：技能目录消息化、工具渐进披露与 stable/context 分段
-status: proposed
+status: approved
+approved: 2026-11-14
 date: 2026-11-13
 proposer: 编排（借 dsh / Claude Code 的注入做法；依据 `research/agent-01-injection-comparison.md` R1 / R3 / R6）
 affects: C-11 `schema/skill.schema.json`、C3b `core/vade/skill/*`、C-05 `schema/rpc.json`、C-06 `schema/events.json`（只追加）、C-18 `schema/config.schema.json`（附带）

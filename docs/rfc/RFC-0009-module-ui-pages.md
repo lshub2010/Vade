@@ -1,7 +1,8 @@
 ---
 rfc: RFC-0009
 title: 模块 UI 页面：原生声明式 schema（新契约 C-19）、只读数据绑定与三类动作
-status: proposed
+status: approved
+approved: 2026-11-14
 date: 2026-11-14
 proposer: 编排（依据 `docs/requirements.md` §8.22.1 决策 #18 / #19、§8.22.3 FR-8.78 / FR-8.79、§8.22.4（C-09 7 → 11）、§8.22.8 #3；`docs/agents/50-U1-ui-skeleton.md` §五 U1-h 与 §七 T5c；`research/ui-decisions.md` 在本 worktree 缺失，19 条裁定以 requirements §8.22.1 表格为准）
 affects: C-19（新，待冻结）；C-03 `schema/manifest.schema.json` 追加 `ui.pages[]`（含 `core/vade/registry/manifest.py` 的 `Manifest` 承接，否则静默丢弃）；C-05 `schema/rpc.json` 的 `ui_to_core` 追加 `ui/tool.call` / `ui/state.get` / `ui/page.get`，`core_to_module` 追加 `state/get` / `page/get`

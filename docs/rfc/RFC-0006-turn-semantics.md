@@ -1,7 +1,8 @@
 ---
 rfc: RFC-0006
 title: turn 语义补充：中断留痕、工具卡字段、重生成/编辑重发、流式多段与单条长度上限
-status: proposed
+status: approved
+approved: 2026-11-14
 date: 2026-11-14
 proposer: 编排（依据 `docs/requirements.md` §8.21 FR-8.30/8.31/8.32/8.35/8.51/8.52、§8.22 修订；`research/ui-02-messages-input-attachments.md` §3.9 C4/C5/C6/C10/C14）
 affects: C-06 `schema/events.json`（5 组字段追加 + 2 个新事件 + 注记级澄清）、C-05 `schema/rpc.json`（新增 `turn/regenerate`、`message/edit_resubmit`，`ui/attach` 的 snapshot 注记）、消息/turn 模型（`core/vade/session/models.py`、`sqlite_store.py` 追加列）、`core/vade/session/queue.py`（中断落库）、`core/vade/loop/engine.py`（工具卡字段与分段）、`core/vade/loop/context.py`（superseded 过滤）

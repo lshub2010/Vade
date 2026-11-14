@@ -434,23 +434,8 @@
         "schema": {
           "oneOf": [
             {
-              "type": "object",
-              "required": [
-                "type"
-              ],
-              "properties": {
-                "type": {
-                  "enum": [
-                    "column",
-                    "row",
-                    "tabs",
-                    "list",
-                    "text",
-                    "component"
-                  ]
-                }
-              },
-              "description": "Inline node tree root (column/row/tabs/list/text/component)."
+              "$ref": "#/$defs/node",
+              "description": "Inline node tree root (column/row/tabs/list/text/component). Closed: see $defs/node."
             },
             {
               "type": "object",
@@ -480,6 +465,439 @@
               }
             }
           ]
+        }
+      }
+    },
+    "uiProps": {
+      "type": "object",
+      "description": "RFC-0009 §4.4/§4.5: props are a CLOSED set. This union is the coarse gate — a consumer that only runs the JSON Schema still cannot smuggle `onClick`/`script`/an unknown prop through, because `additionalProperties` is false. Per-component precision (Button has no `label`, a leaf has no `children`) lives in `core/vade/registry/uipage.py`, which is the authority.",
+      "additionalProperties": false,
+      "properties": {
+        "gap": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "align": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "wrap": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "selected": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "empty_text": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "item_fields": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "text": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "style": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "max_lines": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "format": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "placeholder": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "value": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "multiline": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "max_length": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "subtitle": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "elevated": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "leading_icon": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "trailing_text": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "tool": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "state": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "args_preview": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "result_summary": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "file_id": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "mime": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "tab_title": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        }
+      }
+    },
+    "uiAction": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "description": "RFC-0009 §6: one action. The key set is closed so a `then`/`script`/`href` cannot ride along; `kind` is one of the four the host understands.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "navigate",
+            "tools/call",
+            "ui/submit",
+            "open_url"
+          ]
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "tool": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$"
+        },
+        "args": {
+          "type": "object"
+        },
+        "confirm_text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "content": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "uiOn": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "RFC-0009 §4.4: only the events a component really emits. `onClick`/`onLoad` are not events, they are script hooks.",
+      "properties": {
+        "click": {
+          "$ref": "#/$defs/uiAction"
+        },
+        "change": {
+          "$ref": "#/$defs/uiAction"
+        }
+      }
+    },
+    "uiBinding": {
+      "type": "object",
+      "required": [
+        "bind"
+      ],
+      "additionalProperties": false,
+      "description": "RFC-0009 §5.2: `{\"bind\": path, \"format\"?: name}`. No expressions.",
+      "properties": {
+        "bind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "format": {
+          "type": "string"
+        }
+      }
+    },
+    "node": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false,
+      "description": "RFC-0009 §4.3/§4.4: one node of the declarative tree. CLOSED at every level (type/component/id/visible/data_ref/props/children/on) so a consumer that only validates against this file still refuses `onClick`, `script`, `href`, a host component or an unknown prop. Node/depth/action counts and per-component prop sets are enforced in `core/vade/registry/uipage.py`.",
+      "properties": {
+        "type": {
+          "enum": [
+            "column",
+            "row",
+            "tabs",
+            "list",
+            "text",
+            "component"
+          ]
+        },
+        "component": {
+          "enum": [
+            "Button",
+            "TextField",
+            "Card",
+            "ListItem",
+            "Switch",
+            "ToolCallCard",
+            "AttachmentChip"
+          ],
+          "description": "The seven page components. The four host components (MessageBubble/InputBar/ApprovalDialog/BottomBar) are NOT in this enum: naming one is phishing."
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+        },
+        "visible": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "$ref": "#/$defs/uiBinding"
+            }
+          ]
+        },
+        "data_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "props": {
+          "$ref": "#/$defs/uiProps"
+        },
+        "children": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/node"
+          }
+        },
+        "on": {
+          "$ref": "#/$defs/uiOn"
         }
       }
     }

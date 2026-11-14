@@ -118,6 +118,15 @@ class SessionRPC:
         if not isinstance(client_msg_id, str) or not client_msg_id:
             raise VadeError("INVALID_ARGUMENT", "client_msg_id is required",
                             data={"field": "client_msg_id"})
+        if self._read_only(connection):
+            # B3: `rpc.json` has declared READ_ONLY_SESSION for `ui/submit` since
+            # C-05, and this handler — the ONLY write path a message takes —
+            # never checked it. A read-only viewer could submit a turn, including
+            # through a page's `ui/submit` action, which delegates here.
+            raise VadeError(
+                "READ_ONLY_SESSION",
+                "this session is read-only; submitting a message requires a writable session",
+            )
         # RFC-0004 §6.4: shape (array, 1..20 parts) is checked once, in
         # `SessionLog.submit`, so a direct caller and the RPC surface answer the
         # same `data.field`. Only the identity of the submitting device is

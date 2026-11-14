@@ -76,6 +76,30 @@ def load_schema(path: Path | str | None = None) -> dict[str, Any]:
     return data
 
 
+def _schema_without_ui(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """`schema` with the `ui` subtree relaxed to `{}`.
+
+    RFC-0009 §7.1: a bad page is dropped with a warning, the module's tools
+    still register. Since the C-19 review, `manifest.schema.json` closes the
+    whole node tree (`$defs/node`, `$defs/uiProps`, `$defs/uiAction`), so a page
+    with `onClick` is now a schema violation — which, if it ran as step 1, would
+    turn one bad page into a failed registration. Core therefore validates
+    everything except `ui` against the file, then runs `validate_ui` per page,
+    where the same rules reject that page only.
+
+    The file keeps the closure: it is the contract a third-party consumer (SDK,
+    another language) validates against, and it is what `check_contracts.py`
+    asserts. Only core's ordering differs, and this is the one line that says so.
+    """
+    if "ui" not in (schema.get("properties") or {}):
+        return dict(schema)
+    copy = dict(schema)
+    properties = dict(copy.get("properties") or {})
+    properties["ui"] = {}
+    copy["properties"] = properties
+    return copy
+
+
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
     name: str
@@ -146,8 +170,13 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
         raise ManifestError("", f"manifest must be an object, got {type(raw).__name__}")
 
     # 1. JSON Schema (structure, required fields, types, per-list caps).
+    #    The `ui` subtree is checked separately (step 6b) so that §7.1 holds:
+    #    one bad page must not kill the module's tools. `manifest.schema.json`
+    #    is strict there (closed node/props/action sets) and stays the file a
+    #    third-party consumer validates against; inside core the same rules run
+    #    per page in `validate_ui`, which drops the bad page instead of raising.
     try:
-        js_validate(raw, schema if schema is not None else load_schema())
+        js_validate(raw, _schema_without_ui(schema if schema is not None else load_schema()))
     except SchemaError as exc:
         raise ManifestError(exc.pointer, exc.message) from None
 

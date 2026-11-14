@@ -120,11 +120,40 @@ class FakeRouter:
 
 
 class FakeConnection:
-    def __init__(self, *, device_id: str = "dev-1", read_only: bool = False) -> None:
+    """A connection with a *verified* identity.
+
+    B1: `ui/*` now reads the caller from the connection, so a fixture that
+    leaves `device_id` empty is an anonymous socket and gets `PERMISSION_DENIED`
+    — correct, but not what most tests are about. The default is the module that
+    `make_service` registers, spelled the way `Registry` spells a node id
+    (`module_id#instance_id`). `browser()` is the human looking at a module card.
+    """
+
+    def __init__(
+        self,
+        *,
+        device_id: str = "com.example.download#dl-01",
+        read_only: bool = False,
+        browser_session: bool = False,
+        auth_mode: str | None = None,
+    ) -> None:
         self.device_id = device_id
         self.connection_id = "ui-conn"
         self.read_only = read_only
-        self.auth_mode = "device_key"
+        self.browser_session = browser_session
+        self.auth_mode = auth_mode or ("browser_session" if browser_session else "device_key")
+
+    @classmethod
+    def browser(cls, *, device_id: str = "ui-0123456789abcdef", read_only: bool = False) -> "FakeConnection":
+        return cls(device_id=device_id, browser_session=True, read_only=read_only)
+
+    @classmethod
+    def anonymous(cls) -> "FakeConnection":
+        return cls(device_id="")
+
+    @classmethod
+    def other_module(cls) -> "FakeConnection":
+        return cls(device_id="com.example.other#o-01")
 
 
 def make_service(

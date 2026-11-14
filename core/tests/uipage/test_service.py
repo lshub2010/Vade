@@ -16,7 +16,7 @@ from vade.errors import VadeError
 from vade.modulepage.service import PageLimits
 from vade.registry.uipage import page_digest
 
-from .helpers import FakeCaller, make_service, page
+from .helpers import FakeCaller, FakeConnection, make_service, page
 
 
 def _body(**props: object) -> dict:
@@ -37,7 +37,7 @@ def test_pages_lists_entries_with_entry_and_requires():
 
 def test_inline_page_is_returned_with_its_digest():
     service, record, _c, _r = make_service(page("queue"))
-    result = asyncio.run(service.get_page(record.module_id, record.instance_id, "queue"))
+    result = asyncio.run(service.get_page(FakeConnection(), record.module_id, record.instance_id, "queue"))
     assert result["schema"]["type"] == "column"
     assert result["sha256"] == page_digest(result["schema"])
 
@@ -45,7 +45,7 @@ def test_inline_page_is_returned_with_its_digest():
 def test_unknown_page_is_not_found():
     service, record, _c, _r = make_service(page("queue"))
     with pytest.raises(VadeError) as excinfo:
-        asyncio.run(service.get_page(record.module_id, record.instance_id, "nope"))
+        asyncio.run(service.get_page(FakeConnection(), record.module_id, record.instance_id, "nope"))
     assert excinfo.value.code == "NOT_FOUND"
 
 
@@ -59,8 +59,8 @@ def test_ref_page_is_fetched_checked_and_cached():
     caller = FakeCaller({"page/get": {"schema": body}})
     service, record, _c, _r = make_service(ref_page, caller=caller)
 
-    first = asyncio.run(service.get_page(record.module_id, record.instance_id, "big"))
-    second = asyncio.run(service.get_page(record.module_id, record.instance_id, "big"))
+    first = asyncio.run(service.get_page(FakeConnection(), record.module_id, record.instance_id, "big"))
+    second = asyncio.run(service.get_page(FakeConnection(), record.module_id, record.instance_id, "big"))
     assert first["sha256"] == digest == second["sha256"]
     assert [method for method, _params in caller.calls] == ["page/get"], "second read is cached"
 
@@ -73,7 +73,7 @@ def test_ref_page_digest_mismatch_is_manifest_invalid():
     caller = FakeCaller({"page/get": {"schema": _body()}})
     service, record, _c, _r = make_service(ref_page, caller=caller)
     with pytest.raises(VadeError) as excinfo:
-        asyncio.run(service.get_page(record.module_id, record.instance_id, "big"))
+        asyncio.run(service.get_page(FakeConnection(), record.module_id, record.instance_id, "big"))
     assert excinfo.value.code == "MANIFEST_INVALID"
     assert "sha256" in excinfo.value.message
 
@@ -88,7 +88,7 @@ def test_ref_page_oversize_is_manifest_invalid():
     }
     service, record, _c, _r = make_service(ref_page, caller=FakeCaller({"page/get": {"schema": body}}))
     with pytest.raises(VadeError) as excinfo:
-        asyncio.run(service.get_page(record.module_id, record.instance_id, "big"))
+        asyncio.run(service.get_page(FakeConnection(), record.module_id, record.instance_id, "big"))
     assert excinfo.value.code == "MANIFEST_INVALID"
     assert "64" in excinfo.value.message or "bytes" in excinfo.value.message
 
@@ -104,32 +104,43 @@ def test_ref_body_is_revalidated_at_fetch_time():
     }
     service, record, _c, _r = make_service(ref_page, caller=FakeCaller({"page/get": {"schema": body}}))
     with pytest.raises(VadeError) as excinfo:
-        asyncio.run(service.get_page(record.module_id, record.instance_id, "big"))
+        asyncio.run(service.get_page(FakeConnection(), record.module_id, record.instance_id, "big"))
     assert excinfo.value.code == "MANIFEST_INVALID"
 
 
 def test_state_get_is_cached_and_rev_is_monotonic():
     caller = FakeCaller({"state/get": {"rev": 3, "state": {"queue_len": 2}}})
     service, record, _c, _r = make_service(page("queue"), caller=caller, state_cache_s=60)
+    connection = FakeConnection()
 
-    first = asyncio.run(service.get_state(record.module_id, record.instance_id, "queue"))
-    second = asyncio.run(service.get_state(record.module_id, record.instance_id, "queue"))
+    first = asyncio.run(service.get_state(connection, record.module_id, record.instance_id, "queue"))
+    second = asyncio.run(service.get_state(connection, record.module_id, record.instance_id, "queue"))
     assert first == second
     assert first["rev"] == 3 and first["state"] == {"queue_len": 2}
     assert [m for m, _p in caller.calls] == ["state/get"], "cached within [ui].state_cache_s"
 
-    # a fresh answer with a LOWER rev still advances: clients may render a stale
-    # rev first, so it must never go backwards (§9.3).
+    # B5: a fresh answer with a LOWER rev is a stale answer, and a stale answer
+    # must never be served on a newer rev. `max(rev, cached.rev + 1)` used to
+    # fabricate rev=4 around `{'queue_len': 5}` — the client trusts `rev`, so it
+    # would render old data as new. The cached value wins and the caller is told
+    # the answer was unchanged.
     caller.replies["state/get"] = {"rev": 1, "state": {"queue_len": 5}}
     service.limits = PageLimits(state_cache_s=0)
-    third = asyncio.run(service.get_state(record.module_id, record.instance_id, "queue"))
-    assert third["rev"] == 4 and third["state"] == {"queue_len": 5}
+    third = asyncio.run(service.get_state(connection, record.module_id, record.instance_id, "queue"))
+    assert third["rev"] == 3 and third["state"] == {"queue_len": 2}
+    assert third["unchanged"] is True
+
+    # A genuinely newer rev still lands, and lands whole.
+    caller.replies["state/get"] = {"rev": 4, "state": {"queue_len": 7}}
+    fourth = asyncio.run(service.get_state(connection, record.module_id, record.instance_id, "queue"))
+    assert fourth["rev"] == 4 and fourth["state"] == {"queue_len": 7}
+    assert "unchanged" not in fourth
 
 
 def test_state_get_unsupported_is_reported_as_unsupported():
     service, record, _c, _r = make_service(page("queue"), caller=FakeCaller({}))
     with pytest.raises(VadeError) as excinfo:
-        asyncio.run(service.get_state(record.module_id, record.instance_id, "queue"))
+        asyncio.run(service.get_state(FakeConnection(), record.module_id, record.instance_id, "queue"))
     assert excinfo.value.code == "UNSUPPORTED"
 
 
@@ -137,7 +148,7 @@ def test_state_get_rejects_non_flat_state():
     caller = FakeCaller({"state/get": {"rev": 1, "state": {"nested": {"a": 1}}}})
     service, record, _c, _r = make_service(page("queue"), caller=caller)
     with pytest.raises(VadeError) as excinfo:
-        asyncio.run(service.get_state(record.module_id, record.instance_id, "queue"))
+        asyncio.run(service.get_state(FakeConnection(), record.module_id, record.instance_id, "queue"))
     assert excinfo.value.code == "UNAVAILABLE"
 
 

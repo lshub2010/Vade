@@ -227,6 +227,8 @@ UI_COMPONENTS = {
     "Button", "TextField", "Card", "ListItem", "Switch", "ToolCallCard", "AttachmentChip",
 }
 UI_HOST_COMPONENTS = {"MessageBubble", "InputBar", "ApprovalDialog", "BottomBar"}
+#: RFC-0009 §4.3: the six node types the inline tree may use.
+UI_NODE_TYPES = {"column", "row", "tabs", "list", "text", "component"}
 #: RFC §6's three kinds plus the `open_url` required by the C-19 implementation
 #: brief (http/https only; it opens the user's browser, never loads a page).
 UI_ACTION_KINDS = {"navigate", "tools/call", "ui/submit", "open_url"}
@@ -866,6 +868,45 @@ def check_ui(config: dict, manifest: dict, rpc: dict) -> None:
           "manifest.schema.json $defs.page.additionalProperties must be false")
     check(set(page.get("required") or []) == {"id", "title", "version", "schema"},
           "manifest.schema.json $defs.page.required must be id/title/version/schema")
+    # S5 (C-19 review): the node tree must be closed IN THE FILE, not only in
+    # `uipage.py`. A consumer that validates nothing but this schema (the SDK,
+    # another language's client) had zero protection against `onClick`, an
+    # unknown prop or a host component — every node-level guarantee lived in
+    # Python. These five assertions are what keep that from regressing.
+    defs = manifest.get("$defs") or {}
+    node = defs.get("node") or {}
+    check(node.get("additionalProperties") is False,
+          "manifest.schema.json $defs.node.additionalProperties must be false (a node key is a script hook)")
+    check(set(node.get("properties") or {}) ==
+          {"type", "component", "id", "visible", "data_ref", "props", "children", "on"},
+          f"manifest.schema.json $defs.node.properties drifted: {sorted((node.get('properties') or {}))}")
+    node_props = node.get("properties") or {}
+    check(set((node_props.get("type") or {}).get("enum") or []) == UI_NODE_TYPES,
+          "manifest.schema.json $defs.node.type enum must be the six C-19 node types")
+    check(set((node_props.get("component") or {}).get("enum") or []) == set(UI_COMPONENTS),
+          "manifest.schema.json $defs.node.component enum must be exactly the seven page components "
+          "(a host component in the enum is phishing)")
+    check((node_props.get("props") or {}).get("$ref") == "#/$defs/uiProps",
+          "manifest.schema.json $defs.node.props must point at the closed $defs/uiProps")
+    check((node_props.get("on") or {}).get("$ref") == "#/$defs/uiOn",
+          "manifest.schema.json $defs.node.on must point at the closed $defs/uiOn")
+    ui_props = defs.get("uiProps") or {}
+    check(ui_props.get("additionalProperties") is False,
+          "manifest.schema.json $defs/uiProps.additionalProperties must be false (props are a closed set)")
+    ui_on = defs.get("uiOn") or {}
+    check(ui_on.get("additionalProperties") is False,
+          "manifest.schema.json $defs/uiOn.additionalProperties must be false (`onClick` is not an event)")
+    check(set(ui_on.get("properties") or {}) == {"click", "change"},
+          "manifest.schema.json $defs/uiOn.properties must be exactly click/change")
+    ui_action = defs.get("uiAction") or {}
+    check(ui_action.get("additionalProperties") is False,
+          "manifest.schema.json $defs/uiAction.additionalProperties must be false")
+    check(set((ui_action.get("properties") or {}).get("kind", {}).get("enum") or []) == UI_ACTION_KINDS,
+          "manifest.schema.json $defs/uiAction.kind enum must be the four C-19 action kinds")
+    inline = (((page.get("properties") or {}).get("schema") or {}).get("oneOf") or [{}])[0]
+    check(inline.get("$ref") == "#/$defs/node",
+          "manifest.schema.json page.schema's inline branch must $ref $defs/node "
+          "(otherwise the closed node tree is not reachable from a real manifest)")
     props = page.get("properties") or {}
     check(set((props.get("icon") or {}).get("enum") or []) ==
           {"list", "chart", "settings", "tool", "file", "none"},
@@ -934,8 +975,10 @@ def check_ui(config: dict, manifest: dict, rpc: dict) -> None:
     check(set((page_get.get("result") or {}).keys()) == {"schema", "sha256"},
           "rpc.json ui/page.get.result must be {schema, sha256}")
     state_get = ui_to_core.get("ui/state.get") or {}
-    check(set((state_get.get("result") or {}).keys()) == {"rev", "state", "fetched_at"},
-          "rpc.json ui/state.get.result must be {rev, state, fetched_at}")
+    # B5: `unchanged` is part of the result — the client must be able to tell a
+    # stale reply (cached value returned) from a fresh one.
+    check(set((state_get.get("result") or {}).keys()) == {"rev", "state", "fetched_at", "unchanged"},
+          "rpc.json ui/state.get.result must be {rev, state, fetched_at, unchanged}")
 
     # C-06 is untouched by RFC-0009 (§9.1 #5): a page approval resolves through
     # `approval/decide`, not through a new event family.

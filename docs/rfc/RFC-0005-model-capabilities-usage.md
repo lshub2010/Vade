@@ -4,7 +4,7 @@ title: 模型能力查询与用量：`model/list`、会话级选择优先级与�
 status: proposed
 date: 2026-11-14
 proposer: 编排（依据 `research/ui-decisions.md` #15 / #16、`research/ui-02-messages-input-attachments.md` §3.9 C7；AMEND-22 §8.22.2 R5、D96 / D101 / D102；PROGRESS.md 技术债 1）
-affects: C-05 `schema/rpc.json`（追加 `model/list`、`session/model.get|set`、`session/usage.get` 与 `ui/attach` snapshot 注记）、C-03 `schema/manifest.schema.json`（`capabilities.models[]`，追加）、C-06 `schema/events.json`（只追加）、C-18 `schema/config.schema.json`（`[llm]` 4 键 + `[usage]` 5 键）；内部 `core/vade/llm/*`、`core/vade/session/*`、`core/vade/admin/app.py`
+affects: C-05 `schema/rpc.json`（追加 `model/list`、`session/model.get|set`、`session/usage.get` 与 `ui/attach` snapshot 注记）、C-03 `schema/manifest.schema.json`（`capabilities.models[]`，追加）、C-06 `schema/events.json`（只追加）、C-18 `schema/config.schema.json`（`[llm]` 4 键 + `[usage]` 6 键）；内部 `core/vade/llm/*`、`core/vade/session/*`、`core/vade/admin/app.py`
 related: RFC-0004（附件与多模态；§9 的四个能力字段是本提案的硬依赖）；AMEND-22 §8.22.2 R5；FR-6.3、FR-8.46～8.50、FR-10.3；D96（只存压缩图）、D101（会话级优先）、D102（用量两口径）
 type: 契约追加（C-03 / C-05 / C-06 / C-18）；`LLMProvider.chat` 的 Python 协议变更属 core 内部破坏性
 stage: 草稿，未实现；不与 RFC-0004 同时实现时，能力字段全 `null`，降级路径见 §9
@@ -319,7 +319,7 @@ RFC-0004 §9 已把接口收敛为四个字段（`input_modalities`、`max_image
 | 5 | C-03 | `capabilities.models[]`（≤16 项，字段见 §4.3） | **追加**（`additionalProperties: true`，旧 core 忽略并告警） |
 | 6 | C-06 | `turn.completed.usage` 追加键；`turn.started` 追加 `model_id`/`model_source`；`turn.failed`/`turn.interrupted` 追加可选 `usage` | **追加**（`required` 不动） |
 | 7 | C-06 | 新事件 `usage.budget` | **追加**（v1.0.0 → 1.1.0） |
-| 8 | C-18 | `[llm]` 追加 4 键、新增 `[usage]` 5 键 | **追加**，但 root `additionalProperties:false`：必须随 schema 同批发版；旧 core 读新 `core.toml` 会 `UNKNOWN_CONFIG_KEY` |
+| 8 | C-18 | `[llm]` 追加 4 键、新增 `[usage]` 6 键 | **追加**，但 root `additionalProperties:false`：必须随 schema 同批发版；旧 core 读新 `core.toml` 会 `UNKNOWN_CONFIG_KEY` |
 | 9 | 内部（非契约） | `LLMProvider.chat(..., model=...)`；`sessions.model_id` / `turns.model_id` 追加列；`turns.usage` 覆盖四个终止态；审计 `llm.call` 写入 | **Python 协议破坏性**（3 个实现全在 core）；DB 追加列 |
 
 ### 7.2 C-05：四个新方法
@@ -342,7 +342,7 @@ RFC-0004 §9 已把接口收敛为四个字段（`input_modalities`、`max_image
 - `turn.completed.payload` 顶层**不新增**键；新字段全部在 `usage` 对象内部（events.json 里 `usage` 本来就是 `"object"`），`required` 保持 `[turn_id, state, usage]`。
 - `turn.started.payload` 追加 `model_id`、`model_source`（optional）。
 - `turn.failed.payload` / `turn.interrupted.payload` 追加 `usage`（optional；中断时可能 `source="none"`）。
-- 新事件 `usage.budget`：`payload {scope:"session"|"day", state:"warn"|"exceeded", used:int, limit:int, ratio:number, session_id:string|null}`，`required [scope, state, used, limit, ratio]`。`turn_states` 不改。
+- 新事件 `usage.budget`：`payload {scope:"session"|"day", state:"warn"|"exceeded", used:int, limit:int, ratio:number, degraded:boolean, session_id:string|null}`，`required [scope, state, used, limit, ratio, degraded]`；`degraded=true` 专指“账不可信、本应拒 turn 但降级为告警”（§6.4），`warn` 态恒 `false`。`turn_states` 不改。
 - C-06 的 `version` 由 1.0.0 → 1.1.0；已冻结事件一个字段都不改。
 
 ### 7.5 C-18：`[llm]` 与 `[usage]`
@@ -358,6 +358,7 @@ RFC-0004 §9 已把接口收敛为四个字段（`input_modalities`、`max_image
 | `usage.daily_tokens` | int ≥0 | `0` | hot | core 日预算，0=关 |
 | `usage.warn_ratio` | number 0.1..1 | `0.8` | hot | 告警阈值 |
 | `usage.include_aux` | bool | `true` | hot | 预算是否计 `aux` |
+| `usage.enforce` | string `block`\|`warn` | `block` | hot | 超限时是否拒新 turn；`block` 对齐 FR-8.49，`warn` 仅提示。`block` 在 usage `source="none"` 时自动降级（§6.4） |
 
 `llm.model_module` / `fallback_to_builtin` 今天被 `core/vade/session/__init__.py:183-184` 用默认值读、却被 schema 拒绝（`additionalProperties:false`），这次一并补齐。`[usage]` 是全新节，不覆盖 `[evolve].daily_token_budget`（后者只限自进化触发器，两者共用审计数据但过滤器不同，见 §6.5 第 4 条）。
 
@@ -433,12 +434,12 @@ A1–A12 全部要求真实执行；截图与手写记录不算证据。
 
 ## 13. 影响面与后续
 
-实现阶段要动的文件：`schema/rpc.json`（4 个方法 + snapshot 注记）、`schema/manifest.schema.json`（`capabilities.models`）、`schema/events.json`（3 处追加 + 1 个事件）、`schema/config.schema.json`（§7.5 九键）、`core/vade/llm/base.py` 与 `openai_compat.py` / `module.py`（`chat(model=...)`、按 id 钉住 provider）、`core/vade/session/models.py` + `sqlite_store.py`（两列 + 四终止态 usage）、`core/vade/session/manager.py`（snapshot 追加 `model`、turn 出队解析）、`core/vade/loop/engine.py`（`llm.call` 审计写入、usage 追加键）、`core/vade/admin/app.py`（今日用量改聚合查询 + `purpose` 过滤，§6.5 第 4 条）、`tools/check_contracts.py`（断言 4 个方法、`usage.budget` 已声明、`[usage]` 默认值、`capabilities.models` 形状）。
+实现阶段要动的文件：`schema/rpc.json`（4 个方法 + snapshot 注记）、`schema/manifest.schema.json`（`capabilities.models`）、`schema/events.json`（3 处追加 + 1 个事件）、`schema/config.schema.json`（§7.5 十键：`[llm]` 4 + `[usage]` 6）、`core/vade/llm/base.py` 与 `openai_compat.py` / `module.py`（`chat(model=...)`、按 id 钉住 provider）、`core/vade/session/models.py` + `sqlite_store.py`（两列 + 四终止态 usage）、`core/vade/session/manager.py`（snapshot 追加 `model`、turn 出队解析）、`core/vade/loop/engine.py`（`llm.call` 审计写入、usage 追加键）、`core/vade/admin/app.py`（今日用量改聚合查询 + `purpose` 过滤，§6.5 第 4 条）、`tools/check_contracts.py`（断言 4 个方法、`usage.budget` 已声明、`[usage]` 默认值、`capabilities.models` 形状）。
 
 **不动**：`core/vade/router/*`、`core/vade/policy/*`、`core/vade/audit/{writer,reader}.py`（只加调用点，不改列）、`schema/errors.json`、C-09 组件、`[evolve]` / `[compaction]` 既有键。
 
 **依赖顺序**：RFC-0004 先落地（`parts`、`attach.*`、blob 上传）→ 本提案的 `model/list` 才有“不白传”的落点；本提案先落地而 RFC-0004 未落地时，`model/list` 的能力字段仍可服务 FR-8.47 的徽标，但 §5 的图片门控不生效。U1 任务书必须写明这条降级，否则 UI 会等一个不存在的上传前判据。
 
-**后续（不在本 RFC）**：FR-8.48 的会话级高级参数（复用 `session/*` 名字空间，`session/config.get|set`）；成本/价格表（FR-10.3 的另一半）；模型别名与迁移；`[usage].enforce` 的硬断模式；模块内部 LLM 花费的上报协议（需要模块侧主动报账，属 M6 契约）。
+**后续（不在本 RFC）**：FR-8.48 的会话级高级参数（复用 `session/*` 名字空间，`session/config.get|set`）；成本/价格表（FR-10.3 的另一半）；模型别名与迁移；模块内部 LLM 花费的上报协议（需要模块侧主动报账，属 M6 契约）。
 
 **参考**：`docs/requirements.md` §8.21（FR-8.46～8.50）、§8.22.2 R5、§10（D96 / D101 / D102）；`research/ui-decisions.md` #15 / #16；`research/ui-02-messages-input-attachments.md` §3.9 C7；`schema/rpc.json`、`schema/manifest.schema.json`、`schema/config.schema.json`、`schema/events.json`；`core/vade/llm/{base,module,openai_compat}.py`、`core/vade/loop/engine.py`、`core/vade/session/{models,queue,manager}.py`、`core/vade/admin/app.py`；RFC-0004（§9 四字段与降级路径）。

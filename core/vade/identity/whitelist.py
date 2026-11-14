@@ -108,6 +108,28 @@ class Whitelist:
     def allows(self, fingerprint: str) -> bool:
         return any(e.fingerprint == fingerprint for e in self._entries.values())
 
+    def device_for_fingerprint(self, fingerprint: str) -> str | None:
+        """The paired device that proved this key, as `module_id#instance_id`.
+
+        This is the only identity a Noise peer can offer: the handshake proves
+        possession of a static key, and the whitelist says which pairing that
+        key belongs to. There is no separate "UI device" record, so the node id
+        the rest of core already uses (`Registration.session_id`,
+        `NodeRecord`) is the canonical name.
+
+        One key may be paired under several instances (same device, several
+        node slots); the lowest `(module_id, instance_id)` is returned so the
+        answer is stable across restarts. `None` means "no pairing" — callers
+        must fail closed rather than invent an identity.
+        """
+        matches = sorted(
+            (e.module_id, e.instance_id) for e in self._entries.values()
+            if e.fingerprint == fingerprint
+        )
+        if not matches:
+            return None
+        return f"{matches[0][0]}#{matches[0][1]}"
+
     def fingerprint_for(self, module_id: str, instance_id: str | None = None) -> str | None:
         """`instance_id=None` -> the module's fingerprint when all instances agree."""
         if instance_id is not None:

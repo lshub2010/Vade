@@ -161,6 +161,42 @@ BLOB_ROUTES = {
     ("GET|HEAD", "/ui/blob/{file_id}"),
 }
 
+#: RFC-0009 §7.3: the frozen `[ui]` key set, defaults and apply semantics.
+UI_DEFAULTS: dict[str, object] = {
+    "ui.state_cache_s": 5,
+    "ui.page_cache_bytes": 65536,
+    "ui.module_cache_bytes": 524288,
+    "ui.pending_calls": 256,
+}
+UI_HOT = {
+    "ui.state_cache_s",
+    "ui.page_cache_bytes",
+    "ui.module_cache_bytes",
+    "ui.pending_calls",
+}
+
+#: RFC-0009 §4.5 rev 1: the seven component names, and the four host components
+#: that must never appear on a page (impersonation, not styling).
+UI_COMPONENTS = {
+    "Button", "TextField", "Card", "ListItem", "Switch", "ToolCallCard", "AttachmentChip",
+}
+UI_HOST_COMPONENTS = {"MessageBubble", "InputBar", "ApprovalDialog", "BottomBar"}
+#: RFC §6's three kinds plus the `open_url` required by the C-19 implementation
+#: brief (http/https only; it opens the user's browser, never loads a page).
+UI_ACTION_KINDS = {"navigate", "tools/call", "ui/submit", "open_url"}
+#: §7.3 / §4.2: page counts and byte budgets.
+UI_LIMITS = {
+    "pages_per_module": 8,
+    "ui_block_max_bytes": 49152,
+    "ui_inline_max_bytes": 8192,
+    "ui_ref_max_bytes": 65536,
+    "ui_nodes_per_page": 256,
+    "ui_depth_max": 8,
+}
+
+#: §10.1: the module-page render path may not contain these tokens at all.
+UI_FORBIDDEN_CODE = ("eval(", "Function(", "exec(", "WebView(", "loadUrl(", "<script")
+
 FAILURES: list[str] = []
 
 
@@ -569,6 +605,127 @@ def check_approval_attribution(declared_events: dict) -> None:
         )
 
 
+def check_ui(config: dict, manifest: dict, rpc: dict) -> None:
+    """RFC-0009: the `[ui]` keys, the C-03 append, the C-05 methods, §10.1.
+
+    Three things are asserted that a review can miss by reading:
+
+    * the page block is the only `additionalProperties:false` subtree in C-03
+      (otherwise `on_click` would be forward-compatible, i.e. a script hook);
+    * the component whitelist and the action kinds in code are exactly the
+      contract's (a silently added 8th component is how phishing gets in);
+    * the module-page package contains no evaluator/browser token (§10.1).
+    """
+    section = (config.get("properties") or {}).get("ui")
+    if not isinstance(section, dict):
+        FAILURES.append("config.schema.json: missing [ui] section (RFC-0009 §7.3)")
+    else:
+        check(section.get("additionalProperties") is False, "config.schema.json: [ui].additionalProperties must be false")
+        leaves = dict(walk_leaves(section, "ui"))
+        missing = sorted(set(UI_DEFAULTS) - set(leaves))
+        extra = sorted(set(leaves) - set(UI_DEFAULTS))
+        check(not missing and not extra, f"config.schema.json [ui] key drift: missing={missing} extra={extra}")
+        for dotted, expected in UI_DEFAULTS.items():
+            leaf = leaves.get(dotted) or {}
+            check(leaf.get("default") == expected,
+                  f"config.schema.json {dotted}: default {leaf.get('default')!r} != {expected!r} (RFC-0009 §7.3)")
+            wanted = "hot" if dotted in UI_HOT else "restart"
+            check((leaf.get("x-vade") or {}).get("apply") == wanted,
+                  f"config.schema.json {dotted}: apply must be {wanted} (RFC-0009 §7.3)")
+
+    ui = (manifest.get("properties") or {}).get("ui") or {}
+    check(ui.get("additionalProperties") is False,
+          "manifest.schema.json: ui.additionalProperties must be false (C-19 is the strict subtree)")
+    check("^x-" in (ui.get("patternProperties") or {}),
+          "manifest.schema.json: ui needs the ^x- escape hatch and nothing else")
+    pages = (ui.get("properties") or {}).get("pages") or {}
+    check(pages.get("maxItems") == UI_LIMITS["pages_per_module"],
+          f"manifest.schema.json ui.pages.maxItems must be {UI_LIMITS['pages_per_module']}")
+    page = ((manifest.get("$defs") or {}).get("page")) or {}
+    check(page.get("additionalProperties") is False,
+          "manifest.schema.json $defs.page.additionalProperties must be false")
+    check(set(page.get("required") or []) == {"id", "title", "version", "schema"},
+          "manifest.schema.json $defs.page.required must be id/title/version/schema")
+    props = page.get("properties") or {}
+    check(set((props.get("icon") or {}).get("enum") or []) ==
+          {"list", "chart", "settings", "tool", "file", "none"},
+          "manifest.schema.json page.icon enum drifted from C-19 §4.2")
+    check(set((props.get("entry") or {}).get("enum") or []) == {"auto", "panel", "capabilities"},
+          "manifest.schema.json page.entry enum drifted from C-19 §4.2")
+    branches = list(((props.get("schema") or {}).get("oneOf")) or [])
+    check(len(branches) == 2,
+          "manifest.schema.json page.schema must be oneOf[inline tree, ref] — two disjoint branches")
+    limits = (manifest.get("x-vade") or {}).get("limits") or {}
+    for key, expected in UI_LIMITS.items():
+        check(limits.get(key) == expected,
+              f"manifest.schema.json x-vade.limits.{key} must be {expected} (RFC-0009 §7.3)")
+
+    if str(ROOT / "core") not in sys.path:
+        sys.path.insert(0, str(ROOT / "core"))
+    try:
+        from vade.registry import uipage
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        FAILURES.append(f"core/vade/registry/uipage.py: cannot import ({type(exc).__name__}: {exc})")
+    else:
+        check(set(uipage.COMPONENTS) == UI_COMPONENTS,
+              f"uipage.COMPONENTS {sorted(uipage.COMPONENTS)} != C-19 rev 1 {sorted(UI_COMPONENTS)}")
+        check(set(uipage.HOST_COMPONENTS) == UI_HOST_COMPONENTS,
+              f"uipage.HOST_COMPONENTS {sorted(uipage.HOST_COMPONENTS)} != {sorted(UI_HOST_COMPONENTS)}")
+        check(set(uipage.ACTION_KINDS) == UI_ACTION_KINDS,
+              f"uipage.ACTION_KINDS {sorted(uipage.ACTION_KINDS)} != {sorted(UI_ACTION_KINDS)}")
+        code_limits = {
+            "pages_per_module": uipage.MAX_PAGES,
+            "ui_block_max_bytes": uipage.MAX_UI_BLOCK_BYTES,
+            "ui_inline_max_bytes": uipage.MAX_INLINE_BYTES,
+            "ui_ref_max_bytes": uipage.MAX_REF_BYTES,
+            "ui_nodes_per_page": uipage.MAX_NODES,
+            "ui_depth_max": uipage.MAX_DEPTH,
+        }
+        check(code_limits == UI_LIMITS,
+              f"uipage limits {code_limits} != C-19 {UI_LIMITS}")
+        check(set(uipage.BINDING_ROOTS) == {"module.status", "page.state", "item"},
+              "uipage.BINDING_ROOTS must stay the three read-only roots (§5.1)")
+
+    page_dir = CORE / "modulepage"
+    if not page_dir.is_dir():
+        FAILURES.append("core/vade/modulepage: the C-19 serving package is missing")
+    else:
+        for path in sorted(page_dir.rglob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            for token in UI_FORBIDDEN_CODE:
+                check(token not in text,
+                      f"{path.relative_to(ROOT)}: contains {token!r} — §10.1 forbids any evaluator/browser on the page path")
+
+    ui_to_core = ((rpc.get("directions") or {}).get("ui_to_core")) or {}
+    core_to_module = ((rpc.get("directions") or {}).get("core_to_module")) or {}
+    for name in ("ui/page.get", "ui/state.get", "ui/tool.call"):
+        check(name in ui_to_core, f"rpc.json ui_to_core missing {name} (RFC-0009 §9.3)")
+    for name in ("state/get", "page/get"):
+        check(name in core_to_module, f"rpc.json core_to_module missing {name} (RFC-0009 §9.3)")
+    tool_call = ui_to_core.get("ui/tool.call") or {}
+    required = set((tool_call.get("params") or {}).keys())
+    check({"module_id", "instance_id", "page_id", "tool", "args", "client_call_id"} <= required,
+          f"rpc.json ui/tool.call params missing {sorted({'module_id','instance_id','page_id','tool','args','client_call_id'} - required)}")
+    result = tool_call.get("result") or {}
+    statuses = str(result.get("status") or "")
+    check(all(word in statuses for word in ("approval_required", "denied", "ok", "failed")),
+          "rpc.json ui/tool.call.result.status must name all four C-19 states")
+    page_get = ui_to_core.get("ui/page.get") or {}
+    check(set((page_get.get("result") or {}).keys()) == {"schema", "sha256"},
+          "rpc.json ui/page.get.result must be {schema, sha256}")
+    state_get = ui_to_core.get("ui/state.get") or {}
+    check(set((state_get.get("result") or {}).keys()) == {"rev", "state", "fetched_at"},
+          "rpc.json ui/state.get.result must be {rev, state, fetched_at}")
+
+    # C-06 is untouched by RFC-0009 (§9.1 #5): a page approval resolves through
+    # `approval/decide`, not through a new event family.
+    events_path = SCHEMA / "events.json"
+    if events_path.exists():
+        names = set((json.loads(events_path.read_text(encoding="utf-8")).get("events") or {}))
+        check(not {name for name in names if name.startswith("ui.")},
+              "events.json: RFC-0009 adds no ui.* event (page approvals are RPC-only, §9.4)")
+
+
 def main() -> int:
     manifest = load("manifest.schema.json")
     errors = load("errors.json")
@@ -622,6 +779,7 @@ def main() -> int:
 
     check_attach(config)
     check_tasks(config)
+    check_ui(config, manifest, rpc)
     check_blob_routes()
     check_submit_parts(rpc)
     check_http_endpoints(rpc)
@@ -630,6 +788,7 @@ def main() -> int:
         "module/register", "module/capabilities.update", "module/heartbeat",
         "tools/call", "tools/cancel", "module/drain", "approval/decide", "ui/submit",
         "task/list", "task/log_tail", "task/cancel", "subagent/message",
+        "ui/page.get", "ui/state.get", "ui/tool.call", "state/get", "page/get",
     }
     declared = set()
     for direction in rpc.get("directions", {}).values():

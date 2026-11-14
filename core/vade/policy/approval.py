@@ -78,6 +78,11 @@ class PendingApproval:
     task_id: str | None = None
     task_name: str | None = None
     depth: int = 0
+    #: RFC-0009 §6.2: `request()` awaits the future, so only it may turn a
+    #: missed deadline into a timeout. A minted-but-not-awaited page approval
+    #: (`open_request`) is reaped by `reap_expired` instead, and this flag is
+    #: what keeps the two from racing over the same future.
+    awaited: bool = False
 
 
 class ApprovalManager:
@@ -119,10 +124,26 @@ class ApprovalManager:
         self._approver_probe = probe
 
     # ------------------------------------------------------------------ request
-    async def request(self, req: ApprovalRequest) -> ApprovalDecision:
+    async def open_request(self, req: ApprovalRequest) -> tuple[PendingApproval | None, str]:
+        """Mint an approval WITHOUT waiting for the human (RFC-0009 §6.2).
+
+        Stage one of a module-page `ui/tool.call` may not block a websocket
+        request for 60 s, but it must still bind the args, adjudicate risk and
+        create the request the client will later approve. This does exactly
+        that and returns the `PendingApproval`; the caller stores its id and
+        asks `decision_of()` in stage two.
+
+        Returns `(None, reason)` when no approval is required:
+        `"below_high"` (policy) or `"session_grant"` (an earlier
+        `scope:"session"` decision covers this exact tool + args). Raises
+        `PERMISSION_DENIED` when no approver is attached: returning `None`
+        there would execute a high-risk tool nobody approved, which is the
+        fail-open bug this whole channel exists to prevent.
+        """
+        self.reap_expired()
         risk = self.engine.risk_of(req.tool_id, req.risk)
         if not self.engine.requires_approval(risk):
-            return ApprovalDecision(True, reason="below_high")
+            return None, "below_high"
 
         depth = int(getattr(req, "depth", 0) or 0)
         scope_key = (req.session_id, req.tool_id, digest_args(req.args))
@@ -135,7 +156,7 @@ class ApprovalManager:
             async with self._lock:
                 expiry = self._grants.get(scope_key)
                 if expiry is not None and expiry > self._wall():
-                    return ApprovalDecision(True, reason="session_grant", cached=True)
+                    return None, "session_grant"
 
         if self._approver_probe is not None and not self._approver_probe():
             # No UI attached: deny now. Queueing would stall the turn until the
@@ -146,7 +167,7 @@ class ApprovalManager:
                 args=req.args, session_id=req.session_id, turn_id=req.turn_id,
                 duration_ms=0.0, reason="no_approver", scope="once",
             )
-            return ApprovalDecision(False, reason="no_approver")
+            raise VadeError("PERMISSION_DENIED", "no approver is attached; a high-risk call nobody can approve is refused")
 
         rid = new_request_id()
         loop = asyncio.get_running_loop()
@@ -178,6 +199,30 @@ class ApprovalManager:
                 })
             except Exception:  # a broken UI must not abort the approval wait
                 pass
+        return pending, "approval_required"
+
+    async def request(self, req: ApprovalRequest) -> ApprovalDecision:
+        try:
+            pending, reason = await self.open_request(req)
+        except VadeError as exc:
+            if exc.code != "PERMISSION_DENIED":
+                raise
+            return ApprovalDecision(False, reason="no_approver")
+        if pending is None:
+            return ApprovalDecision(True, reason=reason,
+                                    cached=(reason == "session_grant"))
+        return await self._await_decision(pending)
+
+    async def _await_decision(self, pending: PendingApproval) -> ApprovalDecision:
+        """Wait for `approval/decide` (or the deadline) on a minted request."""
+        rid = pending.request_id
+        req = ApprovalRequest(
+            session_id=pending.session_id, turn_id=pending.turn_id,
+            tool_id=pending.tool_id, args=pending.args, risk=pending.risk,
+            expires_at=int(pending.created_at + self.timeout_s),
+        )
+        risk = pending.risk
+        pending.awaited = True
         try:
             # `shield` is load-bearing: plain `wait_for` cancels the very future
             # the approver resolves, so a decision landing at the deadline used
@@ -230,6 +275,48 @@ class ApprovalManager:
         return ApprovalDecision(True, reason=reason, request_id=rid, scope=scope, by=by,
                                 cached=(reason == "session_grant"))
 
+    # -------------------------------------------------------------- page calls
+    def reap_expired(self, now: float | None = None) -> int:
+        """Resolve minted-but-unawaited approvals whose deadline passed.
+
+        RFC-0009 §6.2 stage two may arrive long after the 60 s window, and a
+        page approval has nobody inside `request()` to time it out. Reaping on
+        the paths that can observe staleness (`open_request`, `decide`,
+        `pending_requests`) keeps the table bounded without a background task,
+        so a test's event loop has nothing left running.
+
+        `awaited` entries are skipped: `_await_decision` owns those deadlines,
+        and stealing its future would turn a clean timeout into a race.
+        """
+        current = self._clock() if now is None else now
+        expired = [
+            p for p in self._pending.values()
+            if p.deadline <= current and not p.awaited
+        ]
+        for pending in expired:
+            if not pending.future.done():
+                pending.future.set_result((False, "system", "once", "approval_timeout"))
+            self._resolved[pending.request_id] = "timeout"
+            self._pending.pop(pending.request_id, None)
+            self._write_audit(
+                kind="approval_timeout", status="denied", code="PERMISSION_DENIED",
+                request_id=pending.request_id, actor="system", tool=pending.tool_id,
+                risk=pending.risk, args=pending.args, session_id=pending.session_id,
+                turn_id=pending.turn_id,
+                duration_ms=(current - pending.started) * 1000.0,
+                reason=f"审批超时（{self.timeout_s:g}s 内无人确认）", scope="once",
+            )
+        return len(expired)
+
+    def decision_of(self, request_id: str) -> str | None:
+        """`allowed` / `denied` / `timeout` / `cancelled`, or None while pending.
+
+        Read-only on purpose: stage two of a page call must never be able to
+        *change* a decision, only observe the one `approval/decide` wrote.
+        """
+        self.reap_expired()
+        return self._resolved.get(request_id)
+
     # ------------------------------------------------------------------- decide
     async def decide(
         self,
@@ -269,6 +356,11 @@ class ApprovalManager:
         scope = str(scope or "once").lower()
         if scope not in {"once", "session"}:
             raise VadeError("INVALID_ARGUMENT", "scope must be once|session")
+
+        # RFC-0009 §6.2: a page approval nobody awaited has no `_await_decision`
+        # to time it out; reap first so "approved 10 minutes later" cannot pass
+        # as a live decision.
+        self.reap_expired()
 
         async with self._lock:
             pending = self._pending.get(request_id)
@@ -348,6 +440,7 @@ class ApprovalManager:
     def pending_requests(self) -> list[dict[str, Any]]:
         """Snapshot for the admin UI; args are included because the approver must
         see exactly what will run (`31 §T2`). Nothing here is persisted."""
+        self.reap_expired()
         return [
             {
                 "request_id": p.request_id, "session_id": p.session_id, "turn_id": p.turn_id,

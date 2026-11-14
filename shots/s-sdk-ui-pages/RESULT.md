@@ -40,7 +40,10 @@ echo manifest AFTER  this batch           : ui_pages=1 ui_warnings=() tools=['ec
 
 ## 4. SDK 测试
 
-新增 9 条（`sdk/python/tests/test_manifest.py`）：`ui` 块确实在 `ui.pages` 下、空列表逐字节不变、多页顺序保持、坏 page id 点名报错、缺必填键点名报错、`--print-manifest` 也带 ui、SDK 不越界判 icon、过 frozen jsonschema、过 core `validate_manifest`（并验证 core 才是降级判官）。
+新增 10 条（`sdk/python/tests/test_manifest.py`，该文件从 6 条变 16 条）：`ui` 块确实在 `ui.pages` 下、空列表逐字节不变、`--print-manifest` 也带 ui、多页顺序保持、坏 page id 点名报错、缺必填键点名报错、SDK 不越界判 icon、过 frozen jsonschema、过 core `validate_manifest`（并验证 core 才是降级判官）、页被深拷贝所以事后改不动 manifest。
+
+> `bff6811` 的提交消息里写成「新增 9 条」，是笔误；`--collect-only` 实测 16 − 6 = 10。
+
 
 ```
 $ pytest sdk/python/tests -q

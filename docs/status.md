@@ -50,6 +50,7 @@
 | client-split | 已迁出 | （见提交） | 用户裁定：客户端也算模块、submodule 取契约、**admin-ui 是 AgentCore 附属产物不算模块** | `ui/` 迁至 `vade-client` 独立仓（43 文件，保留 UI 相关历史）；主仓 `ui/` 只留指针 README；`00-orchestration`/`01-contracts`/`50-52` 任务书加路径口径说明；`admin-ui/` 不动 |
 | rfc0004-parts | 已合并 | PR #16 squash `c4e81ac`，回同步 `58e9e66` | 规格审查 pass（5 应修已修）+ 复核变异承重 | **RFC-0004 后半**：`session/parts.py` 的 §6.4 校验阶梯、`Message.parts` + PRAGMA 可重入迁移、`ui/submit.content` 定型 `parts[]`（1–20）、`rpc.json` 1.1.0、顶层 `http_endpoints`；**part 元数据以 BlobRecord 为准**、`kind`↔`mime` 一致、无设备身份时 `file_id` fail-closed；**549 passed** |
 | device-id | 已合并 | `24bd131` | 反向验证：删接线后 3 条主用例红 | **设备身份接线**：cookie 会话取 `/ui/session` 的 `ui-…`；Noise 握手后按 `remote_fingerprint` 在 whitelist 反查 `module_id#instance_id`；查不到保持 `None`（fail-closed）；含真 Noise 握手与 uvicorn 真 listener 用例；**555 passed** |
+| rfc0007 | 已合并 | `67c5c49` | 待复审（两轮审查未走） | **RFC-0007 子代理/任务**：`task.*` 四事件 + 7 态、进度 ≤2/s 合并（`x-vade.coalesce`，重放不补）、`task/list|log_tail|cancel` + `subagent/message`(UNSUPPORTED)、审批归属四字段、`[tasks]` 13 键；`RingLog` 双上限 + 不透明游标；**607 passed** |
 | rfc0004a | 已合并 | PR #15 squash `3163166`，回同步 `fcd28ea` | 安全审查两轮：首轮 fail（3 阻断）→ 返工 → 复审 **pass**（0 阻断 / 1 应修 / 8 建议） | **RFC-0004 前半**：`core/vade/blob/` 六路由、id `^(?:blb|upl)_…`、sha256 推导路径、设备 token + cookie 四道闸、`multipart` 先于鉴权 415、分片/续传/幂等、写盘前配额、**引用计数**跨设备去重、周期 sweeper（ASGI lifespan）、服务端复校 + PNG 有界解压；`[attach]` 17 键；**489 passed**（+105 blob 用例）；未做：`parts[]` / `ui/submit` 定型（0004b 进行中）、`ui/blob.token`、缩略图/扫描管线 |
 
 ## 里程碑

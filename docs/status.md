@@ -23,9 +23,9 @@
 | M4b | `m4b-evolve` | 未开工 | — | — | — | — | 0 | 依赖 M4a + C3b + C3d，不与其他模块并行；v1.17 改五触发器 + `turn_review` + `lesson` |
 | M5 | `m5-mcp` | 未开工 | — | — | — | — | 0 | |
 | M6 | `m6-model` | 未开工 | — | — | — | — | 0 | |
-| U1 | `u1-ui` | 未开工 | — | — | — | — | 0 | **G3**，第 3 天冻结 C-09；含 **T5b 管理页 WebView 宿主 + 设备绑定（+2 天，仅 Android/Desktop）** |
-| U2 | `u2-miuix` | 未开工 | — | — | — | — | 0 | 依赖 C-09 |
-| U3 | `u3-glass` | 未开工 | — | — | — | — | 0 | 依赖 C-09 |
+| U1 | `u1-ui` | 已合并（**客户端仓**） | 见 `vade-client` `main` @ `31f8f9a` | — | — | — | — | **G3**。`ui/` 已于 2026-11-14 迁出为独立仓 `vade-client`，本行不再跟踪单一批次，实际进度见该仓 `docs/QUICKSTART.md` 状态表与主仓 `docs/rfc/LEDGER.md`。**已核实**：368 tests / 0 failures、三目标绿（`desktopTest` + `assembleDebug` + `compileKotlinWasmJs`）、APK 21,878,888 B、Wasm 链接产物 13,681,513 B、MSI 93,312,713 B。**未完成**：UI 数据仍是 fixtures（`w-wire` 接线中）；ask_user 卡片（`c-askuser`）未合并；模块页宿主（`g-module`）未落地。T5b 管理页 WebView 宿主未开工 |
+| U2 | `u2-miuix` | 未开工（占位） | — | — | — | — | 0 | `MiuixSkin` 仍是**返回 material token 的占位实现**（`vade-client` `skin/Skins.kt`，带「未安装」角标），未注册真 Miuix 组件。底色板已支持暗色（`MiuixSkinEntry.dark`） |
+| U3 | `u3-glass` | 未开工（占位） | — | — | — | — | 0 | `skin/glass/GlassSurface`（haze 24dp + 26%/34% 染色 + `colorEffects` tint）**已存在并被顶栏/底栏调用**，但 glass 皮肤本身仍是占位。⚠️ 用户已两次指出「看不出模糊」，根因是**玻璃背后没有内容经过**（容器内边距把内容裁在栏下），修复在 `g-glass` 进行中 |
 | U4 | `u4-ios` | 暂缓 | — | — | — | — | 0 | **暂缓（用户 2026-11-13 决定）**：v1 首批只做 Android / Desktop / Web 三端，**G4 不作当前门禁**；原「G4；含 T6 iOS WebView 宿主 + P-256 设备绑定（+2 天）」保留为历史范围，恢复需用户重新拍板 |
 | F1 | `f1-release` | 未开工 | — | — | — | — | 0 | **G5** |
 

@@ -7,7 +7,7 @@
 ## 已完成（本仓可核实）
 
 - 契约：C-05 `rpc.json` **1.5.0**，方法 **47**（ui_to_core 34 / core_to_module 7 / module_to_core 6）；C-06 `events.json` **2.0.0**，事件 **34**；C-04 **34** 错误码；append 登记 **10+7+3=20** 块（出处：三份 schema 文件重算，`tools/check_ledger.py` 比对通过）。
-- 服务端测试：**1065 passed**（`pytest core/tests -q`，本 worktree 2026-11-14 复跑 `1065 passed, 6 warnings in 92.20s`；`core/vade/session/RESULT-rfc0014.md` 同数）。
+- 服务端测试：**1078 passed**（`pytest core/tests -q`，2026-11-14 在 `dev_gingshan` 合入 RFC-0003 Q5 后复跑 `1078 passed, 6 warnings in 86.21s`；初版 1065 为 RFC-0014 落地时、Q5 未合时的数）。
 - 契约门禁：`tools/check_contracts.py` → exit 0（`contracts: OK … RFC-0014 session search green …`）。
 - docs 门禁：`docs/check_docs.py` → exit 0（12 项，失败 0 项）。
 - RFC-0001～0009：已批准（frontmatter `approved`）且已实现合并（`docs/status.md` 各「已合并」行 + 契约 appends 登记在案 + 实现文件在仓）。
@@ -19,7 +19,7 @@
 - **「已实现但未批准」**：RFC-0010/0012/0013/0014 frontmatter `status: proposed` —— 代码与契约已落地，批准流程未走（出处：各 RFC frontmatter；`docs/rfc/README.md`）。
 - **文档债**：RFC-0003～0009 frontmatter `stage` 仍写「草稿，未实现」，与 status.md「已合并」矛盾——字段过时未回填（本仓不许改 RFC 正文，只能记录）。
 - **RFC-0011（InputBar 拆分）**：README 记客户端仓 vade-client `d667442` 已实现——**本仓无证据，未核实**。
-- 客户端三端（U1/U2/U3 批次）：status.md 主表均「未开工」，仅 C0c（Miuix 三端可行性）已合并为可行性结论，不是产品功能。
+- 客户端三端（U1/U2/U3）：`ui/` 已迁出为独立仓 **`vade-client`**（本仓不可达，故本页原先只能写「status.md 均未开工」——**那个口径已过期**）。该仓 `main` @ `31f8f9a` 的真实数字：**368 tests / 0 failures**、三目标绿（`desktopTest` + `assembleDebug` + `compileKotlinWasmJs`）、APK 21,878,888 B、Wasm 链接产物 13,681,513 B、MSI 93,312,713 B。**但 UI 数据仍是 fixtures**（`App()` 默认 `FakeSessionSource()`），真连接/真聊天/模块页/ask_user 卡片均未接线——「零件齐 ≠ 能用」，口径见该仓 `docs/QUICKSTART.md` 状态表。
 - `ask_user` 内置工具（RFC-0008 §14）：已注册（`core/vade/loop/builtins.py`；RESULT-askuser-tool.md 944 passed）。
 
 ## 未开始 / 未达成

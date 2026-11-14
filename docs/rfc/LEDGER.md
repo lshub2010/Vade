@@ -14,7 +14,7 @@
 | C-06 事件数 | **34**（含 `turn.state` 枚举条目；不含则 33） | 同上 |
 | C-04 错误码 | **34** | `schema/errors.json` |
 | append 登记块 | rpc.json **10** 块 / events.json **7** 块 / manifest.schema.json **3** 块，合计 **20** | 三文件 `x-vade.appends` |
-| 服务端测试 | **1065 passed**（`pytest core/tests -q`，本 worktree 2026-11-14 复跑：`1065 passed, 6 warnings in 92.20s`；RESULT-rfc0014.md 同数） | 本人复跑 |
+| 服务端测试 | **1078 passed**（`pytest core/tests -q`，2026-11-14 在 `dev_gingshan` 合入 RFC-0003 Q5 后复跑：`1078 passed, 6 warnings in 86.21s`）。本总账初版记录的 **1065** 是 RFC-0014 落地时、RFC-0003 Q5 未合时的数（出处 `core/vade/session/RESULT-rfc0014.md`；+13 = `core/tests/loop/test_compaction_catalog.py`） | 本人复跑 |
 | 契约门禁 | `tools/check_contracts.py` exit 0（`contracts: OK …RFC-0014 session search green…`） | 本人复跑 |
 | docs 门禁 | `docs/check_docs.py` exit 0（12 项，失败 0 项） | 本人复跑 |
 

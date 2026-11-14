@@ -1,7 +1,8 @@
 ---
 rfc: RFC-0005
 title: 模型能力查询与用量：`model/list`、会话级选择优先级与两级用量口径
-status: proposed
+status: approved
+approved: 2026-11-14
 date: 2026-11-14
 proposer: 编排（依据 `research/ui-decisions.md` #15 / #16、`research/ui-02-messages-input-attachments.md` §3.9 C7；AMEND-22 §8.22.2 R5、D96 / D101 / D102；PROGRESS.md 技术债 1）
 affects: C-05 `schema/rpc.json`（追加 `model/list`、`session/model.get|set`、`session/usage.get` 与 `ui/attach` snapshot 注记）、C-03 `schema/manifest.schema.json`（`capabilities.models[]`，追加）、C-06 `schema/events.json`（只追加）、C-18 `schema/config.schema.json`（`[llm]` 4 键 + `[usage]` 6 键）；内部 `core/vade/llm/*`、`core/vade/session/*`、`core/vade/admin/app.py`

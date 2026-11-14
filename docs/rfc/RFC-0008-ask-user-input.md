@@ -1,7 +1,8 @@
 ---
 rfc: RFC-0008
 title: agent 要求输入：`waiting_input` 状态、`turn.input_*` 事件对与 `turn/input` 取值通道
-status: proposed
+status: approved
+approved: 2026-11-14
 date: 2026-11-14
 proposer: 编排（依据 `docs/requirements.md` §8.21 FR-8.54/8.55、§8.22.2 R6 与 D103；`docs/agents/50-U1-ui-skeleton.md` §九把 U1-d 的输入对话框挂在本 RFC 上）
 affects: C-06 `schema/events.json`（新增 `turn.input_required` / `turn.input_resolved`；`turn_states` 与 `turn.state.enum` **追加 `waiting_input`**）、C-05 `schema/rpc.json`（`ui_to_core` 追加 `turn/input`、`turn/input.cancel`；`ui/attach` snapshot 注记 `pending_inputs[]`）、C-18 `schema/config.schema.json`（新增 `[ask_user]`）；`core/vade/session/models.py` 的 `TurnState`、`core/vade/input/`（新增模块）、`core/vade/policy/approval.py`（复用 id 生成与阻塞模式）

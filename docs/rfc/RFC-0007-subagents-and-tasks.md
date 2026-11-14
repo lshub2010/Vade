@@ -1,7 +1,8 @@
 ---
 rfc: RFC-0007
 title: 子代理与后台任务：统一 `task.*` 事件族、查询/取消/日志尾部与审批归属
-status: proposed
+status: approved
+approved: 2026-11-14
 date: 2026-11-14
 proposer: 编排（依据 `docs/requirements.md` §8.21 FR-8.56～8.62、`research/ui-decisions.md` #1、`research/agent-01-injection-comparison.md` R4；`docs/agents/50-U1-ui-skeleton.md` §四把 U1-d 挂在 RFC-0007 上）
 affects: C-06 `schema/events.json`（追加 `task.*` 事件族与顶层 `task_states`，`turn.approval_required` / `turn.approval_resolved` 追加可选字段）、C-05 `schema/rpc.json`（`ui_to_core` 追加 4 方法、`events_core_to_ui.names` 追加）、C-18 `schema/config.schema.json`（新增 `[tasks]`）；`core/vade/session/replay.py` 的覆盖率判定（core 内部）

@@ -1,7 +1,8 @@
 ---
 rfc: RFC-0004
 title: 附件与多模态：`POST /ui/blob` 上传协议、压缩图单 `file_id` 与 content parts 消息结构
-status: proposed
+status: approved
+approved: 2026-11-14
 date: 2026-11-14
 proposer: 编排（依据 `research/ui-decisions.md` #9 / #10、`research/ui-02-messages-input-attachments.md` §3.6 与 §3.9 的 C1/C2/C3/C9/C13；AMEND-21 §8.21.2 R1、AMEND-22 §8.22.2 R1/R5/R8）
 affects: C-05 `schema/rpc.json`（追加 `ui/blob.token` 与 `http_endpoints`，`ui/submit.content` 定型）、消息模型 `core/vade/session/models.py` + `sqlite_store.py`（`Message.content: str` → parts）、C-18 `schema/config.schema.json`（新增 `[attach]`）

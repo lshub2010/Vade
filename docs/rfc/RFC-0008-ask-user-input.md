@@ -8,7 +8,7 @@ proposer: 编排（依据 `docs/requirements.md` §8.21 FR-8.54/8.55、§8.22.2 
 affects: C-06 `schema/events.json`（新增 `turn.input_required` / `turn.input_resolved`；`turn_states` 与 `turn.state.enum` **追加 `waiting_input`**）、C-05 `schema/rpc.json`（`ui_to_core` 追加 `turn/input`、`turn/input.cancel`；`ui/attach` snapshot 注记 `pending_inputs[]`）、C-18 `schema/config.schema.json`（新增 `[ask_user]`）；`core/vade/session/models.py` 的 `TurnState`、`core/vade/input/`（新增模块）、`core/vade/policy/approval.py`（复用 id 生成与阻塞模式）
 related: RFC-0006（"未知事件类型必须忽略"由它提出；"不改 `turn_states`"的口径由本 RFC **首次打破**）；RFC-0007（子代理审批在父会话 seq 广播的先例，本 RFC §5.4 沿用）；RFC-0004（同批 UI 提案；对话框容器复用 C-09 的 `InputBar`）；RFC-0003（`ask_user` 的工具命名族与 L0 目录）
 type: 契约追加（C-05 / C-18）+ **一处枚举拓宽（C-06 `turn_states`，对穷举校验方属破坏性）**；无改名、无字段删除、无 C-04 新码
-stage: 草稿，未实现；不改 `schema/`，不动 `waiting_approval` 的既有语义，不做表单 DSL
+stage: 已实现并合并
 ---
 
 # RFC-0008 · agent 要求输入

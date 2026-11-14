@@ -20,6 +20,7 @@ on.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
@@ -28,7 +29,7 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 from ..errors import VadeError
 from .limits import check_content_limits, content_text
 from .models import (
-    TERMINAL_STATES, Event, Message, Session, Turn, TurnState, new_id, now_ms,
+    TERMINAL_STATES, Event, Message, Session, SessionGroup, Turn, TurnState, new_id, now_ms,
 )
 from .parts import (
     PartLimits,
@@ -44,9 +45,12 @@ from .parts import (
 from .queue import TurnQueue
 from .replay import ReplayBuffer
 from .seq import SeqAllocator
-from .store import SessionStore
+from .store import UNSET, SessionStore
 
-__all__ = ["SessionLog", "SinkWorker", "AttachResult", "EventSink"]
+__all__ = ["SessionLog", "SinkWorker", "AttachResult", "EventSink",
+           "ICON_NAMES", "ICON_PATTERN", "COLOR_PATTERN", "ICON_NAME_MAX",
+           "GROUP_NAME_MAX", "SESSION_TITLE_MAX", "validate_icon", "validate_color",
+           "validate_group_name", "validate_session_title"]
 
 EventSink = Any  # duck-typed: async send(dict) -> None
 
@@ -65,6 +69,90 @@ _TOMBSTONE_LIMIT = 1024
 REASON_SUBMIT = "submit"
 REASON_REGENERATE = "regenerate"
 REASON_EDIT = "edit_resubmit"
+
+# ------------------------------------------------------------------ RFC-0010
+#: RFC-0010 §7.1: Tabler semantic names a session/group icon may carry. The
+#: whitelist is the gate (not just the pattern) so three clients render the
+#: same set; new names are a contract revision, not a client-side hope.
+ICON_NAMES: frozenset[str] = frozenset({
+    "archive", "book", "bookmark", "brain", "briefcase", "bulb", "calendar", "chart-bar",
+    "chat", "clock", "cloud", "code", "database", "file", "file-text", "flag", "folder",
+    "heart", "home", "list", "lock", "mail", "map", "music", "note", "pencil", "phone",
+    "photo", "robot", "rocket", "search", "settings", "star", "tag", "terminal-2", "trash",
+    "video", "wallet", "world",
+})
+#: §7.1: shape cap and pattern. Both are contract constants (§1 #10), not
+#: config: a limit that varies per deployment is not a rendering contract.
+ICON_NAME_MAX = 64
+ICON_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
+#: §7.2: `#RRGGBB` only — no alpha, no named colors, no theme tokens (N4).
+COLOR_PATTERN = re.compile(r"^#[0-9a-fA-F]{6}$")
+#: §7.3: group names are folder labels, session titles are list rows.
+GROUP_NAME_MAX = 64
+SESSION_TITLE_MAX = 200
+
+
+def validate_icon(value: Any) -> str | None:
+    """§7.1: whitelist member + shape + length, or INVALID_ARGUMENT.
+
+    `None` passes through (absent / explicit clear). A shape-valid name that
+    is not a member is refused all the same — unknown metadata must not be
+    written, because it becomes synced contract data on the next list pull.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise VadeError("INVALID_ARGUMENT", "icon must be a whitelist name or null",
+                        data={"field": "icon"})
+    if len(value) > ICON_NAME_MAX or not ICON_PATTERN.match(value) or value not in ICON_NAMES:
+        raise VadeError("INVALID_ARGUMENT",
+                        f"icon {value!r} is not a known icon name (Tabler whitelist)",
+                        data={"field": "icon"})
+    return value
+
+
+def validate_color(value: Any) -> str | None:
+    """§7.2: `#RRGGBB` or INVALID_ARGUMENT; `None` passes through."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not COLOR_PATTERN.match(value):
+        raise VadeError("INVALID_ARGUMENT", "color must be #RRGGBB",
+                        data={"field": "color"})
+    return value
+
+
+def validate_group_name(value: Any) -> str:
+    """§7.3: strip; 1..GROUP_NAME_MAX or INVALID_ARGUMENT."""
+    if not isinstance(value, str):
+        raise VadeError("INVALID_ARGUMENT", "group name must be a string",
+                        data={"field": "name"})
+    clean = value.strip()
+    if not clean or len(clean) > GROUP_NAME_MAX:
+        raise VadeError("INVALID_ARGUMENT",
+                        f"group name must be 1..{GROUP_NAME_MAX} characters after trimming",
+                        data={"field": "name"})
+    return clean
+
+
+def validate_session_title(value: Any) -> str:
+    """§7.3: strip; 1..SESSION_TITLE_MAX or INVALID_ARGUMENT."""
+    if not isinstance(value, str):
+        raise VadeError("INVALID_ARGUMENT", "title must be a string",
+                        data={"field": "title"})
+    clean = value.strip()
+    if not clean or len(clean) > SESSION_TITLE_MAX:
+        raise VadeError("INVALID_ARGUMENT",
+                        f"title must be 1..{SESSION_TITLE_MAX} characters after trimming",
+                        data={"field": "title"})
+    return clean
+
+
+def _validate_sort_order(value: Any) -> int:
+    """§5 `group.create/update`: a manual ordering integer, >= 0."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise VadeError("INVALID_ARGUMENT", "sort_order must be a non-negative integer",
+                        data={"field": "sort_order"})
+    return value
 
 
 class SinkWorker:
@@ -220,6 +308,171 @@ class SessionLog:
 
     def get_session(self, session_id: str) -> Session | None:
         return self.store.load(session_id)
+
+    # ------------------------------------------------------------------ RFC-0010 §5
+    def list_sessions_page(
+        self, *, limit: int = 50, cursor: int = 0,
+        group_id: Any = UNSET, archived: bool = False,
+    ) -> dict[str, Any]:
+        """`session/list`: one light page in FR-8.26 order (§7.4)."""
+        if group_id is not UNSET and group_id is not None:
+            self._require_group(group_id)  # unknown filter -> NOT_FOUND (§7.3)
+        rows = self.store.list_session_rows(
+            limit=limit, offset=cursor, group_id=group_id, archived=archived,
+        )
+        # §1 #8: a full page MIGHT have a successor; a short page is the end.
+        next_cursor = cursor + len(rows) if len(rows) == limit else None
+        return {"sessions": [row.to_wire() for row in rows], "next_cursor": next_cursor}
+
+    async def rename_session(self, session_id: str, title: Any, *, by: str = "user") -> Session:
+        """`session/rename`: title only — content is never touched (§5)."""
+        clean = validate_session_title(title)
+        self._require_session(session_id)
+        self.store.update_session_meta(session_id, {"title": clean})
+        await self._emit_meta_updated(session_id, by)
+        return self._require_session(session_id)
+
+    async def set_pinned(self, session_id: str, pinned: Any, *, by: str = "user") -> Session:
+        """`session/pin`: the FR-8.26 ordering primary key (§7.4)."""
+        if not isinstance(pinned, bool):
+            raise VadeError("INVALID_ARGUMENT", "pinned must be a boolean",
+                            data={"field": "pinned"})
+        self._require_session(session_id)
+        self.store.update_session_meta(
+            session_id, {"pinned_at": now_ms() if pinned else None}
+        )
+        await self._emit_meta_updated(session_id, by)
+        return self._require_session(session_id)
+
+    async def set_archived(self, session_id: str, archived: Any, *, by: str = "user") -> Session:
+        """`session/archive`: leaves the default list, orthogonal to `state` (Q5)."""
+        if not isinstance(archived, bool):
+            raise VadeError("INVALID_ARGUMENT", "archived must be a boolean",
+                            data={"field": "archived"})
+        self._require_session(session_id)
+        self.store.update_session_meta(
+            session_id, {"archived_at": now_ms() if archived else None}
+        )
+        await self._emit_meta_updated(session_id, by)
+        return self._require_session(session_id)
+
+    async def assign_group(
+        self, session_id: str, group_id: Any, *, by: str = "user",
+    ) -> Session:
+        """`session/group.assign`: move to a group (or out, with `None`)."""
+        self._require_session(session_id)
+        if group_id is not None:
+            self._require_group(group_id)
+        self.store.update_session_meta(session_id, {"group_id": group_id})
+        await self._emit_meta_updated(session_id, by)
+        return self._require_session(session_id)
+
+    async def delete_session(self, session_id: str, *, by: str = "user") -> None:
+        """`session/delete`: hard-delete (§8.2), refuse while turns are live.
+
+        The confirmation dialog is client-side (FR-8.26); core's only guard is
+        the active-turn one — a deleted session with a running turn would
+        leave the queue executor writing into rows that no longer exist.
+        """
+        self._require_session(session_id)
+        queue = self._queues.get(session_id)
+        state = queue.state() if queue is not None else None
+        if state and (state.get("running") or state.get("pending")):
+            raise VadeError(
+                "INVALID_ARGUMENT",
+                "session has queued or running turns; stop them before deleting",
+                data={"reason": "turn_active", "turn_id": state.get("running")},
+            )
+        self.store.delete_session(session_id)
+        # Truth first, then the announcement: persist-then-broadcast (§6.2).
+        await self._fanout_session_list_changed(session_id, "removed", by=by)
+        await self.detach(session_id)
+        self._queues.pop(session_id, None)
+
+    async def _fanout_session_list_changed(
+        self, session_id: str, change: str, *, by: str = "system",
+    ) -> None:
+        """§6.2: one `session.list_changed` per OTHER attached session.
+
+        `module.status` precedent: list-level changes have no owning stream,
+        so every attached stream carries the trigger and each client re-pulls
+        `session/list`. The changed session itself is skipped — its own
+        client either just created it or is about to lose it.
+        """
+        for target in self.attached_sessions():
+            if target == session_id:
+                continue
+            try:
+                await self.emit(target, "session.list_changed",
+                                {"session_id": session_id, "change": change, "by": by})
+            except VadeError:
+                # A target deleted mid-fanout must not abort the remaining ones.
+                continue
+
+    async def _emit_meta_updated(self, session_id: str, by: str) -> None:
+        """§6.1: one `session.updated` on the changed session's OWN stream."""
+        session = self.store.load(session_id)
+        if session is None:  # deleted between the write and the emit
+            return
+        payload = session.to_wire()
+        payload["by"] = by
+        await self.emit(session_id, "session.updated", payload)
+
+    def create_group(self, name: Any, *, icon: Any = None, color: Any = None,
+                     sort_order: Any = 0) -> SessionGroup:
+        """`session/group.create`: one level, whitelist icon, #RRGGBB (§7)."""
+        group = SessionGroup(
+            group_id=new_id(), name=validate_group_name(name),
+            icon=validate_icon(icon), color=validate_color(color),
+            sort_order=_validate_sort_order(sort_order),
+        )
+        self.store.create_group(group)
+        return group
+
+    def update_group(self, group_id: str, fields: Mapping[str, Any]) -> SessionGroup:
+        """`session/group.update`: partial — only present keys change (§5)."""
+        self._require_group(group_id)
+        updates: dict[str, Any] = {}
+        if "name" in fields:
+            if fields["name"] is None:
+                raise VadeError("INVALID_ARGUMENT", "name cannot be cleared",
+                                data={"field": "name"})
+            updates["name"] = validate_group_name(fields["name"])
+        if "icon" in fields:
+            updates["icon"] = validate_icon(fields["icon"])
+        if "color" in fields:
+            updates["color"] = validate_color(fields["color"])
+        if "sort_order" in fields:
+            updates["sort_order"] = _validate_sort_order(fields["sort_order"])
+        if not updates:
+            raise VadeError("INVALID_ARGUMENT",
+                            "at least one of name/icon/color/sort_order is required",
+                            data={"field": "fields"})
+        self.store.update_group_fields(group_id, updates)
+        return self._require_group(group_id)
+
+    def delete_group(self, group_id: str) -> int:
+        """`session/group.delete`: §8.1 — members survive, unassigned."""
+        self._require_group(group_id)
+        return self.store.delete_group(group_id)
+
+    def list_groups(self) -> list[dict[str, Any]]:
+        """`session/group.list`: groups in contract order + member counts."""
+        counts = self.store.group_session_counts()
+        return [
+            {**group.to_wire(), "session_count": counts.get(group.group_id, 0)}
+            for group in self.store.list_groups()
+        ]
+
+    def _require_group(self, group_id: Any) -> SessionGroup:
+        if not isinstance(group_id, str) or not group_id:
+            raise VadeError("INVALID_ARGUMENT", "group_id must be a non-empty string",
+                            data={"field": "group_id"})
+        group = self.store.get_group(group_id)
+        if group is None:
+            raise VadeError("NOT_FOUND", f"group {group_id!r} does not exist",
+                            data={"reason": "unknown_group"})
+        return group
 
     # ------------------------------------------------------------------ models
     def set_model_resolver(self, resolver: Any) -> None:
@@ -393,6 +646,10 @@ class SessionLog:
         if session_id is None:
             session = self.create_session()
             session_id = session.id
+            # RFC-0010 §6.2: the auto-created session must reach the lists of
+            # every OTHER attached device (`added`; this client gets its own
+            # snapshot below and does not need the trigger).
+            await self._fanout_session_list_changed(session_id, "added")
         else:
             session = self._require_session(session_id)
 

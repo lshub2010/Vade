@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from ..errors import VadeError
 from ..transport.connection import RpcError
 from .manager import SessionLog
+from .store import UNSET
 
 __all__ = ["SessionRPC", "ConnectionSink"]
 
@@ -83,6 +84,17 @@ class SessionRPC:
             "message/edit_resubmit": self.message_edit_resubmit,
             "turn/input": self.turn_input,
             "turn/input.cancel": self.turn_input_cancel,
+            # RFC-0010 §5 (C-05 1.3.0): session metadata — list / verbs / groups.
+            "session/list": self.session_list,
+            "session/rename": self.session_rename,
+            "session/pin": self.session_pin,
+            "session/archive": self.session_archive,
+            "session/delete": self.session_delete,
+            "session/group.list": self.session_group_list,
+            "session/group.create": self.session_group_create,
+            "session/group.update": self.session_group_update,
+            "session/group.delete": self.session_group_delete,
+            "session/group.assign": self.session_group_assign,
         }
 
     # ------------------------------------------------------------------ ui/*
@@ -333,6 +345,126 @@ class SessionRPC:
         if inspect.isawaitable(result):
             result = await result
         return {"ok": True, "turn_id": result["turn_id"], "status": result["status"]}
+
+    # ------------------------------------------------------------------ RFC-0010 session metadata
+    async def session_list(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """`session/list`: one light page in FR-8.26 order (§5)."""
+        limit = params.get("limit", 50)
+        cursor = params.get("cursor", 0)
+        archived = params.get("archived", False)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+            raise VadeError("INVALID_ARGUMENT", "limit must be an integer in 1..200",
+                            data={"field": "limit"})
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+            raise VadeError("INVALID_ARGUMENT", "cursor must be a non-negative integer",
+                            data={"field": "cursor"})
+        if not isinstance(archived, bool):
+            raise VadeError("INVALID_ARGUMENT", "archived must be a boolean",
+                            data={"field": "archived"})
+        group_id: Any = UNSET
+        if "group_id" in params:
+            group_id = params.get("group_id")
+            if group_id is not None and not isinstance(group_id, str):
+                raise VadeError("INVALID_ARGUMENT",
+                                "group_id must be a string, null, or omitted",
+                                data={"field": "group_id"})
+        return self.log.list_sessions_page(limit=limit, cursor=cursor,
+                                           group_id=group_id, archived=archived)
+
+    async def session_rename(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        if "title" not in params:
+            raise VadeError("INVALID_ARGUMENT", "title is required",
+                            data={"field": "title"})
+        session = await self.log.rename_session(session_id, params.get("title"),
+                                                by=self._who(connection))
+        return {"ok": True, "session": session.to_wire()}
+
+    async def session_pin(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        if "pinned" not in params:
+            raise VadeError("INVALID_ARGUMENT", "pinned is required",
+                            data={"field": "pinned"})
+        session = await self.log.set_pinned(session_id, params.get("pinned"),
+                                            by=self._who(connection))
+        return {"ok": True, "pinned_at": session.pinned_at}
+
+    async def session_archive(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        if "archived" not in params:
+            raise VadeError("INVALID_ARGUMENT", "archived is required",
+                            data={"field": "archived"})
+        session = await self.log.set_archived(session_id, params.get("archived"),
+                                              by=self._who(connection))
+        return {"ok": True, "archived_at": session.archived_at}
+
+    async def session_delete(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """§8.2: the double-confirm dialog already happened client-side."""
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        await self.log.delete_session(session_id, by=self._who(connection))
+        return {"ok": True}
+
+    async def session_group_list(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        return {"groups": self.log.list_groups()}
+
+    async def session_group_create(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        if "parent_id" in params:
+            # §7.3: one level only — the data model has nowhere to hang a parent.
+            raise VadeError("INVALID_ARGUMENT", "groups cannot be nested",
+                            data={"field": "parent_id", "reason": "nesting_forbidden"})
+        if "name" not in params:
+            raise VadeError("INVALID_ARGUMENT", "name is required",
+                            data={"field": "name"})
+        group = self.log.create_group(
+            params.get("name"),
+            icon=params.get("icon"),
+            color=params.get("color"),
+            sort_order=params.get("sort_order", 0),
+        )
+        return {"group": group.to_wire()}
+
+    async def session_group_update(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        group_id = params.get("group_id")
+        if not isinstance(group_id, str) or not group_id:
+            raise VadeError("INVALID_ARGUMENT", "group_id is required",
+                            data={"field": "group_id"})
+        fields = {key: params[key] for key in ("name", "icon", "color", "sort_order")
+                  if key in params}
+        group = self.log.update_group(group_id, fields)
+        return {"group": group.to_wire()}
+
+    async def session_group_delete(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """§8.1: members are unassigned (the count says how many) — never deleted."""
+        group_id = params.get("group_id")
+        if not isinstance(group_id, str) or not group_id:
+            raise VadeError("INVALID_ARGUMENT", "group_id is required",
+                            data={"field": "group_id"})
+        unassigned = self.log.delete_group(group_id)
+        return {"ok": True, "unassigned": unassigned}
+
+    async def session_group_assign(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        if "group_id" not in params:
+            raise VadeError("INVALID_ARGUMENT", "group_id is required (null = ungroup)",
+                            data={"field": "group_id"})
+        group_id = params.get("group_id")
+        await self.log.assign_group(session_id, group_id, by=self._who(connection))
+        return {"ok": True, "group_id": group_id}
 
     def _input_ids(self, connection: Any, params: Mapping[str, Any]) -> tuple[str, str]:
         """Shared guard: writable session, both ids present (§7.4)."""

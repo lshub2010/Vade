@@ -17,7 +17,7 @@ from typing import Any, Mapping
 from .parts import parts_text
 
 __all__ = [
-    "Message", "Role", "TurnState", "Turn", "Session", "QueueItem", "Event",
+    "Message", "Role", "TurnState", "Turn", "Session", "SessionGroup", "QueueItem", "Event",
     "TERMINAL_STATES", "new_id", "now_ms", "message_ref",
 ]
 
@@ -261,9 +261,70 @@ class Session:
     #: RFC-0005 §5.3: explicit per-session model override; `None` = no
     #: override (fall through to `[llm].default_model`, then `priority`).
     model_id: str | None = None
+    # --- RFC-0010 §4.2: user-facing metadata (server-side truth, synced to
+    # every device through `session/list` + `session.updated`). All optional;
+    # rows written before the columns existed read the documented defaults.
+    group_id: str | None = None
+    icon: str | None = None
+    color: str | None = None
+    pinned_at: int | None = None
+    archived_at: int | None = None
+    unread: int = 0
+    #: Last ACTIVITY time (a message/turn row was persisted), not a metadata
+    #: timestamp: renaming must not float a session to the top of "today".
+    #: 0 = unknown (the store coalesces to `created_at` on write and read).
+    updated_at: int = 0
 
     def message_tree(self) -> list[dict[str, Any]]:
         return [m.to_dict() for m in self.messages]
+
+    def to_wire(self) -> dict[str, Any]:
+        """RFC-0010 §4.3/§5: the `session/list` row shape (C-05 1.3.0).
+
+        Deliberately light — no messages, no turns: the list page scrolls and
+        content belongs to `ui/attach`. `updated_at` coalesces to `created_at`
+        for rows that never saw activity.
+        """
+        return {
+            "session_id": self.id,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at or self.created_at,
+            "title": self.title,
+            "icon": self.icon,
+            "color": self.color,
+            "group_id": self.group_id,
+            "pinned_at": self.pinned_at,
+            "archived_at": self.archived_at,
+            "unread": self.unread,
+            "state": self.state,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SessionGroup:
+    """RFC-0010 §4.1: one folder in the session list (one level, no nesting).
+
+    A session belongs to AT MOST one group (`sessions.group_id`), so ordering
+    has a single key and "move to group" is one column write — the folder
+    decision (§1 #1/#2), not a tagging scheme.
+    """
+
+    group_id: str
+    name: str
+    icon: str | None = None
+    color: str | None = None
+    sort_order: int = 0
+    created_at: int = field(default_factory=now_ms)
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "group_id": self.group_id,
+            "name": self.name,
+            "icon": self.icon,
+            "color": self.color,
+            "sort_order": self.sort_order,
+            "created_at": self.created_at,
+        }
 
 
 @dataclass(frozen=True, slots=True)

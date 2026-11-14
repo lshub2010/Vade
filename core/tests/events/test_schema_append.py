@@ -19,6 +19,7 @@ SCHEMA = Path(__file__).resolve().parents[3] / "schema" / "events.json"
 C06_EVENTS = {
     "session.attached", "turn.queued", "turn.started", "turn.delta", "turn.tool_call",
     "turn.tool_result", "turn.approval_required", "turn.approval_resolved",
+    "turn.input_required", "turn.input_resolved",
     "turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled",
     "queue.updated", "module.status", "turn.state",
 }
@@ -32,6 +33,10 @@ C06_REQUIRED = {
     "turn.tool_result": ["turn_id", "call_id", "ok", "summary"],
     "turn.approval_required": ["turn_id", "request_id", "tool", "args", "risk", "expires_at"],
     "turn.approval_resolved": ["turn_id", "request_id", "decision", "by", "scope", "state"],
+    # RFC-0008 §6.1/§6.2: both are state-change events, so `state` is required.
+    "turn.input_required": ["input_id", "turn_id", "state", "kind", "prompt", "schema",
+                            "options", "timeout_s", "expires_at"],
+    "turn.input_resolved": ["input_id", "turn_id", "state", "status", "value", "by"],
     "turn.completed": ["turn_id", "state", "usage"],
     "turn.failed": ["turn_id", "state", "code", "message"],
     "turn.interrupted": ["turn_id", "state", "by"],
@@ -48,15 +53,29 @@ def load() -> dict:
 def test_c06_is_untouched():
     data = load()
     assert data["id"] == "C-06"
-    assert data["version"] == "1.0.0"
+    # RFC-0008 §6.4: the enum was widened (7 -> 8 states), which is breaking for
+    # an exhaustive validator, so the version moved with it. This assertion is
+    # the drift guard for that decision — an extra state without a major bump
+    # (or a major bump with no state) fails here.
+    assert data["version"] == "2.0.0"
     assert data["status"] == "frozen"
     assert data["owner"] == "C3"
     assert C06_EVENTS <= set(data["events"])
     for name, required in C06_REQUIRED.items():
         assert data["events"][name]["required"] == required, name
-    assert data["turn_states"] == ["queued", "waiting_approval", "running", "completed",
-                                   "failed", "interrupted", "cancelled"]
+    assert data["turn_states"] == ["queued", "waiting_approval", "waiting_input", "running",
+                                   "completed", "failed", "interrupted", "cancelled"]
     assert any("C3d may APPEND session.turn / session.closed" in rule for rule in data["rules"])
+
+
+def test_rfc0008_append_block_declares_the_enum_widening():
+    data = load()
+    blocks = data["x-vade"]["appends"]
+    [block] = [b for b in blocks if "RFC-0008" in b["doc"]]
+    assert block["version"] == "2.0.0"
+    assert set(block["adds"]) == {"turn.input_required", "turn.input_resolved"}
+    assert block["enum_widen"]["turn_states"] == ["waiting_input"]
+    assert "none" in block["rewrites"]
 
 
 def test_c14_appends_three_topics():

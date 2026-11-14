@@ -97,8 +97,10 @@ C-06 把 turn 的**状态机**写清楚了，但没写 turn 的**内容语义**�
 
 ```json
 {"turn_id":"t_2","state":"interrupted","by":"user",
- "partial_message_id":"m_7f3a...","partial_chars":128}
+ "partial_message_id":"msg:7f3a…","partial_chars":128}
 ```
+
+> `partial_message_id` 的取值形状与 `result_ref` 一致，都是 `msg:<hex>`；消息行自身存裸 id。审查曾指出此处示例写成 `m_7f3a…` 与契约不符，已订正。
 
 - `partial_chars` 按 Unicode code point 计，与 §8 的长度单位一致；UI 的"已生成 N 字"直接用它，不再自己数 delta（自己数会与 core 差一个在途 delta）。
 - 去重规则：**部分文本以落库消息为准**。客户端如果已经按 delta 渲染了该 turn：① 本地字符数等于 `partial_chars` → 保留本地缓冲，只把气泡绑定到 `partial_message_id`；② 不等 → 说明有在途 delta 丢失，先显示"正在同步…"，重新 `ui/attach` 用 snapshot 替换该气泡后再落定；③ 本地已有该 `partial_message_id` 的消息 → 只换指针，不追加。**禁止**把事件与本地缓冲相加（事件没有文本），也禁止同时渲染两条。没有 `partial_message_id` 时保留本地缓冲。

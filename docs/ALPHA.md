@@ -10,7 +10,7 @@
 
 G1–G5 是**发布级**目标（端到端 + SDK 冻结 / 审批审计闭环 / 三端聊天 / iOS 真机 / 抓包 0 泄漏）。按 G5 口径，alpha 必须等六个模块（fs/shell/web/memory/mcp-bridge/model）齐备、admin 前端完成、M4b 自进化完成——这是数周量级。
 
-但在那之前有一个更高优先级的问题：**「架构到底对不对」还没被真实验证过**。草案时口径：客户端协议层 19/33 方法、UI 全部假数据；真模块只有一个 `echo`（4 个 trivial 工具，用途是证明管道）。截至 2026-11-14，协议层已是 **34/34** 方法有类型封装 + 契约覆盖率守卫测试（`vade-client: composeApp/src/commonMain/kotlin/vade/ui/protocol/VadeClient.kt:110-145`），但 UI 数据层默认仍走 fixtures（`vade-client: composeApp/src/commonMain/kotlin/vade/ui/App.kt:42` 默认 `FakeSessionSource`）——**协议齐了，窗口里的内容还没换**。真模块仍只有 `echo`，且在独立仓 `Vade-module-echo`，本仓 `modules/` 只有 README。在这种情况下继续堆模块，是在未验证的地基上加层。
+但在那之前有一个更高优先级的问题：**「架构到底对不对」还没被真实验证过**。草案时口径：客户端协议层 19/33 方法、UI 全部假数据；真模块只有一个 `echo`（4 个 trivial 工具，用途是证明管道）。截至 2026-11-15，协议层已是 **35/35** 方法有类型封装（今晚随 RFC-0015 补上 `ui/modules`）+ 契约覆盖率守卫测试（`vade-client: composeApp/src/commonMain/kotlin/vade/ui/protocol/VadeClient.kt:110-145`），UI 数据层默认仍走 fixtures（`vade-client: composeApp/src/commonMain/kotlin/vade/ui/App.kt:42` 默认 `FakeSessionSource`），但**这是刻意的**：真模式永远是显式选择（桌面 `VADE_SOURCE=real` / Android intent extra / Wasm `?source=real`）。2026-11-15 起真源已接线并有端到端证据（`RealCoreUiE2ETest`：起真 core，断言界面出现 core 铸造的会话标题、且假数据专有字符串一个都不在），所以「协议齐了、内容还没换」这句已不成立。真模块仍只有 `echo`，且在独立仓 `Vade-module-echo`，本仓 `modules/` 只有 README。在这种情况下继续堆模块，是在未验证的地基上加层。
 
 所以先做**口径 A**：让整条链路真跑起来，用最小成本证伪架构错误。
 
@@ -31,7 +31,7 @@ G1–G5 是**发布级**目标（端到端 + SDK 冻结 / 审批审计闭环 / �
 ### A1 连接与凭证
 - [x] 客户端能在本机连上 core（`ui/attach` 成功，拿到 32-hex session id + 快照） — 证据：`vade-client: shots/w1-proto/smoke.md`（真 core 回 `sessionId=8488050c39f649338930012fbbeaf276`、`fromSeq=0`、快照全字段解码）；封装见 `vade-client: composeApp/src/commonMain/kotlin/vade/ui/protocol/VadeClient.kt:509`。注：本条验的是协议层，窗口内仍是 fixtures（见 A2）。
 - [ ] 首次运行有配对流程（一次性配对码或等价机制），**不把 token 明文落日志** — 现状：机制齐——服务端 `core/vade/identity/pairing.py:152` 的 `PairingStore.create` 铸一次性码，客户端 `POST /ui/session` 换 `__Host-ac_ui` cookie、token 不进日志（`vade-client: composeApp/src/commonMain/kotlin/vade/ui/protocol/VadeTransport.kt:58-120`）；缺：三端都没有**输入配对码的首次运行界面**（`BrowserPairing` 只能由代码注入），双击产物连不上 core。
-- [ ] 断线后自动重连（指数退避，有上限），界面上有明确连接状态 — 现状：指数退避 500 ms → 30 s 上限 + 自动 re-attach 已实现且有测试（`vade-client: composeApp/src/commonMain/kotlin/vade/ui/protocol/VadeClient.kt:96`、`vade-client: composeApp/src/commonMain/kotlin/vade/ui/data/RealSessionState.kt:28`）；缺：界面无连接状态（`vade-client: composeApp/src/commonMain/kotlin/vade/ui/shell/TopBar.kt` 未绑 `RealSessionState`），且桌面默认 `FakeSessionSource`，连接根本不会发生。
+- [ ] 断线后自动重连（指数退避，有上限），界面上有明确连接状态 — 现状：指数退避 500 ms → 30 s 上限 + 自动 re-attach 已实现且有测试（`vade-client: composeApp/src/commonMain/kotlin/vade/ui/protocol/VadeClient.kt:96`、`vade-client: composeApp/src/commonMain/kotlin/vade/ui/data/RealSessionState.kt:28`）；缺：**顶栏**没有连接状态指示（`vade-client: composeApp/src/commonMain/kotlin/vade/ui/shell/TopBar.kt` 未绑 `RealSessionState`）；会话列表顶部已有三态横幅（假数据 / 正在连接 core（带真实 endpoint）/ 失败（带分类、传输原话与可照抄的启动命令））。桌面默认 `FakeSessionSource` 是刻意设计，真模式靠 `VADE_SOURCE=real` 显式开启，`RealCoreUiE2ETest` 已用真 core 端到端验证过。
 
 ### A2 真聊天
 - [ ] 发送消息走 `ui/submit`，返回 `turn_id` 与 `queue_pos` — 现状：类型化封装 + 真 core 冒烟已证（`SubmitResult(turnId=7b2a7edf733e46b9be13ec8db32d9000, queuePos=1)`，`vade-client: shots/w1-proto/smoke.md`）；缺：`ChatState.submit()` 只改本地 `items`、不调用 source（`vade-client: composeApp/src/commonMain/kotlin/vade/ui/chat/ChatState.kt:450`），窗口里的「发送」没有出网。

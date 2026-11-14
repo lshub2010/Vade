@@ -58,6 +58,12 @@ class TurnOutcome:
     assistant_text: str = ""
     tool_calls: tuple[dict[str, Any], ...] = ()
     stopped_reason: str | None = None
+    #: RFC-0002: skill NAMES the prompt hooks activated this turn — verbatim
+    #: pass-through of `PromptParts.activated_skills` (the loader is the
+    #: normalization point: sorted names, never bodies; the loop never re-sorts,
+    #: dedups or truncates). `()` when no hook activated anything. The queue
+    #: emits it as `turn.completed.skills` (always present, `[]` when empty).
+    activated_skills: tuple[str, ...] = ()
 
 
 class _PartCursors:
@@ -167,6 +173,10 @@ class LoopEngine:
         )
         initial_block = parts.tool_block
         parts = await apply_hooks(parts, self._prompt_hooks())
+        # RFC-0002 §2: record the hook-activated skill names NOW. `parts` is
+        # rebound to the part-index cursor further down, so this is the only
+        # point where PromptParts.activated_skills is still reachable.
+        activated_skills = tuple(parts.activated_skills or ())
         visible: set[str] = set()
         if layered and parts.tool_block == initial_block:
             # Hot set after hooks, so layer 2 (a just-activated skill's
@@ -459,6 +469,7 @@ class LoopEngine:
             usage=_usage_record(turn.model_id, usage, reported=reported, steps=llm_calls),
             assistant_text=final_text, tool_calls=tuple(recorded),
             stopped_reason=stopped_reason,
+            activated_skills=activated_skills,
         )
 
     # ------------------------------------------------------------------ helpers

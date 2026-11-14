@@ -13,8 +13,8 @@
 | C-06 events.json 顶部 version | **2.0.0** | `schema/events.json` |
 | C-06 事件数 | **34**（含 `turn.state` 枚举条目；不含则 33） | 同上 |
 | C-04 错误码 | **34** | `schema/errors.json` |
-| append 登记块 | rpc.json **10** 块 / events.json **7** 块 / manifest.schema.json **3** 块，合计 **20** | 三文件 `x-vade.appends` |
-| 服务端测试 | **1078 passed**（`pytest core/tests -q`，2026-11-14 在 `dev_gingshan` 合入 RFC-0003 Q5 后复跑：`1078 passed, 6 warnings in 86.21s`）。本总账初版记录的 **1065** 是 RFC-0014 落地时、RFC-0003 Q5 未合时的数（出处 `core/vade/session/RESULT-rfc0014.md`；+13 = `core/tests/loop/test_compaction_catalog.py`） | 本人复跑 |
+| append 登记块 | rpc.json **10** 块 / events.json **8** 块 / manifest.schema.json **3** 块，合计 **21** | 三文件 `x-vade.appends` |
+| 服务端测试 | **1089 passed**（`pytest core/tests -q`，2026-11-14 在 `dev_gingshan` 合入 RFC-0003 Q5 后复跑：`1078 passed, 6 warnings in 86.21s`；RFC-0002 落地后在 worktree s-rfc0002 复跑：`1089 passed, 6 warnings in 65.79s`，+11 = RFC-0002 新增用例）。本总账初版记录的 **1065** 是 RFC-0014 落地时、RFC-0003 Q5 未合时的数（出处 `core/vade/session/RESULT-rfc0014.md`；+13 = `core/tests/loop/test_compaction_catalog.py`） | 本人复跑 |
 | 契约门禁 | `tools/check_contracts.py` exit 0（`contracts: OK …RFC-0014 session search green…`） | 本人复跑 |
 | docs 门禁 | `docs/check_docs.py` exit 0（12 项，失败 0 项） | 本人复跑 |
 
@@ -23,7 +23,7 @@
 | RFC | 标题 | status（frontmatter） | 实现状态（核实） | 契约方法（C-05 adds） | 契约事件（C-06 adds） | 其他契约登记 | append 版本 | 实现落点（本仓已验证存在） | 测试数（来源） | 验收（行/勾） |
 |---|---|---|---|---|---|---|---|---|---|---|
 | RFC-0001 | 在 C-03 `manifest` 中追加 `subscriptions` | 已实施（C3d，待 C2 追认）〔无 frontmatter，正文表〕 | 已实现 | 无 | 无 | manifest.appends：C-14 1.0.0 `subscriptions` | manifest 1.0.0 | `core/vade/registry/manifest.py` | 5 passed（RFC-0001 §6 自述：`test_c3d_registration_chain.py` 5 例） | 无 A 表（命令式验收）· 0/0 |
-| RFC-0002 | 在 C-06 `turn.completed` 中追加 `skills` | 草案（未实施）〔无 frontmatter，正文表〕 | **未实施** | 无 | 无 | 无 | — | 无落点（未实施） | 未记录（未实施） | 无 A 表 · 0/0 |
+| RFC-0002 | 在 C-06 `turn.completed` 中追加 `skills` | 草案（实施已落，待批准追认）〔无 frontmatter，正文表〕 | 已实现 | 无 | 无（adds=[]；`turn.completed` payload 追加可选字段 `skills`，required 未动） | 无 | C-06 1.3.0（append 级；顶部 version 保持 2.0.0） | `core/vade/loop/engine.py`、`core/vade/session/queue.py` | 新增 11 passed（worktree s-rfc0002：`test_engine.py` 7 例 + `test_queue.py` 4 例）；全量复跑 1089 passed（见 §1） | 无 A 表 · 0/0 |
 | RFC-0003 | 提示词注入分层：技能目录消息化、工具渐进披露与 stable/context 分段 | approved | 已实现（frontmatter stage「草稿，未实现」已过时） | 无 | `turn.skill_catalog`、`turn.tool_discovered` | C-11 `skill.schema.json` x-vade.injection；C-18 `prompt.injection`/`tools.hot`/`tools.hot_max` | C-06 1.1.0 | `core/vade/loop/prompt.py`、`core/vade/skill/loader.py`、`core/vade/loop/engine.py` | 967 passed（`core/vade/prompt/RESULT-rfc0003.md`：基线 934+33） | 13/0 |
 | RFC-0004 | 附件与多模态：`POST /ui/blob` 上传协议、压缩图单 `file_id` 与 content parts 消息结构 | approved | 已实现（frontmatter stage 已过时） | 无方法名——adds 原文：`ui/submit.content typed part union`、`http_endpoints` | 无 | C-18 `[attach]` 17 键 | C-05 1.1.0 | `core/vade/blob/http.py`、`core/vade/session/parts.py`、`core/vade/session/models.py`、`core/vade/session/sqlite_store.py` | 539 passed（`core/vade/session/RESULT-parts.md`）；0004a 记 489（`docs/status.md` rfc0004a 行） | 13/0（验收号 A1–A14，A2/A3 合并一行） |
 | RFC-0005 | 模型能力查询与用量：`model/list`、会话级选择优先级与两级用量口径 | approved | 已实现（frontmatter stage 已过时） | `model/list`、`session/model.get`、`session/model.set`、`session/usage.get` | `usage.budget`（另 `turn.started`/`turn.failed`/`turn.interrupted` 三事件追加字段） | manifest.appends：`capabilities.models`（块 contract 字段写的是 "RFC-0005"，非契约号）；C-18 `[llm]` 4 键 + `[usage]` 6 键 | C-05 1.2.0；C-06 2.0.0；manifest 1.0.0 | `core/vade/llm/catalog.py`、`core/vade/llm/usage.py`、`core/vade/llm/capabilities.py` | 530 passed（`core/vade/llm/RESULT-rfc0005.md`）；status.md 记 860（合并后全量口径） | 13/0（验收号 A1–A12 + A10b） |
@@ -53,12 +53,12 @@
     "events_total_excl_turn_state": 33,
     "error_codes": 34,
     "appends_rpc": 10,
-    "appends_events": 7,
+    "appends_events": 8,
     "appends_manifest": 3
   },
   "rfcs": {
     "RFC-0001": {"status": "已实施（C3d，待 C2 追认）", "impl_state": "已实现", "methods": [], "events": [], "manifest_fields": ["subscriptions"], "append_versions": {"manifest.schema.json": "1.0.0"}, "impl": ["core/vade/registry/manifest.py"], "acceptance_rows": 0, "acceptance_checked": 0},
-    "RFC-0002": {"status": "草案（未实施）", "impl_state": "未实施", "methods": [], "events": [], "manifest_fields": [], "append_versions": {}, "impl": [], "acceptance_rows": 0, "acceptance_checked": 0},
+    "RFC-0002": {"status": "草案（实施已落，待批准追认）", "impl_state": "已实现", "methods": [], "events": [], "manifest_fields": [], "append_versions": {"events.json": "1.3.0"}, "impl": ["core/vade/loop/engine.py", "core/vade/session/queue.py"], "acceptance_rows": 0, "acceptance_checked": 0},
     "RFC-0003": {"status": "approved", "impl_state": "已实现", "methods": [], "events": ["turn.skill_catalog", "turn.tool_discovered"], "manifest_fields": [], "append_versions": {"events.json": "1.1.0"}, "impl": ["core/vade/loop/prompt.py", "core/vade/skill/loader.py", "core/vade/loop/engine.py"], "acceptance_rows": 13, "acceptance_checked": 0},
     "RFC-0004": {"status": "approved", "impl_state": "已实现", "methods": ["ui/submit.content typed part union", "http_endpoints"], "events": [], "manifest_fields": [], "append_versions": {"rpc.json": "1.1.0"}, "impl": ["core/vade/blob/http.py", "core/vade/session/parts.py", "core/vade/session/models.py", "core/vade/session/sqlite_store.py"], "acceptance_rows": 13, "acceptance_checked": 0},
     "RFC-0005": {"status": "approved", "impl_state": "已实现", "methods": ["model/list", "session/model.get", "session/model.set", "session/usage.get"], "events": ["usage.budget"], "manifest_fields": ["capabilities.models"], "append_versions": {"rpc.json": "1.2.0", "events.json": "2.0.0", "manifest.schema.json": "1.0.0"}, "impl": ["core/vade/llm/catalog.py", "core/vade/llm/usage.py", "core/vade/llm/capabilities.py"], "acceptance_rows": 13, "acceptance_checked": 0},
@@ -79,7 +79,7 @@
 
 1. RFC-0003～0009 frontmatter `stage` 均自称「草稿，未实现」，与 status.md「已合并」及契约登记矛盾——stage 字段过时未回填（本仓不许改 RFC 正文，只能在此记录）。
 2. 「34 方法」口径：三方向合计 **47**；34 只是 ui_to_core 方向数（与 34 错误码、34 事件撞数，口头汇报必错）。
-3. 「events.json 10 条 appends」口径：events.json 实为 **7** 块；10 是 rpc.json 的块数；三文件合计 20 块。
+3. 「events.json 10 条 appends」口径：events.json 实为 **8** 块；10 是 rpc.json 的块数；三文件合计 21 块。
 4. append 块级版本 ≠ 契约顶部版本（RFC-0013 块级 1.2.0 / 顶部 1.3.0→1.5.0 共存），引用版本号必须说明是哪一层。
 5. RFC-0007 的 4 个 `task.*` 事件与顶层 `task_states` 在 events.json **没有** append 登记块（rpc.json 侧有登记）——append-per-minor 纪律的缺口。
 6. RESULT-rfc0007.md 记 601 passed，status.md 记 607 passed——无出处解释的 6 条差异。

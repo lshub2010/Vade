@@ -251,7 +251,11 @@ class TurnQueue:
             updated,
             TurnState.COMPLETED,
             {"turn_id": turn.id, "usage": usage, "state": TurnState.COMPLETED.value,
-             "stopped_reason": stopped_reason},
+             "stopped_reason": stopped_reason,
+             # RFC-0002 §2: skill NAMES only, `[]` when none — the key is always
+             # present (never omitted, never null); a replayed old event without
+             # it is read as [] by consumers.
+             "skills": list(getattr(outcome, "activated_skills", ()) or ())},
             messages=messages,
             task=task,
         )

@@ -168,7 +168,8 @@ def test_no_modules_returns_readable_no_capability_message():
 
 def test_no_concrete_tool_names_in_loop_source():
     source = (Path(__file__).resolve().parents[3] / "core" / "vade" / "loop" / "engine.py").read_text()
-    for literal in ("fs__", "shell__", "com.example", "read_file"):
+    for literal in ("fs__", "shell__", "com.example", "read_file",
+                    "skill_load", "tools_search", "tools/search"):
         assert literal not in source, f"agent-loop must not know {literal!r}"
 
 

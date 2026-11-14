@@ -81,6 +81,51 @@
         }
       }
     },
+    "prompt": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "RFC-0003 §7 — prompt injection layout ([prompt]). Additive to C-18 1.1.0, following the [attach]/[tasks] precedent; the root stays additionalProperties:false, so a typo here is UNKNOWN_CONFIG_KEY at startup rather than a silent default.",
+      "properties": {
+        "injection": {
+          "type": "string",
+          "enum": ["legacy", "layered"],
+          "default": "legacy",
+          "x-vade": {
+            "apply": "restart",
+            "owner": "C3",
+            "note": "legacy = the pre-RFC-0003 assembly, byte-identical (golden fixture core/tests/loop/golden/prompt_legacy.json); layered = stable/context split, the skill catalog as a durable user message, and hot/cold tool disclosure. A restart item on purpose: a hot switch would let one session assemble turn N legacy and turn N+1 layered, which breaks the prefix cache in a way no test can reproduce. Default stays legacy until U1-0 acceptance."
+          }
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "RFC-0003 §4.3 — hot/cold tool disclosure ([tools]). Only read when prompt.injection=layered; legacy always sends the full frozen snapshot. Modules cannot self-nominate (Q4): the hot set comes from core built-ins, loaded skills' requires_tools, this config, and the session sticky set.",
+      "properties": {
+        "hot": {
+          "type": "array",
+          "items": {"type": "string"},
+          "default": [],
+          "x-vade": {
+            "apply": "restart",
+            "owner": "C3",
+            "note": "Layer-3 hot list: tool names (LLM form `{prefix}__{tool}` or protocol form `{module_id}/{tool}`) always kept resident. Entries that are not in the turn's frozen snapshot are ignored, never an error."
+          }
+        },
+        "hot_max": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 12,
+          "x-vade": {
+            "apply": "restart",
+            "owner": "C3",
+            "note": "Resident-tools ceiling; overflow is truncated by priority and gets a `+N more tools are available` trailer in tool_block (§4.3.1)."
+          }
+        }
+      }
+    },
     "audit": {
       "type": "object",
       "additionalProperties": false,

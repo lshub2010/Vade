@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
-__all__ = ["CATALOG_HEADER", "Rendered", "estimate_tokens", "render_catalog", "render_bodies"]
+__all__ = ["CATALOG_HEADER", "Rendered", "estimate_tokens", "render_catalog", "render_bodies", "render_content"]
 
 CATALOG_HEADER = "Skills (activate with @name; bodies load on activation):"
 MIN_BODY_CHARS = 400
@@ -141,3 +141,36 @@ def render_bodies(
         return "", (), tuple(sorted(dropped))
     text = "\n\n".join(chunks[name] for name in sorted(chunks))
     return text, tuple(sorted(chunks)), tuple(sorted(dropped))
+
+
+def render_content(
+    states: Sequence[object],
+    mentioned: Sequence[str],
+    *,
+    budget_chars: int,
+) -> str:
+    """RFC-0003 §4.2.3: @name bodies as `<skill_content>` blocks.
+
+    Layered layout: the body leaves the system prompt and arrives as one
+    user-role message (the `skill_content` slot), wrapped per skill with its
+    revision so the model can tell versions apart. Budget rule follows
+    `render_bodies` — most-relevant first, overflow dropped, never re-ranked.
+    """
+    by_name = {str(getattr(s, "name")): s for s in states}
+    budget = max(0, int(budget_chars))
+    blocks: list[str] = []
+    used = 0
+    for name in mentioned:
+        state = by_name.get(str(name))
+        if state is None:
+            continue
+        body = str(getattr(state, "body", ""))
+        revision = int(getattr(state, "revision", 0) or 0)
+        text = f'<skill_content name="{name}" revision="{revision}">\n{body}\n</skill_content>'
+        if used + len(text) > budget and blocks:
+            break
+        if len(text) > budget:
+            continue
+        blocks.append(text)
+        used += len(text) + 2
+    return "\n\n".join(blocks)

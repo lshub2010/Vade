@@ -559,6 +559,27 @@
       },
       "required": ["message_id", "session_id", "superseded_by_message_id", "new_turn_id", "text", "edited_at"],
       "notes": "RFC-0006 1.1.0. Named `edited` but messages are immutable: the old row is never UPDATEd, it only gains `superseded_by`. `text` lets an attached client update the bubble without a re-attach; clients de-duplicate by superseded_by_message_id."
+    },
+    "turn.skill_catalog": {
+      "payload": {
+        "turn_id": "string",
+        "digest": "string (sha256 hex over the catalog entries: name + clipped description + marker, name order)",
+        "entries": ["string (skill names, name order)"],
+        "empty": "boolean (true = the retirement entry: no skills are available this session)"
+      },
+      "required": ["turn_id", "digest"],
+      "notes": "RFC-0003 §4.2/§5.1 row 6. Rides next to the persisted user-role catalog message (the `<system-reminder>` envelope; role=user, own seq). Sent on a session's first layered turn, when the digest changes (full replacement, no diff), and for the empty retirement entry — never twice for the same digest. Q1 answer, option (a): a client may render the paired message as a system notice instead of a user bubble."
+    },
+    "turn.tool_discovered": {
+      "payload": {
+        "turn_id": "string",
+        "tool": "string (model-visible name)",
+        "tool_id": "string",
+        "query_digest": "string(12) (sha256 of the search query that surfaced it, empty when a skill's requires_tools enabled it)",
+        "total_matches": "int"
+      },
+      "required": ["turn_id", "tool", "tool_id"],
+      "notes": "RFC-0003 §4.3.3/§5.5: sent once when a tool first enters the schemas() of a later step in this turn (tools/search hit or loaded-skill requires_tools). The same turn never repeats it for the same tool; tools resident from the turn's start never fire it. Unknown events are ignored by clients (RFC-0008 rule)."
     }
   },
   "x-vade": {
@@ -681,6 +702,20 @@
           "usage.budget is a session event, NOT a C-14 push topic (no x-vade.push marker)"
         ],
         "rewrites": "none. The top-level `version` stays 2.0.0 (RFC-0008's enum widening owns that bump; this batch appends no state). Every pre-existing `required` list, rule and enum is untouched — the only edits to existing entries are OPTIONAL payload keys plus notes. Recorded in full under `x-vade.rfc0005_append`."
+      },
+      {
+        "contract": "C-06",
+        "version": "1.1.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0003-prompt-injection-layers.md",
+        "adds": ["turn.skill_catalog", "turn.tool_discovered"],
+        "overrides": [
+          "turn.skill_catalog travels next to a persisted user-role `<system-reminder>` message (RFC-0003 §4.2); the message itself is an ordinary message row with its own seq, replayed like any other",
+          "turn.tool_discovered is payload-only: it never carries `state` and never changes the turn enum",
+          "RFC-0003 §5.5: unknown events are ignored by clients while last_seq advances (the RFC-0008 rule already covers this; restated here because both events land in one batch)",
+          "top-level `version` stays 2.0.0; `turn_states` / `task_states` untouched (RFC-0003 adds no state); both events are payload-only turn-stream writes emitted by core/vade/loop/engine.py in layered mode only"
+        ],
+        "rewrites": "none"
       }
     ]
   }

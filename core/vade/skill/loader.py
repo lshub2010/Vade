@@ -712,14 +712,25 @@ class SkillLoader:
         ]
 
     # ----------------------------------------------------------------- render
+    @property
+    def injection(self) -> str:
+        """`prompt.injection` (RFC-0003 §7): `legacy` (default) or `layered`."""
+        value = self._cfg("prompt.injection", "legacy")
+        return "layered" if str(value or "").strip().lower() == "layered" else "legacy"
+
     def render(self, parts: Any) -> Any:
         """Prompt hook. Reads only `parts.user_message`, returns a replaced copy.
 
         No per-session state lives here: two concurrent sessions calling this at
-        the same time cannot bleed into each other.
+        the same time cannot bleed into each other. In layered mode the two
+        system slots stay EMPTY (§5.3): the catalog moves to a durable user
+        message the loop sends, and bodies move to `skill_content` (@name) or
+        the `skill_load` tool result.
         """
         states = self.catalog()
         activation = select(getattr(parts, "user_message", "") or "", states, limit=self.max_activated)
+        if self.injection == "layered":
+            return self._render_layered(parts, states, activation)
         catalog, l0_dropped = skill_render.render_catalog(
             states, activation.names, token_budget=self.l0_token_budget
         )
@@ -740,6 +751,95 @@ class SkillLoader:
             skill_bodies=bodies,
             activated_skills=tuple(sorted(injected)),
         )
+
+    def _render_layered(self, parts: Any, states: Any, activation: Any) -> Any:
+        """Layered hook (§4.2.3): only @name mentions get their body, and it
+        travels as a user-role `<skill_content>` message, not a system section.
+        Trigger hits are marked `[match]` in the catalog message instead — the
+        model is expected to call `skill_load` itself (the U1-0 fallback path,
+        if activation drops, is to preload trigger hits here again).
+        """
+        mentioned = tuple(activation.mentioned)
+        content = skill_render.render_content(
+            states, mentioned, budget_chars=self.body_budget_chars
+        )
+        self._note_used(mentioned)
+        return replace(
+            parts,
+            skill_catalog="",
+            skill_bodies="",
+            skill_content=content,
+            activated_skills=tuple(sorted(mentioned)),
+        )
+
+    # ------------------------------------------------------- catalog message
+    def catalog_digest(self, states: Any = None) -> str:
+        """RFC-0003 §4.2.1: sha256 over name + clipped description + marker,
+        name order. Envelope wording and `[match]` markers stay OUT of it, so
+        rewording never resends and per-turn trigger hits never poison it."""
+        from ..loop.catalog import CatalogEntry, catalog_digest as _digest
+
+        entries = [
+            CatalogEntry(name=str(s.name), description=str(s.description), marker=str(s.marker))
+            for s in (states if states is not None else self.catalog())
+        ]
+        return _digest(entries)
+
+    def catalog_message(self, states: Any, last: str | None = None) -> str | None:
+        """RFC-0003 §5.3: the full replacement message, or `None` = do not
+        resend (`last` is the digest of the log's most recent catalog message)."""
+        from ..loop.catalog import CatalogEntry, catalog_message as _message
+
+        entries = [
+            CatalogEntry(name=str(s.name), description=str(s.description), marker=str(s.marker))
+            for s in states
+        ]
+        digest = self.catalog_digest(entries)
+        if last is not None and last == digest:
+            return None
+        return _message(entries, digest)
+
+    def catalog_matches(self, user_text: str) -> tuple[str, ...]:
+        """Names this message activates (@name + trigger hits), rank order —
+        the `[match]` marker set for the catalog message, capped at
+        `max_activated`."""
+        matched = select(user_text or "", self.catalog(), limit=self.max_activated)
+        return tuple(matched.names)
+
+    def requires_for(self, names: Any) -> tuple[str, ...]:
+        """`requires_tools` of the named skills, in order (§4.3.1 layer 2)."""
+        out: list[str] = []
+        for name in names or ():
+            state = self._states.get(str(name))
+            if state is not None:
+                out.extend(str(t) for t in state.requires_tools)
+        return tuple(out)
+
+    def load_body(self, name: str, *, budget_chars: int | None = None) -> tuple[str, int, bool]:
+        """RFC-0003 §4.2.4: one body per call, re-read from disk every time.
+
+        Returns `(body, revision, truncated)`. Because the read is fresh, a
+        body edit needs no version bump and no catalog refresh — catalog and
+        body lifecycles are separate, like dsh's. `budget_chars` (the caller's
+        per-turn remainder) may only shrink the cap, never grow it.
+        """
+        state = self._states.get(name)
+        if state is None:
+            raise VadeError("NOT_FOUND", f"no active skill named {name!r}")
+        if state.status not in ("active", "stale", "unavailable"):
+            raise VadeError("INVALID_ARGUMENT", f"skill {name!r} is {state.status}; not loadable")
+        path = Path(state.meta.path)
+        try:
+            text = path.read_bytes().decode("utf-8")
+            parsed = parse_document(text, required_sections=self.contract.required_sections)
+        except (OSError, UnicodeDecodeError, SkillParseError) as exc:
+            raise VadeError("UNAVAILABLE", f"skill body unreadable: {name}: {type(exc).__name__}") from exc
+        cap = self.body_max_chars if budget_chars is None else max(0, min(int(budget_chars), self.body_max_chars))
+        body, truncated, _reason = truncate_body(
+            parsed.body, max_chars=cap, max_lines=self.body_max_lines, path=path,
+        )
+        self._note_used([name])
+        return body, int(state.revision), bool(truncated)
 
     def _note_used(self, names: Iterable[str]) -> None:
         """In-memory only: a write per turn would be write amplification."""

@@ -10,18 +10,22 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
+import socket
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
 from ..errors import VadeError
-from ..router.dispatch import Router, digest_args
+from ..router.dispatch import Router, ToolCallResult, digest_args
 from ..session.models import Message, Turn, new_id, now_ms
+from .catalog import parse_catalog_digest
 from .context import CompactionConfig, ContextBuilder
+from .coretools import STICKY_K, more_tools_line
 from .ports import ApprovalDecision, ApprovalPort, ApprovalRequest, AuditPort, MemoryPort, NullApprovalPort, NullAuditPort
 from .prompt import PromptParts, apply_hooks, assemble
 from .toolcard import build_args_preview
-from .tools import ToolSnapshot
+from .tools import ToolEntry, ToolSnapshot, resolve_hot
 
 __all__ = ["LoopEngine", "LoopConfig", "TurnOutcome", "DEFAULT_PERSONA"]
 
@@ -38,6 +42,13 @@ class LoopConfig:
     ctx_tokens: int = 32_000
     approval_timeout_s: int = 60
     persona: str = DEFAULT_PERSONA
+    #: RFC-0003 §7: prompt.injection — "legacy" (default) keeps the pre-RFC
+    #: assembly byte-identical; "layered" enables stable/context + catalog
+    #: message + hot/cold tools. A restart item on purpose (§7: no hot switch).
+    injection: str = "legacy"
+    #: RFC-0003 §4.3: tools.hot_max (C-18, default 12) and tools.hot (default []).
+    hot_max: int = 12
+    hot_tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +104,8 @@ class LoopEngine:
         config: LoopConfig | None = None,
         compaction: CompactionConfig | None = None,
         blob_store: Any = None,
+        core_tools: Mapping[str, Any] | None = None,
+        catalog: Any = None,
     ) -> None:
         self.router = router
         self.llm = llm
@@ -105,6 +118,13 @@ class LoopEngine:
         self._prompt_hooks = prompt_hooks or (lambda: ())
         self.config = config or LoopConfig()
         self.context = ContextBuilder(compaction or CompactionConfig(), blob_store=blob_store)
+        # RFC-0003 §4.2/§4.3: core-native tools and the catalog port. Both are
+        # wired by the session component in layered mode only; in legacy they
+        # stay empty and every code path below is the pre-RFC one.
+        self._core_tools: dict[str, Any] = dict(core_tools or {})
+        self._catalog = catalog
+        self._session_hot: dict[str, list[str]] = {}
+        self._layered = self.config.injection == "layered"
 
     async def run_turn(self, turn: Turn, content: Sequence[Mapping[str, Any]]) -> TurnOutcome:
         if self.llm is None:
@@ -113,6 +133,14 @@ class LoopEngine:
         # flags it, then creates this coroutine's task). Do not spend a step.
         self._raise_if_interrupted(turn)
         snapshot = self._snapshot()
+        layered = self._layered
+        if layered and self._core_tools:
+            # Core-native entries join the frozen table BEFORE the no-capability
+            # gate (§4.2.4: the core tools are resident hot tools): in layered
+            # mode a modules-less core still carries the catalog and the core
+            # tools, so the notice must not swallow them. Legacy never grafts
+            # anything, so its gate (and golden bytes) stay untouched.
+            snapshot = snapshot.with_core(self._core_entries())
         if self.router is None or not snapshot:
             text = "No capabilities are available: no module is online, so I cannot run tools."
             await self._turn_emit(
@@ -128,11 +156,28 @@ class LoopEngine:
             tool_block=snapshot.render_block(),
             session_memory=memory_text,
             user_message=turn.user_text,
+            context=_runtime_facts(turn.model_id) if layered else "",
         )
+        initial_block = parts.tool_block
         parts = await apply_hooks(parts, self._prompt_hooks())
-        system_messages = assemble(parts)
+        visible: set[str] = set()
+        if layered and parts.tool_block == initial_block:
+            # Hot set after hooks, so layer 2 (a just-activated skill's
+            # requires_tools) is included (§4.3.1). A hook that customized
+            # tool_block wins over the hot projection.
+            hot, dropped = self._resolve_hot(turn, parts, snapshot)
+            visible = set(hot)
+            block = snapshot.select(hot).render_block()
+            if dropped:
+                block = f"{block}\n{more_tools_line(dropped)}" if block else more_tools_line(dropped)
+            parts = replace(parts, tool_block=block)
+        elif layered:
+            visible = {entry.llm_name for entry in snapshot.entries}
+        system_messages = assemble(parts, injection="layered" if layered else "legacy")
 
         history = list(self._history(turn.session_id))
+        if layered and self._catalog is not None:
+            history = await self._inject_catalog(turn, history)
         fitted = self.context.fit(history, ctx_tokens=self.config.ctx_tokens, current_turn_id=turn.id)
         messages: list[dict[str, Any]] = [m.to_llm() for m in system_messages]
         messages.extend(m.to_llm() for m in fitted)
@@ -144,6 +189,7 @@ class LoopEngine:
         reported = False
         llm_calls = 0
         parts = _PartCursors()
+        start_visible = frozenset(visible)
 
         for step in range(self.config.max_steps):
             parts.begin_step()
@@ -153,7 +199,13 @@ class LoopEngine:
             attribution: dict[str, Any] = {}
             llm_calls += 1
             started = time.perf_counter()
-            stream = self._chat(messages, snapshot.schemas(), turn.model_id, attribution)
+            tools = snapshot.schemas()
+            if layered:
+                # Hot ∪ discovered so far; every entry still comes from the
+                # frozen snapshot, and a discovery joins at the NEXT step
+                # boundary (§4.3.3 — no extra round trip, one schema change).
+                tools = snapshot.select(visible).schemas()
+            stream = self._chat(messages, tools, turn.model_id, attribution)
             try:
                 async for delta in stream:
                     # A provider whose `chat()` swallows the cancellation (or answers
@@ -288,9 +340,7 @@ class LoopEngine:
                     recorded.append({"tool": name, "args_digest": digest_args(args), "ok": False})
                     continue
 
-                result = await self.router.call(
-                    entry.tool_id, args, session_id=turn.session_id, turn_id=turn.id, call_id=call_id
-                )
+                result, core_tool = await self._call_tool(turn, name, entry, args, snapshot, layered, call_id)
                 # The side effect already happened (the module ran), so audit it
                 # BEFORE the interruption guard below can stop the turn: after
                 # the guard there is no code path left that could write it, and
@@ -328,6 +378,13 @@ class LoopEngine:
                 )
                 messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": tool_content})
                 recorded.append({"tool": name, "args_digest": digest_args(args), "ok": result.ok})
+                if layered and core_tool is not None:
+                    # Step-boundary expansion (§4.3.3): a discovery or a loaded
+                    # skill's requires_tools join the NEXT step's schemas.
+                    await self._absorb(turn, core_tool, result, snapshot, visible, start_visible)
+                elif layered and result.ok:
+                    # §4.3.1 layer 4: last successful module calls stay sticky.
+                    self._sticky_add(turn.session_id, name)
             else:
                 continue
 
@@ -365,6 +422,163 @@ class LoopEngine:
         )
 
     # ------------------------------------------------------------------ helpers
+    def _core_entries(self) -> tuple[ToolEntry, ...]:
+        """ToolEntry projections of the core-native tools (§4.2.4). The loop
+        never names them: the specs live in `loop.coretools`."""
+        return tuple(
+            ToolEntry(
+                llm_name=tool.llm_name, tool_id=tool.tool_id, module_id="core",
+                description=tool.description, input_schema=dict(tool.input_schema),
+                risk=tool.risk, timeout_ms=0, idempotent=True,
+            )
+            for tool in self._core_tools.values()
+        )
+
+    def _resolve_hot(self, turn: Turn, parts: PromptParts, snapshot: ToolSnapshot) -> tuple[tuple[str, ...], int]:
+        """§4.3.1: four-layer hot set, resolved against the frozen snapshot."""
+        requires: tuple[str, ...] = ()
+        loaded = tuple(parts.activated_skills or ())
+        if loaded and self._catalog is not None:
+            try:
+                requires = tuple(self._catalog.requires(loaded))
+            except Exception:  # a broken catalog port must not break the turn
+                requires = ()
+        known = tuple(self._session_hot.get(turn.session_id, ()))
+        return resolve_hot(
+            snapshot=snapshot,
+            core_names=tuple(self._core_tools),
+            config_hot=self.config.hot_tools,
+            session_known=known,
+            skill_requires=requires,
+            hot_max=self.config.hot_max,
+        )
+
+    def _entry_for_name(self, snapshot: ToolSnapshot, name: str) -> ToolEntry | None:
+        """Resolve an LLM name OR a protocol tool_id (skills may declare either)."""
+        from .tools import normalize_tool_key
+
+        key = normalize_tool_key(name)
+        if not key:
+            return None
+        for entry in snapshot.entries:
+            if normalize_tool_key(entry.llm_name) == key or normalize_tool_key(entry.tool_id) == key:
+                return entry
+        return None
+
+    def _sticky_add(self, session_id: str, name: str) -> None:
+        """§4.3.1 layer 4: session-sticky tools, most recent last, capped at K."""
+        known = self._session_hot.setdefault(session_id, [])
+        if name in known:
+            known.remove(name)
+        known.append(name)
+        del known[:-STICKY_K]
+        while len(self._session_hot) > 128:  # prune idle sessions, oldest first
+            self._session_hot.pop(next(iter(self._session_hot)))
+
+    async def _absorb(
+        self,
+        turn: Turn,
+        core_tool: Any,
+        result: Any,
+        snapshot: ToolSnapshot,
+        visible: set[str],
+        start_visible: frozenset[str],
+    ) -> None:
+        """Discover / require-enable tools for the next step (§4.3.3).
+
+        Everything is sourced from the frozen snapshot; `turn.tool_discovered`
+        fires once per tool that was NOT resident when the turn began.
+        """
+        meta = core_tool.discovery_meta(result)
+        for raw_name in (*core_tool.discovered(result), *core_tool.requires(result)):
+            entry = self._entry_for_name(snapshot, str(raw_name))
+            if entry is None or entry.llm_name in visible:
+                continue
+            visible.add(entry.llm_name)
+            self._sticky_add(turn.session_id, entry.llm_name)
+            if entry.llm_name in start_visible:
+                continue
+            await self._turn_emit(turn, "turn.tool_discovered", {
+                "turn_id": turn.id, "tool": entry.llm_name, "tool_id": entry.tool_id,
+                "query_digest": str(meta.get("query_digest") or ""),
+                "total_matches": int(meta.get("total_matches") or 0),
+            })
+
+    async def _call_tool(
+        self,
+        turn: Turn,
+        name: str,
+        entry: Any,
+        args: Mapping[str, Any],
+        snapshot: ToolSnapshot,
+        layered: bool,
+        call_id: str,
+    ) -> tuple[Any, Any]:
+        """Router dispatch, or the core handler for a core-native tool (§4.2.4).
+
+        A core tool never reaches the router; its handler is duck-typed and
+        returns an ok/code/message envelope that maps onto `ToolCallResult`, so
+        the audit / result / blob path below stays shared. Returns
+        `(result, core_tool_or_None)` — the loop needs the CoreTool afterwards
+        to absorb discoveries and skill requirements.
+        """
+        core_tool = self._core_tools.get(name) if layered else None
+        if core_tool is None:
+            if self.router is None:  # unreachable past the no-capability gate
+                raise VadeError("UNAVAILABLE", "no router is configured")
+            return (
+                await self.router.call(
+                    entry.tool_id, args, session_id=turn.session_id, turn_id=turn.id, call_id=call_id
+                ),
+                None,
+            )
+        try:
+            raw = await core_tool.handler(args, snapshot, session_id=turn.session_id, turn_id=turn.id)
+        except Exception as exc:  # fail closed, like a broken approver
+            return (
+                ToolCallResult(ok=False, tool_id=entry.tool_id, code=getattr(exc, "code", None) or "INTERNAL",
+                               message=str(exc)),
+                core_tool,
+            )
+        return (
+            ToolCallResult(
+                ok=bool(raw.get("ok")), tool_id=core_tool.tool_id, result=raw.get("result"),
+                code=raw.get("code") or None, message=str(raw.get("message") or ""),
+            ),
+            core_tool,
+        )
+
+    async def _inject_catalog(self, turn: Turn, history: list[Message]) -> list[Message]:
+        """§4.2.2: resend decision against the LOG, not memory.
+
+        The baseline is the last visible catalog message in the session log, so
+        a restart / reconnect / compaction cannot make the loop think a catalog
+        is still in front of the model. `None` baseline = first turn = always
+        send; same digest = send nothing; new digest or empty catalog = one full
+        replacement message (user role, persisted with its own seq).
+        """
+        info = self._catalog.view(turn.user_text or "")
+        last: str | None = None
+        for message in reversed(history):
+            digest = parse_catalog_digest(getattr(message, "content", ""))
+            if digest is not None and getattr(message, "role", "") == "user":
+                last = digest
+                break
+        if last == info.digest:
+            return history
+        message = Message(
+            id=new_id(), session_id=turn.session_id, turn_id=turn.id,
+            role="user", content=info.text, created_at=now_ms(),
+        )
+        await self._turn_emit(
+            turn, "turn.skill_catalog",
+            {"turn_id": turn.id, "digest": info.digest, "entries": list(info.names),
+             "empty": bool(info.empty)},
+            messages=[message],
+        )
+        history.append(message)
+        return history
+
     def _chat(
         self,
         messages: Sequence[Mapping[str, Any]],
@@ -526,6 +740,31 @@ class LoopEngine:
             self.audit.record(event)
         except Exception:
             pass
+
+
+def _runtime_facts(model_id: str | None) -> str:
+    """RFC-0003 §4.4: per-turn facts, written ONLY into the context section.
+
+    The hard rule is one-directional: facts that may change per turn are banned
+    from `stable`, they do not have to exist. There is deliberately no
+    wall-clock line here — a timestamp would break the turn-to-turn context
+    stability that A2 pins, and nothing in v1 consumes it.
+    """
+    lines = ["Runtime facts (may change between turns):"]
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    if cwd:
+        lines.append(f"- cwd: {cwd}")
+    lines.append(f"- model: {model_id or 'unset'}")
+    try:
+        device = socket.gethostname()
+    except OSError:
+        device = ""
+    if device:
+        lines.append(f"- device: {device}")
+    return "\n".join(lines)
 
 
 def _usage_record(

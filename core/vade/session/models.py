@@ -230,18 +230,31 @@ class QueueItem:
 
 @dataclass(frozen=True, slots=True)
 class Event:
-    """One entry of the per-session stream. `seq` is allocated by the core."""
+    """One entry of the per-session stream. `seq` is allocated by the core.
+
+    `coalesce` marks a droppable, self-contained update (RFC-0007 §5.5 R5):
+    `task.progress` is an absolute value, not a delta, so replay coverage may
+    ignore it and a client must not read a gap made only of such events as a
+    hole. It travels on the wire as `x-vade.coalesce` and is still written to
+    the `events` table — this is a coverage question, not a retention one.
+    """
 
     session_id: str
     seq: int
     type: str
     payload: Mapping[str, Any] = field(default_factory=dict)
     ts: int = field(default_factory=now_ms)
+    coalesce: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {"session_id": self.session_id, "seq": self.seq, "type": self.type,
-                "payload": dict(self.payload), "ts": self.ts}
+                "payload": dict(self.payload), "ts": self.ts, "coalesce": self.coalesce}
 
     def to_wire(self) -> dict[str, Any]:
         """Event frame shape: `{type, seq, payload}` (session known per conn)."""
-        return {"type": self.type, "seq": self.seq, "payload": dict(self.payload)}
+        frame: dict[str, Any] = {
+            "type": self.type, "seq": self.seq, "payload": dict(self.payload),
+        }
+        if self.coalesce:
+            frame["x-vade"] = {"coalesce": True}
+        return frame

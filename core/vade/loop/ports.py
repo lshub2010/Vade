@@ -26,6 +26,12 @@ class ApprovalRequest:
     #: Core-owned emit. The port uses it to publish `turn.approval_required`
     #: on the ONE seq stream; it must not open its own event channel.
     emit: Callable[[str, Mapping[str, Any]], Awaitable[Any]] | None = None
+    #: RFC-0007 §7.1 attribution. `task_id` is the task that raised the call
+    #: (`None` for a main-turn call), `depth` is its level in the task tree and
+    #: is what §7.2 rule 4 uses to refuse grant inheritance.
+    task_id: str | None = None
+    task_name: str | None = None
+    depth: int = 0
 
 
 @dataclass(frozen=True, slots=True)

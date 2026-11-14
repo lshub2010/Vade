@@ -138,6 +138,12 @@ class SessionLog:
         self._blobs = blobs
         self.limits = limits or PartLimits()
         self.approval_port: Any = None
+        #: RFC-0007: `TaskRegistry`, installed by `vade.tasks.install()`. Two
+        #: things read it — `snapshot()` (tasks are reconnect truth) and
+        #: `interrupt()` (a stopped turn cancels its subagents). `None` means
+        #: the tasks component is absent, and `snapshot` then omits the key
+        #: entirely so a client can tell "no tasks" from "core predates tasks".
+        self.tasks: Any = None
         self._closed = False
         #: Bound on the first async call; `status.ModuleStatusPublisher` needs
         #: to know which loop to hop onto when the registry (sync) changes.
@@ -194,14 +200,22 @@ class SessionLog:
         payload: Mapping[str, Any] | None = None,
         *,
         messages: Sequence[Message] = (),
+        coalesce: bool = False,
     ) -> Event:
-        """Allocate seq, persist (messages + event), replay-add, then broadcast."""
+        """Allocate seq, persist (messages + event), replay-add, then broadcast.
+
+        `coalesce=True` is RFC-0007 §5.5 R5: the row is persisted and broadcast
+        like any other, but it does not count as a continuity witness for
+        `ui/attach(last_seq=...)` — only droppable, absolute-value updates
+        (`task.progress`) may pass it.
+        """
         self._loop = asyncio.get_running_loop()
         async with self._emit_lock(session_id):
             seq = self._seq.next(session_id)
             event = Event(
                 session_id=session_id, seq=seq, type=event_type,
                 payload=dict(payload or {}), ts=int(self._clock()),
+                coalesce=bool(coalesce),
             )
             stamped = [replace(m, seq=seq) for m in messages]
             self.store.append(session_id, stamped, [event])
@@ -297,7 +311,7 @@ class SessionLog:
                 pending = list(self.approval_port.pending(session_id))
             except Exception:  # pragma: no cover - approval port is C5a's
                 pending = []
-        return {
+        snapshot: dict[str, Any] = {
             "from_seq": self.store.last_seq(session_id),
             "session": {
                 "id": session.id,
@@ -310,6 +324,15 @@ class SessionLog:
             "queue": queue.state() if queue is not None else {"running": None, "pending": []},
             "pending_approvals": pending,
         }
+        if self.tasks is not None:
+            # RFC-0007 §5.6: `attach()` sends a snapshot *instead of* the events
+            # that led here, so a task missing from this dict is a task that
+            # vanishes on reconnect (FR-8.59). Omitted when the component is
+            # absent — a missing key is the documented "not implemented" signal.
+            tasks, truncated = self.tasks.snapshot(session_id)
+            snapshot["tasks"] = tasks
+            snapshot["tasks_truncated"] = bool(truncated)
+        return snapshot
 
     # ------------------------------------------------------------------ turns
     def _queue(self, session_id: str) -> TurnQueue:
@@ -450,7 +473,12 @@ class SessionLog:
 
     async def interrupt(self, session_id: str, turn_id: str, *, by: str = "user") -> bool:
         self._require_session(session_id)
-        return await self._queue(session_id).interrupt(turn_id, by=by)
+        stopped = await self._queue(session_id).interrupt(turn_id, by=by)
+        if stopped and self.tasks is not None:
+            # RFC-0007 §5.7: stopping a turn cancels its subagents, never its
+            # jobs. "Stop thinking for me" is not "cancel that download".
+            await self.tasks.cancel_turn(session_id, turn_id, by="parent")
+        return stopped
 
     async def cancel(self, session_id: str, turn_id: str, *, by: str = "user") -> bool:
         self._require_session(session_id)

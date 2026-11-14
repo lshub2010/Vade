@@ -10,6 +10,8 @@
 | 产出 | Android / Desktop / Web 三端可聊天 + `material` 皮肤 + `Skin` 接口 + 4 个一级目的地骨架 + 模块页面外壳 |
 | 出口 | **G3**；**C-09 `Skin.kt` 第 3 天冻结**、**C-10 `ProtocolClient.kt` 周末冻结** |
 
+> **仓库**：客户端已独立成仓 **`vade-client`**（`github.com/lshub2010/vade-client`，本地 `D:/HermesWorkspace/Vade-client`）。本文所有 `ui/...` 路径均指该仓内路径，不是主仓路径。
+
 ## 一、一句话任务
 
 把 core 的事件流变成一个能用的聊天客户端：**4 个一级目的地（会话 / 活动 / 能力 / 我的）**、三端同源、断线能续、皮肤可换；并且把「皮肤」定成一个**组件工厂接口**，让 U2/U3 能在不碰业务页面的前提下接入。

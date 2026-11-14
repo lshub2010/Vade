@@ -28,6 +28,7 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError
 from .limits import check_content_limits, content_text
+from .search import LIMIT_DEFAULT, validate_query
 from .models import (
     TERMINAL_STATES, Event, Message, Session, SessionGroup, Turn, TurnState, new_id, now_ms,
 )
@@ -328,6 +329,25 @@ class SessionLog:
         # §1 #8: a full page MIGHT have a successor; a short page is the end.
         next_cursor = cursor + len(rows) if len(rows) == limit else None
         return {"sessions": [row.to_wire() for row in rows], "next_cursor": next_cursor}
+
+    # ------------------------------------------------------------------ RFC-0014 §5
+    def search(self, raw_query: Any, *, limit: Any = LIMIT_DEFAULT,
+               offset: Any = 0, session_id: Any = None) -> dict[str, Any]:
+        """`session/search`: titles + live bodies, two-tier order, clipped snippets.
+
+        The limit/offset type+range checks live in exactly ONE place — the
+        `session_search` handler (mirroring `session_list`); duplicating them
+        here would let a future edit delete one copy and leave the mutation
+        tests green. This method only normalizes the query and resolves the
+        optional scope.
+        """
+        query = validate_query(raw_query)
+        if session_id is not None:
+            self._require_session(session_id)
+        hits, total = self.store.search_sessions(
+            query, limit=limit, offset=offset, session_id=session_id,
+        )
+        return {"results": [hit.to_wire() for hit in hits], "total": total}
 
     async def rename_session(self, session_id: str, title: Any, *, by: str = "user") -> Session:
         """`session/rename`: title only — content is never touched (§5)."""

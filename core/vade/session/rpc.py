@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from ..errors import VadeError
 from ..transport.connection import RpcError
 from .manager import SessionLog
+from .search import LIMIT_DEFAULT, LIMIT_MAX
 from .store import UNSET
 
 __all__ = ["SessionRPC", "ConnectionSink"]
@@ -95,6 +96,8 @@ class SessionRPC:
             "session/group.update": self.session_group_update,
             "session/group.delete": self.session_group_delete,
             "session/group.assign": self.session_group_assign,
+            # RFC-0014 §5 (C-05 1.5.0): cross-session search — titles + bodies.
+            "session/search": self.session_search,
         }
 
     # ------------------------------------------------------------------ ui/*
@@ -465,6 +468,35 @@ class SessionRPC:
         group_id = params.get("group_id")
         await self.log.assign_group(session_id, group_id, by=self._who(connection))
         return {"ok": True, "group_id": group_id}
+
+    # ------------------------------------------------------------------ RFC-0014 session search
+    async def session_search(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """`session/search`: parameterized LIKE over titles + live bodies (§4).
+
+        The `limit` cap is enforced HERE and nowhere else, deliberately: it is
+        the single point the contract names, and a second copy in the manager
+        would let a future edit delete one and leave the mutation tests green
+        (RFC-0014 §8 mutation ②).
+        """
+        query = params.get("query")
+        if not isinstance(query, str):
+            raise VadeError("INVALID_ARGUMENT", "query is required and must be a string",
+                            data={"field": "query"})
+        limit = params.get("limit", LIMIT_DEFAULT)
+        offset = params.get("offset", 0)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= LIMIT_MAX:
+            raise VadeError("INVALID_ARGUMENT", f"limit must be an integer in 1..{LIMIT_MAX}",
+                            data={"field": "limit"})
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise VadeError("INVALID_ARGUMENT", "offset must be a non-negative integer",
+                            data={"field": "offset"})
+        session_id = params.get("session_id")
+        if session_id is not None and (not isinstance(session_id, str) or not session_id):
+            raise VadeError("INVALID_ARGUMENT", "session_id must be a non-empty string or null",
+                            data={"field": "session_id"})
+        # Read verb: a read_only connection searches exactly like it lists and
+        # attaches (§4.8) — no READ_ONLY_SESSION refusal here.
+        return self.log.search(query, limit=limit, offset=offset, session_id=session_id)
 
     def _input_ids(self, connection: Any, params: Mapping[str, Any]) -> tuple[str, str]:
         """Shared guard: writable session, both ids present (§7.4)."""

@@ -29,6 +29,7 @@ from .models import (
     Event, Message, Session, SessionGroup, SubagentRun, SubagentState,
     Turn, TurnState, now_ms,
 )
+from .search import LIMIT_DEFAULT, SearchHit, escape_like, find_ascii_ci, make_snippet
 from .store import UNSET, SessionStore
 
 __all__ = ["SQLiteStore"]
@@ -686,6 +687,87 @@ class SQLiteStore(SessionStore):
                 " WHERE group_id IS NOT NULL GROUP BY group_id"
             ).fetchall()
         return {row["group_id"]: int(row["n"]) for row in rows}
+
+    # --------------------------------------------------------------- RFC-0014
+    def search_sessions(
+        self, query: str, *, limit: int = LIMIT_DEFAULT, offset: int = 0,
+        session_id: str | None = None,
+    ) -> tuple[list[SearchHit], int]:
+        """RFC-0014 §4: parameterized LIKE scan over titles + live bodies.
+
+        Injection posture (§4.10): the pattern (`%` + `escape_like(query)` +
+        `%`) and every scope value travel as `?` parameters — no query text is
+        ever concatenated into SQL. `%`, `_` and the backslash are escaped so
+        they match literally; a quote or `--` stays a plain bound value.
+
+        The two tier queries and the per-page snippet lookups share ONE
+        `_lock` hold, so a concurrent `append()` cannot split a title row
+        from its body rows. Ordering is §4.4: title tier first (SQL-side
+        `updated_at DESC, id ASC`), then the body tier (Python-side sort,
+        same keys), pages sliced across the concatenation.
+        """
+        like = "LIKE ? ESCAPE '\\'"
+        pattern = f"%{escape_like(query)}%"
+        title_scope, body_scope, scope_params = "", "", []
+        if session_id is not None:
+            title_scope = " AND id = ?"
+            body_scope = " AND session_id = ?"
+            scope_params = [session_id]
+        with self._lock:
+            title_rows = self._conn.execute(
+                "SELECT id AS session_id, title, updated_at, archived_at FROM sessions"
+                f" WHERE title {like}{title_scope}"
+                " ORDER BY updated_at DESC, id ASC",
+                (pattern, *scope_params),
+            ).fetchall()
+            # §4.1: `superseded_by IS NULL` keeps edit history out of the scan;
+            # §4.7: MIN(rowid) = the FIRST matching message (earliest landing).
+            body_rows = self._conn.execute(
+                "SELECT f.session_id AS session_id, s.title AS title,"
+                " s.updated_at AS updated_at, s.archived_at AS archived_at"
+                " FROM (SELECT session_id, MIN(rowid) AS first_row FROM messages"
+                f"       WHERE content {like} AND superseded_by IS NULL{body_scope}"
+                "       GROUP BY session_id) f"
+                " JOIN sessions s ON s.id = f.session_id",
+                (pattern, *scope_params),
+            ).fetchall()
+
+            title_ids = {row["session_id"] for row in title_rows}
+            body_only = [row for row in body_rows if row["session_id"] not in title_ids]
+            body_only.sort(key=lambda row: (-row["updated_at"], row["session_id"]))
+            total = len(title_rows) + len(body_only)
+            page = [*title_rows, *body_only][offset:offset + limit]
+
+            hits: list[SearchHit] = []
+            for tier, row in enumerate(page):
+                is_title = tier < len(title_rows)
+                common = {
+                    "session_id": row["session_id"],
+                    "title": row["title"],
+                    "updated_at": int(row["updated_at"]),
+                    "archived": bool(row["archived_at"]),
+                }
+                if is_title:
+                    hits.append(SearchHit(matched_in="title", **common))
+                    continue
+                message = self._conn.execute(
+                    "SELECT id, content FROM messages WHERE session_id=?"
+                    f" AND content {like} AND superseded_by IS NULL"
+                    " ORDER BY rowid LIMIT 1",
+                    (row["session_id"], pattern),
+                ).fetchone()
+                message_id = snippet = snippet_offset = None
+                if message is not None:
+                    message_id = message["id"]
+                    at = find_ascii_ci(message["content"], query)
+                    if at >= 0:  # LIKE and the locator fold ASCII identically
+                        snippet_offset = at
+                        snippet = make_snippet(message["content"], at)
+                hits.append(SearchHit(
+                    matched_in="body", message_id=message_id,
+                    snippet=snippet, snippet_offset=snippet_offset, **common,
+                ))
+        return hits, total
 
     # --------------------------------------------------------------- RFC-0012
     def upsert_subagent_run(self, run: SubagentRun) -> None:

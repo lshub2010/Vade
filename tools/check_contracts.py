@@ -40,6 +40,13 @@ Checks (each one has broken at least once in review):
      read-only methods are declared (C-05 1.4.0) and registered in
      `SubagentRPC.handlers()`, and `ALLOWED_TRANSITIONS` (the §7.2 gate)
      refuses exactly the twelve transitions the RFC says it must.
+ 13. RFC-0014: `session/search` is declared (C-05 1.5.0) and registered in
+     `SessionRPC.handlers()`, the §4 constants (query 200 / limit 1..100 /
+     default 20 / snippet 120) live in `core/vade/session/search.py`,
+     `escape_like` touches only the three LIKE metacharacters (a quote and
+     `--` stay literal — parameterization's job), the store binds the pattern
+     (`LIKE ? ESCAPE`) and never interpolates it, and the `x-vade.appends`
+     block carries `adds=["session/search"]` / `rewrites: none` / 1.5.0.
 
 Run:  python3 tools/check_contracts.py      (exit 0 = green)
 """
@@ -294,6 +301,14 @@ SESSION_META_METHODS = {
 SESSION_META_EVENTS = {
     "session.updated": ["session_id", "by"],
     "session.list_changed": ["session_id", "change", "by"],
+}
+
+#: RFC-0014 §5: the one search method, on `ui_to_core` (C-05 1.5.0).
+SESSION_SEARCH_METHODS = {"session/search"}
+#: RFC-0014 §5: the hit-row shape — must match `search.SearchHit.to_wire()`.
+SESSION_SEARCH_HIT_KEYS = {
+    "session_id", "title", "updated_at", "matched_in",
+    "message_id", "snippet", "snippet_offset", "archived",
 }
 
 FAILURES: list[str] = []
@@ -1078,8 +1093,8 @@ def check_subagent_events(events: dict, declared_events: dict, schema_events: se
         & (set(directions.get("module_to_core") or {}) | set(directions.get("core_to_module") or {}))
     )
     check(not elsewhere, f"rpc.json: RFC-0012 methods must not be module-facing: {elsewhere}")
-    check(rpc.get("version") == "1.4.0",
-          f"rpc.json: version must be 1.4.0 after the RFC-0012 append (got {rpc.get('version')!r})")
+    check(rpc.get("version") in ("1.4.0", "1.5.0"),
+          f"rpc.json: version must be 1.4.0 (RFC-0012) or 1.5.0 (RFC-0014, the current head) (got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0012" in str(b.get("doc") or "")), None)
     check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0012")
@@ -1338,8 +1353,8 @@ def check_session_meta(rpc: dict, events: dict) -> None:
             check(field in entry, f"rpc.json {name}: missing {field}")
         unknown = sorted(set(entry.get("errors") or []) - codes)
         check(not unknown, f"rpc.json {name}: errors not declared in C-04: {unknown}")
-    check(rpc.get("version") in ("1.3.0", "1.4.0"),
-          f"rpc.json: version must be 1.3.0 (RFC-0010) or 1.4.0 (RFC-0012, the current head) (got {rpc.get('version')!r})")
+    check(rpc.get("version") in ("1.3.0", "1.4.0", "1.5.0"),
+          f"rpc.json: version must be 1.3.0 (RFC-0010), 1.4.0 (RFC-0012) or 1.5.0 (RFC-0014, the current head) (got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0010" in str(b.get("doc") or "")), None)
     check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0010")
@@ -1424,6 +1439,88 @@ def check_session_meta(rpc: dict, events: dict) -> None:
               "events.json: the RFC-0010 append must be rewrite-free")
         check(eblock.get("version") == "2.0.0",
               "events.json: the RFC-0010 append must NOT claim an enum bump (top-level stays 2.0.0)")
+
+
+def check_session_search(rpc: dict) -> None:
+    """RFC-0014: `session/search` — declared, registered, and injection-safe.
+
+    The two things a review can miss by reading:
+
+    * the limit cap must live in exactly ONE place (the handler) — a second
+      copy would let mutation ② (§8) delete one and keep the tests green;
+    * `escape_like` must touch ONLY the three LIKE metacharacters. Escaping
+      the quote or `--` would corrupt honest queries; parameterization is
+      what keeps those literal, so the gate asserts the quote survives
+      `escape_like` untouched.
+    """
+    directions = rpc.get("directions") or {}
+    ui_to_core = directions.get("ui_to_core") or {}
+    entry = ui_to_core.get("session/search")
+    check(entry is not None, "rpc.json: session/search is missing from ui_to_core (RFC-0014 §5)")
+    elsewhere = sorted(
+        SESSION_SEARCH_METHODS
+        & (set(directions.get("module_to_core") or {}) | set(directions.get("core_to_module") or {}))
+    )
+    check(not elsewhere, f"rpc.json: RFC-0014 methods must not be module-facing: {elsewhere}")
+    if isinstance(entry, dict):
+        for field in ("params", "result", "errors"):
+            check(field in entry, f"rpc.json session/search: missing {field}")
+        unknown = sorted(set(entry.get("errors") or []) - set(load("errors.json").get("codes") or {}))
+        check(not unknown, f"rpc.json session/search: errors not declared in C-04: {unknown}")
+        check(set(entry.get("params") or {}) == {"query", "limit", "offset", "session_id"},
+              "rpc.json session/search.params must be exactly {query, limit, offset, session_id}")
+        check(set(entry.get("result") or {}) == {"results", "total"},
+              "rpc.json session/search.result must be exactly {results, total}")
+        rows = (entry.get("result") or {}).get("results")
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            check(set(rows[0]) == SESSION_SEARCH_HIT_KEYS,
+                  f"rpc.json session/search hit-row shape drifted: {sorted(set(rows[0]) ^ SESSION_SEARCH_HIT_KEYS)}")
+        else:
+            check(False, "rpc.json session/search.result.results: must declare the hit-row shape (one object)")
+    check(rpc.get("version") == "1.5.0",
+          f"rpc.json: version must be 1.5.0 after the RFC-0014 append (got {rpc.get('version')!r})")
+
+    if str(ROOT / "core") not in sys.path:
+        sys.path.insert(0, str(ROOT / "core"))
+    try:
+        from vade.session import search as search_mod
+        from vade.session.rpc import SessionRPC
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        FAILURES.append(f"core/vade/session: cannot import for RFC-0014 checks "
+                        f"({type(exc).__name__}: {exc})")
+        return
+    check("session/search" in SessionRPC(None).handlers(),
+          "SessionRPC.handlers(): session/search is not registered (RFC-0014 §5)")
+    # §4 constants are the contract; they are echoed in schema/rpc.json strings.
+    check((search_mod.QUERY_MAX, search_mod.LIMIT_MAX, search_mod.LIMIT_DEFAULT, search_mod.SNIPPET_MAX)
+          == (200, 100, 20, 120),
+          f"search constants drifted from RFC-0014 §4: "
+          f"QUERY_MAX={search_mod.QUERY_MAX} LIMIT_MAX={search_mod.LIMIT_MAX} "
+          f"LIMIT_DEFAULT={search_mod.LIMIT_DEFAULT} SNIPPET_MAX={search_mod.SNIPPET_MAX}")
+    # §4.10: the escape is the injection gate — metacharacters only.
+    for probe, expect in (("%", "\\%"), ("_", "\\_"), ("\\", "\\\\"), ("'", "'"), ("--", "--"), (";", ";")):
+        got = search_mod.escape_like(probe)
+        check(got == expect,
+              f"escape_like({probe!r}) -> {got!r}, expected {expect!r} "
+              f"(metacharacters only; quote/-- are parameterization's job)")
+    # §4.10: the store binds the pattern — the source may not interpolate it.
+    store_text = (CORE / "session" / "sqlite_store.py").read_text(encoding="utf-8")
+    check("LIKE ? ESCAPE" in store_text,
+          "sqlite_store.search_sessions: the LIKE pattern must be a bound parameter (LIKE ? ESCAPE)")
+    check("LIKE '%" not in store_text,
+          "sqlite_store.search_sessions: found a literal-quote LIKE — the pattern must never enter SQL text")
+
+    rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
+    block = next((b for b in rpc_appends if isinstance(b, dict)
+                  and "RFC-0014" in str(b.get("doc") or "")), None)
+    check(block is not None, "rpc.json: missing the x-vade.appends block for RFC-0014")
+    if block is not None:
+        check(set(block.get("adds") or []) == SESSION_SEARCH_METHODS,
+              "rpc.json: the RFC-0014 append block must add exactly session/search")
+        check(block.get("version") == "1.5.0",
+              "rpc.json: the RFC-0014 append block must carry version 1.5.0")
+        check("none" in str(block.get("rewrites") or ""),
+              "rpc.json: the RFC-0014 append must be rewrite-free")
 
 
 def main() -> int:
@@ -1553,6 +1650,7 @@ def main() -> int:
     check_task_events(events, declared_events, schema_events)
     check_approval_attribution(declared_events)
     check_session_meta(rpc, events)
+    check_session_search(rpc)
     check_subagent_events(events, declared_events, schema_events, rpc)
 
     # ---------------------------------------------------------------- RFC-0003
@@ -1592,7 +1690,7 @@ def main() -> int:
         return 1
     print("contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 34 error codes, config metadata complete, "
           "RFC-0005 append green, RFC-0010 session metadata green, RFC-0012 subagent family green, "
-          "RFC-0003 layers green, event gate green)")
+          "RFC-0014 session search green, RFC-0003 layers green, event gate green)")
     return 0
 
 

@@ -1,6 +1,6 @@
 {
   "id": "C-05",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "status": "frozen",
   "frozen_at": "2026-11-14",
   "owner": "C2",
@@ -139,6 +139,20 @@
           "no method, error code or frozen field changed; the wire key predates this append, so old clients are unaffected and new clients key the grey 'stopped · N chars' bubble off it plus `snapshot.turns[].partial_message_id`"
         ],
         "rewrites": "none. The `partial` key predates this append (RFC-0006); RFC-0013 only documents it in the ui/attach result notes and this block. C-05 top-level `version` stays 1.3.0 (RFC-0010 owns it); this block continues RFC-0006's 1.1.0 partial lineage at 1.2.0 — append-level, non-breaking."
+      },
+      {
+        "contract": "C-05",
+        "version": "1.5.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0014-session-search.md",
+        "adds": ["session/search"],
+        "notes": [
+          "one READ method under ui_to_core: session/search — titles + live message bodies (messages.content, superseded rows excluded per RFC-0006 §6.3); no existing method, error code, direction or field changed",
+          "matching is a parameterized LIKE scan with %/_/\\ escaped literal (ESCAPE '\\'), ASCII case-insensitive and non-ASCII exact (SQLite LIKE semantics); no FTS5 dependency, no new table, column or index",
+          "rows are deduped sessions (title hit dominates body hit), two-tier order: title hits first, then updated_at DESC, id ASC; snippets are hard-clipped to 120 code points with snippet_offset pointing into the original content — full bodies (up to 32000 code points, RFC-0006 §8) never cross the wire",
+          "a core without it answers -32601 (the documented degradation: FR-8.27's local-cached-only search with the '范围：已缓存' badge stays until the client upgrades)"
+        ],
+        "rewrites": "none. One ui_to_core method appended (FR-8.27); C-05 version 1.4.0 -> 1.5.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one). Recorded in core/vade/session/RESULT-rfc0014.md."
       }
     ],
     "rfc0005_append": {
@@ -1116,6 +1130,34 @@
           "NOT_FOUND"
         ],
         "notes": "RFC-0010 append (§5). The single membership column (§1 #1: folders, not tags). Unknown group -> NOT_FOUND (data.reason=unknown_group); unknown session -> NOT_FOUND. Emits session.updated on the session's own stream."
+      },
+      "session/search": {
+        "params": {
+          "query": "string 1..200 after trimming (required; absent/blank/non-string -> INVALID_ARGUMENT)",
+          "limit": "int 1..100, default 20",
+          "offset": "int >= 0, default 0",
+          "session_id": "string (optional; scopes the search to one session, unknown -> NOT_FOUND)"
+        },
+        "result": {
+          "results": [
+            {
+              "session_id": "string",
+              "title": "string|null",
+              "updated_at": "int (unix ms)",
+              "matched_in": "title|body",
+              "message_id": "string|null (set only for body hits)",
+              "snippet": "string|null (<= 120 code points incl. ellipses; null for title hits)",
+              "snippet_offset": "int|null (code-point index of the match start in the ORIGINAL content; null for title hits)",
+              "archived": "bool"
+            }
+          ],
+          "total": "int (distinct matching sessions; a session counts once even when title and body both match)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0014 append (§4/§5). Scope = session titles + live message bodies (messages.content text; rows with superseded_by excluded, RFC-0006 §6.3). Matching = parameterized LIKE with %/_/\\ escaped to literals and ESCAPE '\\', ASCII case-insensitive / non-ASCII exact (SQLite LIKE semantics); no FTS5 dependency, and no new index (a leading-wildcard LIKE cannot use one). Order (§4.4): title hits before body hits, then updated_at DESC, id ASC (stable ties). A session appears at most once; total counts distinct matching sessions. Blank/absent query -> INVALID_ARGUMENT; unknown session_id -> NOT_FOUND. Snippets are clipped windows, never full bodies (bodies reach 32000 code points, RFC-0006 §8)."
       }
     }
   },

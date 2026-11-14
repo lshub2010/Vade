@@ -25,7 +25,10 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
 from ..errors import VadeError
-from .models import Event, Message, Session, SessionGroup, Turn, TurnState, now_ms
+from .models import (
+    Event, Message, Session, SessionGroup, SubagentRun, SubagentState,
+    Turn, TurnState, now_ms,
+)
 from .store import UNSET, SessionStore
 
 __all__ = ["SQLiteStore"]
@@ -86,6 +89,21 @@ CREATE TABLE IF NOT EXISTS events(
     ts INTEGER NOT NULL,
     PRIMARY KEY(session_id, seq)
 );
+CREATE TABLE IF NOT EXISTS subagent_runs(
+    run_id TEXT PRIMARY KEY,
+    parent_session_id TEXT NOT NULL,
+    parent_turn_id TEXT,
+    child_session_id TEXT,
+    label TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    result_digest TEXT,
+    result_chars INTEGER,
+    error_code TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent
+    ON subagent_runs(parent_session_id, created_at);
 """
 
 #: RFC-0006 §9.1 rows 12: appended columns, applied to pre-existing databases.
@@ -668,3 +686,83 @@ class SQLiteStore(SessionStore):
                 " WHERE group_id IS NOT NULL GROUP BY group_id"
             ).fetchall()
         return {row["group_id"]: int(row["n"]) for row in rows}
+
+    # --------------------------------------------------------------- RFC-0012
+    def upsert_subagent_run(self, run: SubagentRun) -> None:
+        """RFC-0012 §4.1: INSERT ... ON CONFLICT DO UPDATE — the manager swaps
+        frozen records, so every state transition is one full-row write. The
+        `CREATE TABLE IF NOT EXISTS` in `_SCHEMA` makes this reentrant for a
+        database that predates the table."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO subagent_runs("
+                "run_id, parent_session_id, parent_turn_id, child_session_id,"
+                " label, state, created_at, finished_at, result_digest,"
+                " result_chars, error_code)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(run_id) DO UPDATE SET"
+                " parent_turn_id=excluded.parent_turn_id,"
+                " child_session_id=excluded.child_session_id,"
+                " label=excluded.label, state=excluded.state,"
+                " created_at=excluded.created_at,"
+                " finished_at=excluded.finished_at,"
+                " result_digest=excluded.result_digest,"
+                " result_chars=excluded.result_chars,"
+                " error_code=excluded.error_code",
+                (
+                    run.run_id, run.parent_session_id, run.parent_turn_id,
+                    run.child_session_id, run.label, run.state.value,
+                    run.created_at, run.finished_at, run.result_digest,
+                    run.result_chars, run.error_code,
+                ),
+            )
+
+    def get_subagent_run(self, run_id: str) -> SubagentRun | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM subagent_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+        return self._subagent_run_from_row(row) if row is not None else None
+
+    def list_subagent_runs(
+        self, *, session_id: str | None = None, states: Sequence[str] | None = None,
+    ) -> list[SubagentRun]:
+        """RFC-0012 §6.1: fixed order (created_at asc, run_id tiebreak). The
+        manager slices pages and builds the opaque cursor on top of this."""
+        where: list[str] = []
+        params: list[Any] = []
+        if session_id is not None:
+            where.append("parent_session_id=?")
+            params.append(session_id)
+        if states:
+            where.append(
+                f"state IN ({','.join('?' for _ in states)})"
+            )
+            params.extend(states)
+        sql = "SELECT * FROM subagent_runs"
+        if where:
+            sql += f" WHERE {' AND '.join(where)}"
+        sql += " ORDER BY created_at ASC, run_id ASC"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._subagent_run_from_row(r) for r in rows]
+
+    @staticmethod
+    def _subagent_run_from_row(row: sqlite3.Row) -> SubagentRun:
+        try:
+            state = SubagentState(row["state"])
+        except ValueError:  # pragma: no cover - a corrupted row is not a crash
+            state = SubagentState.SPAWNED
+        return SubagentRun(
+            run_id=row["run_id"],
+            parent_session_id=row["parent_session_id"],
+            label=row["label"],
+            parent_turn_id=row["parent_turn_id"],
+            child_session_id=row["child_session_id"],
+            state=state,
+            created_at=int(row["created_at"]),
+            finished_at=row["finished_at"],
+            result_digest=row["result_digest"],
+            result_chars=row["result_chars"],
+            error_code=row["error_code"],
+        )

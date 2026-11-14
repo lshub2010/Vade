@@ -19,6 +19,7 @@ from .parts import parts_text
 __all__ = [
     "Message", "Role", "TurnState", "Turn", "Session", "SessionGroup", "QueueItem", "Event",
     "TERMINAL_STATES", "new_id", "now_ms", "message_ref",
+    "SubagentState", "SUBAGENT_TERMINAL_STATES", "SubagentRun", "new_run_id",
 ]
 
 
@@ -48,6 +49,39 @@ class TurnState(str, Enum):
 TERMINAL_STATES = frozenset(
     {TurnState.COMPLETED, TurnState.FAILED, TurnState.INTERRUPTED, TurnState.CANCELLED}
 )
+
+
+class SubagentState(str, Enum):
+    """RFC-0012 §4.3: the five-value `subagent_states` (C-06 top-level key).
+
+    `spawned` (registered, loop not started) and `running` (loop in flight)
+    are deliberately separate: a parent turn can end while a run sits in
+    either, but "never started" and "halfway through" are different things to
+    observe. Terminal states are never left again.
+    """
+
+    SPAWNED = "spawned"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+#: RFC-0012 §7.2: terminal three. Declared after the enum so
+#: `tools/check_contracts.py` can assert schema == code on both sets.
+SUBAGENT_TERMINAL_STATES = frozenset(
+    {SubagentState.COMPLETED, SubagentState.FAILED, SubagentState.CANCELLED}
+)
+
+
+def new_run_id() -> str:
+    """RFC-0012 §7.1: `run_` + 32 lowercase hex.
+
+    The `run_` prefix is load-bearing: it lets `subagent/get` separate a
+    malformed id (`INVALID_ARGUMENT`) from a well-formed unknown one
+    (`NOT_FOUND`) without guessing at hex-ness.
+    """
+    return f"run_{uuid.uuid4().hex}"
 
 
 def new_id() -> str:
@@ -378,3 +412,68 @@ class Event:
         if self.coalesce:
             frame["x-vade"] = {"coalesce": True}
         return frame
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentRun:
+    """One subagent run record (RFC-0012 §4.2). Frozen: the manager swaps records.
+
+    The run is the LLM-loop sibling of `Task` (RFC-0007): it has a
+    `child_session_id` whose session runs its own turns, and its lifecycle
+    lives in `subagent_runs` + the `subagent.*` event family, never in
+    `task.*` (RFC-0012 §8). `result_digest` is the sha-256 fingerprint of the
+    full result text — the text itself lives only in the child session's
+    message stream; `result_chars` lets a client size it without reading it.
+    """
+
+    run_id: str
+    parent_session_id: str
+    label: str
+    parent_turn_id: str | None = None
+    child_session_id: str | None = None
+    state: SubagentState = SubagentState.SPAWNED
+    created_at: int = field(default_factory=now_ms)
+    finished_at: int | None = None
+    result_digest: str | None = None
+    result_chars: int | None = None
+    error_code: str | None = None
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state in SUBAGENT_TERMINAL_STATES
+
+    def duration_ms(self, now: int | None = None) -> int:
+        end = self.finished_at if self.finished_at is not None else (
+            now if now is not None else now_ms()
+        )
+        return max(0, int(end) - int(self.created_at))
+
+    def with_changes(self, **changes: Any) -> "SubagentRun":
+        return replace(self, **changes)
+
+    def to_view(self, *, now: int | None = None, result_preview: str | None = None) -> dict[str, Any]:
+        """RFC-0012 §6.1/§6.2 `SubagentRunView`. Never carries the result text:
+        `result_digest` is the fingerprint, `result_preview` a <=500-char
+        read-time projection the manager derives (absent here = null)."""
+        view: dict[str, Any] = {
+            "run_id": self.run_id,
+            "parent_session_id": self.parent_session_id,
+            "parent_turn_id": self.parent_turn_id,
+            "child_session_id": self.child_session_id,
+            "label": self.label,
+            "state": self.state.value,
+            "created_at": self.created_at,
+            "finished_at": self.finished_at,
+            "result_digest": self.result_digest,
+            "result_chars": self.result_chars,
+            "error_code": self.error_code,
+            "result_preview": result_preview,
+        }
+        if self.is_terminal:
+            view["duration_ms"] = self.duration_ms(now)
+        else:
+            view["duration_ms"] = self.elapsed_ms(now)
+        return view
+
+    def elapsed_ms(self, now: int | None = None) -> int:
+        return self.duration_ms(now)

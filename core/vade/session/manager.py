@@ -267,6 +267,11 @@ class SessionLog:
         #: the tasks component is absent, and `snapshot` then omits the key
         #: entirely so a client can tell "no tasks" from "core predates tasks".
         self.tasks: Any = None
+        #: RFC-0012 §7.3: `SubagentManager`, installed by `vade.subagents.install()`.
+        #: One thing reads it — `_turn_ending()` (a finished parent turn sweeps
+        #: its unfinished child runs before the terminal event). `None` means
+        #: the subagents component is absent and turns end exactly as before.
+        self.subagents: Any = None
         self._closed = False
         #: RFC-0006 §4.2: the text already streamed for a live turn. The queue
         #: reads it through `partial_text()` when it finalizes an interrupt, so
@@ -791,7 +796,7 @@ class SessionLog:
                 cancel_clear_hook=self._cancel_clear_hook,
                 max_pending=self._max_pending,
                 resolve_model=self._resolve_turn_model if self.models is not None else None,
-                pre_terminal_hook=self._input_pre_terminal,
+                pre_terminal_hook=self._turn_ending(session_id),
                 partial_provider=self.partial_text,
             )
             self._queues[session_id] = q
@@ -1225,6 +1230,31 @@ class SessionLog:
                 if turn.id == turn_id:
                     return turn.state.value
         return None
+
+    def _turn_ending(self, session_id: str) -> Any:
+        """RFC-0008 S5 + RFC-0012 §7.3: everything that must happen BEFORE a
+        turn's terminal event is written, chained in one place.
+
+        The queue calls this with `(turn_id, state)`; the session id is bound
+        here because the queue is per-session. Order is contractual: the
+        RFC-0008 input dialog closes first, then every unfinished subagent run
+        of the ending turn is cancelled — so `subagent.result(cancelled)` rows
+        land before `turn.completed` / `turn.failed` / `turn.interrupted` /
+        `turn.cancelled`, and a client never sees a finished parent with a
+        running child. The subagents component is duck-typed (`log.subagents`,
+        set by `vade.subagents.install()`): a core without that component
+        still ends turns exactly as before. Errors must not block
+        finalization — `_finalize` already guards the whole hook.
+        """
+
+        async def hook(turn_id: str, state: TurnState) -> None:
+            await self._input_pre_terminal(turn_id, state)
+            runs: Any = getattr(self, "subagents", None)
+            sweep: Any = getattr(runs, "cancel_for_turn", None)
+            if callable(sweep):
+                await sweep(session_id, turn_id)
+
+        return hook
 
     async def _input_pre_terminal(self, turn_id: str, state: TurnState) -> None:
         """RFC-0008 S5: close pending inputs before the terminal event is written.

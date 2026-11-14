@@ -40,6 +40,13 @@
     "failed",
     "cancelled"
   ],
+  "subagent_states": [
+    "spawned",
+    "running",
+    "completed",
+    "failed",
+    "cancelled"
+  ],
   "events": {
     "session.attached": {
       "payload": {
@@ -591,6 +598,64 @@
         "by"
       ],
       "notes": "RFC-0010 append (§6.2). Fanned out to EVERY attached session (module.status precedent) after a session is created (ui/attach auto-create, change=added) or hard-deleted (session/delete, change=removed); the changed session's own stream is skipped. Deliberately carries NO row payload — every client re-pulls session/list; a payload copy here would be a second truth that drifts. change=removed is the only notice a hard delete gives (§8.2)."
+    },
+    "subagent.spawned": {
+      "payload": {
+        "run_id": "string (run_<32hex>, RFC-0012 §7.1)",
+        "session_id": "string (C-06 stream key; on subagent.* it always equals parent_session_id)",
+        "parent_session_id": "string (the seq space this family broadcasts on)",
+        "parent_turn_id": "string|null (the parent turn that spawned the run)",
+        "child_session_id": "string|null (the run's own LLM-loop session; FR-8.58 jump target)",
+        "label": "string 1..64",
+        "at": "int (unix ms)"
+      },
+      "required": [
+        "run_id",
+        "session_id",
+        "parent_session_id",
+        "parent_turn_id",
+        "child_session_id",
+        "label",
+        "at"
+      ],
+      "notes": "RFC-0012 §5.2. Exactly once per run; emitted BEFORE any later event of the run on the PARENT session's stream. Payload-only class (no `state`): creation is the event name — a run is spawned, then `subagent.status` carries state changes. Nullable keys are required-with-null so every event self-describes without walking back (RFC-0007 §5.3 precedent)."
+    },
+    "subagent.status": {
+      "payload": {
+        "run_id": "string",
+        "session_id": "string (= parent_session_id)",
+        "state": "subagent.state (spawned|running)",
+        "step": "string <=120|null (what the loop is doing now)",
+        "tool_name": "string|null (the tool call in flight)",
+        "at": "int (unix ms)"
+      },
+      "required": [
+        "run_id",
+        "session_id",
+        "state",
+        "at"
+      ],
+      "notes": "RFC-0012 §5.2. State-change event (C-06 rule 4). Required on every legal transition (spawned→running); during `running` the same event carries step/tool_name refreshes with state=running. Nothing may follow the terminal subagent.result for that run (a late status is dropped, not resurrected)."
+    },
+    "subagent.result": {
+      "payload": {
+        "run_id": "string",
+        "session_id": "string (= parent_session_id)",
+        "state": "subagent.state (terminal only: completed|failed|cancelled)",
+        "result_digest": "string (sha-256 hex of the FULL result text — NEVER the text itself; sha256(\"\") for cancelled/failed-with-no-partial)",
+        "result_chars": "int (length of the full result text)",
+        "error_code": "C-04 name|null (core MUST set it when state=failed)",
+        "finished_at": "int (unix ms)"
+      },
+      "required": [
+        "run_id",
+        "session_id",
+        "state",
+        "result_digest",
+        "result_chars",
+        "finished_at"
+      ],
+      "notes": "RFC-0012 §5.2/§5.3. Exactly once per run; the record is written before this is broadcast. DESENSITIZATION RULE: the result text lives only in the child session's message stream — no `result_text`/`summary`/`output` key may appear here; consumers verify and reconcile by fingerprint. The FR-8.56 '≤500 字摘要' is the read-time `result_preview` projection of subagent/get, not a persisted or broadcast field."
     }
   },
   "x-vade": {
@@ -725,6 +790,20 @@
           "session.list_changed is a session-stream fan-out (module.status precedent): clients re-pull session/list instead of maintaining the list from the payload"
         ],
         "rewrites": "none. Top-level `version` stays 2.0.0: no enum widening, no state added — both events are new declarations and every pre-existing entry is unchanged. Neither is a C-14 push topic (no x-vade.push): both travel as session events through SessionLog.emit."
+      },
+      {
+        "contract": "C-06",
+        "version": "2.0.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0012-subagent-events.md",
+        "adds": ["subagent.spawned", "subagent.status", "subagent.result"],
+        "overrides": [
+          "top-level `subagent_states` key appended (task_states precedent): a NEW top-level key, not an entry under `events` — only `turn.state` is exempt from the 'declared events nobody emits' gate (RFC-0007 §9.2)",
+          "subagent.spawned is payload-only (no `state`); subagent.status / subagent.result are state-change events (C-06 rule 4)",
+          "the family broadcasts on the PARENT session's stream: session_id == parent_session_id on every event; the child session need not be attached (FR-8.58)",
+          "DESENSITIZATION: subagent.result carries sha256(result text) + length, never the text; no result_text/summary/output key may appear on any subagent.* event (RFC-0012 §5.3)"
+        ],
+        "rewrites": "none. Top-level `version` stays 2.0.0: no enum widening — `subagent_states` is a NEW top-level key and every pre-existing entry, rule and enum is unchanged. No x-vade.push on any of the three: all travel as session events through SessionLog.emit. Partially supersedes RFC-0007 §4.2's 'do not send subagent.*' for the subagent half (jobs keep task.*; see RFC-0012 §8)."
       }
     ]
   }

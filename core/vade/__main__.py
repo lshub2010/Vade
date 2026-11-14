@@ -150,6 +150,9 @@ def _serve(app: App, uvicorn: Any, *, strict: bool) -> int:
         identity=app.identity,
         registry=app.registry,
         pairing=app.pairing,
+        # RFC-0004 §6.4: the same trust table the Noise handshake checks, used
+        # to name a native peer after the handshake proved its key.
+        whitelist=app.whitelist,
         make_crypto=build_module_crypto(app),
         on_rpc=make_rpc_handler(app),
         policy_mode="allow_all" if app.config.get("dev.allow_all") else "default",

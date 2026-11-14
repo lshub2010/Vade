@@ -14,6 +14,23 @@
       "reserved": ["skill_load", "tools_search", "tools/search"],
       "note": "RFC-0003 §5.4: model-visible core built-ins. They are handled inside core and never routed to a module, so they are NOT methods in `directions` — this table is the registration. No manifest may declare a tool with one of these names, and no module LLM name can collide with them: module names are `{prefix}__{tool}` (always a double underscore), core names never carry one. `tools/search` is the C-05/RPC spelling of the search capability; the model-visible name is `tools_search` because an LLM function name may not contain `/`."
     },
+    "rfc0015_pending": {
+      "contract": "C-05",
+      "version": "1.6.0",
+      "owner": "C3",
+      "doc": "docs/rfc/RFC-0015-ui-modules.md",
+      "adds": [
+        "ui/modules"
+      ],
+      "status": "proposed — NOT an append registration",
+      "notes": [
+        "This block is deliberately kept OUT of `x-vade.appends`. `tools/check_ledger.py:203-205` treats any append block as 'core already implements it' (it forces impl_state=已实现 AND requires the impl paths to exist, :217-223), and RFC-0015 implements nothing in core. The ledger row therefore says 未实施; this block is the record of what becomes an append.",
+        "The top-level `version` stays 1.5.0 for the same reason: `tools/check_contracts.py` hard-asserts the current head in three places (check_session_meta:1356, check_subagent_events:1096, check_session_search:1480) and this RFC may not edit a gate. 1.6.0 is the version this block carries when it moves into `appends` — same discipline as the RFC-0005 block ('an appender may not make a frozen file claim a header it does not own').",
+        "`ui/modules` is declared in `directions.ui_to_core` with its four parts so a client author can read the shape today; its `notes` field starts with PROPOSED so nobody codes against it as if a core served it."
+      ],
+      "rewrites": "none. One read-only ui_to_core method appended; no existing method, direction, error list or field changes. C-06 untouched (no event), C-04 untouched (34 codes), C-03 untouched.",
+      "landing": "In the commit that implements core: (1) delete this block; (2) append the same contract/version/owner/doc/adds/notes/rewrites to the END of `x-vade.appends` (array append — the existing 10 blocks stay byte-identical); (3) bump the top-level `version` 1.5.0 -> 1.6.0; (4) raise the three version pins in `tools/check_contracts.py` in the same commit (a header bump without them is a red gate, by design); (5) flip the LEDGER row for RFC-0015 from 未实施 to 已实现 and sync aggregate.appends_rpc 10 -> 11."
+    },
     "appends": [
       {
         "contract": "C-05",
@@ -1159,6 +1176,40 @@
           "NOT_FOUND"
         ],
         "notes": "RFC-0014 append (§4/§5). Scope = session titles + live message bodies (messages.content text; rows with superseded_by excluded, RFC-0006 §6.3). Matching = parameterized LIKE with %/_/\\ escaped to literals and ESCAPE '\\', ASCII case-insensitive / non-ASCII exact (SQLite LIKE semantics); no FTS5 dependency, and no new index (a leading-wildcard LIKE cannot use one). Order (§4.4): title hits before body hits, then updated_at DESC, id ASC (stable ties). A session appears at most once; total counts distinct matching sessions. Blank/absent query -> INVALID_ARGUMENT; unknown session_id -> NOT_FOUND. Snippets are clipped windows, never full bodies (bodies reach 32000 code points, RFC-0006 §8)."
+      },
+      "ui/modules": {
+        "params": {},
+        "result": {
+          "revision": "int (monotonic within one core process; the Registry revision, the same counter model/list reports)",
+          "modules": [
+            {
+              "module_id": "string (C-03 manifest.module_id)",
+              "instance_id": "string (C-03 manifest.instance_id)",
+              "display_name": "string|null (C-03 manifest.display_name; OPTIONAL in C-03, hence nullable here)",
+              "version": "string|null (C-03 manifest.version, SemVer 2.0.0; null only when the record carries no parsed manifest)",
+              "online": "bool (record.health is ONLINE and connection_id is not None — the same predicate module.status publishes)",
+              "pages": [
+                {
+                  "id": "string (C-03 $defs.page.id = UIPage.page_id; NOT `page_id`)",
+                  "title": "string (1..40)",
+                  "icon": "list|chart|settings|tool|file|none (UIPage.icon, default none)",
+                  "entry": "auto|panel|capabilities (UIPage.entry, default auto)",
+                  "version": "int >= 1 (the PAGE schema revision, not the module SemVer)",
+                  "requires": [
+                    "session"
+                  ],
+                  "refresh_s": "int >= 0 (default 0)"
+                }
+              ]
+            }
+          ]
+        },
+        "errors": [
+          "PERMISSION_DENIED",
+          "UNAVAILABLE",
+          "PAYLOAD_TOO_LARGE"
+        ],
+        "notes": "RFC-0015 §4. **PROPOSED — not served by any core yet**: the declaration lives in `directions` and its append record sits in `x-vade.rfc0015_pending` (§9.2); a core that predates it answers JSON-RPC -32601 (NOT a C-04 code) and the client must degrade to the empty entry block instead of erroring (§7.1). ONE pull returns the WHOLE list because an entry list has to render on first paint. `params` is `{}` and never gains `session_id`: the module set is a process-level fact (`Registry.snapshot()` takes no session) and authorization comes from the connection (`modulepage/auth.py`, review B1), never from a param the caller controls. `pages` is `ModulePageService.pages()` verbatim (`modulepage/service.py:202-221`) — the key is `id`, because C-03 `$defs.page` and the client decoder both call it `id`; renaming it here would create a second spelling. Page BODIES never cross the wire: `ui/page.get` stays the only body channel (ref pages keep their sha256 check there). Ordering: registry order for modules, `manifest.ui.pages[]` order for pages. Callers: a browser session (`ui-...`) sees ENABLED modules only; a module peer sees only itself; an unresolvable caller is PERMISSION_DENIED. `revision` is the Registry revision (`registry/table.py:135-141`) which is bumped next to every `_publish_status(...)` call, so 'a module.status arrived' and 'the revision moved' are the same set — the client invalidates on `module.status` and re-pulls here (§5). No event is added (C-06 stays 34 entries), no error code is added (C-04 stays 34)."
       }
     }
   },

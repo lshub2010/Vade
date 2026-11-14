@@ -165,6 +165,57 @@
         "subagent_message": {"type": "boolean", "default": false, "x-vade": {"apply": "restart", "owner": "C3", "note": "v1 is closed: subagent/message answers UNSUPPORTED (§6.4)."}}
       }
     },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "RFC-0009 §7.3/§9.3 — module page cache and call budget ([ui]). Additive to C-18 1.1.0, following the [attach]/[tasks] precedent; the root stays additionalProperties:false, so a typo here is UNKNOWN_CONFIG_KEY at startup. These are core-side serving limits, not page-schema limits: the schema's own caps (8 KiB inline / 64 KiB ref / 48 KiB block) live in C-03's x-vade.limits and are enforced by the C-19 validator.",
+      "properties": {
+        "state_cache_s": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60,
+          "default": 5,
+          "x-vade": {
+            "apply": "hot",
+            "owner": "C3",
+            "note": "RFC-0009 §9.3: `ui/state.get` serves a cached `page.state` for at most this long per (module, instance, page). 0 disables caching; a client that wants fresh data still cannot force a module round trip more often than this."
+          }
+        },
+        "page_cache_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65536,
+          "default": 65536,
+          "x-vade": {
+            "apply": "hot",
+            "owner": "C3",
+            "note": "RFC-0009 §7.3: per-page ceiling for a fetched `ref` body (<=64 KiB). Above it the page is MANIFEST_INVALID, never truncated."
+          }
+        },
+        "module_cache_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 524288,
+          "default": 524288,
+          "x-vade": {
+            "apply": "hot",
+            "owner": "C3",
+            "note": "RFC-0009 §7.3: per-module ceiling for cached page bodies (<=512 KiB). `ui/page.get` must not become a memory amplifier."
+          }
+        },
+        "pending_calls": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096,
+          "default": 256,
+          "x-vade": {
+            "apply": "hot",
+            "owner": "C3",
+            "note": "RFC-0009 §6.2: how many stage-one `ui/tool.call` approvals may be held per process. The oldest expired entry is reaped first; a full table refuses with OVERLOADED rather than growing."
+          }
+        }
+      }
+    },
     "dev": {
       "type": "object",
       "additionalProperties": false,

@@ -9,7 +9,17 @@
     "status": "frozen",
     "frozen_at": "2026-11-13",
     "owner": "C2",
-    "consumers": ["C4", "M1", "M2", "M3", "M4a", "M4b", "M5", "M6", "C5a"],
+    "consumers": [
+      "C4",
+      "M1",
+      "M2",
+      "M3",
+      "M4a",
+      "M4b",
+      "M5",
+      "M6",
+      "C5a"
+    ],
     "limits": {
       "tools_per_module": 64,
       "tools_global": 128,
@@ -17,20 +27,44 @@
       "description_max_len": 512,
       "max_payload_ceiling": 65519,
       "timeout_ms_min": 100,
-      "timeout_ms_max": 600000
+      "timeout_ms_max": 600000,
+      "pages_per_module": 8,
+      "ui_block_max_bytes": 49152,
+      "ui_inline_max_bytes": 8192,
+      "ui_ref_max_bytes": 65536,
+      "ui_nodes_per_page": 256,
+      "ui_depth_max": 8
     },
     "appends": [
       {
         "contract": "C-14",
         "version": "1.0.0",
-        "fields": ["subscriptions"],
+        "fields": [
+          "subscriptions"
+        ],
         "doc": "docs/rfc/RFC-0001-manifest-subscriptions.md",
         "why": "C-03 shipped without the field C-14's manifest gate reads. `additionalProperties: true` let a module send it, but `Manifest` dropped it, so every real registration was rejected `not in manifest`."
+      },
+      {
+        "contract": "C-19",
+        "version": "1.0.0",
+        "fields": [
+          "ui"
+        ],
+        "doc": "docs/rfc/RFC-0009-module-ui-pages.md",
+        "why": "C-03 shipped without a page surface, so a module's only UI was the out-of-process `webui`. Same trap as C-14: `additionalProperties: true` lets `ui` through, but a `Manifest` that does not parse it drops it silently. The `ui` subtree is the one place where `additionalProperties` is false -- an unknown key in a page can only be a script hook."
       }
     ]
   },
   "type": "object",
-  "required": ["module_id", "instance_id", "version", "protocol", "capabilities", "limits"],
+  "required": [
+    "module_id",
+    "instance_id",
+    "version",
+    "protocol",
+    "capabilities",
+    "limits"
+  ],
   "additionalProperties": true,
   "properties": {
     "module_id": {
@@ -63,13 +97,21 @@
     "role": {
       "type": "string",
       "description": "Self-declared role. `evolve` is only honoured when the fingerprint is in core's [evolve].allowlist; otherwise it is demoted to `tool`.",
-      "enum": ["tool", "evolve", "ui"],
+      "enum": [
+        "tool",
+        "evolve",
+        "ui"
+      ],
       "default": "tool"
     },
     "concurrency": {
       "type": "string",
       "description": "exclusive: one instance per module (second registration -> TOOL_CONFLICT). pooled: up to limits.max_concurrency instances, least-inflight routing. mirrored: any number, no load, events broadcast.",
-      "enum": ["exclusive", "pooled", "mirrored"],
+      "enum": [
+        "exclusive",
+        "pooled",
+        "mirrored"
+      ],
       "default": "exclusive"
     },
     "priority": {
@@ -81,18 +123,24 @@
     },
     "capabilities": {
       "type": "object",
-      "required": ["tools"],
+      "required": [
+        "tools"
+      ],
       "additionalProperties": true,
       "properties": {
         "tools": {
           "type": "array",
           "maxItems": 64,
-          "items": {"$ref": "#/$defs/tool"}
+          "items": {
+            "$ref": "#/$defs/tool"
+          }
         },
         "prompts": {
           "type": "array",
           "maxItems": 64,
-          "items": {"$ref": "#/$defs/prompt"}
+          "items": {
+            "$ref": "#/$defs/prompt"
+          }
         },
         "events": {
           "type": "array",
@@ -107,7 +155,10 @@
     },
     "limits": {
       "type": "object",
-      "required": ["max_concurrency", "max_payload"],
+      "required": [
+        "max_concurrency",
+        "max_payload"
+      ],
       "additionalProperties": true,
       "properties": {
         "max_concurrency": {
@@ -130,7 +181,12 @@
       "description": "Only declared sources are injected. `session_id` is the only source implemented in v1; anything else is rejected.",
       "maxItems": 8,
       "uniqueItems": true,
-      "items": {"type": "string", "enum": ["session_id"]}
+      "items": {
+        "type": "string",
+        "enum": [
+          "session_id"
+        ]
+      }
     },
     "subscriptions": {
       "type": "array",
@@ -146,12 +202,36 @@
     "extensions": {
       "type": "object",
       "description": "Opaque to core. Never parsed, never forwarded to the admin API."
+    },
+    "ui": {
+      "type": "object",
+      "description": "C-19 append (RFC-0009 §9.2). Declarative module pages. STRICT on purpose: this is the one subtree in C-03 where `additionalProperties` is false, because an unknown key inside a page is a script hook, not forward compatibility. A page that fails validation is dropped with a warning (`Manifest.ui_warnings`); the module's tools still register. `ui.pages` missing or empty means the module has NO entry anywhere (FR-8.79 §8.2): no empty tab, no placeholder row.",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-": {}
+      },
+      "properties": {
+        "pages": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/page"
+          }
+        }
+      }
     }
   },
   "$defs": {
     "tool": {
       "type": "object",
-      "required": ["name", "description", "input_schema", "risk", "timeout_ms", "idempotent"],
+      "required": [
+        "name",
+        "description",
+        "input_schema",
+        "risk",
+        "timeout_ms",
+        "idempotent"
+      ],
       "additionalProperties": true,
       "properties": {
         "name": {
@@ -168,18 +248,28 @@
         "input_schema": {
           "type": "object",
           "description": "Any JSON Schema, but the root `type` must be `object`.",
-          "required": ["type"],
+          "required": [
+            "type"
+          ],
           "properties": {
-            "type": {"const": "object"}
+            "type": {
+              "const": "object"
+            }
           },
           "additionalProperties": true
         },
         "risk": {
           "type": "string",
           "description": "Declared risk. core adjudicates against [policy.tool_risk] and may only raise it. Unlisted tools become `high`.",
-          "enum": ["low", "medium", "high"]
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
         },
-        "idempotent": {"type": "boolean"},
+        "idempotent": {
+          "type": "boolean"
+        },
         "timeout_ms": {
           "type": "integer",
           "minimum": 100,
@@ -194,15 +284,138 @@
     },
     "prompt": {
       "type": "object",
-      "required": ["id", "content"],
+      "required": [
+        "id",
+        "content"
+      ],
       "additionalProperties": true,
       "properties": {
         "id": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
         },
-        "content": {"type": "string", "minLength": 1, "maxLength": 32768},
-        "description": {"type": "string", "maxLength": 512}
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 512
+        }
+      }
+    },
+    "page": {
+      "type": "object",
+      "description": "One page declaration. `schema` is either the inline node tree (<=8 KiB serialised) or `{\"ref\": {page_id, sha256}}` (<=64 KiB, fetched through `ui/page.get`; the digest is pinned here so a page cannot be swapped after registration).",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-": {}
+      },
+      "required": [
+        "id",
+        "title",
+        "version",
+        "schema"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "icon": {
+          "enum": [
+            "list",
+            "chart",
+            "settings",
+            "tool",
+            "file",
+            "none"
+          ],
+          "default": "none"
+        },
+        "entry": {
+          "enum": [
+            "auto",
+            "panel",
+            "capabilities"
+          ],
+          "default": "auto"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "requires": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "enum": [
+              "session"
+            ]
+          }
+        },
+        "refresh_s": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600,
+          "description": "Optional client hint: how often to re-issue `ui/state.get` while the page is open. Absent = refresh on entry, on `online` and on user retry only. core's own cache ceiling is [ui].state_cache_s."
+        },
+        "schema": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "column",
+                    "row",
+                    "tabs",
+                    "list",
+                    "text",
+                    "component"
+                  ]
+                }
+              },
+              "description": "Inline node tree root (column/row/tabs/list/text/component)."
+            },
+            {
+              "type": "object",
+              "required": [
+                "ref"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "ref": {
+                  "type": "object",
+                  "required": [
+                    "page_id",
+                    "sha256"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "page_id": {
+                      "type": "string",
+                      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+                    },
+                    "sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
       }
     }
   }

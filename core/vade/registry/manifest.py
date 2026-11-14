@@ -147,6 +147,12 @@ class Manifest:
     #: Pages that failed validation are absent, and `ui_warnings` says which.
     ui_pages: tuple[UIPage, ...] = ()
     ui_warnings: tuple[str, ...] = ()
+    #: C-03 top-level `display_name` (optional there, hence `None` here). RFC-0015
+    #: projects it into `ui/modules`; the schema has carried it since C-03 and
+    #: this dataclass used to drop it — the same "schema has it, `Manifest` loses
+    #: it" shape RFC-0009 §9.2 named. Trailing default keeps every existing
+    #: construction valid.
+    display_name: str | None = None
 
     @property
     def protocol_major(self) -> int:
@@ -352,6 +358,12 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
         json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
 
+    # C-03 top-level `display_name` (optional, 1..64 chars when present). It used
+    # to be dropped here, so nothing downstream could project it; RFC-0015's
+    # `ui/modules` needs it verbatim, and the client uses it as the entry title
+    # ("no name -> no entry"), never as a fallback to `module_id`.
+    display_name_raw = raw.get("display_name")
+
     return Manifest(
         module_id=str(raw["module_id"]),
         instance_id=str(raw["instance_id"]),
@@ -370,4 +382,5 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
         models=models,
         ui_pages=ui_pages,
         ui_warnings=ui_warnings,
+        display_name=str(display_name_raw) if display_name_raw is not None else None,
     )

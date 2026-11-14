@@ -10,7 +10,7 @@
 |---|---|---|
 | C-05 rpc.json 顶部 version | **1.5.0** | `schema/rpc.json` |
 | C-05 方法数 | ui_to_core **35** / core_to_module **7** / module_to_core **6**，三方向合计 **48** | 同上 |
-| RFC-0015 pending 块 | `x-vade.rfc0015_pending` **1** 块（**不是** append 登记：目标版本 1.6.0，core 未实现，落地时转进 `appends`） | `schema/rpc.json` |
+| RFC-0015 pending 块 | `x-vade.rfc0015_pending` **1** 块（**不是** append 登记：目标版本 1.6.0；**core 已在 `tmp/s-modules-impl` 实现**，但 C-05 顶部仍被 `check_contracts` 三处版本钉钉在 1.5.0，故登记块未转正） | `schema/rpc.json` |
 | C-06 events.json 顶部 version | **2.0.0** | `schema/events.json` |
 | C-06 事件数 | **34**（含 `turn.state` 枚举条目；不含则 33） | 同上 |
 | C-04 错误码 | **34** | `schema/errors.json` |
@@ -37,7 +37,7 @@
 | RFC-0012 | 子代理事件族 R3：`subagent.spawned` / `subagent.status` / `subagent.result` 三事件与 `subagent/list` / `subagent/get` 两方法 | proposed | 已实现（core 侧；stage 自述一致） | `subagent/list`、`subagent/get` | `subagent.spawned`、`subagent.status`、`subagent.result`（顶层 `subagent_states` 新键） | — | C-05 1.4.0；C-06 2.0.0 | `core/vade/subagents/manager.py`、`core/vade/subagents/rpc.py` | 985 passed（`core/vade/subagents/RESULT-rfc0012.md`：966+19） | 10/0 |
 | RFC-0013 | 中断留痕落库（R9）：partial 消息进 snapshot，删掉「只能从 turn.delta 重建」的旧注记 | proposed | 已实现（core 侧；stage 自述一致） | 无（adds=[]，仅注记） | 无（adds=[]；`turn.interrupted.notes` 就地改写——显式偏离「不改 notes 字节」惯例） | — | C-05 1.2.0（append 级）；C-06 1.2.0（append 级） | `core/vade/session/queue.py`、`core/vade/session/sqlite_store.py`、`core/vade/session/models.py` | 979 passed（`core/vade/session/RESULT-rfc0013.md`：966+13） | 8/0 |
 | RFC-0014 | 会话搜索：`session/search`（标题 + 正文 LIKE 扫描、两档排序、片段硬截断） | proposed | 已实现（core 侧；stage 自述一致） | `session/search` | 无 | — | C-05 1.5.0 | `core/vade/session/search.py`、`core/vade/session/sqlite_store.py`、`core/vade/session/rpc.py`、`core/vade/session/manager.py` | 1065 passed（`core/vade/session/RESULT-rfc0014.md`：1041+24；本 worktree 复跑同数） | 14/0 |
-| RFC-0015 | 模块清单通道：`ui/modules`（一次拉全量模块与页面入口、`revision` 单调、`module.status` 作失效边） | proposed | **未实施**（本棒只落 RFC 与 `directions.ui_to_core` 声明；登记块在 `x-vade.rfc0015_pending`，**不是** append——总账不自称已实现） | 无（`ui/modules` 已在 `directions.ui_to_core`，但**未**登记进 `x-vade.appends`，故本列空） | 无 | 无（C-06 无新事件、C-04 无新码、C-03/C-18 不动） | pending 1.6.0（未登记；落地时才转 appends + 顶部 1.5.0→1.6.0） | — | 未记录（本棒不写 core；`pytest core/tests -q` 基线 1089 不含本方法） | 12/0 |
+| RFC-0015 | 模块清单通道：`ui/modules`（一次拉全量模块与页面入口、`revision` 单调、`module.status` 作失效边） | proposed | **core 已实现，契约登记仍 pending**（`ModulePageService.list_modules()` + `ui/modules` handler；但 C-05 顶部版本升 1.6.0 实测仍红 `check_contracts` 三处版本钉 1356/1096/1480，本棒不许改门禁，故 pending 块未转 `appends`、`impl_state` 按门禁口径保持 `未实施`——**不是**「没写 core」） | 无（`ui/modules` 已在 `directions.ui_to_core` 且已被 core 服务，但**未**登记进 `x-vade.appends`，故本列空） | 无 | 无（C-06 无新事件、C-04 无新码、C-03/C-18 不动；C-03 的 `display_name` 原先被 `Manifest` dataclass 丢掉，本棒补上） | pending 1.6.0（未登记；转 appends 需与顶部 1.5.0→1.6.0 + 三处版本钉同批） | `core/vade/modulepage/service.py`、`core/vade/modulepage/rpc.py`、`core/vade/modulepage/__init__.py`、`core/vade/registry/manifest.py` | 32 passed（新增 `core/tests/uipage/test_list_modules.py` 17 + `test_list_modules_auth.py` 8 + `test_list_modules_limits.py` 6 + `core/tests/e2e/test_ui_modules_ws.py` 1；全量 1164 passed） | 12/0 |
 
 > 「验收」列 = 验收表条目行数 / 已勾选数。**全部 14 份 RFC 的验收表均无勾选列，机械计数 `[x]` 均为 0**——「已勾选」这回事在本仓从不存在过，勿再说「验收已勾完」。
 > append 版本是**块级**登记版本（append-per-minor 纪律），与契约**顶部**版本（C-05 现 1.5.0 / C-06 现 2.0.0）是两个东西；RFC-0013 两个块都是 1.2.0 但顶部版本不动，这是设计而非错误，但口头汇报极易混——见 §4-4。
@@ -73,7 +73,7 @@
     "RFC-0012": {"status": "proposed", "impl_state": "已实现", "methods": ["subagent/list", "subagent/get"], "events": ["subagent.spawned", "subagent.status", "subagent.result"], "manifest_fields": [], "append_versions": {"rpc.json": "1.4.0", "events.json": "2.0.0"}, "impl": ["core/vade/subagents/manager.py", "core/vade/subagents/rpc.py"], "acceptance_rows": 10, "acceptance_checked": 0},
     "RFC-0013": {"status": "proposed", "impl_state": "已实现", "methods": [], "events": [], "manifest_fields": [], "append_versions": {"rpc.json": "1.2.0", "events.json": "1.2.0"}, "impl": ["core/vade/session/queue.py", "core/vade/session/sqlite_store.py", "core/vade/session/models.py"], "acceptance_rows": 8, "acceptance_checked": 0},
     "RFC-0014": {"status": "proposed", "impl_state": "已实现", "methods": ["session/search"], "events": [], "manifest_fields": [], "append_versions": {"rpc.json": "1.5.0"}, "impl": ["core/vade/session/search.py", "core/vade/session/sqlite_store.py", "core/vade/session/rpc.py", "core/vade/session/manager.py"], "acceptance_rows": 14, "acceptance_checked": 0},
-    "RFC-0015": {"status": "proposed", "impl_state": "未实施", "methods": [], "events": [], "manifest_fields": [], "append_versions": {}, "impl": [], "acceptance_rows": 12, "acceptance_checked": 0}
+    "RFC-0015": {"status": "proposed", "impl_state": "未实施", "methods": [], "events": [], "manifest_fields": [], "append_versions": {}, "impl": [], "acceptance_rows": 12, "acceptance_checked": 0, "note": "core 已实现（tmp/s-modules-impl：service.list_modules + rpc handler + 32 tests）。impl_state 仍是 未实施 是因为本块只记契约登记：没有 appends 块时 check_ledger 只接受 未实施/客户端仓；转 appends 需同批升 C-05 顶部 1.6.0 并抬 check_contracts 三处版本钉（1356/1096/1480），本棒不许改门禁"}
   }
 }
 ```
@@ -81,7 +81,7 @@
 ## 4. 本表已知的口径冲突（详单与证据见 `docs/rfc/LEDGER-RESULT.md`）
 
 1. RFC-0003～0009 frontmatter `stage` 均自称「草稿，未实现」，与 status.md「已合并」及契约登记矛盾——stage 字段过时未回填（本仓不许改 RFC 正文，只能在此记录）。
-2. 「35 方法」口径：三方向合计 **48**；35 只是 ui_to_core 方向数（与 34 错误码、34 事件撞数，口头汇报必错）。其中 `ui/modules`（RFC-0015）是**提案声明**：在 `directions` 里、**不在** `appends` 里、core 未实现。
+2. 「35 方法」口径：三方向合计 **48**；35 只是 ui_to_core 方向数（与 34 错误码、34 事件撞数，口头汇报必错）。其中 `ui/modules`（RFC-0015）已在 `directions` 里、**不在** `appends` 里：core 侧（`list_modules()` + handler）与本声明同批落地，但契约登记仍是 pending（顶部版本被三处版本钉钉在 1.5.0）。
 3. 「events.json 10 条 appends」口径：events.json 实为 **8** 块；10 是 rpc.json 的块数；三文件合计 21 块。
 4. append 块级版本 ≠ 契约顶部版本（RFC-0013 块级 1.2.0 / 顶部 1.3.0→1.5.0 共存），引用版本号必须说明是哪一层。
 5. RFC-0007 的 4 个 `task.*` 事件与顶层 `task_states` 在 events.json **没有** append 登记块（rpc.json 侧有登记）——append-per-minor 纪律的缺口。

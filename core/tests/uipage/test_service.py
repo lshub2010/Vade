@@ -163,7 +163,8 @@ def test_install_publishes_handlers_before_session_exists():
     assert app.modulepage is app.module_pages
     providers = getattr(app, "handler_providers", None)
     assert isinstance(providers, list) and len(providers) == 1
-    assert set(providers[0]()) == {"ui/page.get", "ui/state.get", "ui/tool.call"}
+    # RFC-0015 added the fourth name; the set stays exact on purpose.
+    assert set(providers[0]()) == {"ui/page.get", "ui/state.get", "ui/tool.call", "ui/modules"}
 
 
 def test_install_merges_into_an_existing_handler_table():
@@ -173,4 +174,6 @@ def test_install_merges_into_an_existing_handler_table():
 
     app = SimpleNamespace(config=None, session_handlers={"ui/submit": object()})
     install(app)
-    assert set(app.session_handlers) == {"ui/submit", "ui/page.get", "ui/state.get", "ui/tool.call"}
+    assert set(app.session_handlers) == {
+        "ui/submit", "ui/page.get", "ui/state.get", "ui/tool.call", "ui/modules",
+    }

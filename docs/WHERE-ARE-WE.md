@@ -12,7 +12,7 @@
 - docs 门禁：`docs/check_docs.py` → exit 0（12 项，失败 0 项）。
 - RFC-0001～0009：已批准（frontmatter `approved`）且已实现合并（`docs/status.md` 各「已合并」行 + 契约 appends 登记在案 + 实现文件在仓）。
 - RFC-0010 / 0012 / 0013 / 0014：core 侧已实现（各自 `core/vade/*/RESULT-rfc*.md` + C-05 1.3.0/1.4.0/1.5.0 与 C-06 登记块）。
-- RFC-0015（`ui/modules` 模块清单通道）：**提案，未实施**——`schema/rpc.json` 的 `directions.ui_to_core` 已声明（`params:{}`、`result:{revision, modules[]}`），登记块在 `x-vade.rfc0015_pending`（**不是** append，故 LEDGER 行 `impl_state=未实施`）；core 与客户端均未接线，**A3（模块页入口）仍然缺数据源**。
+- RFC-0015（`ui/modules` 模块清单通道）：**core 已实现，契约登记仍 pending**——`ModulePageService.list_modules()`（`core/vade/modulepage/service.py`）+ `ui/modules` handler（`core/vade/modulepage/rpc.py`，经 `app.session_handlers` 分发），32 条新测试含真 WS 端到端；C-05 顶部仍 **1.5.0**（升 1.6.0 实测仍红 `check_contracts` 三处版本钉，本棒不许改门禁），登记块留在 `x-vade.rfc0015_pending`，故 LEDGER 行 `impl_state=未实施` 是**契约登记口径**，不是「没写 core」；**客户端未接线 → A3（模块页入口）仍缺数据源**（§8 三处未做）。
 - RFC-0004 数据面 `/ui/blob` 六路由 + content parts 定型（`core/vade/blob/http.py`、`core/vade/session/parts.py`；RESULT-parts.md 539 passed）。
 
 ## 在飞 / 有保留的「完成」

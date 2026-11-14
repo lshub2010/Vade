@@ -6,6 +6,17 @@ to C5a's `vade.admin.cli:main`. Before C5a lands, the import failure must say
 
 `--print-fingerprint` prints ONLY the core identity fp8. TLS fingerprint is a
 separate command (`--print-tls-fingerprint`) and a separate value.
+
+First run pairing (alpha A1-2): a browser can only attach after redeeming a
+`purpose=browser` pair code, and there was no way to obtain one without a
+cookie or the Noise handshake. On startup, once the listener is bound, the core
+now mints one single-use browser code and prints a machine-parseable line:
+
+    pair_code=青松-A7K2M9 purpose=browser expires_in=600s
+
+`--no-pair-banner` suppresses both the mint and the print (scripts/tests).
+The code is printed with `print`, never logged: `setup_logging` emits JSON
+lines and a live pair code must not reach a log sink.
 """
 
 from __future__ import annotations
@@ -18,9 +29,22 @@ from typing import Any
 from .app import App, create_app
 from .config import ConfigError, load_config
 from .identity import tls as tls_module
+from .identity.pairing import Purpose
 from .errors import VadeError
 
-__all__ = ["main", "build_parser", "build_module_crypto"]
+__all__ = [
+    "main",
+    "build_parser",
+    "build_module_crypto",
+    "announce_pair_code",
+    "mint_browser_pair_code",
+    "pair_banner_lines",
+    "PAIR_BANNER_TTL",
+]
+
+#: Browser pair codes are short-lived on purpose: the banner prints once, and
+#: a code that outlives the terminal scrolls away with its own blast radius.
+PAIR_BANNER_TTL = 600
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--san", action="append", default=None, help="extra TLS SAN (repeatable)")
     parser.add_argument("--print-fingerprint", action="store_true", help="print core identity fp8 and exit")
     parser.add_argument("--print-tls-fingerprint", action="store_true", help="print TLS certificate fingerprint and exit")
+    parser.add_argument(
+        "--no-pair-banner",
+        action="store_true",
+        help="do not mint/print the browser pair code on startup (scripts and tests)",
+    )
     parser.add_argument("--strict", action="store_true", help="refuse to start when core components are missing")
 
     subparsers = parser.add_subparsers(dest="command")
@@ -54,6 +83,64 @@ def _admin_main(args: argparse.Namespace) -> int:
         return 2
     forwarded = ["--help"] if getattr(args, "admin_help", False) else args.args
     return int(admin_main(forwarded) or 0)
+
+
+def pair_banner_lines(code: str, *, purpose: str = "browser", ttl: int = PAIR_BANNER_TTL) -> tuple[str, str]:
+    """Startup banner: line 1 machine-parseable, line 2 for humans.
+
+    Line 1's shape is documented in `docs/PAIRING.md`: split on single spaces
+    and read `pair_code=`, `purpose=`, `expires_in=` (always seconds).
+    """
+    machine = f"pair_code={code} purpose={purpose} expires_in={ttl}s"
+    human = (
+        "vade: first-run pairing — enter this code in the app/browser (it redeems via POST /ui/session). "
+        f"Single-use, expires in {ttl}s; restart the core for a fresh one. "
+        "Pass --no-pair-banner to hide this."
+    )
+    return machine, human
+
+
+def mint_browser_pair_code(pairing: Any | None, *, ttl: int = PAIR_BANNER_TTL) -> str:
+    """Mint one short-lived browser code; raise a C-04 error when pairing is off."""
+    if pairing is None:
+        raise VadeError("CODE_INVALID", "pairing is not configured; no browser pair code was minted")
+    return pairing.create(Purpose.BROWSER, ttl=ttl)
+
+
+def announce_pair_code(
+    pairing: Any | None,
+    *,
+    enabled: bool = True,
+    stream: Any = None,
+    error_stream: Any = None,
+    ttl: int = PAIR_BANNER_TTL,
+) -> str | None:
+    """Mint and print the first-run pair banner; return the code (or None).
+
+    `print`, never `log`: `setup_logging` writes JSON lines, and a live pair
+    code must not land in a log sink. `enabled=False` (`--no-pair-banner`)
+    also skips minting, so a scripted start leaves no live row behind.
+    """
+    if not enabled:
+        return None
+    out = sys.stdout if stream is None else stream
+    err = sys.stderr if error_stream is None else error_stream
+    try:
+        code = mint_browser_pair_code(pairing, ttl=ttl)
+    except VadeError as exc:
+        # Readable failure (pairing disabled), never a traceback: the core is
+        # still usable for modules, it just cannot pair a browser this run.
+        print(f"vade: {exc.code}: {exc.message}", file=err)
+        return None
+    except Exception as exc:  # noqa: BLE001 - a banner must not kill a live core
+        print(f"vade: pair banner failed ({type(exc).__name__}): {exc}", file=err)
+        return None
+    machine, human = pair_banner_lines(code, ttl=ttl)
+    # Flush: stdout is block-buffered when redirected to a pipe/file, and a
+    # banner that only appears at process exit is useless for first-run setup.
+    print(machine, file=out, flush=True)
+    print(human, file=out, flush=True)
+    return code
 
 
 def _cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
@@ -106,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 3
 
-    return int(_serve(app, uvicorn, strict=args.strict))
+    return int(_serve(app, uvicorn, strict=args.strict, pair_banner=not args.no_pair_banner))
 
 
 def build_module_crypto(app: App) -> Any:
@@ -136,7 +223,7 @@ def build_module_crypto(app: App) -> Any:
     return make_crypto
 
 
-def _serve(app: App, uvicorn: Any, *, strict: bool) -> int:
+def _serve(app: App, uvicorn: Any, *, strict: bool, pair_banner: bool = True) -> int:
     import asyncio
 
     from .app import install_components, make_rpc_handler
@@ -165,19 +252,34 @@ def _serve(app: App, uvicorn: Any, *, strict: bool) -> int:
     cert, key = app.config.get("tls.cert"), app.config.get("tls.key")
     if cert and key:
         tls = {"ssl_certfile": cert, "ssl_keyfile": key}
-    uvicorn.run(
-        core_app,
-        host=host or "127.0.0.1",
-        port=int(port_text),
-        log_level="warning",
-        # uvicorn's ProxyHeadersMiddleware trusts X-Forwarded-For from
-        # 127.0.0.1 by default and rewrites scope["client"]. That silently
-        # defeats the pair-code rate limit (any client can rotate the header).
-        # Behind a real reverse proxy, enable it deliberately AND construct
-        # CoreApp(trust_forwarded_for=True).
-        proxy_headers=False,
-        **tls,
+    server = uvicorn.Server(
+        uvicorn.Config(
+            core_app,
+            host=host or "127.0.0.1",
+            port=int(port_text),
+            log_level="warning",
+            # uvicorn's ProxyHeadersMiddleware trusts X-Forwarded-For from
+            # 127.0.0.1 by default and rewrites scope["client"]. That silently
+            # defeats the pair-code rate limit (any client can rotate the header).
+            # Behind a real reverse proxy, enable it deliberately AND construct
+            # CoreApp(trust_forwarded_for=True).
+            proxy_headers=False,
+            **tls,
+        )
     )
+
+    async def serve_until_stopped() -> None:
+        # `uvicorn.run` blocks with no "ready" hook, so drive `Server` by hand
+        # and announce the pair code only once the socket is bound: a failed
+        # bind must never advertise a live code that points at nothing.
+        serving = asyncio.create_task(server.serve())
+        while not server.started and not serving.done():
+            await asyncio.sleep(0.02)
+        if server.started and not server.should_exit:
+            announce_pair_code(app.pairing, enabled=pair_banner)
+        await serving
+
+    asyncio.run(serve_until_stopped())
     return 0
 
 

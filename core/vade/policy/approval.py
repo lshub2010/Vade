@@ -74,6 +74,10 @@ class PendingApproval:
     scope_key: tuple[str, str, str]
     future: "asyncio.Future[tuple[bool, str, str, str]]"
     emit: Callable[[str, Mapping[str, Any]], Awaitable[Any]] | None = None
+    #: RFC-0007 §7.1: who is asking. `depth == 0` means the main turn.
+    task_id: str | None = None
+    task_name: str | None = None
+    depth: int = 0
 
 
 class ApprovalManager:
@@ -120,12 +124,18 @@ class ApprovalManager:
         if not self.engine.requires_approval(risk):
             return ApprovalDecision(True, reason="below_high")
 
+        depth = int(getattr(req, "depth", 0) or 0)
         scope_key = (req.session_id, req.tool_id, digest_args(req.args))
         now = self._clock()
-        async with self._lock:
-            expiry = self._grants.get(scope_key)
-            if expiry is not None and expiry > self._wall():
-                return ApprovalDecision(True, reason="session_grant", cached=True)
+        if depth == 0:
+            # RFC-0007 §7.2 rule 4: a `scope:"session"` grant covers the main
+            # turn of this session only. A subagent that hits the same tool with
+            # the same arguments must ask again — otherwise "allow one file
+            # write" is amplified into "any write, from any spawned agent".
+            async with self._lock:
+                expiry = self._grants.get(scope_key)
+                if expiry is not None and expiry > self._wall():
+                    return ApprovalDecision(True, reason="session_grant", cached=True)
 
         if self._approver_probe is not None and not self._approver_probe():
             # No UI attached: deny now. Queueing would stall the turn until the
@@ -145,6 +155,9 @@ class ApprovalManager:
             tool_id=req.tool_id, args=dict(req.args or {}), risk=risk,
             deadline=now + self.timeout_s, started=now, created_at=self._wall(),
             scope_key=scope_key, future=loop.create_future(), emit=req.emit,
+            task_id=getattr(req, "task_id", None),
+            task_name=getattr(req, "task_name", None),
+            depth=depth,
         )
         async with self._lock:
             self._pending[rid] = pending
@@ -154,7 +167,14 @@ class ApprovalManager:
                     "turn_id": req.turn_id, "request_id": rid, "tool": req.tool_id,
                     "args": dict(req.args or {}), "risk": risk,
                     "expires_at": int(pending.created_at + self.timeout_s),
+                    # §7.1: `session_id` was already on the wire before C-06
+                    # declared it (a drift `check_contracts.py` could not see,
+                    # since it only verifies that required ⊆ payload). It is
+                    # registered now, together with the attribution triple.
                     "session_id": req.session_id,
+                    "task_id": pending.task_id,
+                    "task_name": pending.task_name,
+                    "depth": pending.depth,
                 })
             except Exception:  # a broken UI must not abort the approval wait
                 pass
@@ -268,10 +288,11 @@ class ApprovalManager:
             pending.future.set_result((allow, by or actor_kind, scope, "" if allow else "denied by approver"))
             self._resolved[request_id] = "allowed" if allow else "denied"
             self._pending.pop(request_id, None)
-            if allow and scope == "session":
+            if allow and scope == "session" and pending.depth == 0:
                 # Session grants die with the session (on_session_end) and are
                 # bounded by an 8h ceiling so a forgotten session cannot live
-                # forever in memory.
+                # forever in memory. A subagent's approval stores nothing:
+                # RFC-0007 §7.2 rule 4, no downwards inheritance.
                 self._grants[pending.scope_key] = self._wall() + 8 * 3600
 
         elapsed = (self._clock() - pending.started) * 1000.0
@@ -283,7 +304,7 @@ class ApprovalManager:
             duration_ms=elapsed, reason="approved" if allow else "denied by approver",
             scope=scope,
         )
-        if allow and scope == "session":
+        if allow and scope == "session" and pending.depth == 0:
             self._write_audit(
                 kind="approval_scope_granted", status="allowed", code=None,
                 request_id=request_id, actor=by or actor_kind, tool=pending.tool_id,
@@ -294,6 +315,10 @@ class ApprovalManager:
         resolved = {
             "request_id": request_id, "decision": "allow" if allow else "deny",
             "by": by or actor_kind, "scope": scope, "state": "running",
+            # §7.1: the same attribution the prompt carried, so a device that
+            # missed `turn.approval_required` can still close the right card.
+            "task_id": pending.task_id, "task_name": pending.task_name,
+            "depth": pending.depth,
         }
         if allow and pending.emit is not None:
             # On denial C3's engine emits `turn.approval_resolved` itself; on
@@ -328,6 +353,7 @@ class ApprovalManager:
                 "request_id": p.request_id, "session_id": p.session_id, "turn_id": p.turn_id,
                 "tool": p.tool_id, "args": dict(p.args), "risk": p.risk,
                 "created_at": p.created_at, "deadline": p.deadline,
+                "task_id": p.task_id, "task_name": p.task_name, "depth": p.depth,
             }
             for p in self._pending.values()
         ]

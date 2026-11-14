@@ -37,6 +37,23 @@ class _LazyApproval:
     async def check(self, request: Any) -> Any:
         return await self._port().check(request)
 
+    def pending(self, session_id: str) -> list[dict[str, Any]]:
+        """RFC-0007 §5.6: `snapshot.pending_approvals[]` carries `task_id`.
+
+        The port's public list is `pending_requests()` (all sessions, for the
+        admin surface); the snapshot wants this session's rows. Without this
+        delegation `hasattr(port, "pending")` is false and the snapshot is
+        always empty, so the attribution never reaches a reconnecting client.
+        """
+        port = getattr(self._app, "approval_port", None)
+        getter = getattr(port, "pending_requests", None)
+        if not callable(getter):
+            return []
+        try:
+            return [row for row in getter() if row.get("session_id") == session_id]
+        except Exception:  # pragma: no cover - approval port is C5a's
+            return []
+
     async def on_session_end(self, session_id: str) -> None:
         port = getattr(self._app, "approval_port", None)
         if port is not None and hasattr(port, "on_session_end"):

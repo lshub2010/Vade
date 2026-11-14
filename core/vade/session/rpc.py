@@ -154,13 +154,20 @@ class SessionRPC:
             ok, resolved = resolved
         session_id = getattr(resolved, "session_id", None)
         turn_id = getattr(resolved, "turn_id", None)
+        attribution: dict[str, Any] = {}
+        if isinstance(resolved, Mapping):
+            # RFC-0007 §7.1: `decide()` returns the attribution it resolved, so
+            # the event that closes the dialog names the same task the prompt did.
+            for key in ("task_id", "task_name", "depth"):
+                if key in resolved:
+                    attribution[key] = resolved[key]
         if session_id and turn_id:
             # Always close the dialog on every attached UI, even on a failed
             # first-wins race — otherwise the other devices spin forever.
             await self.log.emit(session_id, "turn.approval_resolved", {
                 "turn_id": turn_id, "request_id": request_id, "decision": decision,
                 "by": getattr(connection, "device_id", None) or "admin",
-                "scope": scope, "state": "running",
+                "scope": scope, "state": "running", **attribution,
             })
         return {"ok": bool(ok)}
 

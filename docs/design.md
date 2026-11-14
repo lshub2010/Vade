@@ -4,9 +4,9 @@
 |---|---|
 | 产品名 | **Vade Agent Runtime**（中文「偕行」），简称 **Vade**；包名 / URI scheme / 协议版本用 `vade` |
 | 版本 | v1.19（v1.18 + AMEND-21/22：客户端功能全集 52 条；19 条 UI/协议裁定——4 目的地、桌面双栏+可折叠右面板、C-09 扩到 11 组件、附件走 `POST /ui/blob`、只存压缩图、端上转写、Web **数据面**可写（D100 废止 D76，管理面 cookie 仍只读）、会话级模型优先、`waiting_input`、模块 UI 页面 C-19 待冻结） |
-| 对齐需求 | `requirements.md` v1.0 + AMEND-01～22 |
+| 对齐需求 | `requirements.md` v1.0 + AMEND-01～23 |
 | 状态 | **已确认**，可进入阶段 3 拆任务 |
-| 变更触发 | AMEND-02（多实例/多端）、AMEND-03（队列/中断）、AMEND-04（皮肤/底栏、T1）、AMEND-08（扩展点/知识库）、AMEND-09（记忆/自进化）、AMEND-12（三面分离/配对码）、AMEND-13（管理面鉴权/rekey）、AMEND-14（setup token）、AMEND-15（token 轮换）、AMEND-16（记忆/技能管理）、AMEND-17（WebView 反转/设备绑定/去 SSH）、AMEND-18（审查修正：setup 门禁/绑定签名/票顺序）、AMEND-19（自进化节流/记忆硬顶/配置面全量化）、AMEND-20（文档一致性修订）、AMEND-21（客户端功能全集 52 条）、AMEND-22（19 条 UI/协议裁定；D76 废止） |
+| 变更触发 | AMEND-02（多实例/多端）、AMEND-03（队列/中断）、AMEND-04（皮肤/底栏、T1）、AMEND-08（扩展点/知识库）、AMEND-09（记忆/自进化）、AMEND-12（三面分离/配对码）、AMEND-13（管理面鉴权/rekey）、AMEND-14（setup token）、AMEND-15（token 轮换）、AMEND-16（记忆/技能管理）、AMEND-17（WebView 反转/设备绑定/去 SSH）、AMEND-18（审查修正：setup 门禁/绑定签名/票顺序）、AMEND-19（自进化节流/记忆硬顶/配置面全量化）、AMEND-20（文档一致性修订）、AMEND-21（客户端功能全集 52 条）、AMEND-22（19 条 UI/协议裁定；D76 废止）、AMEND-23（七份 RFC 批准；C-04 `BUDGET_EXCEEDED` / C-05 `ui/tool.call` / C-06 2.0.0 待实施） |
 
 ## 0. 本版相对 v1.0 的实质变化
 

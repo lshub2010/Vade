@@ -247,6 +247,8 @@ POST /ui/blob
 
 `Message` 新增 `parts: tuple[dict[str, Any], ...] = ()`（空 = 旧行），原来的 `content` 降为**只读属性**（不是字段），返回文本投影；`queue.py`、`llm`、`compaction` 里所有 `m.content` 读点一行不改。`Turn.user_text` 取同一投影：纯图片 turn 得到 `"[image: IMG_0042.jpg]"`（非空）——否则“user_text 空”会在别处冒出第二个拦截点。
 
+> **实现注记（v1）**：`content` 保留为 dataclass **字段**，在 `__post_init__` 里由 `parts` 派生（只读语义，仍不是 property）——改成 property 会让冻结的 `core/vade/loop/` 里 `Message(content=...)` 与 `dataclasses.replace(..., content=...)` 的调用点全部失效。v1 用字段派生，§6.2 的语义（`content` == 文本投影、读点零改动）不变。
+
 - 投影规则（写死，供压缩与测试断言）：text 原样；image → `[image: {name}]`；file → `[file: {name}]`；`\n` 连接。
 - 存储：`ALTER TABLE messages ADD COLUMN parts TEXT`（NULL = 旧行），启动用 `PRAGMA table_info(messages)` 判断，**幂等**；`content` 列**继续存文本投影**（NOT NULL 不动），搜索、压缩、既有 SQL 全照旧。
 - 写：新消息同时写 `content`（投影）与 `parts`（JSON）；两者不一致视为缺陷，用 A6 钉住。回滚：旧版本读新库不认 `parts`，但 `content` 仍是合法文本 → 降级为“只有文字”的会话，不崩不丢主体。这是选“双写”而非“只写 parts”的唯一理由。

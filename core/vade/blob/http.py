@@ -102,6 +102,7 @@ class BlobApp:
         )
 
     def close(self) -> None:
+        """Sync teardown for callers without a loop (fixtures, crash paths)."""
         self.service.close()
 
     # ---------------------------------------------------------------- lifecycle
@@ -112,6 +113,17 @@ class BlobApp:
     async def stop(self) -> None:
         """Cancel the GC task and *await* it, then release the store."""
         await self.service.aclose()
+
+    async def aclose(self) -> None:
+        """Awaitable closer, same work as `stop`.
+
+        `App.shutdown()` looks for `aclose` first and awaits it; without this
+        name the generic closer fell back to the sync `close()`, which cancels
+        the sweeper without ever waiting for it. Keeping the alias means both
+        paths (lifespan `stop`, app shutdown `aclose`) really do await the
+        cancellation.
+        """
+        await self.stop()
 
     # --------------------------------------------------------------------- ASGI
     async def __call__(self, scope: Mapping[str, Any], receive: Receive, send: Send) -> None:

@@ -102,3 +102,43 @@ $ .venv/Scripts/python.exe docs/check_docs.py
 
 仍未覆盖：JPEG/WebP 只有头部解析（RFC §5.3 的有界解码在 core 无 codec 的前提下只对 PNG 成立），
 已在 §5 第 4 条记为已知缺口。
+
+## 7. 复审 r2 返工（应修 1 + 建议 2/4/6）
+
+复审报告 `Vade-REVIEW-blob-r2.md` 留了 1 条应修与 8 条建议；本轮处理 4 条（应修 + 建议 2/4/6）。每条都先写断言确认能抓住症状，再改实现，最后用变异自证「删掉修复必红」。
+
+| 项 | 症状 | 修法 | 用例 | 变异自证（`cp` 备份还原，未用 `git checkout`） |
+|---|---|---|---|---|
+| **应修** 去重回落到 missing / infected 行 | 上传 → 字节丢失 → `reconcile()` 标 `missing` → 同内容重传：`begin` 因 `state != "ok"` 不复用，`complete` 走到 `add_blob` 的 `IntegrityError` 分支直接返回**旧行** → 201 带一个 `GET` 必 410 的 `file_id`，而字节其实已在磁盘上（「重传自救」失效）。`scan=="infected"` 同理：201 拿到扫描器已删掉的行 | `complete` 在 `add_blob` 之后比较 `stored.file_id != record.file_id`（= 去重命中）：<br>• `scan=="infected"` → 删掉刚放回的字节（按摘要全局清除，与扫描器路径同语义）、删会话，`PERMISSION_DENIED / data={field:sha256, reason:infected}`（403）；<br>• `state != "ok"` → `store.revive_blob()` 用本次复校过的 mime/name/kind/width/height/scan 重置该行、`state='ok'`、`expires_at` 按 `blob_ttl_seconds` 重算。引用计数不动（该行本就持有 1 个引用，再加会永久泄漏） | `test_a_missing_row_is_revived_when_the_same_content_is_uploaded_again`（→ 201、GET 200 且字节相等、`state=ok`、`scan=clean`、`name` 更新、`expires_at` 重算、`ref_count==1`）；`test_an_infected_row_is_not_revived_by_a_re_upload`（→ 403、字节不落盘、会话不残留、GET 404） | 把 `if stored.state != "ok":` 换成 `if False:` → 红在 `assert 410 == 200`（**正是复审描述的症状**）；把 `if stored.scan == "infected":` 换成 `if False:` → 红在 `assert 201 == 403` |
+| **建议 4** lifespan 转发无回归 | 删 `server.py:111-112`（`elif kind == "lifespan"` 两行）后全量 489 仍绿；`start`/`stop` 的转发从没经过 ASGI 入口 | 新增 `core/tests/blob/test_lifespan.py`：假 blob 记录 `start`/`stop`，向 `CoreApp` 的真 ASGI 入口依次发 `lifespan.startup` / `lifespan.shutdown`，断言两条 `*.complete` 与调用顺序；另加 `blob=None` 仍 complete、`start` 抛 → `startup.failed`、真 `BlobApp` 走完 lifespan 后 `_gc_task is None` 且 `_closed` | 同文件 4 条（`test_lifespan_startup_and_shutdown_reach_the_blob_channel` 等） | 注释掉 `elif kind == "lifespan":` 两行 → **4 failed**：`assert [] == [{'type': 'lifespan.startup.complete'}...]`；`cp` 还原后 sha256 仍 `d846c69b…`、`grep MUTATION` 0 命中 |
+| **建议 2** `App.shutdown()` 拿不到 `aclose` | `BlobApp` 只有 `close()`，`getattr(blob,"aclose",None)` 恒 `None` → 走同步 `close()`：`task.cancel()` 后不 await，注释「优先异步关闭」与实现不符 | `BlobApp` 新增 `async def aclose()`（= `await self.stop()` = `service.aclose()`）；`close()` 保留为无 loop 时的同步兜底；`app.py:104-116` 的注释改成实话（两条路都在，`aclose` 会 await） | `test_shutdown_prefers_the_async_closer`（两者都有 → 只调 `aclose`）、`test_shutdown_falls_back_to_a_sync_closer`（只有 `close` → 调它）、`test_shutdown_awaits_the_real_blob_app`（真 `BlobApp`：`aclose` 存在，shutdown 后任务 `cancelled()` 且 `_closed`） | 把 `async def aclose` 改名 → `test_shutdown_awaits_the_real_blob_app` 红（`callable(None)`）；改名前的同步兜底用例仍绿，说明这条红的正是「没等到 aclose」 |
+| **建议 6** `_put_part` 只捕 `FileNotFoundError` | Windows 上 `open(target,"r+b")` 被外部句柄（AV/备份/索引器）占用抛 `PermissionError`（`OSError` 子类但不是 `FileNotFoundError`）→ 500 | `except OSError`；答案统一为 `NOT_FOUND / field=upload_id`（与「会话消失」同义），预检 `target.exists()` 保留 | `test_a_part_that_cannot_open_its_temp_file_is_not_a_500`（把 `.part` 换成目录：Windows 抛 `PermissionError`、POSIX 抛 `IsADirectoryError`，同一个 `OSError` 面） | 改回 `except FileNotFoundError` → 红，`PermissionError` 冒到 ASGI（500）。实测本机报 `PermissionError: [Errno 13] ... .part` |
+| **建议 3**（未做，说明） | `stop()` 抛异常会从 `_lifespan` 冒出 | 本轮未改：`try/finally` 已保证 `shutdown.complete` 先发出（uvicorn 不卡），只影响日志噪音；留给下一批与审计/日志一起处理 | — | — |
+
+未取用的复审建议：1（JPEG/WebP 头部-only，已在 §5 记为已知缺口）、5（`kind:"file"`+`image/*` 强制尺寸）、7（`mime=` 三元恒等式）、8（`__Host-ac_csrf` 的 C-05 登记）——均不在本批范围。
+
+### 门禁（本机原始输出）
+
+```
+$ .venv/Scripts/python.exe -m pytest core/tests -q
+499 passed, 5 warnings in 28.28s          # 基线 489 + 10 条新用例（7 lifespan + 3 review_fixes）
+
+$ .venv/Scripts/python.exe tools/check_contracts.py
+contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 33 error codes, config metadata complete, event gate green)
+
+$ .venv/Scripts/python.exe docs/check_docs.py
+合计 12 项，失败 0 项。
+```
+
+### 改动文件
+
+| 文件 | 内容 | sha256（本轮后） |
+|---|---|---|
+| `core/vade/blob/service.py` | dedupe 命中的 infected 拒收 / missing 复活；`_put_part_locked` 改捕 `OSError` | `2a8606c4586e…` |
+| `core/vade/blob/store.py` | 新增 `revive_blob()`（只复活 `state='missing'`，不动 `ref_count`、不动 `created_at`） | `fb1be1501e90…` |
+| `core/vade/blob/http.py` | `BlobApp.aclose()`；`close()` 补 docstring | `95dca9e40eb1…` |
+| `core/vade/app.py` | `App.shutdown()` 注释与两条关闭路径对齐 | `cc1844c699ec…` |
+| `core/tests/blob/test_lifespan.py` | 新增 7 条：lifespan 转发 4 + `App.shutdown` 3 | `eeccf4b76634…` |
+| `core/tests/blob/test_review_fixes.py` | 新增 3 条（§8/§9），未删任何既有断言 | `add7a7b5a273…` |
+
+结论：4 条全部真修并有变异佐证；全量 499 绿、契约与文档门禁绿；不 push。

@@ -20,6 +20,17 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError
 from .models import Event, Message, Session, Turn, TurnState, new_id, now_ms
+from .parts import (
+    PartLimits,
+    apply_attachment_metadata,
+    attachment_ids,
+    check_limits,
+    has_renderable,
+    normalize,
+    parts_text,
+    require_shape,
+    resolve_attachments,
+)
 from .queue import TurnQueue
 from .replay import ReplayBuffer
 from .seq import SeqAllocator
@@ -105,6 +116,8 @@ class SessionLog:
         clock: Callable[[], float] = time.time,
         max_pending: int = 100,
         sink_queue: int = 256,
+        blobs: Any = None,
+        limits: PartLimits | None = None,
     ) -> None:
         self.store = store
         self.replay = replay or ReplayBuffer()
@@ -118,6 +131,12 @@ class SessionLog:
         self._cancel_clear_hook: Callable[[str], None] | None = None
         self._max_pending = max_pending
         self._sink_queue = sink_queue
+        #: RFC-0004 §6.4 step 4: `ui/submit` verifies `file_id`s against the live
+        #: blob service. A callable is accepted so the session component can be
+        #: installed before (or without) the upload channel; `None` means
+        #: attachments are unavailable, not "skip the check".
+        self._blobs = blobs
+        self.limits = limits or PartLimits()
         self.approval_port: Any = None
         self._closed = False
         #: Bound on the first async call; `status.ModuleStatusPublisher` needs
@@ -315,38 +334,119 @@ class SessionLog:
         session_id: str,
         content: Sequence[Mapping[str, Any]],
         client_msg_id: str,
+        *,
+        device_id: str | None = None,
     ) -> tuple[Turn, int]:
-        self._require_session(session_id)
-        if not client_msg_id:
-            raise VadeError("INVALID_ARGUMENT", "client_msg_id is required")
-        blocks = tuple(dict(b) for b in content)
-        user_text = _text_of(blocks)
-        if not user_text.strip():
-            raise VadeError("INVALID_ARGUMENT", "content has no text block")
+        """Store a user message and queue its turn (RFC-0004 §6.4, in order).
 
+        The ladder is contractual: each step below is one numbered item of §6.4.
+        Reordering two of them changes which `data.field` a client sees, and the
+        UI keys its highlighting off that pointer — so this function is not the
+        place for "while we are here" fixes.
+        """
+        # 0. The session must exist before anything else can be answered.
+        self._require_session(session_id)
+
+        # 1. Shape: a non-empty array of at most 20 parts, and a client id.
+        if not isinstance(client_msg_id, str) or not client_msg_id.strip():
+            raise VadeError(
+                "INVALID_ARGUMENT", "client_msg_id is required", data={"field": "client_msg_id"}
+            )
+        blocks = require_shape(content)
+
+        # 2. Idempotency BEFORE validation. A retry of the same submit must
+        #    return the original turn even if a TTL expired or the effective
+        #    model changed in between — otherwise the retry "fixes" itself into
+        #    a different error and the UI shows a phantom failure.
         existing = self.store.find_turn_by_client_msg(session_id, client_msg_id)
         if existing is not None:
             # Idempotent replay of the same submit: same turn, no new queue entry.
             return existing, self._queue(session_id).position(existing.id)
 
+        # 3. Part types, required fields, per-turn text budget and part count.
+        parts = normalize(blocks, self.limits)
+
+        # 4. Every file_id: shape, exists, visible, owned, unexpired, scanned.
+        records = resolve_attachments(self._blob_service(), parts, device_id=device_id)
+
+        # 4b. The blob store owns the metadata: replace the client's declared
+        #     mime/name/size/width/height/sha256 with the measured record before
+        #     step 5 judges them — otherwise "check the size" checks a number the
+        #     client chose. The part type is re-checked against the record here.
+        parts = apply_attachment_metadata(parts, records)
+
+        # 5. Static `[attach]` ceilings on the authoritative bytes and pixels.
+        #    Per-model caps need RFC-0005 (§9) and are deliberately absent, not
+        #    forgotten.
+        check_limits(parts, self.limits)
+
+        # 6. At least one part a renderer can draw (a pure-image turn passes).
+        user_text = parts_text(parts)
+        if not has_renderable(parts):
+            raise VadeError(
+                "INVALID_ARGUMENT",
+                "content has no renderable part",
+                data={"field": "content"},
+            )
+
+        # 7. Persist: turn row, message (+ its parts), pinned blobs, one emit.
         turn = Turn(
             id=new_id(), session_id=session_id, state=TurnState.QUEUED,
             client_msg_id=client_msg_id, user_text=user_text,
         )
         self.store.update_turn(session_id, turn)  # row exists before the event
         message = Message(
-            id=new_id(), session_id=session_id, turn_id=turn.id, role="user", content=user_text,
+            id=new_id(), session_id=session_id, turn_id=turn.id, role="user",
+            content=user_text, parts=parts,
         )
-        await self.emit(
-            session_id, "turn.queued",
-            {"turn_id": turn.id, "state": turn.state.value, "client_msg_id": client_msg_id},
-            messages=[message],
-        )
+        pinned = self._pin(records, device_id)
+        try:
+            await self.emit(
+                session_id, "turn.queued",
+                {"turn_id": turn.id, "state": turn.state.value, "client_msg_id": client_msg_id},
+                messages=[message],
+            )
+        except BaseException:
+            # A message that never landed must not leave its blobs immortal:
+            # pinned blobs are exempt from TTL GC (§4.7), so an orphan here is
+            # storage that no future session can free.
+            self._unpin(pinned)
+            raise
         queue = self._queue(session_id)
-        pos = queue.enqueue(turn, blocks)
+        pos = queue.enqueue(turn, parts)
         await self.emit(session_id, "queue.updated", queue.state_payload())
         queue.ensure_worker()
         return turn, pos
+
+    # ------------------------------------------------------------------ blobs
+    def _blob_service(self) -> Any:
+        """Resolve the blob service (or `None`): callable → `BlobApp` → service."""
+        blobs = self._blobs
+        if callable(blobs):
+            blobs = blobs()
+        if blobs is None:
+            return None
+        return getattr(blobs, "service", blobs)
+
+    def _pin(self, records: Sequence[Any], device_id: str | None) -> list[str]:
+        """§4.7: pin in the same breath as the message write."""
+        service = self._blob_service()
+        ids = attachment_ids(records)
+        if service is None or not ids:
+            return []
+        pin = getattr(service, "pin", None)
+        if not callable(pin):
+            return []
+        pinned: Any = pin(ids, device_id=device_id)
+        return [str(item) for item in (pinned or [])]
+
+    def _unpin(self, file_ids: Sequence[str]) -> None:
+        service = self._blob_service()
+        if service is None or not file_ids:
+            return
+        unpin = getattr(service, "unpin", None)
+        if callable(unpin):
+            unpin(list(file_ids))
 
     async def interrupt(self, session_id: str, turn_id: str, *, by: str = "user") -> bool:
         self._require_session(session_id)
@@ -379,8 +479,3 @@ class SessionLog:
         close = getattr(self.store, "close", None)
         if callable(close):
             close()
-
-
-def _text_of(blocks: Sequence[Mapping[str, Any]]) -> str:
-    parts = [str(b.get("text", "")) for b in blocks if b.get("type", "text") == "text"]
-    return "\n".join(p for p in parts if p)

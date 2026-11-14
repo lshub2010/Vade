@@ -311,3 +311,91 @@ async def test_acomplete_answers_exactly_like_complete(make_env):
     assert body_b["sha256"] == fast_payload["sha256"]
     assert (body_a["width"], body_a["height"]) == (8, 8)
     assert (body_b["width"], body_b["height"]) == (9, 8)
+
+
+# ---------------------------------------- 8. dedupe must not return a dead row
+def test_a_missing_row_is_revived_when_the_same_content_is_uploaded_again(env):
+    """Bytes lost → `reconcile()` marks the row → the re-upload must heal it.
+
+    The old code answered 201 with the *stale* row, so `GET` returned 410 for a
+    file whose bytes were back on disk: "re-upload to recover" silently failed.
+    """
+    data = png()
+    first = env.upload(data, name="first.png")
+    assert first.status == 201, first.json
+    file_id, sha = first.json["file_id"], first.json["sha256"]
+    path = blob_path(env.service.root, sha)
+    assert path.exists()
+
+    path.unlink()  # the bytes are gone (crash, operator, disk loss)
+    assert env.service.reconcile() == (0, 1)
+    assert env.service.store.get_blob(file_id).state == "missing"
+    gone = env.client.get(f"/ui/blob/{file_id}", headers=env.headers())
+    assert gone.status == 410, gone.json
+
+    env.clock.advance(120)
+    again = env.upload(data, name="revived.png")
+    assert again.status == 201, again.json
+    assert again.json["file_id"] == file_id  # the same row, not a second one
+
+    # The symptom the review found: the 201 above used to point at a row `GET`
+    # answered 410 for, even though the bytes were back on disk.
+    fetched = env.client.get(f"/ui/blob/{file_id}", headers=env.headers())
+    assert fetched.status == 200, fetched.json
+    assert fetched.body == data
+    assert again.json["name"] == "revived.png"
+
+    row = env.service.store.get_blob(file_id)
+    assert row.state == "ok"
+    assert row.scan == "clean"
+    assert row.name == "revived.png"
+    assert row.expires_at == pytest.approx(env.service.now() + env.service.settings.blob_ttl_seconds)
+    assert env.service.store.ref_count(sha) == 1  # reviving takes no second reference
+
+
+def test_an_infected_row_is_not_revived_by_a_re_upload(env):
+    """Quarantined content stays gone; the honest answer is a refusal."""
+    data = png()
+    first = env.upload(data)
+    assert first.status == 201, first.json
+    file_id, sha = first.json["file_id"], first.json["sha256"]
+    path = blob_path(env.service.root, sha)
+
+    # Exactly what `run_pending_scans` does when the scanner exits 1.
+    env.service.store.set_scan(file_id, "infected")
+    path.unlink()
+    assert not path.exists()
+
+    response = env.upload(data)
+    assert response.status == 403, response.json
+    assert response.json["code"] == "PERMISSION_DENIED"
+    assert response.json["data"] == {"field": "sha256", "reason": "infected"}
+
+    assert not path.exists()  # the bytes we just put back were dropped again
+    row = env.service.store.get_blob(file_id)
+    assert row.scan == "infected" and row.state == "ok"  # not revived
+    assert env.service.store.open_uploads() == []  # no session left holding quota
+    assert env.client.get(f"/ui/blob/{file_id}", headers=env.headers()).status == 404
+
+
+# ------------------------------------------- 9. a locked temp file is not a 500
+def test_a_part_that_cannot_open_its_temp_file_is_not_a_500(env):
+    """`OSError` (Windows lock, replaced path) → 404, never a stack trace.
+
+    A directory in place of the `.part` makes the open fail with an `OSError`
+    on every platform (`PermissionError` on Windows, `IsADirectoryError`
+    elsewhere), which is exactly the shape a concurrent abort/AV lock produces.
+    """
+    data = png()
+    begun = env.begin(_image_payload(data))
+    assert begun.status == 201, begun.json
+    upload_id = begun.json["upload_id"]
+    temp = tmp_path(env.service.root, upload_id)
+    temp.unlink()
+    temp.mkdir()
+
+    response = env.put_part(upload_id, 0, data)
+
+    assert response.status == 404, response.json
+    assert response.json["code"] == "NOT_FOUND"
+    assert response.json["data"]["field"] == "upload_id"

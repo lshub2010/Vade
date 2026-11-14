@@ -107,7 +107,8 @@ class App:
         # RFC-0004: the blob store holds a sqlite handle *and* a GC task; close
         # both with the app so a restart does not depend on process exit. The
         # async closer is preferred because it awaits the cancelled sweeper
-        # instead of leaving a pending task behind.
+        # instead of leaving a pending task behind (`BlobApp` exposes both:
+        # `aclose` awaits, `close` is the sync fallback).
         blob = getattr(self, "blob", None)
         if blob is not None:
             closer = getattr(blob, "aclose", None) or getattr(blob, "close", None)

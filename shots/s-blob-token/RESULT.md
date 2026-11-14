@@ -91,7 +91,7 @@ contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 34 error codes, … event gate g
 ## 7. 发现但**没有**动的既有漂移（不属本棒范围）
 
 - `docs/WHERE-ARE-WE.md:15` 仍写「RFC-0015 契约登记 pending / 顶部 1.5.0」，而 `15312d0` 已把它转正为 1.6.0。这行是过期的。
-- `RFC-0004:128` 与 `:308` 的 `Authorization: Bearer ***` / `Bearer <ui/bl…` 两处被表格竖线截断；`rpc.json:1217` 的同一句话也是残句。RFC-0016 §9.1 第 4 行要求落地时一起改写。
+- `RFC-0004:128` 与 `:308` 的 `Authorization: Bearer ***` 与 `Bearer <ui/bl…` 两处被表格竖线截断；`rpc.json:1217` 的同一句话也是残句。RFC-0016 §9.1 第 4 行要求落地时一起改写。
 - `rpc.json` 五处 note 与 `rpc.py:82` 注释仍宣称 `-32601`（§3）。
 - `docs/rfc/README.md` 原先漏登记 RFC-0015——本棒补上了，所以索引现在是 0001…0016 全量（0011 在 0013 之前是既有顺序，未改）。
 
@@ -100,3 +100,9 @@ contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 34 error codes, … event gate g
 - 没有实现：`ui/blob.token` 不在 `schema/rpc.json`，core 也没有 handler。RFC 的 §4.1 JSON 片段已用 `json.loads` 验证可解析，六条 `endpoints` 与 `rpc.json` 逐字比对通过，落地时可直接粘。
 - 没有跑 `pytest`（纯文档，且本棒不许改 core）。
 - 没有动 `tools/check_contracts.py` 的三处版本钉（`1096/1356/1480`）——RFC §13.2/§13.4 写明了落地时**只追加** 1.7.0，并给了「改成 1.8.0 仍须 FAIL」的咬合验证要求。
+
+## 9. 基线与远端（交接提示）
+
+- 本分支基于 `15312d0`（`origin/dev_gingshan` 当时的 tip）。
+- 本棒进行期间 `origin/dev_gingshan` 前进到 `8e79529`（`docs(alpha): 校正三处过期口径…`，只动 `docs/ALPHA.md`）。因此 `git diff origin/dev_gingshan..HEAD` 会把 `docs/ALPHA.md` 显示成「被我改回旧版」——**不是我改的**（`git show --stat e3e74d5 / 5996218` 可证：我的两个提交只碰 5 个 docs 文件 + 本报告）。合并时按普通 merge 取两侧即可，两边的文件集不相交。
+- 按红线**没有** rebase / amend / reset，也没有 push。

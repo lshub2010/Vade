@@ -23,6 +23,7 @@ from typing import Any, Mapping, Sequence
 
 from ..blob.ids import is_id
 from ..errors import VadeError
+from ..logging import get_logger
 
 __all__ = [
     "TEXT",
@@ -31,6 +32,10 @@ __all__ = [
     "AUDIO",
     "PART_TYPES",
     "HARD_MAX_PARTS",
+    "HARD_TEXT_CHARS",
+    "HARD_IMAGE_BYTES",
+    "HARD_IMAGE_EDGE",
+    "HARD_IMAGE_PIXELS",
     "IMAGE_MIMES",
     "PartLimits",
     "require_shape",
@@ -39,6 +44,7 @@ __all__ = [
     "has_renderable",
     "check_limits",
     "resolve_attachments",
+    "apply_attachment_metadata",
     "attachment_ids",
 ]
 
@@ -48,14 +54,25 @@ FILE = "file"
 AUDIO = "audio"
 PART_TYPES = (TEXT, IMAGE, FILE, AUDIO)
 
-#: C-05 `ui/submit.content.maxItems` (§7.2). `attach.max_per_turn` is the soft
+#: C-05 1.1.0 `ui/submit.content.maxItems` (§7.2). `attach.max_per_turn` is the soft
 #: ceiling (10) the config owns; this one is the frozen schema's hard cap.
 HARD_MAX_PARTS = 20
+
+#: C-05 / D96 / §7.2 frozen ceilings. C-18's `[attach]` may *narrow* these but
+#: never widen them: a part above them is one the frozen schema (or the D96
+#: sizing rule behind it) rejects on the wire, so `PartLimits` clamps and warns
+#: instead of letting the same core emit history its own schema calls illegal.
+HARD_TEXT_CHARS = 32000
+HARD_IMAGE_BYTES = 5242880
+HARD_IMAGE_EDGE = 2048
+HARD_IMAGE_PIXELS = 4194304
 
 #: §6.1: the only three image types that may be attached (FR-8.38).
 IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/webp"})
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")
+
+_log = get_logger("vade.session.parts")
 
 
 # --------------------------------------------------------------------- limits
@@ -78,12 +95,28 @@ class PartLimits:
     max_bytes: int = 104857600
 
     def __post_init__(self) -> None:
-        # The schema already bounds `max_per_turn` to 20; a hand-built Config
-        # (tests, embedded use) must not be able to exceed the frozen cap.
-        if int(self.max_per_turn) > HARD_MAX_PARTS:
-            object.__setattr__(self, "max_per_turn", HARD_MAX_PARTS)
-        if int(self.max_per_turn) < 1:
-            object.__setattr__(self, "max_per_turn", 1)
+        # C-18 owns the dial, C-05 owns the ceiling. A configured number above a
+        # frozen one is clamped (loudly) rather than honoured: otherwise the same
+        # core, given a legal `[attach]`, produces messages its own schema calls
+        # illegal — and every step-5 check built on these numbers becomes a
+        # check against a client-chosen ceiling again.
+        for name, ceiling, floor in (
+            ("max_per_turn", HARD_MAX_PARTS, 1),
+            ("text_max_chars", HARD_TEXT_CHARS, 1),
+            ("image_max_bytes", HARD_IMAGE_BYTES, 1),
+            ("image_max_edge", HARD_IMAGE_EDGE, 1),
+            ("image_max_pixels", HARD_IMAGE_PIXELS, 1),
+        ):
+            value = int(getattr(self, name))
+            bounded = min(max(value, floor), ceiling)
+            if bounded != value:
+                _log.warning(
+                    "attach.%s=%s exceeds the frozen C-05 ceiling %s; clamped",
+                    name,
+                    value,
+                    ceiling,
+                )
+                object.__setattr__(self, name, bounded)
 
     @classmethod
     def from_config(cls, config: Any) -> "PartLimits":
@@ -188,6 +221,18 @@ def _require_file_id(part: Mapping[str, Any], field: str) -> str:
     if not isinstance(file_id, str) or not file_id:
         raise _invalid(f"{field}.file_id", "file_id is required")
     return file_id
+
+
+def _measured_dimension(value: Any) -> int | None:
+    """A `BlobRecord` dimension as a positive int, or `None` if unusable.
+
+    The record's numbers come from the decoder, not the client, so there is no
+    message to write: a non-positive or missing edge is a blob the session
+    layer must refuse rather than serialise into a schema-illegal part.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return int(value)
 
 
 def _normalize_image(part: Mapping[str, Any], field: str, limits: PartLimits) -> dict[str, Any]:
@@ -336,7 +381,11 @@ def has_renderable(parts: Sequence[Mapping[str, Any]]) -> bool:
 
 # ---------------------------------------------------------------------- limits
 def check_limits(parts: Sequence[Mapping[str, Any]], limits: PartLimits) -> None:
-    """§6.4 step 5: declared bytes/pixels against `[attach]`, then the total.
+    """§6.4 step 5: bytes, pixels and edge length against `[attach]`, then the total.
+
+    Judge the *authoritative* numbers: `manager.submit` runs
+    `apply_attachment_metadata` before this, so `size/width/height` are the ones
+    the blob store measured, not the ones the client typed.
 
     Only `attach.*` static ceilings exist here: per-model caps need RFC-0005
     (§9), which is not landed, so the documented degradation is "static limits
@@ -358,6 +407,23 @@ def check_limits(parts: Sequence[Mapping[str, Any]], limits: PartLimits) -> None
                 )
             width = int(part.get("width") or 0)
             height = int(part.get("height") or 0)
+            edge = int(limits.image_max_edge)
+            # C-05 froze `width/height maximum: 2048`; a declared 1×1 over a
+            # 4000 px blob used to slip past both this and the schema.
+            if width > edge:
+                raise _too_large(
+                    f"{field}.width",
+                    f"image is wider than {edge} pixels",
+                    limit=edge,
+                    actual=width,
+                )
+            if height > edge:
+                raise _too_large(
+                    f"{field}.height",
+                    f"image is taller than {edge} pixels",
+                    limit=edge,
+                    actual=height,
+                )
             if width * height > int(limits.image_max_pixels):
                 raise _too_large(
                     f"{field}.pixels",
@@ -403,6 +469,13 @@ def resolve_attachments(
     file exist" is how the two halves drift apart. Malformed ids get the same
     NOT_FOUND as missing ones (§8.4: no oracle), but the field pointer names the
     part, so the UI can highlight the chip.
+
+    An attachment with no device identity is **fail-closed**: under the default
+    `read_scope="core"`, `stat()` deliberately hands back another device's blob
+    (multi-device history, §8.5), so "is it ours" has to be answered here — and
+    with no identity there is nothing to compare. A transport that does not put
+    `device_id` on the connection simply cannot submit parts carrying a
+    `file_id`; text-only turns are unaffected.
     """
     wanted = [
         (index, part)
@@ -418,8 +491,15 @@ def resolve_attachments(
             "attachment storage is not available",
             data={"field": f"content[{index}].type", "reason": "attachments_disabled"},
         )
+    if device_id is None:
+        index = wanted[0][0]
+        raise VadeError(
+            "PERMISSION_DENIED",
+            "attachments require a known device identity",
+            data={"field": f"content[{index}].file_id", "reason": "device_unknown"},
+        )
 
-    principal = _Principal(device_id=str(device_id or ""))
+    principal = _Principal(device_id=str(device_id))
     records: list[Any] = []
     for index, part in wanted:
         field = f"content[{index}].file_id"
@@ -434,7 +514,9 @@ def resolve_attachments(
             raise VadeError(
                 exc.code, exc.message, data={**(exc.data or {}), "field": field}
             ) from exc
-        if device_id and getattr(blob, "device_id", None) != device_id:
+        # `stat()` only enforces ownership when `read_scope="device"`; a submit
+        # may never reference another device's blob, whatever the read scope.
+        if getattr(blob, "device_id", None) != device_id:
             raise VadeError(
                 "PERMISSION_DENIED", "file belongs to another device", data={"field": field}
             )
@@ -454,6 +536,87 @@ def resolve_attachments(
             raise VadeError("NOT_FOUND", "file was removed by the scanner", data={"field": field})
         records.append(blob)
     return records
+
+
+def apply_attachment_metadata(
+    parts: Sequence[Mapping[str, Any]], records: Sequence[Any]
+) -> tuple[dict[str, Any], ...]:
+    """§6.4 step 4, second half: the blob store owns the metadata.
+
+    `normalize` only *parses* what the client claims. `BlobRecord` is what the
+    upload channel actually measured: real byte count, decoded dimensions,
+    sniffed mime, recomputed sha256, stored name. Keeping the claim let a
+    3 MiB / 4000 px image travel as `{"size":1,"width":1,"height":1}` and turned
+    step 5 into a check of a number the client picked — so every attachment
+    field is replaced here, *before* `check_limits` runs.
+
+    The part type is checked against the record as well: an `image` part may
+    only name a blob whose authoritative mime is one of `IMAGE_MIMES` (the
+    upload side re-derives image-ness from the mime — `kind` is a client hint
+    there — so mime, not the hint, is the honest predicate), and a `file` part
+    may name anything. A mismatch is the client lying about the chip it draws.
+    """
+    by_id: dict[str, Any] = {}
+    for record in records:
+        file_id = str(getattr(record, "file_id", "") or "")
+        if file_id:
+            by_id[file_id] = record
+
+    out: list[dict[str, Any]] = [dict(part) for part in parts]
+    for index, part in enumerate(parts):
+        kind = part.get("type")
+        if kind not in (IMAGE, FILE):
+            continue
+        field = f"content[{index}]"
+        file_id = str(part.get("file_id") or "")
+        record = by_id.get(file_id)
+        if record is None:
+            # `resolve_attachments` just proved it exists; a miss is a wiring bug.
+            raise VadeError("NOT_FOUND", "file not found", data={"field": f"{field}.file_id"})
+
+        mime = str(getattr(record, "mime", "") or "")
+        name = str(getattr(record, "name", "") or "")
+        size = int(getattr(record, "size", 0) or 0)
+
+        if kind == FILE:
+            out[index] = {
+                "type": FILE,
+                "file_id": file_id,
+                "mime": mime,
+                "name": name,
+                "size": size,
+            }
+            continue
+
+        if mime not in IMAGE_MIMES:
+            raise _invalid(
+                f"{field}.kind",
+                f"part type 'image' but the stored file is {mime or 'untyped'!r}",
+                reason="kind_mismatch",
+                expected=sorted(IMAGE_MIMES),
+                actual=mime or None,
+            )
+        width = _measured_dimension(getattr(record, "width", None))
+        height = _measured_dimension(getattr(record, "height", None))
+        if width is None or height is None:
+            # C-05 requires integer dimensions; a record without them cannot be
+            # serialised into a legal image part.
+            raise VadeError(
+                "UNSUPPORTED",
+                "stored image has no decoded dimensions",
+                data={"field": f"{field}.width", "reason": "image_dimensions_unknown"},
+            )
+        out[index] = {
+            "type": IMAGE,
+            "file_id": file_id,
+            "mime": mime,
+            "name": name,
+            "size": size,
+            "width": width,
+            "height": height,
+            "sha256": str(getattr(record, "sha256", "") or ""),
+        }
+    return tuple(out)
 
 
 def attachment_ids(records: Sequence[Any]) -> list[str]:

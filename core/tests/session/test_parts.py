@@ -214,7 +214,10 @@ def test_file_part_reaches_the_model_as_a_text_hint(tmp_path):
             width=None, height=None,
         )
         log = _log(tmp_path, blobs=service)
-        await log.submit(SESSION, [{"type": "text", "text": "读一下"}, _file(doc)], "c-1")
+        await log.submit(
+            SESSION, [{"type": "text", "text": "读一下"}, _file(doc)], "c-1",
+            device_id="dev-1",
+        )
         message = log.store.load(SESSION).messages[0]
         payload = message.to_llm()
         assert isinstance(payload["content"], list)
@@ -362,6 +365,7 @@ def test_malformed_file_id_is_not_found_with_the_part_pointer(tmp_path):
                 SESSION,
                 [{"type": "text", "text": "x"}, _image(_add_blob(service), file_id="blb_short")],
                 "c-1",
+                device_id="dev-1",
             )
         assert exc.value.code == "NOT_FOUND"
         assert exc.value.data["field"] == "content[1].file_id"
@@ -518,6 +522,134 @@ def test_attachments_disabled_refuses_image_parts(tmp_path):
     _run(scenario())
 
 
+# ------------------------------------------- attachment metadata (R1, §6.4/4b)
+def test_declared_metadata_is_replaced_by_the_blob_record(tmp_path):
+    """The record measures; the part only carries hints.
+
+    A real 3 MiB / 1600×1200 webp submitted as `{"size":1,"width":1,"height":1,
+    "mime":"image/png","sha256":"0"*64}` must be stored with the record's
+    numbers — otherwise step 5 checks a number the client picked.
+    """
+    async def scenario():
+        service = _service(tmp_path)
+        real = _add_blob(
+            service, size=3 * 1024 * 1024, mime="image/webp", name="real.webp",
+            width=1600, height=1200,
+        )
+        log = _log(tmp_path, blobs=service)
+        lie = _image(
+            real, size=1, width=1, height=1, mime="image/png", name="lie.png",
+            sha256="0" * 64,
+        )
+        await log.submit(SESSION, [lie], "c-1", device_id="dev-1")
+        stored = log.store.load(SESSION).messages[0].parts[0]
+        assert stored == {
+            "type": "image",
+            "file_id": real.file_id,
+            "mime": "image/webp",
+            "name": "real.webp",
+            "size": 3 * 1024 * 1024,
+            "width": 1600,
+            "height": 1200,
+            "sha256": real.sha256,
+        }
+        await log.wait_idle(SESSION)
+        await log.close()
+
+    _run(scenario())
+
+
+def test_a_declared_small_size_cannot_hide_a_real_oversize_image(tmp_path):
+    """Step 5 must judge the measured bytes, or `{"size":1024}` bypasses it."""
+    async def scenario():
+        service = _service(tmp_path)
+        big = _add_blob(service, size=6 * 1024 * 1024)
+        log = _log(tmp_path, blobs=service)
+        with pytest.raises(VadeError) as exc:
+            await log.submit(SESSION, [_image(big, size=1024)], "c-1", device_id="dev-1")
+        assert exc.value.code == "PAYLOAD_TOO_LARGE"
+        assert exc.value.data["field"] == "content[0].size"
+        assert exc.value.data["actual"] == 6 * 1024 * 1024
+        assert exc.value.data["limit"] == 5242880
+        assert log.store.load(SESSION).turns == ()
+        await log.close()
+
+    _run(scenario())
+
+
+def test_a_pdf_cannot_be_declared_as_an_image_part(tmp_path):
+    """`type:"image"` may only name a blob whose stored mime is an image."""
+    async def scenario():
+        service = _service(tmp_path)
+        doc = _add_blob(
+            service, kind="file", mime="application/pdf", name="spec.pdf",
+            size=902_144, width=None, height=None,
+        )
+        log = _log(tmp_path, blobs=service)
+        with pytest.raises(VadeError) as exc:
+            await log.submit(
+                SESSION, [_image(doc, mime="image/png")], "c-1", device_id="dev-1"
+            )
+        assert exc.value.code == "INVALID_ARGUMENT"
+        assert exc.value.data["field"] == "content[0].kind"
+        assert exc.value.data["reason"] == "kind_mismatch"
+        assert exc.value.data["actual"] == "application/pdf"
+        assert log.store.load(SESSION).turns == ()
+        await log.close()
+
+    _run(scenario())
+
+
+def test_a_real_image_over_the_edge_cap_cannot_hide_behind_1x1(tmp_path):
+    """C-05 froze `width/height maximum: 2048`; 1×1 must not launder 3000 px."""
+    async def scenario():
+        service = _service(tmp_path)
+        wide = _add_blob(service, width=3000, height=1000)
+        log = _log(tmp_path, blobs=service)
+        with pytest.raises(VadeError) as exc:
+            await log.submit(
+                SESSION, [_image(wide, width=1, height=1)], "c-1", device_id="dev-1"
+            )
+        assert exc.value.code == "PAYLOAD_TOO_LARGE"
+        assert exc.value.data["field"] == "content[0].width"
+        assert exc.value.data["limit"] == 2048
+        assert exc.value.data["actual"] == 3000
+        await log.close()
+
+    _run(scenario())
+
+
+# --------------------------------------------------- device identity (R2, fail-closed)
+def test_a_file_id_without_a_device_identity_is_denied(tmp_path):
+    """No identity ⇒ no attribution: under `read_scope="core"` `stat()` would
+    happily return another device's blob, so submit must fail closed."""
+    async def scenario():
+        service = _service(tmp_path)
+        image = _add_blob(service)
+        log = _log(tmp_path, blobs=service)
+        with pytest.raises(VadeError) as exc:
+            await log.submit(SESSION, [_image(image)], "c-1")
+        assert exc.value.code == "PERMISSION_DENIED"
+        assert exc.value.data["field"] == "content[0].file_id"
+        assert exc.value.data["reason"] == "device_unknown"
+        assert log.store.load(SESSION).turns == ()
+        await log.close()
+
+    _run(scenario())
+
+
+def test_a_text_only_turn_needs_no_device_identity(tmp_path):
+    """Fail-closed covers `file_id`s, not the whole submit path."""
+    async def scenario():
+        log = _log(tmp_path)
+        _, pos = await log.submit(SESSION, [{"type": "text", "text": "hi"}], "c-1")
+        assert pos == 1
+        await log.wait_idle(SESSION)
+        await log.close()
+
+    _run(scenario())
+
+
 # -------------------------------------------------------------- §6.4 step 5/3
 def test_declared_image_size_over_the_cap_is_payload_too_large(tmp_path):
     async def scenario():
@@ -559,6 +691,46 @@ def test_text_over_the_budget_is_payload_too_large(tmp_path):
             )
         assert exc.value.code == "PAYLOAD_TOO_LARGE"
         assert exc.value.data["field"] == "content[0].text"
+        await log.close()
+
+    _run(scenario())
+
+
+def test_configured_limits_are_clamped_to_the_frozen_c05_ceilings(tmp_path):
+    """C-18 owns the dial, C-05 the ceiling: `max_edge: 8192` cannot widen 2048."""
+    limits = PartLimits(
+        max_per_turn=50,
+        text_max_chars=64_000,
+        image_max_bytes=10 * 1024 * 1024,
+        image_max_edge=8192,
+        image_max_pixels=64 * 1024 * 1024,
+    )
+    assert limits.max_per_turn == 20
+    assert limits.text_max_chars == 32_000
+    assert limits.image_max_bytes == 5_242_880
+    assert limits.image_max_edge == 2048
+    assert limits.image_max_pixels == 4_194_304
+
+    async def scenario():
+        service = _service(tmp_path)
+        wide = _add_blob(service, width=3000, height=2000)
+        log = _log(
+            tmp_path, blobs=service,
+            limits=PartLimits(image_max_edge=8192, text_max_chars=64000),
+        )
+        # The declared edge is still parsed, but against the clamped 2048.
+        with pytest.raises(VadeError) as exc:
+            await log.submit(SESSION, [_image(wide)], "c-1", device_id="dev-1")
+        assert exc.value.code == "INVALID_ARGUMENT"
+        assert exc.value.data["field"] == "content[0].width"
+        assert exc.value.data["limit"] == 2048
+        with pytest.raises(VadeError) as text_exc:
+            await log.submit(
+                SESSION, [{"type": "text", "text": "x" * 40000}], "c-2", device_id="dev-1"
+            )
+        assert text_exc.value.code == "PAYLOAD_TOO_LARGE"
+        assert text_exc.value.data["field"] == "content[0].text"
+        assert text_exc.value.data["limit"] == 32000
         await log.close()
 
     _run(scenario())
@@ -690,7 +862,10 @@ def test_stored_content_equals_the_projection(tmp_path):
         service = _service(tmp_path)
         image = _add_blob(service)
         log = _log(tmp_path, blobs=service)
-        await log.submit(SESSION, [{"type": "text", "text": "hi"}, _image(image)], "c-1")
+        await log.submit(
+            SESSION, [{"type": "text", "text": "hi"}, _image(image)], "c-1",
+            device_id="dev-1",
+        )
         message = log.store.load(SESSION).messages[0]
         assert message.content == parts_text(message.parts)
         raw = log.store._conn.execute(
@@ -758,6 +933,32 @@ def test_rpc_submit_returns_field_pointers(tmp_path):
         assert bad.code == "INVALID_ARGUMENT"
         assert bad.data == {"field": "content[0].type"}
         await log.wait_idle(SESSION)
+        await log.close()
+
+    _run(scenario())
+
+
+class _AnonymousConn:
+    """A transport that never resolved a device: no `device_id` attribute."""
+
+    connection_id = "conn-2"
+
+
+def test_rpc_submit_without_a_device_identity_denies_attachments(tmp_path):
+    """R2 on the production path: `SessionRPC` reads `connection.device_id`."""
+    async def scenario():
+        service = _service(tmp_path)
+        image = _add_blob(service)
+        log = _log(tmp_path, blobs=service)
+        rpc = SessionRPC(log)
+        bad = await rpc.dispatch(
+            _AnonymousConn(), "ui/submit",
+            {"session_id": SESSION, "client_msg_id": "c-1", "content": [_image(image)]},
+        )
+        assert isinstance(bad, RpcError)
+        assert bad.code == "PERMISSION_DENIED"
+        assert bad.data == {"field": "content[0].file_id", "reason": "device_unknown"}
+        assert log.store.load(SESSION).turns == ()
         await log.close()
 
     _run(scenario())

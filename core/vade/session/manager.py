@@ -22,6 +22,7 @@ from ..errors import VadeError
 from .models import Event, Message, Session, Turn, TurnState, new_id, now_ms
 from .parts import (
     PartLimits,
+    apply_attachment_metadata,
     attachment_ids,
     check_limits,
     has_renderable,
@@ -368,8 +369,15 @@ class SessionLog:
         # 4. Every file_id: shape, exists, visible, owned, unexpired, scanned.
         records = resolve_attachments(self._blob_service(), parts, device_id=device_id)
 
-        # 5. Static `[attach]` ceilings on declared bytes and pixels. Per-model
-        #    caps need RFC-0005 (§9) and are deliberately absent, not forgotten.
+        # 4b. The blob store owns the metadata: replace the client's declared
+        #     mime/name/size/width/height/sha256 with the measured record before
+        #     step 5 judges them — otherwise "check the size" checks a number the
+        #     client chose. The part type is re-checked against the record here.
+        parts = apply_attachment_metadata(parts, records)
+
+        # 5. Static `[attach]` ceilings on the authoritative bytes and pixels.
+        #    Per-model caps need RFC-0005 (§9) and are deliberately absent, not
+        #    forgotten.
         check_limits(parts, self.limits)
 
         # 6. At least one part a renderer can draw (a pure-image turn passes).

@@ -323,6 +323,28 @@ class BlobStore:
             raise VadeError("INTERNAL", "blob row disappeared during insert")
         return _blob(row)
 
+    def revive_blob(self, file_id: str, record: BlobRecord) -> BlobRecord:
+        """Re-admit a row whose bytes are back on disk (state `missing` → `ok`).
+
+        Only `state='missing'` is revived: `ok` rows need nothing (the insert
+        was a plain dedupe) and `infected` ones are refused by the caller. The
+        reference count is untouched — the row already held its one reference,
+        so reviving must not take a second (it would leak the file forever).
+        """
+        with self._tx() as db:
+            db.execute(
+                "UPDATE blobs SET mime=?, name=?, kind=?, width=?, height=?, scan=?,"
+                " state='ok', expires_at=? WHERE file_id=? AND state='missing'",
+                (
+                    record.mime, record.name, record.kind, record.width, record.height,
+                    record.scan, record.expires_at, file_id,
+                ),
+            )
+            row = db.execute("SELECT * FROM blobs WHERE file_id=?", (file_id,)).fetchone()
+        if row is None:  # pragma: no cover - we just touched it under the same lock
+            raise VadeError("INTERNAL", "blob row disappeared during revive")
+        return _blob(row)
+
     def find_blob_by_content(self, device_id: str, sha256: str, size: int) -> BlobRecord | None:
         with self._lock:
             row = self._db.execute(

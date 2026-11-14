@@ -19,6 +19,7 @@ from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 from ..errors import VadeError
 from ..router.dispatch import Router, ToolCallResult, digest_args
 from ..session.models import Message, Turn, new_id, now_ms
+from .builtins import BuiltinContext, BuiltinRegistry
 from .catalog import parse_catalog_digest
 from .context import CompactionConfig, ContextBuilder
 from .coretools import STICKY_K, more_tools_line
@@ -106,6 +107,7 @@ class LoopEngine:
         blob_store: Any = None,
         core_tools: Mapping[str, Any] | None = None,
         catalog: Any = None,
+        builtins: BuiltinRegistry | None = None,
     ) -> None:
         self.router = router
         self.llm = llm
@@ -125,6 +127,9 @@ class LoopEngine:
         self._catalog = catalog
         self._session_hot: dict[str, list[str]] = {}
         self._layered = self.config.injection == "layered"
+        # RFC-0008 §14: core-owned tools (`ask_user`) that need no module. The
+        # engine only sees the registry interface — never a concrete name.
+        self.builtins = builtins
 
     async def run_turn(self, turn: Turn, content: Sequence[Mapping[str, Any]]) -> TurnOutcome:
         if self.llm is None:
@@ -141,7 +146,9 @@ class LoopEngine:
             # tools, so the notice must not swallow them. Legacy never grafts
             # anything, so its gate (and golden bytes) stay untouched.
             snapshot = snapshot.with_core(self._core_entries())
-        if self.router is None or not snapshot:
+        # Built-ins (`ask_user`, RFC-0008 §14) need no module: a turn with an
+        # empty module snapshot can still ask the user a question.
+        if self.router is None or (not snapshot and not self.builtins):
             text = "No capabilities are available: no module is online, so I cannot run tools."
             await self._turn_emit(
                 turn, "turn.delta",
@@ -153,7 +160,7 @@ class LoopEngine:
         memory_text = await self._read_memory(turn.session_id)
         parts = PromptParts(
             persona=self.config.persona,
-            tool_block=snapshot.render_block(),
+            tool_block=self._tool_block(snapshot),
             session_memory=memory_text,
             user_message=turn.user_text,
             context=_runtime_facts(turn.model_id) if layered else "",
@@ -182,6 +189,12 @@ class LoopEngine:
         messages: list[dict[str, Any]] = [m.to_llm() for m in system_messages]
         messages.extend(m.to_llm() for m in fitted)
 
+        # One frozen tool surface per turn: module snapshot + built-in tools,
+        # in that order (the snapshot is per-turn; built-ins are static).
+        tools = list(snapshot.schemas())
+        if self.builtins:
+            tools.extend(self.builtins.schemas())
+
         usage: dict[str, int] = {}
         recorded: list[dict[str, Any]] = []
         final_text = ""
@@ -199,12 +212,16 @@ class LoopEngine:
             attribution: dict[str, Any] = {}
             llm_calls += 1
             started = time.perf_counter()
-            tools = snapshot.schemas()
+            tools = list(snapshot.schemas())
             if layered:
                 # Hot ∪ discovered so far; every entry still comes from the
                 # frozen snapshot, and a discovery joins at the NEXT step
                 # boundary (§4.3.3 — no extra round trip, one schema change).
-                tools = snapshot.select(visible).schemas()
+                tools = list(snapshot.select(visible).schemas())
+            if self.builtins:
+                # RFC-0008 §14: core-owned tools are appended after the frozen
+                # module table, so their position never shifts a module entry.
+                tools.extend(self.builtins.schemas())
             stream = self._chat(messages, tools, turn.model_id, attribution)
             try:
                 async for delta in stream:
@@ -265,10 +282,14 @@ class LoopEngine:
                 name = call["name"]
                 args = _parse_args(call["arguments"])
                 entry = snapshot.get(name)
+                # Built-ins are consulted only when the module snapshot has no
+                # such name; the engine stays name-blind either way.
+                builtin = self.builtins.get(name) if self.builtins else None
+                target = entry if entry is not None else builtin
                 # An unknown tool has no manifest, so no risk level was ever
                 # vetted for it: preview it as high (shape only) rather than
                 # guessing `low` and echoing arguments nobody approved.
-                risk = getattr(entry, "risk", None) or "high"
+                risk = getattr(target, "risk", None) or "high"
                 tool_call_payload = {
                     "turn_id": turn.id, "call_id": call_id, "tool": name,
                     # The digest is untouched by RFC-0006: it stays the audit
@@ -291,11 +312,14 @@ class LoopEngine:
                 else:
                     await self._turn_emit(turn, "turn.tool_call", tool_call_payload)
 
-                if entry is None:
+                if target is None:
                     self._raise_if_interrupted(turn)
+                    available = list(snapshot.names())
+                    if self.builtins:
+                        available.extend(self.builtins.names())
                     message = (
                         f"Tool {name!r} does not exist. Available tools: "
-                        + (", ".join(snapshot.names()) or "(none)")
+                        + (", ".join(available) or "(none)")
                         + ". Continue without it."
                     )
                     tool_message = Message(id=new_id(), session_id=turn.session_id,
@@ -314,7 +338,7 @@ class LoopEngine:
                     recorded.append({"tool": name, "args_digest": digest_args(args), "ok": False})
                     continue
 
-                decision = await self._check_approval(turn, entry, args)
+                decision = await self._check_approval(turn, target, args)
                 if not decision.allowed:
                     self._raise_if_interrupted(turn)
                     message = f"Tool call denied: {decision.reason or 'denied by policy'}. Continue without it."
@@ -340,14 +364,23 @@ class LoopEngine:
                     recorded.append({"tool": name, "args_digest": digest_args(args), "ok": False})
                     continue
 
-                result, core_tool = await self._call_tool(turn, name, entry, args, snapshot, layered, call_id)
+                if builtin is not None:
+                    # Core-owned tool: executed here, not through the router.
+                    # The manager owns blocking, timeout, cancel and the
+                    # `turn.input_required`/`turn.input_resolved` pair.
+                    # RFC-0003's layered bookkeeping (`core_tool`) does not apply:
+                    # a builtin never joins the snapshot nor the discovery set.
+                    result = await self._call_builtin(turn, builtin, args)
+                    core_tool = None
+                else:
+                    result, core_tool = await self._call_tool(turn, name, entry, args, snapshot, layered, call_id)
                 # The side effect already happened (the module ran), so audit it
                 # BEFORE the interruption guard below can stop the turn: after
                 # the guard there is no code path left that could write it, and
                 # an interrupted turn would leave no trace of a real tool call.
                 audit_event: dict[str, Any] = {
                     "kind": "tool_call", "session_id": turn.session_id, "turn_id": turn.id,
-                    "tool": entry.tool_id, "ok": result.ok, "code": result.code,
+                    "tool": target.tool_id, "ok": result.ok, "code": result.code,
                 }
                 interrupted = self._is_interrupted(turn)
                 if interrupted:
@@ -356,7 +389,7 @@ class LoopEngine:
                 if interrupted:
                     raise asyncio.CancelledError
                 summary, summary_cut = _summary(result)
-                tool_content, content_cut = self._tool_content(entry, result)
+                tool_content, content_cut = self._tool_content(target, result)
                 tool_message = Message(id=new_id(), session_id=turn.session_id,
                                        turn_id=turn.id, role="tool", name=name,
                                        tool_call_id=call_id, content=tool_content)
@@ -706,6 +739,53 @@ class LoopEngine:
         except Exception:
             # Fail closed: a broken approver must never silently allow a call.
             return ApprovalDecision(False, reason="approval_error")
+
+    def _tool_block(self, snapshot: Any) -> str:
+        """Prompt tool list: module tools first, then the always-available core tools."""
+        block = snapshot.render_block()
+        if self.builtins:
+            builtin_block = self.builtins.render_block()
+            block = f"{block}\n{builtin_block}" if block else builtin_block
+        return block
+
+    async def _call_builtin(self, turn: Turn, builtin: Any, args: Mapping[str, Any]) -> Any:
+        """Run a core-owned tool and normalize the outcome to `ToolCallResult`.
+
+        The handler is a loop-package object (`builtins.py`); a `VadeError`
+        from it — `INVALID_ARGUMENT` on a malformed question, §4.4 item 4 —
+        becomes an error tool result and the turn CONTINUES; any other
+        exception is `INTERNAL` for the same reason. `CancelledError` always
+        propagates: an interrupted turn must die, and the manager has already
+        claimed + emitted `turn.input_resolved` on its way out (S5).
+
+        `ctx.emit` is the RAW session writer on purpose: the manager's
+        interrupt-time resolution must land BEFORE `turn.interrupted`, and the
+        guarded `_turn_emit` would swallow exactly that write (the turn is
+        already flagged when the cancellation unwinds through the wait).
+        """
+        self._raise_if_interrupted(turn)
+        started = time.perf_counter()
+        ctx = BuiltinContext(
+            session_id=turn.session_id, turn_id=turn.id,
+            emit=lambda event_type, payload: self._emit(turn.session_id, event_type, payload),
+        )
+        try:
+            result = await builtin.handler(dict(args), ctx)
+        except asyncio.CancelledError:
+            raise
+        except VadeError as exc:
+            result = ToolCallResult(False, builtin.tool_id, code=exc.code, message=exc.message)
+        except Exception as exc:  # noqa: BLE001 - a builtin must not fail the turn
+            result = ToolCallResult(False, builtin.tool_id, code="INTERNAL",
+                                    message=f"built-in tool {builtin.llm_name} failed: {exc}")
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        if not getattr(result, "duration_ms", 0):
+            result = ToolCallResult(
+                ok=result.ok, tool_id=result.tool_id, result=result.result,
+                code=result.code, message=result.message, retriable=result.retriable,
+                duration_ms=max(duration_ms, 1),
+            )
+        return result
 
     async def _read_memory(self, session_id: str) -> str:
         if self.memory is None:

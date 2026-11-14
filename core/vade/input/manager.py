@@ -178,6 +178,21 @@ class InputManager:
     def note_ui_attached(self, delta: int = 1) -> None:
         self._ui_count = max(0, self._ui_count + delta)
 
+    def ui_attached(self, session_id: str) -> int | None:
+        """Public availability probe for the `ask_user` tool (§8.4).
+
+        Returns the attached-UI count for `session_id`, or `None` when no
+        probe is wired (availability unknown — the caller decides). A broken
+        probe reads as 0, fail-closed: the tool must answer `UNAVAILABLE`
+        instead of silently blocking a turn nobody can answer.
+        """
+        if self._ui_probe is None:
+            return None
+        try:
+            return max(int(self._ui_probe(session_id)), 0)
+        except Exception:
+            return 0
+
     @property
     def ui_count(self) -> int:
         return self._ui_count
@@ -201,6 +216,38 @@ class InputManager:
 
     def resolved(self, input_id: str) -> ResolvedInput | None:
         return self._resolved.get(input_id)
+
+    # ---------------------------------------------------------------- port
+    async def ask(self, prompt: Any) -> Any:
+        """`loop.ports.InputPort` implementation: one question, one answer.
+
+        The engine's built-in `ask_user` tool arrives through this adapter —
+        the loop package only knows the `InputPort` protocol, so this is where
+        the shapes meet: `InputPrompt` becomes the core-owned `InputRequest`,
+        and the `InputOutcome` maps to `InputAnswer` (`submitted` -> status
+        `"answered"`; timeout/cancel keep their status with `value=None`).
+        Imported lazily: `vade.input` must stay importable before `vade.loop`.
+        """
+        from ..loop.ports import InputAnswer
+        from .models import InputRequest
+
+        request = InputRequest(
+            session_id=prompt.session_id, turn_id=prompt.turn_id,
+            kind=prompt.kind, prompt=prompt.prompt, detail=prompt.detail,
+            options=[dict(option) for option in (prompt.options or ())],
+            timeout_s=prompt.timeout_s, default=prompt.default,
+            max_length=prompt.max_length, source=dict(prompt.source or {}),
+            emit=prompt.emit,
+        )
+        outcome = await self.request(request)
+        if outcome.ok:
+            return InputAnswer(ok=True, value=outcome.value, status="answered",
+                               input_id=outcome.input_id)
+        return InputAnswer(ok=False, value=None, status=outcome.status,
+                           input_id=outcome.input_id,
+                           code=outcome.code or "CANCELLED",
+                           reason=outcome.reason, message=outcome.message)
+
 
     # ------------------------------------------------------------------ request
     async def request(self, req: InputRequest) -> InputOutcome:

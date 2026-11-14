@@ -225,8 +225,54 @@ def test_open_url_rejects_non_http_schemes(target):
     assert "http/https" in warnings[0]
 
 
-@pytest.mark.parametrize("target", ["https://example.com/docs", "http://192.168.1.2:8080/x?y=1"])
+@pytest.mark.parametrize("target", ["https://example.com/docs", "http://example.com:8080/x?y=1"])
 def test_open_url_accepts_http_and_https(target):
+    page = copy.deepcopy(PAGE)
+    root_of(page)["children"][3]["on"]["click"] = {"kind": "open_url", "to": target}
+    pages, warnings = validate_ui({"pages": [page]}, module_tools=("refresh",))
+    assert warnings == ()
+    assert pages[0].actions()[0].target == target
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        # S4: the host the user reads must be the host that opens.
+        "https://user:pw@ok.example/x",          # userinfo hides the real host
+        "https://***@evil.com/x",                # reads as `***`, opens evil.com
+        "http://127.0.0.1:8080/x",               # loopback
+        "http://127.1/x",
+        "http://[::1]/x",                        # IPv6 loopback
+        "http://10.0.0.1/x",                     # private
+        "http://172.16.4.4/x",                   # 172.16/12
+        "http://192.168.1.2:8080/x",             # private (the old test's "ok" case)
+        "http://169.254.169.254/latest/meta",    # cloud metadata
+        "http://localhost:8080/x",
+        "http://router.local/x",
+        "https://ok.example/x%0a%0dSet-Cookie:x", # encoded control characters
+        "https://ok.example/x%0d%0a",
+        "https://ok.example/#javascript:alert(1)",
+    ],
+)
+def test_open_url_refuses_host_spoofing_and_private_targets(target):
+    page = copy.deepcopy(PAGE)
+    root_of(page)["children"][3]["on"]["click"] = {"kind": "open_url", "to": target}
+    pages, warnings = validate_ui({"pages": [page]}, module_tools=("refresh",))
+    assert pages == (), f"{target!r} must be refused"
+    assert warnings
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        # A public name that merely STARTS with a private-looking label is a
+        # public name: `127.0.0.1.evil.com` resolves to evil.com, not loopback.
+        "https://127.0.0.1.evil.com/x",
+        "https://example.com/127.0.0.1",
+        "https://172.32.0.1/x",
+    ],
+)
+def test_open_url_still_allows_public_hosts(target):
     page = copy.deepcopy(PAGE)
     root_of(page)["children"][3]["on"]["click"] = {"kind": "open_url", "to": target}
     pages, warnings = validate_ui({"pages": [page]}, module_tools=("refresh",))

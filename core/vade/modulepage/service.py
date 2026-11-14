@@ -49,6 +49,13 @@ from ..router.dispatch import (
     digest_args,
     validate_arguments,
 )
+from .auth import (
+    Caller,
+    authorize_target,
+    device_of,
+    is_read_only,
+    require_visible,
+)
 
 __all__ = ["ModulePageService", "PageLimits", "PAGE_GET_DEADLINE_MS", "STATE_GET_DEADLINE_MS"]
 
@@ -93,7 +100,14 @@ class _CachedState:
 
 @dataclass(slots=True)
 class _PendingCall:
-    """Stage-one record for `ui/tool.call`. Holds the args digest, never a token."""
+    """Stage-one record for `ui/tool.call`. Holds the args digest, never a token.
+
+    `session_id` and `approver_device_id` are the binding B2 was missing: an
+    approval is a statement by one device about one session, and stage two must
+    be the same device in the same session. Comparing only the args digest let
+    `session-ALICE` approve a call that then executed as `session-BOB`, with the
+    module receiving `session_id=session-BOB` (the value `_execute` forwards).
+    """
 
     call_id: str
     module_id: str
@@ -105,6 +119,8 @@ class _PendingCall:
     request_id: str
     expires_at: float          # wall clock, from the approval
     created_mono: float
+    session_id: str = ""
+    approver_device_id: str = ""
 
 
 class ModulePageService:
@@ -124,7 +140,16 @@ class ModulePageService:
         self._clock = clock
         self._wall = wall_clock
         self._state_cache: dict[tuple[str, str, str], _CachedState] = {}
-        self._page_cache: dict[tuple[str, str, str], tuple[str, Mapping[str, Any], int]] = {}
+        #: B5: one lock per page key. `get_state` is two awaits long (module
+        #: round trip), so "compare then write" is not atomic on its own: a slow
+        #: rev=3 answer could land after a fast rev=9 one and hang the OLD state
+        #: on a NEWER rev. The lock makes compare-and-swap atomic per key and
+        #: keeps unrelated pages from queueing behind each other.
+        self._state_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        #: S3: the ref cache is keyed by the digest pinned in the manifest, so a
+        #: `capabilities.update` that changes the body changes the key and the
+        #: stale body can never be served (§10.3 anti-substitution).
+        self._page_cache: dict[tuple[str, str, str, str], tuple[Mapping[str, Any], int]] = {}
         self._calls: dict[str, _PendingCall] = {}
 
     # --------------------------------------------------------------- components
@@ -227,8 +252,17 @@ class ModulePageService:
         return reply
 
     # ------------------------------------------------------------------ page/get
-    async def get_page(self, module_id: str, instance_id: str, page_id: str) -> dict[str, Any]:
+    async def get_page(
+        self, connection: Any, module_id: str, instance_id: str, page_id: str
+    ) -> dict[str, Any]:
+        """Serve one page to `connection` (§9.3).
+
+        The connection decides *whether* this caller may see the page; the
+        params only say *which* page. See `modulepage/auth.py`.
+        """
+        caller = authorize_target(connection, module_id, instance_id)
         record = self._record(module_id, instance_id)
+        require_visible(caller, record)
         page = self._page(record, page_id)
         if page.is_ref:
             body, digest = await self._ref_body(record, page)
@@ -239,10 +273,14 @@ class ModulePageService:
         return {"schema": body, "sha256": digest}
 
     async def _ref_body(self, record: Any, page: UIPage) -> tuple[Mapping[str, Any], str]:
-        key = (record.module_id, record.instance_id, page.page_id)
+        declared = page.ref[1] if page.ref is not None else ""
+        # S3: the digest is part of the key. A `capabilities.update` that pins a
+        # new body changes `declared`, so the old entry is unreachable instead of
+        # being re-served for the rest of the process lifetime.
+        key = (record.module_id, record.instance_id, page.page_id, declared)
         cached = self._page_cache.get(key)
         if cached is not None:
-            return dict(cached[1]), cached[0]
+            return dict(cached[0]), declared
 
         reply = await self._module_rpc(
             record, "page/get", {"page_id": page.page_id}, PAGE_GET_DEADLINE_MS
@@ -260,7 +298,6 @@ class ModulePageService:
                 f"{page.pointer}/schema: ref body is {size} bytes > {ceiling}",
             )
         digest = page_digest(body)
-        declared = page.ref[1] if page.ref is not None else ""
         if digest != declared:
             # The manifest pinned the digest; a module cannot swap the body after
             # registration (§10.3).
@@ -269,15 +306,15 @@ class ModulePageService:
                 f"{page.pointer}/schema: sha256 mismatch (manifest {declared[:12]}…, body {digest[:12]}…)",
             )
         self._trim_page_cache(record.module_id, size)
-        self._page_cache[key] = (digest, dict(body), size)
+        self._page_cache[key] = (dict(body), size)
         return dict(body), digest
 
     def _trim_page_cache(self, module_id: str, incoming: int) -> None:
-        total = sum(size for (mod, _i, _p), (_d, _s, size) in self._page_cache.items() if mod == module_id)
+        total = sum(size for (mod, _i, _p, _d), (_b, size) in self._page_cache.items() if mod == module_id)
         if total + incoming <= self.limits.module_cache_bytes:
             return
         for key in [k for k in self._page_cache if k[0] == module_id]:
-            _digest, _body, size = self._page_cache.pop(key)
+            _body, size = self._page_cache.pop(key)
             total -= size
             if total + incoming <= self.limits.module_cache_bytes:
                 return
@@ -288,6 +325,13 @@ class ModulePageService:
         Registration checked the declaration; this checks the body actually being
         returned (a ref page arrives later, and a client may be older than core).
         Failure is `MANIFEST_INVALID`, never a partial tree.
+
+        B4: a ref body is NOT an inline declaration. Passing `allow_ref=False`
+        with the default 8 KiB ceiling applied the manifest's inline budget to a
+        fetched tree, so 9 770 / 15 614 / 23 406 / 29 250-byte ref pages were
+        all refused — i.e. the ref mechanism could never serve anything the
+        inline budget could not already hold. The body gets `MAX_REF_BYTES`
+        here; the node/depth/action limits are unchanged.
         """
         declaration = {
             "id": page.page_id,
@@ -307,13 +351,21 @@ class ModulePageService:
                 page_ids=[p.page_id for p in record.manifest.ui_pages],
                 pointer=page.pointer,
                 allow_ref=False,
+                # The 48 KiB block budget still applies to the whole `ui` block
+                # at registration; the fetched body is capped at 64 KiB by
+                # `_ref_body` before it ever gets here.
+                inline_max_bytes=MAX_REF_BYTES,
             )
         except UIPageError as exc:
             raise VadeError("MANIFEST_INVALID", str(exc)) from None
 
     # ----------------------------------------------------------------- state/get
-    async def get_state(self, module_id: str, instance_id: str, page_id: str) -> dict[str, Any]:
+    async def get_state(
+        self, connection: Any, module_id: str, instance_id: str, page_id: str
+    ) -> dict[str, Any]:
+        caller = authorize_target(connection, module_id, instance_id)
         record = self._record(module_id, instance_id)
+        require_visible(caller, record)
         page = self._page(record, page_id)
         key = (record.module_id, record.instance_id, page.page_id)
         now = self._clock()
@@ -333,10 +385,27 @@ class ModulePageService:
             # The module's own state is untrusted input; a malformed blob is
             # UNAVAILABLE for this page, not a core crash and not a rendered page.
             raise VadeError("UNAVAILABLE", f"{record.module_id} returned an invalid page state: {exc.reason}") from None
-        if cached is not None:
-            rev = max(rev, cached.rev + 1)  # §9.3: rev is monotonic per page
-        entry = _CachedState(rev=rev, state=state, fetched_mono=now, fetched_at=int(self._wall()))
-        self._state_cache[key] = entry
+
+        # B5: compare-and-swap under a per-key lock, and NEVER invent a rev.
+        # `max(rev, cached.rev + 1)` used to fabricate a newer rev around older
+        # data — worse than a plain regression, because the client trusts `rev`
+        # and would render `{'v': 'old'}` as rev 10. A module's `rev` is the only
+        # ordering signal core has; if it goes backwards, the older answer loses.
+        lock = self._state_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            previous = self._state_cache.get(key)
+            if previous is not None and rev <= previous.rev:
+                if rev == previous.rev:
+                    # Same rev, same data: refresh the TTL so the page is not
+                    # re-fetched on every tick, and keep the stored value.
+                    previous.fetched_mono = now
+                    return {"rev": previous.rev, "state": dict(previous.state),
+                            "fetched_at": previous.fetched_at, "unchanged": True}
+                # Older than what we already served: drop it on the floor.
+                return {"rev": previous.rev, "state": dict(previous.state),
+                        "fetched_at": previous.fetched_at, "unchanged": True}
+            entry = _CachedState(rev=rev, state=state, fetched_mono=now, fetched_at=int(self._wall()))
+            self._state_cache[key] = entry
         return {"rev": entry.rev, "state": dict(state), "fetched_at": entry.fetched_at}
 
     # --------------------------------------------------------------- ui/tool.call
@@ -359,7 +428,22 @@ class ModulePageService:
             if value is not None and not isinstance(value, str):
                 raise VadeError("INVALID_ARGUMENT", f"{name} must be a string", data={"field": name})
 
+        # B1: the caller must own the target module. A browser may read a page
+        # but never *call* one without the approval flow below — and the
+        # approval is minted against the connection that asked.
+        caller = authorize_target(connection, module_id, instance_id)
+        # B3: `rpc.json` has declared READ_ONLY_SESSION for this method since
+        # C-05 1.2.0 and nothing checked it. A read-only session is exactly the
+        # one that must not be able to turn a page into a tool call: the page
+        # was rendered by a viewer, not by a writer.
+        if is_read_only(connection):
+            raise VadeError(
+                "READ_ONLY_SESSION",
+                "this session is read-only; a page may not call a tool from it",
+            )
+
         record = self._record(module_id, instance_id)
+        require_visible(caller, record)
         page = self._page(record, page_id)
         spec = record.manifest.tool(tool)
         if spec is None:
@@ -449,6 +533,10 @@ class ModulePageService:
             request_id=pending.request_id,
             expires_at=pending.created_at + float(getattr(approval, "timeout_s", 60.0)),
             created_mono=self._clock(),
+            # B2: bind the mint to the session and the device that asked. Stage
+            # two compares both verbatim; see `_second_stage`.
+            session_id=session_id,
+            approver_device_id=device_of(connection),
         )
         self._remember_call(call)
         self._audit({
@@ -492,6 +580,28 @@ class ModulePageService:
             raise VadeError("PERMISSION_DENIED", "args differ from the approved request (digest mismatch)")
         if approval_id != pending_call.request_id:
             raise VadeError("PERMISSION_DENIED", "approval_id does not match the minted request")
+        # B2: an approval is a statement by ONE device about ONE session. The
+        # args digest alone let `session-ALICE` approve a call that stage two
+        # then ran as `session-BOB` — the module received `session-BOB` as its
+        # `session_id`, so the human approved one conversation and the write
+        # landed in another. Both halves are compared verbatim, and the field
+        # name says which one failed.
+        if session_id != pending_call.session_id:
+            # Not consumed on refusal: the call_id + approval_id pair is a
+            # capability, and burning it because *someone else* presented it
+            # would let a third party cancel a legitimate approval.
+            raise VadeError(
+                "PERMISSION_DENIED",
+                f"this call was minted for session {pending_call.session_id!r}; "
+                f"redeeming it from {session_id!r} is not the approval that was granted",
+                data={"field": "session_id"},
+            )
+        if device_of(connection) != pending_call.approver_device_id:
+            raise VadeError(
+                "PERMISSION_DENIED",
+                "this call was minted by a different device; the approval belongs to that device",
+                data={"field": "approver"},
+            )
         approval = self._approval()
         if approval is None:
             raise VadeError("UNAVAILABLE", "the approval port disappeared between stages")
@@ -602,8 +712,15 @@ class ModulePageService:
         and audit are the same as a typed message. `navigate` and `open_url` are
         **resolved, not executed**: the host performs them, and neither can leave
         the app except through an http(s) URL the user sees.
+
+        B1/B3: this is a fifth entry point into the same pages, so it carries the
+        same two gates. `tool_call` and `ui/submit` check them again downstream;
+        `navigate`/`open_url` have no downstream, so without the checks here a
+        module could route another module's page — the exact hole B1 named.
         """
+        caller = authorize_target(connection, module_id, instance_id)
         record = self._record(module_id, instance_id)
+        require_visible(caller, record)
         page = self._page(record, page_id)
         action = self._find_action(page, event=event, node_id=node_id)
         if action is None:

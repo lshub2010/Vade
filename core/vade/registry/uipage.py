@@ -137,6 +137,21 @@ MODULE_STATUS_FIELDS = frozenset({"online", "version", "instance_id"})
 #: §5.2: presentation-only formats. Unknown ones degrade to text (§7.2).
 BINDING_FORMATS = frozenset({"text", "int", "decimal", "percent", "bytes", "datetime", "relative"})
 
+#: §6.5: hosts a page may not send the user to. A page is untrusted input; a
+#: deep link into the router's admin panel or a loopback service is a
+#: same-origin request the user cannot see coming, and `169.254.169.254` is the
+#: cloud metadata endpoint. Names are compared after `.`-splitting so
+#: `127.0.0.1.evil.com` is still allowed (it resolves to evil.com, not loopback)
+#: while `127.0.0.1` and `[::1]` are not.
+BLOCKED_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".localdomain")
+BLOCKED_HOST_EXACT = frozenset({"localhost"})
+PRIVATE_IPV4_PREFIXES = ("127.", "10.", "192.168.", "169.254.", "0.", "255.")
+#: 172.16.0.0/12 — only the second octet decides, so it is a range check.
+PRIVATE_IPV4_SECOND_OCTETS = range(16, 32)
+_IPV4_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+#: `127`, `127.1`, `10.1.2.3.4` — everything `inet_aton` would treat as a literal.
+_DOTTED_NUMERIC_RE = re.compile(r"^\d{1,3}(\.\d{1,3})*$")
+
 #: §7.2: any key whose meaning could be "run something". Compared after
 #: lower-casing and dropping `_`/`-`, so `onClick`, `on_click` and `ON-CLICK`
 #: are one entry — a normalisation the attacker cannot dodge by spelling.
@@ -716,8 +731,25 @@ def check_navigate(target: str, *, pointer: str, page_ids: Sequence[str]) -> Non
 
 
 def check_open_url(target: str, *, pointer: str) -> None:
+    """http/https only, and the host the user reads is the host that opens.
+
+    The scheme check alone was not enough: `https://user:pw@ok.example/x` reads
+    as `ok.example` but the browser goes to `ok.example` — fine — while
+    `https://***@evil.com/x` reads as `***` and goes to `evil.com`; `127.0.0.1`
+    and `[::1]` are requests into the user's own machine; `%0a`/`%0d` and a
+    `#javascript:` fragment are how a target survives a downstream renderer that
+    decodes before it validates. Every one of them is refused here, at
+    registration and again at routing time.
+    """
     if any(ord(ch) < 0x20 for ch in target):
         _fail(pointer, "URL contains control characters")
+    lowered = target.lower()
+    for encoded in ("%0a", "%0d", "%09", "%00"):
+        if encoded in lowered:
+            # A percent-encoded control character is the same attack one decode
+            # later; a downstream renderer that unquotes before validating
+            # would otherwise see a newline where the check saw `%0a`.
+            _fail(pointer, f"URL contains an encoded control character ({encoded})")
     try:
         parts = urlsplit(target)
     except ValueError:
@@ -730,6 +762,54 @@ def check_open_url(target: str, *, pointer: str) -> None:
         )
     if not parts.netloc:
         _fail(pointer, f"{target!r} has no host")
+    if "@" in parts.netloc:
+        # `user:pw@host` and `***@host` both make the readable part disagree
+        # with the real host. No page needs credentials in a link it shows the
+        # user, so the whole shape is refused rather than stripped.
+        _fail(
+            pointer,
+            f"{target!r} carries userinfo (`user:pw@`); the visible host would not be the host that opens",
+        )
+    if parts.fragment and parts.fragment.lstrip().lower().startswith("javascript:"):
+        _fail(pointer, "URL fragment starts with `javascript:` (a renderer that follows it executes script)")
+    host = (parts.hostname or "").strip().rstrip(".")
+    if not host:
+        _fail(pointer, f"{target!r} has no host")
+    _check_open_url_host(host, pointer=pointer)
+
+
+def _check_open_url_host(host: str, *, pointer: str) -> None:
+    """Refuse loopback, private and metadata targets (literal hosts only)."""
+    lowered = host.lower()
+    if lowered in BLOCKED_HOST_EXACT or lowered.endswith(BLOCKED_HOST_SUFFIXES):
+        _fail(pointer, f"host {host!r} is a local name; open_url may not reach the user's machine")
+    if lowered.startswith("[") and lowered.endswith("]"):
+        lowered = lowered[1:-1]
+    if ":" in lowered:
+        # IPv6: `::1` loopback, `fc00::/7` unique-local, `fe80::/10` link-local.
+        if lowered in ("::1", "::"):
+            _fail(pointer, f"host {host!r} is the IPv6 loopback; open_url may not reach the user's machine")
+        if lowered.startswith("fc") or lowered.startswith("fd") or lowered.startswith("fe80"):
+            _fail(pointer, f"host {host!r} is an IPv6 private address; open_url may not reach the user's machine")
+        return
+    match = _IPV4_RE.match(lowered)
+    if match is None:
+        # Not a dotted quad. A bare numeric host is still a literal address to
+        # every resolver in use (`http://127.1/` and `http://127/` both reach
+        # loopback; inet_aton accepts 1..4 parts), so it is judged on its first
+        # label rather than waved through.
+        if _DOTTED_NUMERIC_RE.match(lowered) and lowered.split(".")[0] in ("0", "10", "127", "169", "172", "192", "255"):
+            _fail(pointer, f"host {host!r} is a private/loopback address in shorthand form; open_url may not reach the user's machine")
+        return
+    octets = [int(group) for group in match.groups()]
+    if any(value > 255 for value in octets):
+        # Not a real IPv4 literal; leave it to the host's resolver rather than
+        # guessing what a lenient parser would do with it.
+        return
+    if lowered.startswith(PRIVATE_IPV4_PREFIXES):
+        _fail(pointer, f"host {host!r} is a private/loopback IPv4 address; open_url may not reach the user's machine")
+    if octets[1] in PRIVATE_IPV4_SECOND_OCTETS and octets[0] == 172:
+        _fail(pointer, f"host {host!r} is a private IPv4 address (172.16/12); open_url may not reach the user's machine")
 
 
 # ----------------------------------------------------------------------- nodes
@@ -900,8 +980,18 @@ def validate_page(
     page_ids: Sequence[str] = (),
     pointer: str = "/ui/pages/0",
     allow_ref: bool = True,
+    inline_max_bytes: int | None = None,
 ) -> UIPage:
-    """Validate one page declaration. Raises :class:`UIPageError` on any doubt."""
+    """Validate one page declaration. Raises :class:`UIPageError` on any doubt.
+
+    `inline_max_bytes` exists because the 8 KiB inline ceiling is a *manifest*
+    budget, not a body budget: the body of a `ref` page arrives through
+    `page/get` and is allowed `MAX_REF_BYTES` (RFC Q1 — the whole reason refs
+    exist). `ui/page.get` re-validates that body here with
+    `allow_ref=False, inline_max_bytes=MAX_REF_BYTES`; without the override the
+    8 KiB ceiling applied to the fetched tree and every page above 8 KiB was
+    refused, which made the ref mechanism dead.
+    """
     _scan_forbidden(raw, pointer)
     page = _require_mapping(raw, pointer)
     unknown = sorted(key for key in page if key not in _PAGE_KEYS and not str(key).startswith("x-"))
@@ -976,10 +1066,11 @@ def validate_page(
         ref = (ref_page, digest)
     else:
         size = len(serialize(schema_raw))
-        if size > MAX_INLINE_BYTES:
+        ceiling = MAX_INLINE_BYTES if inline_max_bytes is None else int(inline_max_bytes)
+        if size > ceiling:
             _fail(
                 f"{pointer}/schema",
-                f"inline schema is {size} bytes > {MAX_INLINE_BYTES} (use a ref for big pages)",
+                f"inline schema is {size} bytes > {ceiling} (use a ref for big pages)",
             )
         counter = [0]
         actions_total = [0]

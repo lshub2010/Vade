@@ -2,9 +2,15 @@
 
 Same shape as `session/rpc.py` and `tasks/rpc.py`: `async handler(connection,
 params)` returning a plain dict, `VadeError` for refusals. `install()` merges the
-three names into `app.session_handlers`, the one table the dispatcher reads —
-`ui/tool.call` therefore inherits the device authentication and session context
-the rest of `ui/*` already has; this file adds no auth surface of its own.
+three names into `app.session_handlers`, the one table the dispatcher reads.
+
+**The `connection` argument is load-bearing.** C2's dispatcher
+(`app.py::make_rpc_handler`) hands every `ui/*` method to whatever socket asked,
+so this file is the last place that can tell module A from module B. It used to
+drop the argument on the floor for `page.get`/`state.get` — the handler signature
+had it, the body did not — and that is precisely how module A read module B's
+page and state. Every method now passes it to the service, which resolves the
+caller in `modulepage/auth.py` and refuses a target that is not its own.
 """
 
 from __future__ import annotations
@@ -29,11 +35,11 @@ class ModulePageRPC:
 
     async def page_get(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
         module_id, instance_id, page_id = _ids(params)
-        return await self.service.get_page(module_id, instance_id, page_id)
+        return await self.service.get_page(connection, module_id, instance_id, page_id)
 
     async def state_get(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
         module_id, instance_id, page_id = _ids(params)
-        return await self.service.get_state(module_id, instance_id, page_id)
+        return await self.service.get_state(connection, module_id, instance_id, page_id)
 
     async def tool_call(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
         return await self.service.tool_call(connection, params)

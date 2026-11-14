@@ -107,6 +107,44 @@
         }
       }
     },
+    "attach": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "RFC-0004 attachment upload channel (`/ui/blob*`). Additive to C-18 1.0.0; the root stays additionalProperties:false, so a typo here is UNKNOWN_CONFIG_KEY at startup rather than a silent default.",
+      "properties": {
+        "enabled": {"type": "boolean", "default": true, "x-vade": {"apply": "restart", "owner": "C2", "note": "false => /ui/blob* is 404 (the route does not exist) and ui/submit refuses image/file parts."}},
+        "max_bytes": {"type": "integer", "minimum": 1024, "default": 104857600, "x-vade": {"apply": "restart", "owner": "C2", "note": "Hard per-file ceiling (100 MiB). 413 data.field=size."}},
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "default": {"max_bytes": 5242880, "max_edge": 2048, "max_pixels": 4194304},
+          "properties": {
+            "max_bytes": {"type": "integer", "minimum": 1024, "default": 5242880, "x-vade": {"apply": "restart", "owner": "C2", "note": "D96: 5 MiB after client compression, not the original pick."}},
+            "max_edge": {"type": "integer", "minimum": 16, "maximum": 8192, "default": 2048, "x-vade": {"apply": "restart", "owner": "C2"}},
+            "max_pixels": {"type": "integer", "minimum": 1024, "default": 4194304, "x-vade": {"apply": "restart", "owner": "C2", "note": "Decode-bomb ceiling: width*height from the header, checked before any decode."}}
+          }
+        },
+        "part_size": {"type": "integer", "minimum": 65536, "default": 10485760, "x-vade": {"apply": "restart", "owner": "C2", "note": "Part ceiling; the client may propose less, the server clamps to [5 MiB, this]. Body max is part_size + 1 KiB."}},
+        "part_max_concurrent": {"type": "integer", "minimum": 1, "maximum": 16, "default": 3, "x-vade": {"apply": "hot", "owner": "C2", "note": "FR-8.39: three parallel parts. Over the limit is 429 OVERLOADED, not a conflict."}},
+        "max_per_turn": {"type": "integer", "minimum": 1, "maximum": 20, "default": 10, "x-vade": {"apply": "hot", "owner": "C3", "note": "ui/submit part count (FR-8.41); 20 is the schema hard cap."}},
+        "text_max_chars": {"type": "integer", "minimum": 1, "default": 32000, "x-vade": {"apply": "hot", "owner": "C3", "note": "FR-8.45 per-turn text ceiling."}},
+        "ttl_hours": {"type": "number", "minimum": 0, "default": 1, "x-vade": {"apply": "restart", "owner": "C2", "note": "Unpinned blob TTL. Pinned blobs never expire (§4.7)."}},
+        "upload_idle_ttl_min": {"type": "number", "minimum": 1, "default": 15, "x-vade": {"apply": "hot", "owner": "C2", "note": "An open upload with no new part for this long is 404 and its temp file is collected."}},
+        "quota_bytes": {"type": "integer", "minimum": 1048576, "default": 2147483648, "x-vade": {"apply": "hot", "owner": "C2", "note": "Per device, committed + open uploads. The temp area is a quarter of it. 413 data.reason=quota|tmp_quota."}},
+        "gc_interval_s": {"type": "number", "minimum": 10, "default": 60, "x-vade": {"apply": "hot", "owner": "C2", "note": "Sweeper period; the GC lease is twice this."}},
+        "thumb_px": {"type": "integer", "minimum": 64, "maximum": 1024, "default": 320, "x-vade": {"apply": "hot", "owner": "C2", "note": "`?v=thumb` long edge; derived lazily and never part of dedupe."}},
+        "read_scope": {"type": "string", "enum": ["core", "device"], "default": "core", "x-vade": {"apply": "hot", "owner": "C2", "note": "core = any authenticated principal may read (multi-device history); device = uploader only, cross-device is 403 PERMISSION_DENIED."}},
+        "scan": {
+          "type": "object",
+          "additionalProperties": false,
+          "default": {"enabled": false, "command": ""},
+          "properties": {
+            "enabled": {"type": "boolean", "default": false, "x-vade": {"apply": "restart", "owner": "C2", "note": "complete returns status=scanning; HEAD carries scan=pending|clean|infected. Off by default: single-user self-hosting."}},
+            "command": {"type": "string", "default": "", "x-vade": {"apply": "restart", "owner": "C2", "note": "Executable plus args; the blob path is appended. Exit 0 = clean, 1 = infected (file removed)."}}
+          }
+        }
+      }
+    },
     "dev": {
       "type": "object",
       "additionalProperties": false,

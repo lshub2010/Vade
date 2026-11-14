@@ -153,6 +153,8 @@ def _serve(app: App, uvicorn: Any, *, strict: bool) -> int:
         make_crypto=build_module_crypto(app),
         on_rpc=make_rpc_handler(app),
         policy_mode="allow_all" if app.config.get("dev.allow_all") else "default",
+        # RFC-0004: `/ui/blob*` lives on this listener, mounted by `vade.blob`.
+        blob=getattr(app, "blob", None),
     )
 
     host, _, port_text = str(app.config.get("core.listen")).rpartition(":")

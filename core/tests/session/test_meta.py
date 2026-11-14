@@ -634,9 +634,9 @@ def test_rpc_schema_and_handlers_agree_on_the_ten_methods():
     rpc_data = json.loads(SCHEMA_RPC.read_text(encoding="utf-8"))
     # The pin tracks the current C-05 head: 1.3.0 was RFC-0010's append;
     # RFC-0012 (subagent/list|get) owned 1.4.0; RFC-0014 (session/search)
-    # owns 1.5.0. The TEN_METHODS assertions below are the real subject of
-    # this test and did not move.
-    assert rpc_data["version"] == "1.5.0"
+    # owned 1.5.0; RFC-0015 (ui/modules) owns 1.6.0. The TEN_METHODS
+    # assertions below are the real subject of this test and did not move.
+    assert rpc_data["version"] == "1.6.0"
     ui = rpc_data["directions"]["ui_to_core"]
     registered = set(SessionRPC(None).handlers())
     for name in TEN_METHODS:

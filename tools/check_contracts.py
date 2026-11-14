@@ -19,6 +19,9 @@ Checks (each one has broken at least once in review):
      instead of being exempted. Every entry the schema marks
      `x-vade.push: events/deliver` must be pushed, every pushed topic must be
      declared, and the marked set must equal the topic set the bus serves.
+  9. RFC-0004: `[attach]` carries exactly the 17 keys of §7.4 with their
+     documented defaults/apply semantics, and `core/vade/blob/http.py` declares
+     the six `/ui/blob*` routes the RFC froze.
 
 Run:  python3 tools/check_contracts.py      (exit 0 = green)
 """
@@ -52,6 +55,48 @@ STATE_CHANGE_EVENTS = {
     "turn.interrupted", "turn.cancelled", "turn.approval_resolved",
 }
 PAYLOAD_ONLY_EVENTS = {"turn.delta", "turn.tool_call", "turn.tool_result"}
+
+#: RFC-0004 §7.4: the frozen `[attach]` key set, defaults and apply semantics.
+#: Kept here (not derived from the schema) so a silent default change goes red.
+ATTACH_DEFAULTS: dict[str, object] = {
+    "attach.enabled": True,
+    "attach.max_bytes": 104857600,
+    "attach.image.max_bytes": 5242880,
+    "attach.image.max_edge": 2048,
+    "attach.image.max_pixels": 4194304,
+    "attach.part_size": 10485760,
+    "attach.part_max_concurrent": 3,
+    "attach.max_per_turn": 10,
+    "attach.text_max_chars": 32000,
+    "attach.ttl_hours": 1,
+    "attach.upload_idle_ttl_min": 15,
+    "attach.quota_bytes": 2147483648,
+    "attach.gc_interval_s": 60,
+    "attach.thumb_px": 320,
+    "attach.read_scope": "core",
+    "attach.scan.enabled": False,
+    "attach.scan.command": "",
+}
+ATTACH_HOT = {
+    "attach.part_max_concurrent",
+    "attach.max_per_turn",
+    "attach.text_max_chars",
+    "attach.upload_idle_ttl_min",
+    "attach.quota_bytes",
+    "attach.gc_interval_s",
+    "attach.thumb_px",
+    "attach.read_scope",
+}
+
+#: RFC-0004 §4.1 route table; `GET|HEAD` is one row in the RFC.
+BLOB_ROUTES = {
+    ("POST", "/ui/blob"),
+    ("PUT", "/ui/blob/upload/{upload_id}"),
+    ("HEAD", "/ui/blob/upload/{upload_id}"),
+    ("POST", "/ui/blob/upload/{upload_id}/complete"),
+    ("DELETE", "/ui/blob/upload/{upload_id}"),
+    ("GET|HEAD", "/ui/blob/{file_id}"),
+}
 
 FAILURES: list[str] = []
 
@@ -155,6 +200,50 @@ def walk_leaves(node: dict, prefix: str = ""):
             yield dotted, sub
 
 
+def check_attach(config: dict) -> None:
+    """RFC-0004 §7.4: exactly 17 keys, documented defaults, hot|restart."""
+    attach = (config.get("properties") or {}).get("attach")
+    if not isinstance(attach, dict):
+        FAILURES.append("config.schema.json: missing [attach] section (RFC-0004 §7.4)")
+        return
+    check(
+        attach.get("additionalProperties") is False,
+        "config.schema.json: [attach].additionalProperties must be false",
+    )
+    leaves = dict(walk_leaves(attach, "attach"))
+    missing = sorted(set(ATTACH_DEFAULTS) - set(leaves))
+    extra = sorted(set(leaves) - set(ATTACH_DEFAULTS))
+    check(not missing and not extra, f"config.schema.json [attach] key drift: missing={missing} extra={extra}")
+    for dotted, expected in ATTACH_DEFAULTS.items():
+        leaf = leaves.get(dotted) or {}
+        check(
+            leaf.get("default") == expected,
+            f"config.schema.json {dotted}: default {leaf.get('default')!r} != {expected!r} (RFC-0004 §7.4)",
+        )
+        wanted = "hot" if dotted in ATTACH_HOT else "restart"
+        check(
+            (leaf.get("x-vade") or {}).get("apply") == wanted,
+            f"config.schema.json {dotted}: apply must be {wanted} (RFC-0004 §7.4)",
+        )
+
+
+def check_blob_routes() -> None:
+    """RFC-0004 §4.1: the six routes are a contract, not an implementation detail."""
+    if str(ROOT / "core") not in sys.path:
+        sys.path.insert(0, str(ROOT / "core"))
+    try:
+        from vade.blob.http import ROUTES
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        FAILURES.append(f"core/vade/blob/http.py: cannot import ROUTES ({type(exc).__name__}: {exc})")
+        return
+    declared = {(method, path) for method, path in ROUTES}
+    check(
+        declared == BLOB_ROUTES,
+        "blob route drift vs RFC-0004 §4.1: "
+        f"missing={sorted(BLOB_ROUTES - declared)} extra={sorted(declared - BLOB_ROUTES)}",
+    )
+
+
 def main() -> int:
     manifest = load("manifest.schema.json")
     errors = load("errors.json")
@@ -204,6 +293,9 @@ def main() -> int:
             check(meta.get("apply") in ("hot", "restart"), f"config key {dotted}: apply must be hot|restart")
             check(bool(meta.get("owner")), f"config key {dotted}: owner missing")
             check("default" in leaf, f"config key {dotted}: default missing")
+
+    check_attach(config)
+    check_blob_routes()
 
     methods = {
         "module/register", "module/capabilities.update", "module/heartbeat",

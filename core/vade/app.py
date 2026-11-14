@@ -103,6 +103,11 @@ class App:
     async def shutdown(self) -> None:
         if self.pairing is not None:
             self.pairing.close()
+        # RFC-0004: the blob store holds a sqlite handle; close it with the app
+        # so a restart does not depend on process exit to release -wal/-shm.
+        blob = getattr(self, "blob", None)
+        if blob is not None and hasattr(blob, "close"):
+            blob.close()
         self.started = False
 
     # ------------------------------------------------------------------ hooks

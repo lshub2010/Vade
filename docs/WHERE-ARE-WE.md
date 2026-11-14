@@ -6,12 +6,13 @@
 
 ## 已完成（本仓可核实）
 
-- 契约：C-05 `rpc.json` **1.5.0**，方法 **47**（ui_to_core 34 / core_to_module 7 / module_to_core 6）；C-06 `events.json` **2.0.0**，事件 **34**；C-04 **34** 错误码；append 登记 **10+7+3=20** 块（出处：三份 schema 文件重算，`tools/check_ledger.py` 比对通过）。
-- 服务端测试：**1078 passed**（`pytest core/tests -q`，2026-11-14 在 `dev_gingshan` 合入 RFC-0003 Q5 后复跑 `1078 passed, 6 warnings in 86.21s`；初版 1065 为 RFC-0014 落地时、Q5 未合时的数）。
+- 契约：C-05 `rpc.json` **1.5.0**，方法 **48**（ui_to_core 35 / core_to_module 7 / module_to_core 6）；C-06 `events.json` **2.0.0**，事件 **34**；C-04 **34** 错误码；append 登记 **10+8+3=21** 块（另有 `x-vade.rfc0015_pending` **1** 块，**不是** append；出处：三份 schema 文件重算，`tools/check_ledger.py` 比对通过）。
+- 服务端测试：**1089 passed**（`pytest core/tests -q`；本 worktree 复跑 `1089 passed`，基线见 `docs/rfc/LEDGER.md` §1）。
 - 契约门禁：`tools/check_contracts.py` → exit 0（`contracts: OK … RFC-0014 session search green …`）。
 - docs 门禁：`docs/check_docs.py` → exit 0（12 项，失败 0 项）。
 - RFC-0001～0009：已批准（frontmatter `approved`）且已实现合并（`docs/status.md` 各「已合并」行 + 契约 appends 登记在案 + 实现文件在仓）。
 - RFC-0010 / 0012 / 0013 / 0014：core 侧已实现（各自 `core/vade/*/RESULT-rfc*.md` + C-05 1.3.0/1.4.0/1.5.0 与 C-06 登记块）。
+- RFC-0015（`ui/modules` 模块清单通道）：**提案，未实施**——`schema/rpc.json` 的 `directions.ui_to_core` 已声明（`params:{}`、`result:{revision, modules[]}`），登记块在 `x-vade.rfc0015_pending`（**不是** append，故 LEDGER 行 `impl_state=未实施`）；core 与客户端均未接线，**A3（模块页入口）仍然缺数据源**。
 - RFC-0004 数据面 `/ui/blob` 六路由 + content parts 定型（`core/vade/blob/http.py`、`core/vade/session/parts.py`；RESULT-parts.md 539 passed）。
 
 ## 在飞 / 有保留的「完成」
@@ -31,8 +32,8 @@
 ## 口径陷阱（已说错过的两件事 + 本次新发现）
 
 - 「代码里有 GlassSurface」≠「glass 皮肤生效」；「字符图标存在」≠「已清零」——一切以 LEDGER + 测试输出为准。
-- 「34 方法」是 ui_to_core 一个方向的数；三方向合计 **47**（说全表 34 就是错的）。
-- 「events.json 10 条 appends」错：events.json 是 **7** 块；10 是 rpc.json 的块数。
+- 「35 方法」是 ui_to_core 一个方向的数；三方向合计 **48**（说全表 35 就是错的）。其中 `ui/modules` 是**提案声明**：在 `directions` 里、不在 `appends` 里、core 未实现——「schema 里有」≠「core 在服务」。
+- 「events.json 10 条 appends」错：events.json 是 **8** 块；10 是 rpc.json 的块数。
 - RFC-0007 的 4 个 `task.*` 事件在 events.json **无 append 登记块**（rpc.json 侧有）——纪律缺口，详见 `docs/rfc/LEDGER-RESULT.md`。
 
 ## 未核实清单

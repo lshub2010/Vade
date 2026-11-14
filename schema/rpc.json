@@ -1,13 +1,13 @@
 {
   "id": "C-05",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "status": "frozen",
   "frozen_at": "2026-11-14",
   "owner": "C2",
   "source_of_truth": "docs/design.md §2.5",
   "x-vade": {
-    "appends": "RFC-0004, RFC-0007",
-    "notes": "1.1.0 is additive except one tightening: `ui/submit.content` goes from `[object]` to a typed part union (§6.1/§7.2), which only malformed clients notice — a legal old `[{\"type\":\"text\"}]` still passes. New top-level `http_endpoints` declares the `/ui/blob*` family that lives on the data-plane listener (§7.3). Nothing else changed; C-06 and C-04 are untouched by RFC-0004. RFC-0007 appends four observation/control methods (`task/list`, `task/log_tail`, `task/cancel`, `subagent/message`) and mirrors the four `task.*` names into `events_core_to_ui`; no existing method changed, and a core that predates it answers `NOT_FOUND` (the documented UI degradation)."
+    "appends": "RFC-0004, RFC-0007, RFC-0009",
+    "notes": "1.1.0 is additive except one tightening: `ui/submit.content` goes from `[object]` to a typed part union (§6.1/§7.2), which only malformed clients notice — a legal old `[{\"type\":\"text\"}]` still passes. New top-level `http_endpoints` declares the `/ui/blob*` family that lives on the data-plane listener (§7.3). Nothing else changed; C-06 and C-04 are untouched by RFC-0004. RFC-0007 appends four observation/control methods (`task/list`, `task/log_tail`, `task/cancel`, `subagent/message`) and mirrors the four `task.*` names into `events_core_to_ui`; no existing method changed, and a core that predates it answers `NOT_FOUND` (the documented UI degradation). RFC-0009 appends three ui_to_core methods (`ui/page.get`, `ui/state.get`, `ui/tool.call`) and two core_to_module methods (`state/get`, `page/get`). `ui/tool.call` is the one that widens the attack surface: it removes the implicit 'a tool call always belongs to a turn' premise, so ownership, risk, approval (args-digest bound) and audit all stay in core (§10.2). No existing method changed."
   },
   "transport": "JSON-RPC 2.0 over a Noise transport frame (type 0x02) or over plain text frames on the browser_session channel",
   "envelope": {
@@ -89,6 +89,36 @@
         "result": {"accepted": true},
         "errors": ["MODULE_DRAINING"],
         "notes": "Core stops routing new calls. In-flight calls finish or time out, then close."
+      }
+    ,
+      "state/get": {
+        "params": {
+          "page_id": "string"
+        },
+        "result": {
+          "rev": "int",
+          "state": "object"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND",
+          "UNSUPPORTED"
+        ],
+        "notes": "RFC-0009 §9.3. Module side of `ui/state.get`. A module without pages answers UNSUPPORTED, which is a legal answer, not a bug."
+      },
+      "page/get": {
+        "params": {
+          "page_id": "string"
+        },
+        "result": {
+          "schema": "object"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND",
+          "UNSUPPORTED"
+        ],
+        "notes": "RFC-0009 §9.3. Module side of `ui/page.get`, only for `ref` pages. Core verifies the body against the sha256 pinned in the manifest before validating it."
       }
     },
     "ui_to_core": {
@@ -233,6 +263,86 @@
         "result": {"ok": true, "turn_id": "string|null", "delivery": "queued|steering"},
         "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "UNSUPPORTED", "READ_ONLY_SESSION", "OVERLOADED"],
         "notes": "RFC-0007 §6.4. Only for kind=subagent with a non-null child_session_id, and only when tasks.subagent_message=true (default false → UNSUPPORTED, which is the v1 answer). delivery=queued means the child handles it as a new message after its current turn; steering (injecting a running turn) is reserved and answers UNSUPPORTED."
+      }
+    ,
+      "ui/page.get": {
+        "params": {
+          "module_id": "string",
+          "instance_id": "string",
+          "page_id": "string"
+        },
+        "result": {
+          "schema": "object (the page body: inline tree or the ref target)",
+          "sha256": "string (64 hex)"
+        },
+        "errors": [
+          "NOT_FOUND",
+          "MANIFEST_INVALID",
+          "UNSUPPORTED",
+          "UNAVAILABLE"
+        ],
+        "notes": "RFC-0009 §9.3. The page must be one the module declared in `manifest.ui.pages`; the client-supplied module_id is only a locator and must match the page's owner. For a `ref` page core fetches `page/get` from the module, enforces <=64 KiB and the sha256 pinned in the manifest, then re-runs the C-19 validator -- a digest mismatch, an oversize body or an unparseable tree is MANIFEST_INVALID and the entry stays greyed. inline pages are re-validated and returned without a module round trip. A page the registration dropped is NOT_FOUND (its entry never appears, §7.4)."
+      },
+      "ui/state.get": {
+        "params": {
+          "module_id": "string",
+          "instance_id": "string",
+          "page_id": "string"
+        },
+        "result": {
+          "rev": "int (monotonic)",
+          "state": "object (flat: string|number|bool|null)",
+          "fetched_at": "int (unix seconds)"
+        },
+        "errors": [
+          "NOT_FOUND",
+          "UNSUPPORTED",
+          "UNAVAILABLE",
+          "TIMEOUT"
+        ],
+        "notes": "RFC-0009 §9.3. Read-only proxy for the module's `state/get`; core caches by (module, instance, page) for at most [ui].state_cache_s and keeps `rev` monotonic so a client may render a stale value first. `state` is capped at 8 KiB / 64 keys; a module that does not implement `state/get` yields UNSUPPORTED, which the client shows as an unavailable banner -- never a white page (§5.4). No session_id is sent: the page reads this module's state only."
+      },
+      "ui/tool.call": {
+        "params": {
+          "module_id": "string",
+          "instance_id": "string",
+          "page_id": "string",
+          "tool": "string (must be declared in this module's capabilities.tools)",
+          "args": "object (literal / {\"bind\"} / {\"input\"} values only)",
+          "client_call_id": "string",
+          "session_id": "string|null",
+          "call_id": "string|null (second stage: the id from stage one)",
+          "approval_id": "string|null (second stage: the approval request_id)"
+        },
+        "result": {
+          "call_id": "string",
+          "status": "approval_required|denied|ok|failed",
+          "approval": {
+            "request_id": "string",
+            "tool": "string",
+            "args": "object",
+            "risk": "low|medium|high",
+            "expires_at": "int",
+            "args_digest": "string"
+          },
+          "result": "any (status=ok)",
+          "error": {
+            "code": "C-04 code",
+            "message": "string",
+            "retriable": "bool"
+          }
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND",
+          "PERMISSION_DENIED",
+          "PAYLOAD_TOO_LARGE",
+          "TIMEOUT",
+          "OVERLOADED",
+          "UNAVAILABLE",
+          "READ_ONLY_SESSION"
+        ],
+        "notes": "RFC-0009 §6.2/§9.3. Two stages: stage one validates ownership + args against the module's `input_schema`, computes risk as max(declared, [policy.tool_risk]) and, when approval is required, mints an approval WITHOUT executing anything; it returns approval_required + the approval object. Stage two repeats the call with `call_id` + `approval_id` and exactly the same `args`; core compares the args digest (a different body is PERMISSION_DENIED), refuses an expired/pending/denied request, and only then dispatches through the SAME router path as `tools/call`. A low-risk tool may answer `ok` in stage one. The client-supplied module_id locates the page and never authorises the call: ownership comes from the page, risk and approval from core. No turn, no message, no model context."
       }
     }
   },

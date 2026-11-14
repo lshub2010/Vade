@@ -9,7 +9,7 @@ folding, literal `%`/`_`, CJK exactness), ordering (title tier > body tier,
 
 Injection posture (§4.10): the store binds every value — the escaped pattern
 included — through `?` placeholders. `escape_like` touches exactly the three
-LIKE metacharacters (`%`, `_`, `\`); a single quote and `--` are NOT LIKE
+LIKE metacharacters (`%`, `_`, `\\`); a single quote and `--` are NOT LIKE
 metacharacters, so escaping them would corrupt honest queries ("it's", "a--b")
 — parameterization is what keeps those literal.
 """
@@ -47,7 +47,7 @@ SNIPPET_CONTEXT = 40
 def escape_like(text: str) -> str:
     """Escape the three LIKE metacharacters; `ESCAPE '\\'` restores them.
 
-    `%` and `_` are wildcards, `\` is the escape itself. A single quote and
+    `%` and `_` are wildcards, `\\` is the escape itself. A single quote and
     `--` are deliberately untouched (§4.10): they are not LIKE metacharacters,
     and parameters make them literal already.
     """

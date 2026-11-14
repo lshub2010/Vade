@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 from .models import Event, Message, Session, SessionGroup, Turn
+from .search import LIMIT_DEFAULT, SearchHit
 
 __all__ = ["SessionStore", "UNSET"]
 
@@ -84,3 +85,20 @@ class SessionStore(Protocol):
         ...
 
     def group_session_counts(self) -> dict[str, int]: ...
+
+    # --- RFC-0014 §5: session/search (titles + live bodies) -----------------
+    def search_sessions(
+        self, query: str, *, limit: int = LIMIT_DEFAULT, offset: int = 0,
+        session_id: str | None = None,
+    ) -> tuple[list[SearchHit], int]:
+        """RFC-0014 §4: parameterized LIKE scan; returns (page, total).
+
+        `query` is the already-validated literal (manager ran `validate_query`).
+        Implementations MUST bind the escaped pattern through a placeholder —
+        never concatenate query text into SQL (§4.10; A9 pins it with
+        injection samples). `session_id=None` searches the whole workspace;
+        a string pins the scan to one session. `total` counts DISTINCT
+        matching sessions (a session counts once even when title and body
+        both match).
+        """
+        ...

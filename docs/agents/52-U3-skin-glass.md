@@ -9,6 +9,8 @@
 | 产出 | **11 个组件**（D93：原 7 + `MessageBubble`/`AttachmentChip`/`ToolCallCard`/`InputBar`）+ 9 张截图 + 给 U4 的 `GLASS_SPEC.md` |
 | 出口 | 独立验收：glass × 3 底栏 × 3 平台；Android 12- 不崩不白屏 |
 
+> **仓库**：客户端已独立成仓 **`vade-client`**（`github.com/lshub2010/vade-client`，本地 `D:/HermesWorkspace/Vade-client`）。本文所有 `ui/...` 路径均指该仓内路径，不是主仓路径。
+
 ## 一、一句话任务
 
 做一套「毛玻璃」皮肤，但**不假装所有平台都能折射**：Android 13+ 有 AGSL 折射，Desktop/Web 只做模糊，Android 12- 降级为模糊 + 描边，三端都不能崩。

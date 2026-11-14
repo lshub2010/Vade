@@ -9,6 +9,8 @@
 | 产出 | **11 个组件**（D93：原 7 + `MessageBubble`/`AttachmentChip`/`ToolCallCard`/`InputBar`）+ 三端 9 张验收截图 |
 | 出口 | 独立验收：miuix × 3 底栏 × 3 平台全部通过 |
 
+> **仓库**：客户端已独立成仓 **`vade-client`**（`github.com/lshub2010/vade-client`，本地 `D:/HermesWorkspace/Vade-client`）。本文所有 `ui/...` 路径均指该仓内路径，不是主仓路径。
+
 ## 一、一句话任务
 
 用 Miuix 实现一套和 Material **质感明显不同**的皮肤：更方、更紧凑、分隔线而非阴影；三端都能跑，底栏三态都不塌。

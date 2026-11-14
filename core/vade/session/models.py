@@ -18,7 +18,7 @@ from .parts import parts_text
 
 __all__ = [
     "Message", "Role", "TurnState", "Turn", "Session", "QueueItem", "Event",
-    "TERMINAL_STATES", "new_id", "now_ms",
+    "TERMINAL_STATES", "new_id", "now_ms", "message_ref",
 ]
 
 
@@ -54,6 +54,17 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def message_ref(message: Message) -> str:
+    """`msg:<hex>` pointer to a persisted message (RFC-0006 §4.3/§5.1).
+
+    One convention for every pointer the core emits (`result_ref`,
+    `partial_message_id`): the message row keeps its bare `uuid4().hex` id, the
+    pointer carries the `msg:` scheme so a client can tell a pointer from an
+    opaque id. `split(":", 1)[1]` is the snapshot key.
+    """
+    return f"msg:{message.id}"
+
+
 @dataclass(frozen=True, slots=True)
 class Message:
     """One stored message. `parts` is the message; `content` is its projection.
@@ -81,6 +92,12 @@ class Message:
     tool_call_id: str | None = None
     tool_calls: tuple[dict[str, Any], ...] = ()
     created_at: int = field(default_factory=now_ms)
+    #: RFC-0006 §4: an assistant message written by `interrupt`, holding the
+    #: text that had already been streamed. Never re-emitted as a delta.
+    partial: bool = False
+    #: RFC-0006 §6.3: the message that replaced this one (edit_resubmit). The
+    #: row itself is immutable — only this pointer is ever written.
+    superseded_by: str | None = None
     parts: tuple[dict[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
@@ -154,6 +171,8 @@ class Message:
             "name": self.name,
             "tool_call_id": self.tool_call_id,
             "created_at": self.created_at,
+            "partial": self.partial,
+            "superseded_by": self.superseded_by,
             "parts": self.wire_parts(),
         }
 
@@ -172,9 +191,29 @@ class Turn:
     error_message: str | None = None
     usage: Mapping[str, Any] = field(default_factory=dict)
     tool_calls: tuple[dict[str, Any], ...] = ()
+    # --- RFC-0006 §6.1: linear version chain (all optional, old rows read as
+    # defaults; `root_turn_id`/`version` coalesce to id/1 on read).
+    root_turn_id: str | None = None
+    parent_turn_id: str | None = None
+    version: int = 1
+    superseded_by: str | None = None
+    superseded_reason: str | None = None
+    user_message_id: str | None = None
+    #: RFC-0006 §4: the `partial=true` assistant message written on interrupt.
+    partial_message_id: str | None = None
+    #: RFC-0006 §6.2: content part types (`image`, `file`, …) this turn was
+    #: queued with, other than `text`. Only `text` is persisted as a message,
+    #: so `regenerate` cannot rebuild the rest yet and must refuse instead of
+    #: silently dropping an attachment. Empty for a text-only turn.
+    user_parts: tuple[str, ...] = ()
 
     def with_state(self, state: TurnState, **changes: Any) -> "Turn":
         return replace(self, state=state, **changes)
+
+    @property
+    def root_id(self) -> str:
+        """Coalesced root: a turn created before RFC-0006 is its own root."""
+        return self.root_turn_id or self.id
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -190,6 +229,14 @@ class Turn:
             "error_message": self.error_message,
             "usage": dict(self.usage),
             "tool_calls": list(self.tool_calls),
+            "root_turn_id": self.root_id,
+            "parent_turn_id": self.parent_turn_id,
+            "version": self.version or 1,
+            "superseded_by": self.superseded_by,
+            "superseded_reason": self.superseded_reason,
+            "user_message_id": self.user_message_id,
+            "partial_message_id": self.partial_message_id,
+            "user_parts": list(self.user_parts),
         }
 
 

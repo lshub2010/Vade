@@ -6,8 +6,46 @@
   "owner": "C2",
   "source_of_truth": "docs/design.md §2.5",
   "x-vade": {
-    "appends": "RFC-0004, RFC-0007",
-    "notes": "1.1.0 is additive except one tightening: `ui/submit.content` goes from `[object]` to a typed part union (§6.1/§7.2), which only malformed clients notice — a legal old `[{\"type\":\"text\"}]` still passes. New top-level `http_endpoints` declares the `/ui/blob*` family that lives on the data-plane listener (§7.3). Nothing else changed; C-06 and C-04 are untouched by RFC-0004. RFC-0007 appends four observation/control methods (`task/list`, `task/log_tail`, `task/cancel`, `subagent/message`) and mirrors the four `task.*` names into `events_core_to_ui`; no existing method changed, and a core that predates it answers `NOT_FOUND` (the documented UI degradation)."
+    "appends": [
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0004-attachments-multimodal.md",
+        "adds": ["ui/submit.content typed part union", "http_endpoints"],
+        "notes": [
+          "ui/submit.content goes from `[object]` to a typed part union (§6.1/§7.2); a legal old `[{\"type\":\"text\"}]` still passes, only malformed clients notice",
+          "new top-level `http_endpoints` declares the `/ui/blob*` family that lives on the data-plane listener (§7.3)",
+          "C-06 and C-04 are untouched by RFC-0004"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0007-subagents-and-tasks.md",
+        "adds": ["task/list", "task/log_tail", "task/cancel", "subagent/message"],
+        "notes": [
+          "four observation/control methods and the four `task.*` names mirrored into `events_core_to_ui`; no existing method changed",
+          "a core that predates it answers `NOT_FOUND` (the documented UI degradation)"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0006-turn-semantics.md",
+        "adds": ["turn/regenerate", "message/edit_resubmit"],
+        "notes": [
+          "ui/attach: snapshot.turns[] and messages[].partial / messages[].superseded_by are appended keys; `snapshot` stays an object and old clients ignore them",
+          "session/fork is intentionally NOT registered in v1: clients get JSON-RPC -32601, not UNSUPPORTED",
+          "PAYLOAD_TOO_LARGE carries error.data = {field, limit, actual, unit} (RFC-0006 §8)"
+        ],
+        "rewrites": "none"
+      }
+    ]
   },
   "transport": "JSON-RPC 2.0 over a Noise transport frame (type 0x02) or over plain text frames on the browser_session channel",
   "envelope": {
@@ -186,6 +224,21 @@
         "result": {"ok": true},
         "errors": ["APPROVER_INVALID", "READ_ONLY_SESSION", "NOT_FOUND"]
       },
+      "turn/regenerate": {
+        "params": {"session_id": "string", "turn_id": "string", "client_msg_id": "string"},
+        "result": {"turn_id": "string", "root_turn_id": "string", "version": "int",
+                   "supersedes_turn_id": "string", "queue_pos": "int"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "READ_ONLY_SESSION", "OVERLOADED", "UNSUPPORTED"],
+        "notes": "RFC-0006 1.1.0. New turn for the same user message; the old turn gets superseded_by and a turn.superseded event. `client_msg_id` is the idempotency key; data.reason is turn_active|not_tail|not_head|client_msg_id_conflict."
+      },
+      "message/edit_resubmit": {
+        "params": {"session_id": "string", "message_id": "string", "content": ["object"],
+                   "client_msg_id": "string"},
+        "result": {"turn_id": "string", "message_id": "string", "supersedes_turn_id": "string",
+                   "root_turn_id": "string", "version": "int", "queue_pos": "int"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "READ_ONLY_SESSION", "OVERLOADED", "PAYLOAD_TOO_LARGE"],
+        "notes": "RFC-0006 1.1.0. Appends a NEW user message and points the old one at it (messages are immutable); only the last user message is editable."
+      },
       "task/list": {
         "params": {
           "session_id": "string|null (omitted = across sessions; NOT shared execution)",
@@ -234,6 +287,7 @@
         "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "UNSUPPORTED", "READ_ONLY_SESSION", "OVERLOADED"],
         "notes": "RFC-0007 §6.4. Only for kind=subagent with a non-null child_session_id, and only when tasks.subagent_message=true (default false → UNSUPPORTED, which is the v1 answer). delivery=queued means the child handles it as a new message after its current turn; steering (injecting a running turn) is reserved and answers UNSUPPORTED."
       }
+
     }
   },
   "http_endpoints": {
@@ -276,6 +330,8 @@
       "turn.interrupted",
       "queue.updated",
       "module.status",
+      "turn.superseded",
+      "message.edited",
       "task.started",
       "task.status",
       "task.progress",

@@ -559,6 +559,38 @@
       },
       "required": ["message_id", "session_id", "superseded_by_message_id", "new_turn_id", "text", "edited_at"],
       "notes": "RFC-0006 1.1.0. Named `edited` but messages are immutable: the old row is never UPDATEd, it only gains `superseded_by`. `text` lets an attached client update the bubble without a re-attach; clients de-duplicate by superseded_by_message_id."
+    },
+    "session.updated": {
+      "payload": {
+        "session_id": "string",
+        "title": "string|null (RFC-0010)",
+        "icon": "string|null (Tabler whitelist name)",
+        "color": "string|null (#RRGGBB)",
+        "group_id": "string|null",
+        "pinned_at": "int|null (unix ms)",
+        "archived_at": "int|null (unix ms)",
+        "unread": "int (0|1)",
+        "updated_at": "int (unix ms)",
+        "by": "device_id|admin|system"
+      },
+      "required": [
+        "session_id",
+        "by"
+      ],
+      "notes": "RFC-0010 append (§6.1). Emitted on the CHANGED session's own stream only, after a successful metadata write (session/rename, session/pin, session/archive, session/group.assign): a client attached to that session updates the row in place. A device that is not attached re-pulls session/list. Metadata edge, NOT a state change: carries no `state`, never reopens a turn. Nullable keys are written with null so the event describes itself."
+    },
+    "session.list_changed": {
+      "payload": {
+        "session_id": "string (the session that was created or deleted)",
+        "change": "added|removed",
+        "by": "device_id|admin|system"
+      },
+      "required": [
+        "session_id",
+        "change",
+        "by"
+      ],
+      "notes": "RFC-0010 append (§6.2). Fanned out to EVERY attached session (module.status precedent) after a session is created (ui/attach auto-create, change=added) or hard-deleted (session/delete, change=removed); the changed session's own stream is skipped. Deliberately carries NO row payload — every client re-pulls session/list; a payload copy here would be a second truth that drifts. change=removed is the only notice a hard delete gives (§8.2)."
     }
   },
   "x-vade": {
@@ -681,6 +713,18 @@
           "usage.budget is a session event, NOT a C-14 push topic (no x-vade.push marker)"
         ],
         "rewrites": "none. The top-level `version` stays 2.0.0 (RFC-0008's enum widening owns that bump; this batch appends no state). Every pre-existing `required` list, rule and enum is untouched — the only edits to existing entries are OPTIONAL payload keys plus notes. Recorded in full under `x-vade.rfc0005_append`."
+      },
+      {
+        "contract": "C-06",
+        "version": "2.0.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0010-session-metadata.md",
+        "adds": ["session.updated", "session.list_changed"],
+        "overrides": [
+          "session.updated is a metadata edge: it carries no `state` and must not be treated as a turn state change (C-06 rule 4 does not apply)",
+          "session.list_changed is a session-stream fan-out (module.status precedent): clients re-pull session/list instead of maintaining the list from the payload"
+        ],
+        "rewrites": "none. Top-level `version` stays 2.0.0: no enum widening, no state added — both events are new declarations and every pre-existing entry is unchanged. Neither is a C-14 push topic (no x-vade.push): both travel as session events through SessionLog.emit."
       }
     ]
   }

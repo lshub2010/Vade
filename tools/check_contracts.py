@@ -28,6 +28,11 @@ Checks (each one has broken at least once in review):
      `name` shape AND is still parsed into `Manifest.models` (a schema field
      core drops is worse than no field), `usage.budget` is declared in C-06 with
      its six required keys, and the four new methods live in `ui_to_core`.
+ 11. RFC-0010: the ten `session/*` metadata methods are declared (C-05 1.3.0)
+     and registered in `SessionRPC.handlers()`, the §7 validation constants
+     (icon whitelist + pattern, `#RRGGBB`, name limits) live in
+     `core/vade/session/manager.py`, and the two C-06 metadata events exist
+     with their frozen `required` arrays and no `state` / push pollution.
 
 Run:  python3 tools/check_contracts.py      (exit 0 = green)
 """
@@ -244,6 +249,18 @@ UI_LIMITS = {
 
 #: §10.1: the module-page render path may not contain these tokens at all.
 UI_FORBIDDEN_CODE = ("eval(", "Function(", "exec(", "WebView(", "loadUrl(", "<script")
+
+#: RFC-0010 §5: the ten session-metadata methods, all on `ui_to_core` (C-05 1.3.0).
+SESSION_META_METHODS = {
+    "session/list", "session/rename", "session/pin", "session/archive", "session/delete",
+    "session/group.list", "session/group.create", "session/group.update",
+    "session/group.delete", "session/group.assign",
+}
+#: RFC-0010 §6: the two C-06 events, with their exact `required` arrays.
+SESSION_META_EVENTS = {
+    "session.updated": ["session_id", "by"],
+    "session.list_changed": ["session_id", "change", "by"],
+}
 
 FAILURES: list[str] = []
 
@@ -989,6 +1006,122 @@ def check_ui(config: dict, manifest: dict, rpc: dict) -> None:
               "events.json: RFC-0009 adds no ui.* event (page approvals are RPC-only, §9.4)")
 
 
+def check_session_meta(rpc: dict, events: dict) -> None:
+    """RFC-0010: the ten `session/*` methods, the §7 validation constants, and the two events.
+
+    Three things a review can miss by reading:
+
+    * the icon whitelist is the GATE, not just the pattern — a shape-valid
+      unknown name must be refused (otherwise "whitelist" is decoration);
+    * the events must not be state-change events (they are metadata edges) and
+      must not be C-14 push topics;
+    * the handlers must actually be registered in `SessionRPC.handlers()` —
+      a schema entry without a handler answers -32601 on a real socket.
+    """
+    directions = rpc.get("directions") or {}
+    ui_to_core = directions.get("ui_to_core") or {}
+    missing = sorted(SESSION_META_METHODS - set(ui_to_core))
+    check(not missing, f"rpc.json ui_to_core missing RFC-0010 methods: {missing}")
+    elsewhere = sorted(
+        SESSION_META_METHODS
+        & (set(directions.get("module_to_core") or {}) | set(directions.get("core_to_module") or {}))
+    )
+    check(not elsewhere, f"rpc.json: RFC-0010 methods must not be module-facing: {elsewhere}")
+    codes = set(load("errors.json").get("codes") or {})
+    for name in sorted(SESSION_META_METHODS & set(ui_to_core)):
+        entry = ui_to_core.get(name) or {}
+        for field in ("params", "result", "errors"):
+            check(field in entry, f"rpc.json {name}: missing {field}")
+        unknown = sorted(set(entry.get("errors") or []) - codes)
+        check(not unknown, f"rpc.json {name}: errors not declared in C-04: {unknown}")
+    check(rpc.get("version") == "1.3.0",
+          f"rpc.json: version must be 1.3.0 after the RFC-0010 append (got {rpc.get('version')!r})")
+    rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
+    rblock = next((b for b in rpc_appends if "RFC-0010" in str(b.get("doc") or "")), None)
+    check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0010")
+    if rblock is not None:
+        check(set(rblock.get("adds") or []) == SESSION_META_METHODS,
+              "rpc.json: the RFC-0010 append block must add exactly the ten session/* methods")
+        check("none" in str(rblock.get("rewrites") or ""),
+              "rpc.json: the RFC-0010 append must be rewrite-free")
+
+    # §7: the validation rules live in code; the constants are the contract.
+    if str(ROOT / "core") not in sys.path:
+        sys.path.insert(0, str(ROOT / "core"))
+    try:
+        from vade.errors import VadeError
+        from vade.session import manager as session_manager
+        from vade.session.rpc import SessionRPC
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        FAILURES.append(f"core/vade/session: cannot import for RFC-0010 checks "
+                        f"({type(exc).__name__}: {exc})")
+        return
+    check(str(session_manager.ICON_PATTERN.pattern) == r"^[a-z][a-z0-9-]*$",
+          "manager.ICON_PATTERN drifted from RFC-0010 §7.1")
+    check(session_manager.ICON_NAME_MAX == 64,
+          f"manager.ICON_NAME_MAX must be 64, is {session_manager.ICON_NAME_MAX}")
+    check(session_manager.GROUP_NAME_MAX == 64,
+          f"manager.GROUP_NAME_MAX must be 64, is {session_manager.GROUP_NAME_MAX}")
+    check(str(session_manager.COLOR_PATTERN.pattern) == r"^#[0-9a-fA-F]{6}$",
+          "manager.COLOR_PATTERN drifted from RFC-0010 §7.2 (#RRGGBB only)")
+    check(len(session_manager.ICON_NAMES) >= 16,
+          f"manager.ICON_NAMES whitelist is implausibly small ({len(session_manager.ICON_NAMES)})")
+    for icon in session_manager.ICON_NAMES:
+        check(bool(session_manager.ICON_PATTERN.match(icon)) and len(icon) <= session_manager.ICON_NAME_MAX,
+              f"manager.ICON_NAMES member {icon!r} violates its own §7.1 shape rule")
+    for probe, expect_ok in (("chat", True), ("zz-not-an-icon", False), ("1bad", False), ("Chat", False)):
+        try:
+            ok = session_manager.validate_icon(probe) == probe
+        except VadeError:
+            ok = False
+        check(ok == expect_ok,
+              f"manager.validate_icon({probe!r}) -> {ok!r}, expected {expect_ok!r} (§7.1 whitelist gate)")
+    for probe in ("#fff", "#GGHHII", "red", "4a90d9", "#4a90d90"):
+        try:
+            session_manager.validate_color(probe)
+            rejected = False
+        except VadeError:
+            rejected = True
+        check(rejected, f"manager.validate_color({probe!r}) must be refused (§7.2)")
+    try:
+        session_manager.validate_color("#4A90D9")
+        accepted = True
+    except VadeError:
+        accepted = False
+    check(accepted, "manager.validate_color('#4A90D9') must be accepted (§7.2)")
+
+    registered = set(SessionRPC(None).handlers())
+    absent = sorted(SESSION_META_METHODS - registered)
+    check(not absent, f"SessionRPC.handlers() missing RFC-0010 methods: {absent}")
+
+    # §6: the two events, their exact `required`, and no state/push pollution.
+    declared = dict(events.get("events") or {})
+    for name, required in SESSION_META_EVENTS.items():
+        spec = declared.get(name)
+        check(isinstance(spec, dict), f"events.json: {name} is missing (RFC-0010 §6)")
+        if isinstance(spec, dict):
+            check(set(spec.get("required") or []) == set(required),
+                  f"events.json {name}: required must be exactly {sorted(required)}")
+            undeclared = [f for f in required if f not in (spec.get("payload") or {})]
+            check(not undeclared, f"events.json {name}: required fields not declared in payload: {undeclared}")
+            check("state" not in (spec.get("required") or []),
+                  f"events.json {name}: a metadata edge must not require `state`")
+            check((spec.get("x-vade") or {}).get("push") is None,
+                  f"events.json {name}: must not be a C-14 push topic (session event)")
+            check("state" not in (spec.get("payload") or {}),
+                  f"events.json {name}: metadata edge must not carry `state` (§6)")
+    appends = (events.get("x-vade") or {}).get("appends") or []
+    eblock = next((b for b in appends if "RFC-0010" in str(b.get("doc") or "")), None)
+    check(eblock is not None, "events.json: missing the x-vade.appends block for RFC-0010")
+    if eblock is not None:
+        check(set(eblock.get("adds") or []) == set(SESSION_META_EVENTS),
+              "events.json: the RFC-0010 append block must add exactly the two session.* events")
+        check("none" in str(eblock.get("rewrites") or ""),
+              "events.json: the RFC-0010 append must be rewrite-free")
+        check(eblock.get("version") == "2.0.0",
+              "events.json: the RFC-0010 append must NOT claim an enum bump (top-level stays 2.0.0)")
+
+
 def main() -> int:
     manifest = load("manifest.schema.json")
     errors = load("errors.json")
@@ -1113,6 +1246,7 @@ def main() -> int:
     check_rfc0006(events, rpc, config)
     check_task_events(events, declared_events, schema_events)
     check_approval_attribution(declared_events)
+    check_session_meta(rpc, events)
 
     # ---------------------------------------------------------------- RFC-0008
     # C-06 went 1.0.0 -> 2.0.0 because `turn_states` was WIDENED: an exhaustive
@@ -1147,7 +1281,7 @@ def main() -> int:
             print(f"  - {failure}")
         return 1
     print("contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 34 error codes, config metadata complete, "
-          "RFC-0005 append green, event gate green)")
+          "RFC-0005 append green, RFC-0010 session metadata green, event gate green)")
     return 0
 
 

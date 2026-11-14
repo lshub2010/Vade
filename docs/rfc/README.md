@@ -13,3 +13,4 @@
 | RFC-0007 | 子代理与后台任务：统一 `task.*` 事件族、`task/list` / `log_tail` / `cancel`、审批归属与通知去重 | approved（已批准，未实施） |
 | RFC-0008 | agent 要求输入：`waiting_input` 状态、`turn.input_*` 事件对与 `turn/input` 取值通道 | approved（已批准，未实施） |
 | RFC-0009 | 模块 UI 页面：原生声明式 schema（新契约 C-19）、只读数据绑定与三类动作 | approved（已批准，未实施） |
+| RFC-0010 | 会话元数据：分组（文件夹）/ 图标 / 颜色 / 置顶，与 `session/*` 十方法 | proposed（core 侧已实现：C-05 1.3.0 + C-06 两事件，见 `core/vade/session/RESULT-rfc0010.md`） |

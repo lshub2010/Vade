@@ -1,6 +1,6 @@
 {
   "id": "C-05",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "status": "frozen",
   "frozen_at": "2026-11-14",
   "owner": "C2",
@@ -98,6 +98,14 @@
           "no existing method, direction or error list changed; a core without these answers -32601 and the UI degrades to a read-only badge (FR-8.46)"
         ],
         "rewrites": "none. Recorded in full under `x-vade.rfc0005_append`."
+      },
+      {
+        "contract": "C-05",
+        "version": "1.3.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0010-session-metadata.md",
+        "adds": ["session/list", "session/rename", "session/pin", "session/archive", "session/delete", "session/group.list", "session/group.create", "session/group.update", "session/group.delete", "session/group.assign"],
+        "rewrites": "none. Ten ui_to_core methods appended (FR-8.26 verbs + folder management); no existing method, error code, direction or field changed. session/list introduces the session_row shape — nothing else returns it. Recorded in core/vade/session/RESULT-rfc0010.md."
       }
     ],
     "rfc0005_append": {
@@ -866,6 +874,174 @@
           "READ_ONLY_SESSION"
         ],
         "notes": "RFC-0009 §6.2/§9.3/§10.2. Two stages: stage one validates ownership + args against the module's `input_schema`, computes risk as max(declared, [policy.tool_risk]) and, when approval is required, mints an approval WITHOUT executing anything; it returns approval_required + the approval object. Stage two repeats the call with `call_id` + `approval_id` and exactly the same `args`; core compares the args digest (a different body is PERMISSION_DENIED), refuses an expired/pending/denied request, and only then dispatches through the SAME router path as `tools/call`. **Binding (B2):** the mint records the requesting `session_id` and `device_id`, and stage two compares both verbatim — a different session or device is PERMISSION_DENIED with `data.field` = `session_id`|`approver`, and a refused redemption does not consume the mint. **Caller authentication (B1):** the target module must be the caller's own; a browser may invoke a page tool but always through this approval flow. **Read-only (B3):** a read-only session is READ_ONLY_SESSION before anything is minted. A low-risk tool may answer `ok` in stage one. The client-supplied module_id locates the page and never authorises the call: ownership comes from the caller identity, risk and approval from core. No turn, no message, no model context."
+      },
+      "session/list": {
+        "params": {
+          "limit": "int 1..200, default 50",
+          "cursor": "int >= 0, default 0 (opaque offset; echo next_cursor to continue)",
+          "group_id": "string|null (optional; null = ungrouped only, omitted = all groups)",
+          "archived": "bool, default false"
+        },
+        "result": {
+          "sessions": [
+            {
+              "session_id": "string",
+              "created_at": "int (unix ms)",
+              "updated_at": "int (unix ms; last activity, the FR-8.26 order key)",
+              "title": "string|null",
+              "icon": "string|null (Tabler whitelist name)",
+              "color": "string|null (#RRGGBB)",
+              "group_id": "string|null",
+              "pinned_at": "int|null",
+              "archived_at": "int|null",
+              "unread": "int (0|1)",
+              "state": "open|closed"
+            }
+          ],
+          "next_cursor": "int|null (null = end of list)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (§5). The LIGHT list: metadata only, no messages/turns — content is ui/attach's job. Order is fixed (§7.4): pinned first, then updated_at DESC, created_at DESC, id ASC (stable ties). group_id is a FILTER, not a sort group — the client renders inline groups from the row (FR-8.26). Unknown group_id -> NOT_FOUND (data.reason=unknown_group). next_cursor = cursor+len(sessions) on a FULL page only; a short page is the end."
+      },
+      "session/rename": {
+        "params": {
+          "session_id": "string",
+          "title": "string 1..200 after trimming"
+        },
+        "result": {
+          "ok": "bool",
+          "session": "session_row (same shape as session/list items)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (FR-8.26 verb). Metadata only — messages/turns are untouched. Emits session.updated on the session's own stream (§6.1). An empty/blank title is INVALID_ARGUMENT (v1 has no clear-title semantics)."
+      },
+      "session/pin": {
+        "params": {
+          "session_id": "string",
+          "pinned": "bool (required; true = pin, false = unpin)"
+        },
+        "result": {
+          "ok": "bool",
+          "pinned_at": "int|null (unix ms; null after unpin)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (FR-8.26 verb). pinned_at is the list-order primary key (§7.4: pinned sessions come first, still ordered by updated_at among themselves). Emits session.updated."
+      },
+      "session/archive": {
+        "params": {
+          "session_id": "string",
+          "archived": "bool (required)"
+        },
+        "result": {
+          "ok": "bool",
+          "archived_at": "int|null (unix ms; null after unarchive)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (FR-8.26 verb). Archived sessions leave the default list (session/list defaults archived=false) and appear under the archived filter. Orthogonal to the session `state` (open/closed, RFC-0005): archiving does not close the session (RFC-0010 §10 Q5). Emits session.updated."
+      },
+      "session/delete": {
+        "params": {
+          "session_id": "string"
+        },
+        "result": {
+          "ok": "bool"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 §8.2 (FR-8.26 verb, 二次确认). Hard delete: the sessions/turns/messages/events rows are removed in one transaction — core has no trash can, the double-confirm dialog is CLIENT responsibility. Guard: queued or running turns refuse with INVALID_ARGUMENT (data.reason=turn_active); interrupt first. Broadcasts session.list_changed{change:'removed'} to every OTHER attached session (§6.2). No new C-04 code (§1 #10)."
+      },
+      "session/group.list": {
+        "params": {},
+        "result": {
+          "groups": [
+            {
+              "group_id": "string",
+              "name": "string 1..64",
+              "icon": "string|null (Tabler whitelist name)",
+              "color": "string|null (#RRGGBB)",
+              "sort_order": "int >= 0",
+              "created_at": "int (unix ms)",
+              "session_count": "int"
+            }
+          ]
+        },
+        "errors": [],
+        "notes": "RFC-0010 append (§5). Ordered by sort_order, created_at, group_id. session_count is the folded-row number; v1 emits no event for group.* changes — clients re-pull after their own mutations (RFC-0010 §10 Q4)."
+      },
+      "session/group.create": {
+        "params": {
+          "name": "string 1..64 after trimming (required)",
+          "icon": "string|null (optional, Tabler whitelist)",
+          "color": "string|null (optional, #RRGGBB)",
+          "sort_order": "int >= 0, default 0"
+        },
+        "result": {
+          "group": "group_row (same shape as session/group.list items minus session_count)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT"
+        ],
+        "notes": "RFC-0010 append (§4.1/§7.3). group_id is core-allocated (uuid4 hex). A parent_id param is INVALID_ARGUMENT with data.reason=nesting_forbidden — groups are folders, ONE level, no tree (§1 #2)."
+      },
+      "session/group.update": {
+        "params": {
+          "group_id": "string",
+          "name": "string 1..64 (optional; explicit null is INVALID_ARGUMENT — a name cannot be cleared)",
+          "icon": "string|null (optional; null = clear, omitted = keep)",
+          "color": "string|null (optional; null = clear, omitted = keep)",
+          "sort_order": "int >= 0 (optional)"
+        },
+        "result": {
+          "group": "group_row"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (§5). Partial update: only keys present in params change; at least one must be present."
+      },
+      "session/group.delete": {
+        "params": {
+          "group_id": "string"
+        },
+        "result": {
+          "ok": "bool",
+          "unassigned": "int (sessions moved back to ungrouped)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 §8.1. Deleting a group NEVER deletes sessions: every member's group_id is set to NULL in the same transaction and unassigned reports how many. A deleted conversation is never the side effect of a deleted folder."
+      },
+      "session/group.assign": {
+        "params": {
+          "session_id": "string",
+          "group_id": "string|null (null = move out of any group)"
+        },
+        "result": {
+          "ok": "bool",
+          "group_id": "string|null (echo)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (§5). The single membership column (§1 #1: folders, not tags). Unknown group -> NOT_FOUND (data.reason=unknown_group); unknown session -> NOT_FOUND. Emits session.updated on the session's own stream."
       }
     }
   },

@@ -25,8 +25,8 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
 from ..errors import VadeError
-from .models import Event, Message, Session, Turn, TurnState
-from .store import SessionStore
+from .models import Event, Message, Session, SessionGroup, Turn, TurnState, now_ms
+from .store import UNSET, SessionStore
 
 __all__ = ["SQLiteStore"]
 
@@ -38,6 +38,14 @@ CREATE TABLE IF NOT EXISTS sessions(
     seq_counter INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'open',
     model_id TEXT
+);
+CREATE TABLE IF NOT EXISTS session_groups(
+    group_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    icon TEXT,
+    color TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS turns(
     id TEXT PRIMARY KEY,
@@ -98,6 +106,18 @@ _APPENDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("partial_message_id", "TEXT"),
         ("user_parts", "TEXT"),
     ),
+    #: RFC-0010 §4.2: user-facing metadata. All columns are additive with safe
+    #: defaults; `updated_at` is backfilled to `created_at` right after the
+    #: ALTERs (below), so pre-RFC sessions sort by their last-known activity.
+    "sessions": (
+        ("group_id", "TEXT"),
+        ("icon", "TEXT"),
+        ("color", "TEXT"),
+        ("pinned_at", "INTEGER"),
+        ("archived_at", "INTEGER"),
+        ("unread", "INTEGER NOT NULL DEFAULT 0"),
+        ("updated_at", "INTEGER NOT NULL DEFAULT 0"),
+    ),
 }
 
 _SUPPORTS_RETURNING = sqlite3.sqlite_version_info >= (3, 35, 0)
@@ -140,6 +160,54 @@ def _message_from_row(row: sqlite3.Row) -> Message:
 
 
 
+def _session_from_row(row: sqlite3.Row) -> Session:
+    """Decode one sessions row, tolerating a database that predates a column.
+
+    Same probe discipline as `_message_from_row` / `_turn_from_row`: a store
+    opened against a file the migration never reached must read the documented
+    defaults (RFC-0010 §4.2) instead of raising KeyError.
+    """
+    columns = row.keys()
+
+    def optional(name: str, default: Any = None) -> Any:
+        return row[name] if name in columns else default
+
+    return Session(
+        id=row["id"], created_at=row["created_at"], title=row["title"],
+        seq_counter=row["seq_counter"], state=row["state"],
+        model_id=optional("model_id"),
+        group_id=optional("group_id"), icon=optional("icon"), color=optional("color"),
+        pinned_at=optional("pinned_at"), archived_at=optional("archived_at"),
+        unread=int(optional("unread", 0) or 0),
+        updated_at=int(optional("updated_at", 0) or 0),
+    )
+
+
+def _group_from_row(row: sqlite3.Row) -> SessionGroup:
+    columns = row.keys()
+
+    def optional(name: str, default: Any = None) -> Any:
+        return row[name] if name in columns else default
+
+    return SessionGroup(
+        group_id=row["group_id"], name=row["name"],
+        icon=optional("icon"), color=optional("color"),
+        sort_order=int(optional("sort_order", 0) or 0),
+        created_at=int(row["created_at"]),
+    )
+
+
+#: RFC-0010 §5: metadata columns `update_session_meta` may write. Anything
+#: else (seq_counter, state, model_id) has its own protocol method.
+_META_COLUMNS = frozenset({
+    "title", "icon", "color", "group_id", "pinned_at", "archived_at", "unread", "updated_at",
+})
+
+#: RFC-0010 §7.4: pinned first, then last activity descending, `id` breaks
+#: ties so the same page set is reproducible across clients.
+_LIST_ORDER = "(pinned_at IS NULL) ASC, updated_at DESC, created_at DESC, id ASC"
+
+
 class SQLiteStore(SessionStore):
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -162,6 +230,19 @@ class SQLiteStore(SessionStore):
             self._ensure_columns()
             # RFC-0004 §6.2: `messages.parts` on a pre-parts database.
             self._migrate()
+            # RFC-0010 §4.2: the list-order index needs the appended columns,
+            # so it is created AFTER the migration (not in `_SCHEMA`, where a
+            # fresh file would not have `pinned_at`/`updated_at` yet).
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_order"
+                " ON sessions(archived_at, pinned_at, updated_at)"
+            )
+            # §4.2 backfill: a session that predates `updated_at` has never
+            # shown activity in the new column — its last-known activity is
+            # its creation. The predicate keeps this reentrant: rows written
+            # after the migration always carry a real value (create coalesces,
+            # append stamps now_ms), so this UPDATE converges to no-op.
+            self._conn.execute("UPDATE sessions SET updated_at = created_at WHERE updated_at = 0")
 
     def _ensure_columns(self) -> None:
         for table, columns in _APPENDED_COLUMNS.items():
@@ -227,10 +308,15 @@ class SQLiteStore(SessionStore):
     def create_session(self, session: Session) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT OR IGNORE INTO sessions(id, created_at, title, seq_counter, state, model_id)"
-                " VALUES(?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO sessions(id, created_at, title, seq_counter, state, model_id,"
+                " group_id, icon, color, pinned_at, archived_at, unread, updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (session.id, session.created_at, session.title, session.seq_counter, session.state,
-                 session.model_id),
+                 session.model_id, session.group_id, session.icon, session.color,
+                 session.pinned_at, session.archived_at, session.unread,
+                 # RFC-0010 §4.2: a session with no recorded activity is as old
+                 # as itself — never let 0 sink it below every migrated row.
+                 session.updated_at or session.created_at),
             )
 
     def append(
@@ -255,6 +341,14 @@ class SQLiteStore(SessionStore):
         if not msgs and not events and not turns and not message_updates:
             return
         with self._transaction() as conn:
+            # RFC-0010 §4.2: real ACTIVITY (a message or turn row landed) is
+            # what advances `updated_at` — the FR-8.26 list-order key. Attach /
+            # queue bookkeeping events carry neither and must not float a
+            # session to the top of "today" on every reconnect.
+            if msgs or turns:
+                conn.execute(
+                    "UPDATE sessions SET updated_at=? WHERE id=?", (now_ms(), sess_id)
+                )
             for turn in turns:
                 self._upsert_turn(conn, sess_id, turn)
             if msgs:
@@ -440,6 +534,11 @@ class SQLiteStore(SessionStore):
         return Session(
             id=row["id"], created_at=row["created_at"], title=row["title"],
             seq_counter=row["seq_counter"], state=row["state"], model_id=row["model_id"],
+            # RFC-0010 §4.2: always present here — `load` only runs after the
+            # reentrant migration added the metadata columns.
+            group_id=row["group_id"], icon=row["icon"], color=row["color"],
+            pinned_at=row["pinned_at"], archived_at=row["archived_at"],
+            unread=row["unread"], updated_at=row["updated_at"],
             messages=tuple(_message_from_row(r) for r in msg_rows),
             turns=tuple(self._turn_from_row(r) for r in turn_rows),
         )
@@ -455,3 +554,117 @@ class SQLiteStore(SessionStore):
             if session is not None:
                 out.append(session)
         return out
+
+    # ------------------------------------------------------------------ RFC-0010
+    def list_session_rows(
+        self, *, limit: int = 50, offset: int = 0,
+        group_id: Any = UNSET, archived: bool = False,
+    ) -> list[Session]:
+        """RFC-0010 §5: one page of the LIGHT list (metadata only).
+
+        `group_id` follows the `UNSET` protocol: omitted = every group,
+        `None` = ungrouped only, a string = that group. The caller has already
+        validated group existence; this method only filters.
+        """
+        where = ["archived_at IS NULL" if not archived else "archived_at IS NOT NULL"]
+        params: list[Any] = []
+        if group_id is not UNSET:
+            if group_id is None:
+                where.append("group_id IS NULL")
+            else:
+                where.append("group_id = ?")
+                params.append(group_id)
+        params.extend([limit, offset])
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM sessions WHERE {' AND '.join(where)}"
+                f" ORDER BY {_LIST_ORDER} LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        return [_session_from_row(r) for r in rows]
+
+    def update_session_meta(self, sess_id: str, fields: dict) -> None:
+        """RFC-0010 §5: write a whitelist of metadata columns in one UPDATE.
+
+        Raises NOT_FOUND when the session row is gone; unknown keys are a
+        programming error at the caller (manager), refused here as well so a
+        future field cannot silently bypass the column set.
+        """
+        unknown = set(fields) - _META_COLUMNS
+        if unknown:
+            raise VadeError("INTERNAL", f"metadata fields not writable: {sorted(unknown)}")
+        if not fields:
+            return
+        sets = ", ".join(f"{name}=?" for name in fields)
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE sessions SET {sets} WHERE id=?",
+                (*fields.values(), sess_id),
+            )
+            if cursor.rowcount == 0:
+                raise VadeError("NOT_FOUND", f"session {sess_id!r} does not exist")
+
+    def delete_session(self, sess_id: str) -> None:
+        """RFC-0010 §8.2: hard-delete every row of one session, atomically."""
+        with self._transaction() as conn:
+            conn.execute("DELETE FROM messages WHERE session_id=?", (sess_id,))
+            conn.execute("DELETE FROM turns WHERE session_id=?", (sess_id,))
+            conn.execute("DELETE FROM events WHERE session_id=?", (sess_id,))
+            conn.execute("DELETE FROM sessions WHERE id=?", (sess_id,))
+
+    def create_group(self, group: SessionGroup) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO session_groups(group_id, name, icon, color, sort_order, created_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (group.group_id, group.name, group.icon, group.color,
+                 group.sort_order, group.created_at),
+            )
+
+    def get_group(self, group_id: str) -> SessionGroup | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM session_groups WHERE group_id=?", (group_id,)
+            ).fetchone()
+        return _group_from_row(row) if row else None
+
+    def list_groups(self) -> list[SessionGroup]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM session_groups ORDER BY sort_order ASC, created_at ASC, group_id ASC"
+            ).fetchall()
+        return [_group_from_row(r) for r in rows]
+
+    def update_group_fields(self, group_id: str, fields: dict) -> None:
+        allowed = frozenset({"name", "icon", "color", "sort_order"})
+        unknown = set(fields) - allowed
+        if unknown:
+            raise VadeError("INTERNAL", f"group fields not writable: {sorted(unknown)}")
+        if not fields:
+            return
+        sets = ", ".join(f"{name}=?" for name in fields)
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE session_groups SET {sets} WHERE group_id=?",
+                (*fields.values(), group_id),
+            )
+            if cursor.rowcount == 0:
+                raise VadeError("NOT_FOUND", f"group {group_id!r} does not exist")
+
+    def delete_group(self, group_id: str) -> int:
+        """RFC-0010 §8.1: members go to ungrouped, NEVER deleted (one txn)."""
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE sessions SET group_id=NULL WHERE group_id=?", (group_id,)
+            )
+            unassigned = cursor.rowcount
+            conn.execute("DELETE FROM session_groups WHERE group_id=?", (group_id,))
+        return unassigned
+
+    def group_session_counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT group_id, COUNT(*) AS n FROM sessions"
+                " WHERE group_id IS NOT NULL GROUP BY group_id"
+            ).fetchall()
+        return {row["group_id"]: int(row["n"]) for row in rows}

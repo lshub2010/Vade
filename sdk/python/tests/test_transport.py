@@ -15,8 +15,13 @@ def test_key_file_is_created_0600_and_never_overwritten(tmp_path):
     path = tmp_path / "data" / "module.key"
     seed, public = load_or_create_key(path)
     assert len(seed) == 64 and len(public) == 32
-    mode = stat.S_IMODE(os.stat(path).st_mode)
-    assert mode == 0o600, oct(mode)
+    # POSIX mode bits are a no-op on Windows (chmod does nothing), so the 0600 claim
+    # is only checkable on POSIX. Same guard, same wording as
+    # core/tests/admin/test_passwords.py and core/tests/test_skill/test_install.py —
+    # Linux still validates; nothing else in this test is relaxed.
+    if os.name != "nt":
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600, oct(mode)
 
     again, again_public = load_or_create_key(path)
     assert again == seed

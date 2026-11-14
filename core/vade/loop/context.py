@@ -135,13 +135,26 @@ class ContextBuilder:
         *,
         ctx_tokens: int | None = None,
         current_turn_id: str | None = None,
+        protect: Callable[[Message], bool] | None = None,
     ) -> list[Message]:
+        """Fit `messages` into the window; `protect` marks semantic survivors.
+
+        `protect(message) -> True` spares a message from every attack below —
+        it is never pruned (step 1), never trimmed (step 2) and never dropped
+        (step 3). The caller owns the predicate because whether a message is
+        semantically load-bearing is the CALLER's knowledge, not the fitter's:
+        the loop (RFC-0003 Q5) marks the durable skill-catalog reminder, whose
+        loss would not even be noticed by the resend decision (it compares
+        against the raw log, not the fitted view). Protection must not turn
+        compaction into a no-op: everything the predicate rejects still goes
+        through steps 1–3 unchanged.
+        """
         ctx = ctx_tokens or self.config.ctx_tokens
         cfg = self.config
         if self.tokens(messages) <= cfg.threshold * ctx:
             return list(messages)
 
-        keep = self._protected_indices(messages, current_turn_id)
+        keep = self._protected_indices(messages, current_turn_id, protect=protect)
         working = list(messages)
 
         # 1) prune old oversized tool results without calling a model
@@ -176,13 +189,20 @@ class ContextBuilder:
             keep = {i - 1 if i > index else i for i in keep}
         return working
 
-    def _protected_indices(self, messages: Sequence[Message], current_turn_id: str | None) -> set[int]:
+    def _protected_indices(
+        self,
+        messages: Sequence[Message],
+        current_turn_id: str | None,
+        protect: Callable[[Message], bool] | None = None,
+    ) -> set[int]:
         cfg = self.config
         protected: set[int] = set()
         for index, message in enumerate(messages):
             if message.role == "system":
                 protected.add(index)
             if current_turn_id is not None and message.turn_id == current_turn_id:
+                protected.add(index)
+            if protect is not None and protect(message):
                 protected.add(index)
         protected.update(range(min(cfg.protect_first_n, len(messages))))
         if cfg.protect_last_n:

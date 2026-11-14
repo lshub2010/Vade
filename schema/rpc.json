@@ -1,10 +1,14 @@
 {
   "id": "C-05",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "status": "frozen",
-  "frozen_at": "2026-11-13",
+  "frozen_at": "2026-11-14",
   "owner": "C2",
   "source_of_truth": "docs/design.md §2.5",
+  "x-vade": {
+    "appends": "RFC-0004",
+    "notes": "1.1.0 is additive except one tightening: `ui/submit.content` goes from `[object]` to a typed part union (§6.1/§7.2), which only malformed clients notice — a legal old `[{\"type\":\"text\"}]` still passes. New top-level `http_endpoints` declares the `/ui/blob*` family that lives on the data-plane listener (§7.3). Nothing else changed; C-06 and C-04 are untouched by RFC-0004."
+  },
   "transport": "JSON-RPC 2.0 over a Noise transport frame (type 0x02) or over plain text frames on the browser_session channel",
   "envelope": {
     "request": {"jsonrpc": "2.0", "id": "int|string", "method": "string", "params": "object"},
@@ -91,7 +95,8 @@
       "ui/attach": {
         "params": {"session_id": "string|null", "last_seq": "int|null"},
         "result": {"session_id": "string", "from_seq": "int", "snapshot": "object|null"},
-        "errors": ["NOT_FOUND", "PERMISSION_DENIED"]
+        "errors": ["NOT_FOUND", "PERMISSION_DENIED"],
+        "notes": "RFC-0004 §6.3: `snapshot.messages[]` carries `parts` — the minimal field set all three clients must render in the same order: `[{type:'text',text} | {type:'image',file_id,mime,name,size,width,height,sha256} | {type:'file',file_id,mime,name,size}]`. Rows written before parts existed are read back as a single `text` part synthesised from `content` (never rewritten on disk); `content` keeps carrying the text projection, so a client that ignores `parts` renders exactly as before. Attachments are referenced by `file_id` only — never a local URI (§2.3)."
       },
       "ui/detach": {
         "params": {"session_id": "string"},
@@ -99,9 +104,72 @@
         "errors": ["NOT_FOUND"]
       },
       "ui/submit": {
-        "params": {"session_id": "string", "content": ["object"], "client_msg_id": "string"},
+        "params": {
+          "session_id": "string",
+          "client_msg_id": "string (non-empty; the idempotency key)",
+          "content": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "description": "RFC-0004 §6.1: ordered content parts. The order is the display order and the server must not reorder it. A message with no text part but at least one image/file part is legal (pure-image turn); `attach.max_per_turn` is the soft ceiling, 20 the frozen hard cap.",
+            "items": {
+              "oneOf": [
+                {
+                  "title": "text",
+                  "type": "object",
+                  "required": ["type", "text"],
+                  "properties": {
+                    "type": {"const": "text"},
+                    "text": {"type": "string", "minLength": 1, "maxLength": 32000}
+                  }
+                },
+                {
+                  "title": "image",
+                  "type": "object",
+                  "required": ["type", "file_id", "mime", "name", "size", "width", "height", "sha256"],
+                  "properties": {
+                    "type": {"const": "image"},
+                    "file_id": {"type": "string", "pattern": "^blb_[0-9a-z]{26}$"},
+                    "mime": {"type": "string", "enum": ["image/jpeg", "image/png", "image/webp"]},
+                    "name": {"type": "string", "minLength": 1, "maxLength": 255},
+                    "size": {"type": "integer", "minimum": 1},
+                    "width": {"type": "integer", "minimum": 1, "maximum": 2048},
+                    "height": {"type": "integer", "minimum": 1, "maximum": 2048},
+                    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                  }
+                },
+                {
+                  "title": "file",
+                  "type": "object",
+                  "required": ["type", "file_id", "mime", "name", "size"],
+                  "properties": {
+                    "type": {"const": "file"},
+                    "file_id": {"type": "string", "pattern": "^blb_[0-9a-z]{26}$"},
+                    "mime": {"type": "string", "minLength": 3, "maxLength": 255},
+                    "name": {"type": "string", "minLength": 1, "maxLength": 255},
+                    "size": {"type": "integer", "minimum": 1}
+                  }
+                },
+                {
+                  "title": "audio",
+                  "type": "object",
+                  "description": "Reserved on purpose (§7.2 / D97): the type stays in the union so FR-8.42 is not narrowed, but v1 answers 501 UNSUPPORTED data.reason='audio_disabled'. Enabling it is a core predicate change, not a schema change.",
+                  "required": ["type", "file_id", "mime", "name", "size"],
+                  "properties": {
+                    "type": {"const": "audio"},
+                    "file_id": {"type": "string", "pattern": "^blb_[0-9a-z]{26}$"},
+                    "mime": {"type": "string", "minLength": 3, "maxLength": 255},
+                    "name": {"type": "string", "minLength": 1, "maxLength": 255},
+                    "size": {"type": "integer", "minimum": 1}
+                  }
+                }
+              ]
+            }
+          }
+        },
         "result": {"turn_id": "string", "queue_pos": "int"},
-        "errors": ["INVALID_ARGUMENT", "READ_ONLY_SESSION", "OVERLOADED"]
+        "errors": ["INVALID_ARGUMENT", "NOT_FOUND", "PAYLOAD_TOO_LARGE", "UNSUPPORTED", "READ_ONLY_SESSION", "OVERLOADED"],
+        "notes": "RFC-0004 §6.4 — the validation ORDER is contractual: (1) shape, (2) idempotency by client_msg_id, (3) part types/required fields/text budget, (4) every file_id exists + visible + owned + unexpired, (5) `attach.*` byte/pixel ceilings, (6) at least one renderable part, (7) persist + pin. A refusal carries `error.data.field` pointing at the offending part (`content[i].<key>`); `content has no renderable part` is the new wording for the old `content has no text block`, same INVALID_ARGUMENT code."
       },
       "ui/interrupt": {
         "params": {"session_id": "string", "turn_id": "string"},
@@ -119,6 +187,30 @@
         "errors": ["APPROVER_INVALID", "READ_ONLY_SESSION", "NOT_FOUND"]
       }
     }
+  },
+  "http_endpoints": {
+    "note": "RFC-0004 §7.3: the attachment channel is HTTP on the core's own listener, not JSON-RPC. A 5 MiB image is ~107x the 65 519-byte transport frame (§2.1), so bytes have to enter core outside the ws control plane. Listed here because an undocumented second entry point is how 'how do I upload' gets re-invented per client.",
+    "listener": "data plane (core.listen) — same process as /ws and /ui/session; /admin* is deliberately 404 here",
+    "auth": {
+      "device": "Authorization: Bearer <token minted over the already-authenticated device channel>",
+      "browser": "__Host-ac_ui cookie + x-vade-csrf (double submit) + exact Origin allowlist + Sec-Fetch-Site: same-origin",
+      "read_only": "explicitly read-only sessions are 403 READ_ONLY_SESSION on writes only; reads stay allowed so history images render"
+    },
+    "body_max": {"begin": 65536, "part": "attach.part_size + 1024"},
+    "content_types": {
+      "begin_complete": ["application/json"],
+      "part": ["application/octet-stream"],
+      "rejected": ["multipart/form-data", "application/x-www-form-urlencoded", "text/plain"]
+    },
+    "endpoints": [
+      {"method": "POST", "path": "/ui/blob", "semantics": "begin: declare sha256/size/mime/dimensions", "idempotency": "(device_id, sha256, size)", "body_max": 65536},
+      {"method": "PUT", "path": "/ui/blob/upload/{upload_id}?offset=N", "semantics": "write one part (raw bytes, offset on a part_size boundary)", "idempotency": "(upload_id, offset)", "body_max": "attach.part_size + 1024"},
+      {"method": "HEAD", "path": "/ui/blob/upload/{upload_id}", "semantics": "received ranges / offset_next / expires_at (the resume anchor)", "idempotency": "read", "body_max": 0},
+      {"method": "POST", "path": "/ui/blob/upload/{upload_id}/complete", "semantics": "recompute size+sha256, emit file_id", "idempotency": "(upload_id)", "body_max": 65536},
+      {"method": "DELETE", "path": "/ui/blob/upload/{upload_id}", "semantics": "abort the upload session; never deletes a committed blob (204, idempotent)", "idempotency": "(upload_id)", "body_max": 0},
+      {"method": "GET|HEAD", "path": "/ui/blob/{file_id}[?v=thumb]", "semantics": "fetch bytes (single Range, immutable) / metadata + scan; ?v=thumb is the same file_id", "idempotency": "read", "body_max": 0}
+    ],
+    "x-vade": {"appends": "RFC-0004", "fr_exception": "FR-8.2 (AMEND-22 R1) 的唯一例外"}
   },
   "events_core_to_ui": {
     "note": "C-06 owns this table (schema/events.json). Listed here only so method-table consumers know the names referenced by ui/*.",

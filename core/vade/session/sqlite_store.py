@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS messages(
     seq INTEGER NOT NULL DEFAULT 0,
     name TEXT,
     tool_call_id TEXT,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    parts TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE TABLE IF NOT EXISTS events(
@@ -75,6 +76,38 @@ CREATE TABLE IF NOT EXISTS events(
 _SUPPORTS_RETURNING = sqlite3.sqlite_version_info >= (3, 35, 0)
 
 
+def _parts_json(message: Message) -> str | None:
+    """`parts` column: JSON array, or NULL for a legacy text-only message."""
+    if not message.parts:
+        return None
+    return json.dumps([dict(p) for p in message.parts], ensure_ascii=False)
+
+
+def _message_from_row(row: sqlite3.Row) -> Message:
+    """Decode one row, tolerating a database that predates `parts`.
+
+    `row.keys()` instead of `row["parts"]`: a store opened read-only against an
+    old file (or a caller poking a hand-built fixture) must not raise KeyError
+    just because the migration had nothing to write.
+    """
+    parts: tuple[dict[str, Any], ...] = ()
+    raw = row["parts"] if "parts" in row.keys() else None
+    if raw:
+        try:
+            decoded = json.loads(raw)
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, list):
+            parts = tuple(dict(p) for p in decoded if isinstance(p, dict))
+    return Message(
+        id=row["id"], session_id=row["session_id"], role=row["role"],
+        content=row["content"], turn_id=row["turn_id"], seq=row["seq"],
+        name=row["name"], tool_call_id=row["tool_call_id"], created_at=row["created_at"],
+        parts=parts,
+    )
+
+
+
 class SQLiteStore(SessionStore):
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -87,6 +120,35 @@ class SQLiteStore(SessionStore):
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    # ------------------------------------------------------------- migration
+    def _migrate(self) -> None:
+        """RFC-0004 §6.2: add `messages.parts` to a pre-parts database.
+
+        Reentrant by construction: the `PRAGMA table_info` probe decides, so a
+        second open of an already-migrated file is a no-op, and a fresh file
+        (created by `_SCHEMA`) is a no-op too. The `except OperationalError`
+        straddles the one race the probe cannot close — two processes opening
+        the same file at once, where both see no column and the loser's ALTER
+        fails with "duplicate column name". If the column is there afterwards,
+        that is success, not an error.
+
+        Nothing is rewritten: `parts` stays NULL for old rows and reads
+        synthesise the text part (§6.3). Old binaries read the new file just
+        fine — they select the columns they know, and `content` is still there.
+        """
+        if "parts" in self._message_columns():
+            return
+        try:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN parts TEXT")
+        except sqlite3.OperationalError:
+            if "parts" not in self._message_columns():
+                raise
+
+    def _message_columns(self) -> set[str]:
+        rows = self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        return {str(row[1]) for row in rows}
 
     # ------------------------------------------------------------------ txn
     @contextmanager
@@ -121,10 +183,10 @@ class SQLiteStore(SessionStore):
             if msgs:
                 conn.executemany(
                     "INSERT INTO messages(id, session_id, turn_id, role, content, seq, name,"
-                    " tool_call_id, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    " tool_call_id, created_at, parts) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     [
                         (m.id, m.session_id, m.turn_id, m.role, m.content, m.seq,
-                         m.name, m.tool_call_id, m.created_at)
+                         m.name, m.tool_call_id, m.created_at, _parts_json(m))
                         for m in msgs
                     ],
                 )
@@ -249,14 +311,7 @@ class SQLiteStore(SessionStore):
         return Session(
             id=row["id"], created_at=row["created_at"], title=row["title"],
             seq_counter=row["seq_counter"], state=row["state"],
-            messages=tuple(
-                Message(
-                    id=r["id"], session_id=r["session_id"], role=r["role"],
-                    content=r["content"], turn_id=r["turn_id"], seq=r["seq"],
-                    name=r["name"], tool_call_id=r["tool_call_id"], created_at=r["created_at"],
-                )
-                for r in msg_rows
-            ),
+            messages=tuple(_message_from_row(r) for r in msg_rows),
             turns=tuple(self._turn_from_row(r) for r in turn_rows),
         )
 

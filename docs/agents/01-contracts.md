@@ -181,3 +181,6 @@
 | 日期 | 契约 | 变更 | 影响 |
 |---|---|---|---|
 | 2026-11-07 | 全部 | 初始冻结计划 | — |
+| 2026-11-14 | C-05 | `ui/submit.content` 定型为有序 `parts[]`（`oneOf` text / image / file / audio，`minItems:1`、`maxItems:20`）；新增顶层 `http_endpoints`（六条 blob 路由、鉴权、`body_max`、`x-vade`）；`rpc.json` 1.0.0 → **1.1.0** | **破坏性**：`content` 不再是单个对象；旧客户端读新消息需回退到 `parts_text` 拼接 |
+| 2026-11-14 | C-18 | 新增 `[attach]` 17 键（RFC-0004 §7.4：配额/TTL/图片上限/扫描/缩略图） | 追加；根 `additionalProperties:false`，旧 core 读新配置会 `UNKNOWN_CONFIG_KEY`，必须随 schema 同批发版 |
+| 2026-11-14 | C-06 | **不改**（RFC-0004 §7.5：附件不推 `attachment.*` 事件；`turn_states` 不动） | 无 |

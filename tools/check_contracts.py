@@ -244,6 +244,87 @@ def check_blob_routes() -> None:
     )
 
 
+PART_TITLES = {"text", "image", "file", "audio"}
+PART_REQUIRED = {
+    "text": {"type", "text"},
+    "image": {"type", "file_id", "mime", "name", "size", "width", "height", "sha256"},
+    "file": {"type", "file_id", "mime", "name", "size"},
+    "audio": {"type", "file_id", "mime", "name", "size"},
+}
+
+
+def check_submit_parts(rpc: dict) -> None:
+    """RFC-0004 §6.1/§7.2: `ui/submit.content` is a typed part union, not `[object]`.
+
+    This is the one breaking change in the batch: a client that sends a block
+    nobody defined used to be silently ignored. The schema is the only place a
+    client author can see that, so its shape is asserted rather than trusted.
+    """
+    submit = ((rpc.get("directions") or {}).get("ui_to_core") or {}).get("ui/submit") or {}
+    content = ((submit.get("params") or {}).get("content")) or {}
+    if not isinstance(content, dict):
+        FAILURES.append("rpc.json ui/submit.content is not a typed array (RFC-0004 §7.2)")
+        return
+    check(content.get("type") == "array", "rpc.json ui/submit.content: type must be array")
+    check(content.get("minItems") == 1, "rpc.json ui/submit.content: minItems must be 1")
+    check(content.get("maxItems") == 20, "rpc.json ui/submit.content: maxItems must be 20 (hard cap)")
+    branches = list(((content.get("items") or {}).get("oneOf")) or [])
+    titles = [str((branch or {}).get("title")) for branch in branches]
+    check(
+        set(titles) == PART_TITLES,
+        f"rpc.json ui/submit.content.oneOf: part types {sorted(titles)} != {sorted(PART_TITLES)}",
+    )
+    for branch in branches:
+        title = str((branch or {}).get("title"))
+        props = (branch or {}).get("properties") or {}
+        const = (props.get("type") or {}).get("const")
+        check(const == title, f"rpc.json ui/submit.content[{title}]: type const {const!r} != {title!r}")
+        required = set((branch or {}).get("required") or [])
+        expected = PART_REQUIRED.get(title, set())
+        check(
+            required == expected,
+            f"rpc.json ui/submit.content[{title}]: required {sorted(required)} != {sorted(expected)}",
+        )
+        for name in expected:
+            check(name in props, f"rpc.json ui/submit.content[{title}]: {name} not declared")
+    image = next((b for b in branches if (b or {}).get("title") == "image"), {}) or {}
+    mimes = set(((image.get("properties") or {}).get("mime") or {}).get("enum") or [])
+    check(
+        mimes == {"image/jpeg", "image/png", "image/webp"},
+        f"rpc.json ui/submit.content[image].mime: {sorted(mimes)} is not the FR-8.38 whitelist",
+    )
+
+
+def check_http_endpoints(rpc: dict) -> None:
+    """RFC-0004 §7.3: `/ui/blob*` is declared next to the RPC table it is not part of."""
+    endpoints = rpc.get("http_endpoints")
+    if not isinstance(endpoints, dict):
+        FAILURES.append("rpc.json: missing http_endpoints (RFC-0004 §7.3)")
+        return
+    rows = endpoints.get("endpoints") or []
+    # The RFC's §4.1 table and this list must describe the same six routes; the
+    # published rows carry decorators (`?offset=N`, `[?v=thumb]`), so compare the
+    # bare path or `POST /ui/blob` would "match" everything under /ui/blob/upload.
+    declared = {
+        (str(row.get("method")), str(row.get("path") or "").split("?")[0].split("[")[0])
+        for row in rows
+        if isinstance(row, dict)
+    }
+    check(len(rows) == len(BLOB_ROUTES), f"rpc.json http_endpoints: {len(rows)} routes, RFC §4.1 has {len(BLOB_ROUTES)}")
+    check(
+        declared == BLOB_ROUTES,
+        "rpc.json http_endpoints drift vs RFC-0004 §4.1: "
+        f"missing={sorted(BLOB_ROUTES - declared)} extra={sorted(declared - BLOB_ROUTES)}",
+    )
+    check("listener" in endpoints, "rpc.json http_endpoints: listener missing")
+    check("auth" in endpoints, "rpc.json http_endpoints: auth missing")
+    check("body_max" in endpoints, "rpc.json http_endpoints: body_max missing")
+    check(
+        (endpoints.get("x-vade") or {}).get("appends") == "RFC-0004",
+        "rpc.json http_endpoints: x-vade.appends must name RFC-0004",
+    )
+
+
 def main() -> int:
     manifest = load("manifest.schema.json")
     errors = load("errors.json")
@@ -296,6 +377,8 @@ def main() -> int:
 
     check_attach(config)
     check_blob_routes()
+    check_submit_parts(rpc)
+    check_http_endpoints(rpc)
 
     methods = {
         "module/register", "module/capabilities.update", "module/heartbeat",

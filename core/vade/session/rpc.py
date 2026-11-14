@@ -50,7 +50,10 @@ class SessionRPC:
         try:
             return await handler(connection, dict(params or {}))
         except VadeError as exc:
-            return RpcError(exc.code, exc.message)
+            # `data` is part of C-04's envelope (`error.data.field`); dropping
+            # it here used to erase every field pointer between the check and
+            # the client (§6.4 / G7).
+            return RpcError(exc.code, exc.message, dict(exc.data) if exc.data else None)
         except Exception:
             # C-04: message only, never a traceback across the boundary.
             return RpcError("INTERNAL", "session RPC failed")
@@ -93,12 +96,21 @@ class SessionRPC:
         content = params.get("content")
         client_msg_id = params.get("client_msg_id")
         if not isinstance(session_id, str):
-            raise VadeError("INVALID_ARGUMENT", "session_id is required")
-        if not isinstance(content, list):
-            raise VadeError("INVALID_ARGUMENT", "content must be an array of blocks")
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
         if not isinstance(client_msg_id, str) or not client_msg_id:
-            raise VadeError("INVALID_ARGUMENT", "client_msg_id is required")
-        turn, pos = await self.log.submit(session_id, content, client_msg_id)
+            raise VadeError("INVALID_ARGUMENT", "client_msg_id is required",
+                            data={"field": "client_msg_id"})
+        # RFC-0004 §6.4: shape (array, 1..20 parts) is checked once, in
+        # `SessionLog.submit`, so a direct caller and the RPC surface answer the
+        # same `data.field`. Only the identity of the submitting device is
+        # resolved here — it is what §6.4 step 4 compares `file_id` ownership to.
+        turn, pos = await self.log.submit(
+            session_id,
+            content,  # type: ignore[arg-type]
+            client_msg_id,
+            device_id=getattr(connection, "device_id", None) or None,
+        )
         return {"turn_id": turn.id, "queue_pos": pos}
 
     async def ui_interrupt(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:

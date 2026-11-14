@@ -84,7 +84,17 @@ Environment: `VADE_CORE_URL`, `VADE_INSTANCE_ID`, `MODULE_KEY_PATH`,
 `ModuleApp(module_id, version, concurrency="exclusive", *, display_name=None,
 priority=0, capabilities=("tools",), instance_id=None, role="tool",
 max_concurrency=4, max_payload=65519, protocol="vade/v1", logger=None,
-env_prefix=None)`.
+env_prefix=None, ui_pages=())`.
+
+`ui_pages` declares C-19 module pages (RFC-0009 §9.2) — the `ui.pages[]` block
+that gives a module an entry in `ui/modules`. The SDK checks only that every
+entry is a mapping carrying `id`/`title`/`version`/`schema` and that `id`
+matches `^[a-z][a-z0-9_-]{0,31}$`, and it raises `ValueError` naming the page.
+The rest (icon enum, node tree, budgets, `navigate` targets) belongs to core's
+`validate_ui()`, which **drops** a bad page into `Manifest.ui_warnings` instead
+of failing registration. The manifest gains a `ui` key **only** when at least
+one page is declared: `ui.pages` absent or empty means "no entry anywhere"
+(FR-8.79), so an empty `ui_pages` leaves the payload byte-for-byte unchanged.
 
 `add_tool` may only be called before the module is live. After registration use
 `await app.replace_tools([...])`: it sends `module/capabilities.update` and

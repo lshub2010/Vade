@@ -8,15 +8,16 @@
 
 | 项 | 值 | 出处 |
 |---|---|---|
-| C-05 rpc.json 顶部 version | **1.6.0** | `schema/rpc.json` |
-| C-05 方法数 | ui_to_core **35** / core_to_module **7** / module_to_core **6**，三方向合计 **48** | 同上 |
+| C-05 rpc.json 顶部 version | **1.7.0** | `schema/rpc.json` |
+| C-05 方法数 | ui_to_core **36** / core_to_module **7** / module_to_core **6**，三方向合计 **49** | 同上 |
 | RFC-0015 append 块 | `x-vade.appends` 第 **11** 块（C-05 **1.6.0**，`adds=["ui/modules"]`，`rewrites: none`）。原先的 `x-vade.rfc0015_pending` 占位块已在本棒（`s-rfc0015-register`）转正后删除 | `schema/rpc.json` |
+| RFC-0016 append 块 | `x-vade.appends` 第 **12** 块（C-05 **1.7.0**，`adds=["ui/blob.token"]`，`rewrites: none`）；顶部 version 同批 1.6.0 → 1.7.0，`http_endpoints.auth.device` 注记改为点名铸造方法 | `schema/rpc.json` |
 | C-06 events.json 顶部 version | **2.0.0** | `schema/events.json` |
 | C-06 事件数 | **34**（含 `turn.state` 枚举条目；不含则 33） | 同上 |
 | C-04 错误码 | **34** | `schema/errors.json` |
-| append 登记块 | rpc.json **11** 块 / events.json **8** 块 / manifest.schema.json **3** 块，合计 **22** | 三文件 `x-vade.appends` |
-| 服务端测试 | **1164 passed**（`pytest core/tests -q`，在基线 `774b22c` 上：1132 + RFC-0015 的 32 条；出处 `shots/s-modules-impl/RESULT.md`、`shots/s-rfc0015-register/RESULT.md`）。历史：**1089 passed**（2026-11-14 在 `dev_gingshan` 合入 RFC-0003 Q5 后复跑：`1078 passed, 6 warnings in 86.21s`；RFC-0002 落地后在 worktree s-rfc0002 复跑：`1089 passed, 6 warnings in 65.79s`，+11 = RFC-0002 新增用例）。本总账初版记录的 **1065** 是 RFC-0014 落地时、RFC-0003 Q5 未合时的数（出处 `core/vade/session/RESULT-rfc0014.md`；+13 = `core/tests/loop/test_compaction_catalog.py`） | 本人复跑 |
-| 契约门禁 | `tools/check_contracts.py` exit 0（`contracts: OK …RFC-0014 session search green…`） | 本人复跑 |
+| append 登记块 | rpc.json **12** 块 / events.json **8** 块 / manifest.schema.json **3** 块，合计 **23** | 三文件 `x-vade.appends` |
+| 服务端测试 | **1203 passed**（`pytest core/tests -q`，worktree `s-blob-impl`，基线 `7941b93`：1165 + 本棒 38 = 32 `test_rpc_token.py` + 5 `test_revoke_purges_tokens.py` + 1 `test_blob_token_ws.py`；`1203 passed, 9 warnings in 526.67s`）。历史：**1164 passed**（`shots/s-modules-impl/RESULT.md`、`shots/s-rfc0015-register/RESULT.md`，其中 s-rfc0015 基线实跑口径 **1165**，见该报告 §8）；**1089 passed**（2026-11-14 在 `dev_gingshan` 合入 RFC-0003 Q5 后复跑）。本总账初版记录的 **1065** 是 RFC-0014 落地时、RFC-0003 Q5 未合时的数（出处 `core/vade/session/RESULT-rfc0014.md`） | 本人复跑 |
+| 契约门禁 | `tools/check_contracts.py` exit 0（`contracts: OK …RFC-0014 session search green, RFC-0016 blob token green…`） | 本人复跑 |
 | docs 门禁 | `docs/check_docs.py` exit 0（12 项，失败 0 项） | 本人复跑 |
 
 ## 2. 主表（每条 RFC 一行）
@@ -38,24 +39,24 @@
 | RFC-0013 | 中断留痕落库（R9）：partial 消息进 snapshot，删掉「只能从 turn.delta 重建」的旧注记 | proposed | 已实现（core 侧；stage 自述一致） | 无（adds=[]，仅注记） | 无（adds=[]；`turn.interrupted.notes` 就地改写——显式偏离「不改 notes 字节」惯例） | — | C-05 1.2.0（append 级）；C-06 1.2.0（append 级） | `core/vade/session/queue.py`、`core/vade/session/sqlite_store.py`、`core/vade/session/models.py` | 979 passed（`core/vade/session/RESULT-rfc0013.md`：966+13） | 8/0 |
 | RFC-0014 | 会话搜索：`session/search`（标题 + 正文 LIKE 扫描、两档排序、片段硬截断） | proposed | 已实现（core 侧；stage 自述一致） | `session/search` | 无 | — | C-05 1.5.0 | `core/vade/session/search.py`、`core/vade/session/sqlite_store.py`、`core/vade/session/rpc.py`、`core/vade/session/manager.py` | 1065 passed（`core/vade/session/RESULT-rfc0014.md`：1041+24；本 worktree 复跑同数） | 14/0 |
 | RFC-0015 | 模块清单通道：`ui/modules`（一次拉全量模块与页面入口、`revision` 单调、`module.status` 作失效边） | proposed | **已实现**（契约登记：`x-vade.appends` 第 **11** 块 / C-05 **1.6.0**，`adds=["ui/modules"]`、`rewrites: none`；占位块 `x-vade.rfc0015_pending` 已删除。core：`ModulePageService.list_modules()` + `ui/modules` handler，经 `app.session_handlers` 分发。**客户端未接线 → A3（模块页入口）仍缺数据源**） | `ui/modules` | 无 | 无（C-06 无新事件、C-04 无新码、C-03/C-18 不动；C-03 的 `display_name` 原先被 `Manifest` dataclass 丢掉，s-modules-impl 补上，`ui/modules` 的 `display_name` 依赖它） | rpc.json **1.6.0**（append 块，`rewrites: none`） | `core/vade/modulepage/service.py`、`core/vade/modulepage/rpc.py`、`core/vade/modulepage/__init__.py`、`core/vade/registry/manifest.py` | 32 passed（`core/tests/uipage/test_list_modules.py` 17 + `test_list_modules_auth.py` 8 + `test_list_modules_limits.py` 6 + `core/tests/e2e/test_ui_modules_ws.py` 1；全量 1164 passed，出处 `shots/s-modules-impl/RESULT.md`、`shots/s-rfc0015-register/RESULT.md`） | 12/0 |
-| RFC-0016 | 附件上传的设备凭据铸造：`ui/blob.token`（补上 RFC-0004 §4.5 漏登记的方法，原生配对设备凭此上传并提交附件） | proposed | 未实施（本棒只交付设计：`schema/**`、`core/**`、`sdk/**`、`tools/check_*.py` 一行未动；契约里还没有方法也没有 append 块，故 LEDGER 的 aggregate 仍记 1.6.0 / 48 / appends 11） | 无（未登记） | 无 | 无 | — | — | — | 12/0 |
+| RFC-0016 | 附件上传的设备凭据铸造：`ui/blob.token`（补上 RFC-0004 §4.5 漏登记的方法，原生配对设备凭此上传并提交附件） | proposed | **已实现**（契约登记：`x-vade.appends` 第 **12** 块 / C-05 **1.7.0**，`adds=["ui/blob.token"]`、`rewrites: none`；顶部 1.6.0→1.7.0。core：`BlobTokenRPC`（严格参数 / cookie 拒 / 绑 `connection.device_id`）经 `handler_providers` 双路发布；Q7 拍板落地：Bearer 读面按设备隔离（`stat()` 不再看 `read_scope`）；Q4 接线：解绑设备即清 token（`Whitelist.revoke` 回调扩成 `(fingerprint, removed_ids)`，`App._revoke_connection` 调 `BlobService.revoke_device`）。**客户端未接线 → A11 客户端三态在 vade-client，core 侧只交付 dispatch 形状断言**） | `ui/blob.token` | 无 | 无 | rpc.json **1.7.0**（append 块，`rewrites: none`） | `core/vade/blob/rpc.py`、`core/vade/blob/__init__.py`、`core/vade/blob/service.py`、`core/vade/app.py`、`core/vade/identity/whitelist.py` | 新增 32 passed（`core/tests/blob/test_rpc_token.py` 32 例含 A1–A11 + 拍板 Q1/Q3/Q7）+ 5 passed（`core/tests/identity/test_revoke_purges_tokens.py`）+ 1 passed（`core/tests/e2e/test_blob_token_ws.py` 真 socket：Noise 铸 token → HTTP 上传 → `ui/submit` → 新连接 `ui/attach` 取回）；全量见 §1（出处 `shots/s-blob-impl/RESULT.md`） | 12/0 |
 
 > 「验收」列 = 验收表条目行数 / 已勾选数。**全部 16 份 RFC 的验收表均无勾选列，机械计数 `[x]` 均为 0**——「已勾选」这回事在本仓从不存在过，勿再说「验收已勾完」。
-> append 版本是**块级**登记版本（append-per-minor 纪律），与契约**顶部**版本（C-05 现 1.6.0 / C-06 现 2.0.0）是两个东西；RFC-0013 两个块都是 1.2.0 但顶部版本不动，这是设计而非错误，但口头汇报极易混——见 §4-4。
+> append 版本是**块级**登记版本（append-per-minor 纪律），与契约**顶部**版本（C-05 现 1.7.0 / C-06 现 2.0.0）是两个东西；RFC-0013 两个块都是 1.2.0 但顶部版本不动，这是设计而非错误，但口头汇报极易混——见 §4-4。
 
 ## 3. 机器事实块（`check_ledger.py` 以此为准重算比对；手改本块必须与契约同步）
 
 ```json
 {
   "aggregate": {
-    "rpc_version": "1.6.0",
-    "rpc_methods_by_direction": {"module_to_core": 6, "core_to_module": 7, "ui_to_core": 35},
-    "rpc_methods_total": 48,
+    "rpc_version": "1.7.0",
+    "rpc_methods_by_direction": {"module_to_core": 6, "core_to_module": 7, "ui_to_core": 36},
+    "rpc_methods_total": 49,
     "events_version": "2.0.0",
     "events_total_incl_turn_state": 34,
     "events_total_excl_turn_state": 33,
     "error_codes": 34,
-    "appends_rpc": 11,
+    "appends_rpc": 12,
     "appends_events": 8,
     "appends_manifest": 3
   },
@@ -75,7 +76,7 @@
     "RFC-0013": {"status": "proposed", "impl_state": "已实现", "methods": [], "events": [], "manifest_fields": [], "append_versions": {"rpc.json": "1.2.0", "events.json": "1.2.0"}, "impl": ["core/vade/session/queue.py", "core/vade/session/sqlite_store.py", "core/vade/session/models.py"], "acceptance_rows": 8, "acceptance_checked": 0},
     "RFC-0014": {"status": "proposed", "impl_state": "已实现", "methods": ["session/search"], "events": [], "manifest_fields": [], "append_versions": {"rpc.json": "1.5.0"}, "impl": ["core/vade/session/search.py", "core/vade/session/sqlite_store.py", "core/vade/session/rpc.py", "core/vade/session/manager.py"], "acceptance_rows": 14, "acceptance_checked": 0},
     "RFC-0015": {"status": "proposed", "impl_state": "已实现", "methods": ["ui/modules"], "events": [], "manifest_fields": [], "append_versions": {"rpc.json": "1.6.0"}, "impl": ["core/vade/modulepage/service.py", "core/vade/modulepage/rpc.py", "core/vade/modulepage/__init__.py", "core/vade/registry/manifest.py"], "acceptance_rows": 12, "acceptance_checked": 0},
-    "RFC-0016": {"status": "proposed", "impl_state": "未实施", "methods": [], "events": [], "manifest_fields": [], "append_versions": {}, "impl": [], "acceptance_rows": 12, "acceptance_checked": 0}
+    "RFC-0016": {"status": "proposed", "impl_state": "已实现", "methods": ["ui/blob.token"], "events": [], "manifest_fields": [], "append_versions": {"rpc.json": "1.7.0"}, "impl": ["core/vade/blob/rpc.py", "core/vade/blob/__init__.py", "core/vade/blob/service.py", "core/vade/app.py", "core/vade/identity/whitelist.py", "tools/check_contracts.py"], "acceptance_rows": 12, "acceptance_checked": 0}
   }
 }
 ```
@@ -91,3 +92,4 @@
 7. rpc.json 的 RFC-0009 append 块缺 `contract` 字段；manifest.schema.json 的 RFC-0005 块 `contract` 写 "RFC-0005" 而非契约号——同数组内命名口径不一。
 8. RFC-0011 唯一实现证据在客户端仓（vade-client `d667442`），本仓不可验证。
 9. **「声明先于实现」已收口**（保留为历史条目）：RFC-0015 的 `ui/modules` 曾在 `s-modules-rfc` 只写进 `directions.ui_to_core`、登记块放在 `x-vade.rfc0015_pending`——因为 append 在总账里等于声明「已实现」（`tools/check_ledger.py:203-205` 硬要求 `impl_state=已实现` 且 impl 路径必须存在）。`s-rfc0015-register` 把三件事同批做完：① pending 块转进 `appends` 末尾（第 11 块，块版本 1.6.0，既有 10 块未动）；② 顶部 version 1.5.0→1.6.0；③ `tools/check_contracts.py` 三处版本钉**追加** 1.6.0（1.3.0/1.4.0/1.5.0 原样保留；临时改 1.7.0 实测仍 FAIL，见 `shots/s-rfc0015-register/RESULT.md` §5）。另加 `core/tests` 里三处「顶部版本」断言同步（既有惯例：RFC-0014 的 6b568b9 同样只改版本号与相邻注释）。
+10. **RFC-0016 同批走完「登记 + 实现」**（`s-blob-impl`，2026-11-15）：第 12 块登记与 core 实现同批落地，故本表不再出现「声明先于实现」窗口。三处版本钉**只追加** 1.7.0（1.3.0–1.6.0 原样保留），并新增 `check_blob_token()`（方法形状 / endpoints 与 `http_endpoints` 别名比对 / `TOKEN_TTL_*` 常量 / handler 注册 / auth.device 点名方法 / append 块）；门禁咬合实测：顶部临时改 1.8.0、删 `endpoints.fetch`、改 `expires_at` 键名、`errors` 换 `UNAVAILABLE`、`params` 加 `device_id`、append 块版本改 1.6.0 —— 六种变异全部 FAIL，还原后 OK（`shots/s-blob-impl/RESULT.md`）。`core/tests` 三处「顶部版本」断言 1.6.0→1.7.0（同 §4-9 惯例）。

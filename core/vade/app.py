@@ -141,9 +141,20 @@ class App:
         """Constraint 5 input: the key already paired to this module, if any."""
         return self.whitelist.fingerprint_for(module_id) if self.whitelist is not None else None
 
-    def _revoke_connection(self, fingerprint: str) -> None:
+    def _revoke_connection(self, fingerprint: str, removed_ids: tuple[str, ...] = ()) -> None:
         if self.registry is not None:
             self.registry.revoke_fingerprint(fingerprint)
+        # RFC-0016 §5.6-17 / Q4 (RFC default, NOT 拍板): unbinding a device
+        # kills its minted blob tokens in the same stroke — without this the
+        # tokens of an unbound device stay valid until their TTL ceiling
+        # (900 s), and a revoked pairing could keep uploading. `removed_ids`
+        # are the deleted `module#instance` names, i.e. exactly the
+        # `device_id` values tokens were minted against (§5.1-1).
+        blob = getattr(self, "blob", None)
+        service = getattr(blob, "service", None) if blob is not None else None
+        if service is not None:
+            for device_id in removed_ids:
+                service.revoke_device(device_id)
 
     def print_fingerprint(self) -> str:
         """ONLY the core identity fp8 (`SHA-256(core_pub)[:16]`).
@@ -237,7 +248,18 @@ def make_rpc_handler(app: App) -> Any:
         # socket and T6 only exists in unit tests.
         session_handlers = getattr(app, "session_handlers", None) or {}
         if method in session_handlers:
-            return await session_handlers[method](connection, params)
+            try:
+                return await session_handlers[method](connection, params)
+            except VadeError as exc:
+                # RFC-0016 (found by the e2e ws test): a provider-published
+                # handler that raises VadeError must degrade to the C-04 error
+                # envelope, exactly the way `SessionRPC.dispatch` converts its
+                # own (`session/rpc.py:61-74`, `data` rides along). Letting it
+                # propagate closes the socket (`connection.py:170` catches it
+                # one frame up) instead of answering the client — a refused
+                # mint (cookie session / no identity) would look like a
+                # dropped connection and the client would retry forever.
+                return RpcError(exc.code, exc.message, dict(exc.data) if exc.data else None)
         return RpcError("NOT_FOUND", f"unknown method {method!r}")
 
     return handler

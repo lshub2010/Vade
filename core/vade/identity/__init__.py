@@ -31,7 +31,11 @@ def install(app: Any) -> None:
     app.identity = load_or_create(data_dir)
     app.whitelist = Whitelist(
         data_dir / "identity" / "whitelist.json",
-        on_revoke=lambda fp: app.registry.revoke_fingerprint(fp) if getattr(app, "registry", None) else None,
+        # RFC-0016 §5.6-17: the on_revoke contract is (fingerprint,
+        # removed_ids). Delegate to the App hook so unbind closes live
+        # connections AND purges the device's blob tokens — one wiring, not
+        # two that can drift.
+        on_revoke=lambda fp, removed: app._revoke_connection(fp, removed),
     )
     app.pairing = PairingStore(
         data_dir / "pairing.sqlite3",

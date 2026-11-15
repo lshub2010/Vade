@@ -14,6 +14,7 @@ from typing import Any
 
 from .auth import CSRF_COOKIE, CSRF_HEADER, UI_COOKIE, Authenticator, Principal
 from .http import BEGIN_BODY_MAX, PART_BODY_SLACK, ROUTES, BlobApp, build_from_config
+from .rpc import BlobTokenRPC
 from .service import BlobService
 from .settings import AttachSettings
 
@@ -21,6 +22,7 @@ __all__ = [
     "install",
     "BlobApp",
     "BlobService",
+    "BlobTokenRPC",
     "AttachSettings",
     "Authenticator",
     "Principal",
@@ -48,15 +50,26 @@ def _audit_sink(app: Any):
 
 
 def install(app: Any) -> None:
-    if getattr(app, "blob", None) is not None:
-        return
+    if getattr(app, "blob", None) is None and getattr(app, "config", None) is not None:
+        settings = AttachSettings.from_config(app.config)
+        if settings.enabled:
+            _install_data_plane(app, settings)
+        else:
+            # RFC-0016 §5.7-19: disabled means `app.blob` stays None. The six
+            # `/ui/blob*` routes 404 (no oracle) while the ws minting method
+            # still exists and answers UNSUPPORTED — a client that cannot tell
+            # "feature off" from "core too old" would nag the user to update
+            # a core that is not broken (§7.2).
+            app.blob = None
+    # RFC-0016: publish the minting handler regardless of the data plane —
+    # `BlobTokenRPC` resolves `app.blob` lazily per call, so the method exists
+    # (and answers UNSUPPORTED) even when attachments are disabled.
+    _install_token_rpc(app)
+
+
+def _install_data_plane(app: Any, settings: AttachSettings) -> None:
     if getattr(app, "config", None) is None:
         return
-    settings = AttachSettings.from_config(app.config)
-    if not settings.enabled:
-        app.blob = None
-        return
-
     data_dir = Path(str(app.config.get("core.data_dir", "./data")))
     service = BlobService(data_dir, settings, audit=_audit_sink(app))
     origins = tuple(app.config.get("server.ui_origins", []) or [])
@@ -85,3 +98,28 @@ def install(app: Any) -> None:
     except RuntimeError:
         return
     service.ensure_sweeper()
+
+
+def _install_token_rpc(app: Any) -> None:
+    """Publish `ui/blob.token` (RFC-0016 §13.2), both registration paths.
+
+    Same story as `modulepage.install`: `blob` sorts before `session`
+    alphabetically, so at install time `app.session_handlers` usually does not
+    exist yet — the provider list is the path `session.install()` actually
+    drains. Writing into the dict when it DOES exist (tests, bare apps) keeps
+    those handlers reachable too, and publishing both ways is idempotent.
+    """
+    if getattr(app, "blob_token_rpc", None) is not None:
+        return
+    rpc = BlobTokenRPC(app)
+    app.blob_token_rpc = rpc
+    handlers = getattr(app, "session_handlers", None)
+    if isinstance(handlers, dict):
+        for name, handler in rpc.handlers().items():
+            handlers.setdefault(name, handler)
+    providers = getattr(app, "handler_providers", None)
+    if not isinstance(providers, list):
+        providers = []
+        app.handler_providers = providers
+    if rpc.handlers not in providers:
+        providers.append(rpc.handlers)

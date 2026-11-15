@@ -47,6 +47,13 @@ Checks (each one has broken at least once in review):
      `--` stay literal — parameterization's job), the store binds the pattern
      (`LIKE ? ESCAPE`) and never interpolates it, and the `x-vade.appends`
      block carries `adds=["session/search"]` / `rewrites: none` / 1.5.0.
+ 14. RFC-0016: `ui/blob.token` is declared (C-05 1.7.0) with the §4 shape
+     (params exactly {ttl_s}, result token/expires_at/max_bytes/endpoints{6},
+     the four reused C-04 codes), registered in `BlobTokenRPC.handlers()`,
+     the `TOKEN_TTL_*` constants are 600/60/900, the `endpoints` aliases match
+     the `http_endpoints` rows verbatim, `http_endpoints.auth.device` names
+     the minting method, and the append block carries
+     `adds=["ui/blob.token"]` / `rewrites: none` / 1.7.0.
 
 Run:  python3 tools/check_contracts.py      (exit 0 = green)
 """
@@ -1093,8 +1100,9 @@ def check_subagent_events(events: dict, declared_events: dict, schema_events: se
         & (set(directions.get("module_to_core") or {}) | set(directions.get("core_to_module") or {}))
     )
     check(not elsewhere, f"rpc.json: RFC-0012 methods must not be module-facing: {elsewhere}")
-    check(rpc.get("version") in ("1.4.0", "1.5.0", "1.6.0"),
-          f"rpc.json: version must be 1.4.0 (RFC-0012), 1.5.0 (RFC-0014) or 1.6.0 (RFC-0015, the current head) (got {rpc.get('version')!r})")
+    check(rpc.get("version") in ("1.4.0", "1.5.0", "1.6.0", "1.7.0"),
+          f"rpc.json: version must be 1.4.0 (RFC-0012), 1.5.0 (RFC-0014), 1.6.0 (RFC-0015) "
+          f"or 1.7.0 (RFC-0016, the current head) (got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0012" in str(b.get("doc") or "")), None)
     check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0012")
@@ -1353,8 +1361,9 @@ def check_session_meta(rpc: dict, events: dict) -> None:
             check(field in entry, f"rpc.json {name}: missing {field}")
         unknown = sorted(set(entry.get("errors") or []) - codes)
         check(not unknown, f"rpc.json {name}: errors not declared in C-04: {unknown}")
-    check(rpc.get("version") in ("1.3.0", "1.4.0", "1.5.0", "1.6.0"),
-          f"rpc.json: version must be 1.3.0 (RFC-0010), 1.4.0 (RFC-0012), 1.5.0 (RFC-0014) or 1.6.0 (RFC-0015, the current head) (got {rpc.get('version')!r})")
+    check(rpc.get("version") in ("1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0"),
+          f"rpc.json: version must be 1.3.0 (RFC-0010), 1.4.0 (RFC-0012), 1.5.0 (RFC-0014), "
+          f"1.6.0 (RFC-0015) or 1.7.0 (RFC-0016, the current head) (got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0010" in str(b.get("doc") or "")), None)
     check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0010")
@@ -1477,8 +1486,9 @@ def check_session_search(rpc: dict) -> None:
                   f"rpc.json session/search hit-row shape drifted: {sorted(set(rows[0]) ^ SESSION_SEARCH_HIT_KEYS)}")
         else:
             check(False, "rpc.json session/search.result.results: must declare the hit-row shape (one object)")
-    check(rpc.get("version") in ("1.5.0", "1.6.0"),
-          f"rpc.json: version must be 1.5.0 (RFC-0014) or 1.6.0 (RFC-0015, the current head) after the RFC-0014 append (got {rpc.get('version')!r})")
+    check(rpc.get("version") in ("1.5.0", "1.6.0", "1.7.0"),
+          f"rpc.json: version must be 1.5.0 (RFC-0014), 1.6.0 (RFC-0015) or "
+          f"1.7.0 (RFC-0016, the current head) after the RFC-0014 append (got {rpc.get('version')!r})")
 
     if str(ROOT / "core") not in sys.path:
         sys.path.insert(0, str(ROOT / "core"))
@@ -1521,6 +1531,108 @@ def check_session_search(rpc: dict) -> None:
               "rpc.json: the RFC-0014 append block must carry version 1.5.0")
         check("none" in str(block.get("rewrites") or ""),
               "rpc.json: the RFC-0014 append must be rewrite-free")
+
+
+#: RFC-0016 §4.1: the minting method and its frozen shape.
+BLOB_TOKEN_METHOD = "ui/blob.token"
+BLOB_TOKEN_PARAMS = {"ttl_s"}
+BLOB_TOKEN_RESULT = {"token", "expires_at", "max_bytes", "endpoints"}
+BLOB_TOKEN_ENDPOINT_KEYS = {"begin", "part", "complete", "abort", "resume", "fetch"}
+BLOB_TOKEN_ERRORS = {"INVALID_ARGUMENT", "PERMISSION_DENIED", "READ_ONLY_SESSION", "UNSUPPORTED"}
+
+
+def check_blob_token(rpc: dict) -> None:
+    """RFC-0016 §10 A1: `ui/blob.token` is declared, shaped, and registered.
+
+    Three things a review can miss by reading:
+
+    * the `endpoints` table is an ALIAS of `http_endpoints.endpoints[]` — a
+      second copy that drifted would hand clients routes the listener no
+      longer serves, so the check compares the two tables verbatim;
+    * the handler must be registered in `BlobTokenRPC.handlers()` — a schema
+      entry without a handler answers NOT_FOUND on a real socket;
+    * the `TOKEN_TTL_*` constants ARE the contract (拍板 Q2: 600 s default,
+      60..900 window) — a constant drift silently changes credential
+      lifetimes for every client that pinned the RFC value.
+    """
+    directions = rpc.get("directions") or {}
+    ui_to_core = directions.get("ui_to_core") or {}
+    entry = ui_to_core.get(BLOB_TOKEN_METHOD)
+    check(entry is not None, f"rpc.json: {BLOB_TOKEN_METHOD} is missing from ui_to_core (RFC-0016 §4)")
+    elsewhere = sorted(
+        {BLOB_TOKEN_METHOD}
+        & (set(directions.get("module_to_core") or {}) | set(directions.get("core_to_module") or {}))
+    )
+    check(not elsewhere, f"rpc.json: RFC-0016 methods must not be module-facing: {elsewhere}")
+    if isinstance(entry, dict):
+        for field in ("params", "result", "errors", "notes"):
+            check(field in entry, f"rpc.json {BLOB_TOKEN_METHOD}: missing {field}")
+        codes = set(load("errors.json").get("codes") or {})
+        unknown = sorted(set(entry.get("errors") or []) - codes)
+        check(not unknown, f"rpc.json {BLOB_TOKEN_METHOD}: errors not declared in C-04: {unknown}")
+        check(set(entry.get("params") or {}) == BLOB_TOKEN_PARAMS,
+              "rpc.json ui/blob.token.params must be exactly {ttl_s}")
+        check(set(entry.get("result") or {}) == BLOB_TOKEN_RESULT,
+              "rpc.json ui/blob.token.result must be exactly {token, expires_at, max_bytes, endpoints}")
+        endpoints = (entry.get("result") or {}).get("endpoints")
+        if isinstance(endpoints, dict):
+            check(set(endpoints) == BLOB_TOKEN_ENDPOINT_KEYS,
+                  "rpc.json ui/blob.token.endpoints must have exactly the six keys")
+            declared_rows = {
+                f'{str(row.get("method"))} {str(row.get("path"))}'
+                for row in ((rpc.get("http_endpoints") or {}).get("endpoints") or [])
+                if isinstance(row, dict)
+            }
+            check(set(endpoints.values()) == declared_rows,
+                  "rpc.json ui/blob.token.endpoints drift vs http_endpoints.endpoints[] "
+                  f"(they are aliases, not a second contract): {sorted(set(endpoints.values()) ^ declared_rows)}")
+        else:
+            check(False, "rpc.json ui/blob.token.result.endpoints must be the six-key object")
+        check(set(entry.get("errors") or []) == BLOB_TOKEN_ERRORS,
+              "rpc.json ui/blob.token.errors must be exactly the four reused C-04 codes (no new code)")
+
+    check(rpc.get("version") == "1.7.0",
+          f"rpc.json: version must be 1.7.0 (RFC-0016 owns the C-05 head) (got {rpc.get('version')!r})")
+
+    if str(ROOT / "core") not in sys.path:
+        sys.path.insert(0, str(ROOT / "core"))
+    try:
+        from vade.blob.rpc import BLOB_TOKEN_ENDPOINTS, BlobTokenRPC
+        from vade.blob.service import TOKEN_TTL_DEFAULT, TOKEN_TTL_MAX, TOKEN_TTL_MIN
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        FAILURES.append(f"core/vade/blob: cannot import for RFC-0016 checks "
+                        f"({type(exc).__name__}: {exc})")
+        return
+    check(BLOB_TOKEN_METHOD in BlobTokenRPC(None).handlers(),
+          "BlobTokenRPC.handlers(): ui/blob.token is not registered (RFC-0016 §5)")
+    check((TOKEN_TTL_DEFAULT, TOKEN_TTL_MIN, TOKEN_TTL_MAX) == (600, 60, 900),
+          f"blob.service TOKEN_TTL_* drifted from RFC-0016 §5.2: "
+          f"default={TOKEN_TTL_DEFAULT} min={TOKEN_TTL_MIN} max={TOKEN_TTL_MAX}")
+    # The code-side alias table and the schema say the same six routes.
+    check(set(BLOB_TOKEN_ENDPOINTS) == BLOB_TOKEN_ENDPOINT_KEYS,
+          "vade.blob.rpc.BLOB_TOKEN_ENDPOINTS keys drifted from RFC-0016 §4.3")
+    schema_endpoints = set((((entry or {}).get("result") or {}).get("endpoints") or {}).values())
+    check(set(BLOB_TOKEN_ENDPOINTS.values()) == schema_endpoints,
+          "BLOB_TOKEN_ENDPOINTS values drift vs schema/rpc.json ui/blob.token.endpoints")
+    # auth.device must name the minting method (§9.3): it is the only
+    # client-visible sentence about where a bearer comes from.
+    auth_device = str(((rpc.get("http_endpoints") or {}).get("auth") or {}).get("device") or "")
+    check(BLOB_TOKEN_METHOD in auth_device,
+          "rpc.json http_endpoints.auth.device must name ui/blob.token (RFC-0016 §9.3)")
+
+    rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
+    block = next((b for b in rpc_appends if isinstance(b, dict)
+                  and "RFC-0016" in str(b.get("doc") or "")), None)
+    check(block is not None, "rpc.json: missing the x-vade.appends block for RFC-0016")
+    if block is not None:
+        check(set(block.get("adds") or []) == {BLOB_TOKEN_METHOD},
+              "rpc.json: the RFC-0016 append block must add exactly ui/blob.token")
+        check(block.get("version") == "1.7.0",
+              "rpc.json: the RFC-0016 append block must carry version 1.7.0")
+        check("none" in str(block.get("rewrites") or ""),
+              "rpc.json: the RFC-0016 append must be rewrite-free")
+        check(block.get("contract") == "C-05" and block.get("owner") == "C2",
+              "rpc.json: the RFC-0016 append block must carry contract C-05 / owner C2")
 
 
 def main() -> int:
@@ -1651,6 +1763,7 @@ def main() -> int:
     check_approval_attribution(declared_events)
     check_session_meta(rpc, events)
     check_session_search(rpc)
+    check_blob_token(rpc)
     check_subagent_events(events, declared_events, schema_events, rpc)
 
     # ---------------------------------------------------------------- RFC-0003
@@ -1690,7 +1803,7 @@ def main() -> int:
         return 1
     print("contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 34 error codes, config metadata complete, "
           "RFC-0005 append green, RFC-0010 session metadata green, RFC-0012 subagent family green, "
-          "RFC-0014 session search green, RFC-0003 layers green, event gate green)")
+          "RFC-0014 session search green, RFC-0016 blob token green, RFC-0003 layers green, event gate green)")
     return 0
 
 

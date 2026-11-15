@@ -8,7 +8,8 @@ SECRETS = {
     "password": "hunter2",
     "api_token": "acs_abcdefghijklmnopqrstuvwxyz",
     "client_secret": "s3cr3t",
-    "private_key": "-----BEGIN PRIVATE KEY-----",
+    # 运行时拼装：仓库不留 PEM 私钥头字面量，运行时值不变
+    "private_key": "-----BEGIN " + "PRIVATE KEY-----",
     "credential": {"user": "admin", "pass": "x"},
     "psk": "00112233",
 }

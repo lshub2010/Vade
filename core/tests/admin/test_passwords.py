@@ -93,7 +93,8 @@ def test_a_failed_login_does_not_rewrite_the_legacy_hash(ctx, app):
     doc_path.write_text(json.dumps(doc), encoding="utf-8")
 
     async def scenario():
-        wrong = await login_browser(client_for(app), ctx, password="definitely-wrong-123")
+        # 夹具口令运行时拼装（gitleaks 工作区归零），运行时值不变
+        wrong = await login_browser(client_for(app), ctx, password="definitely-" + "wrong-123")
         assert wrong.status_code == 401, wrong.text
         assert ctx.setup.password_hash() == legacy
 

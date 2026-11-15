@@ -128,3 +128,18 @@ G1–G5 是**发布级**目标（端到端 + SDK 冻结 / 审批审计闭环 / �
 - `tools/check_contracts.py` → `contracts: OK`；`tools/check_ledger.py` → `ledger: OK (16 RFC rows; rpc 1.7.0 49 methods in 3 directions, events 2.0.0 34 entries, 34 error codes, appends 12+8+3)`；`docs/check_docs.py` → 12 项 / 失败 0
 - gitleaks：主仓与客户端工作区 `dir` 扫描 **0 命中**、私钥 grep 工作区 **0/0**（全历史存量：gitleaks 5 / 私钥 grep 1200，历史重写明确不做）
 - §三 证据路径逐条 `test -e`：**59/59 在盘**（本轮重写后清点；§八 引用的 `vade-client: shots/…` 证据路径另计、亦全部在盘）
+
+---
+
+## 九、待办（alpha 之后第一批）
+
+alpha 0.0.1 的发布面**不包含**下面这些；它们要么需要真模型、要么是体验/健壮性补口，已确认不阻断发布。
+
+| # | 待办 | 现状 | 收口判据 |
+|---|---|---|---|
+| T1 | **连接状态指示**（对应 §三 A1-3） | 重连与指数退避（500 ms → 30 s 上限）已实现且有测试；但顶栏不绑 `RealSessionState`（grep 零命中），`ListStatus` 的 `Connected` 刻意不画 ⇒ 会话中段断线用户看不见 | 顶栏或会话中段出现持续连接态；断线 → 重连 → 恢复三态各有测试；真机拔网可复现 |
+| T2 | **「重启 → 重连 → 快照恢复」端到端**（对应 §三 A2-3） | 读侧（`ui/attach` + snapshot）与写侧（`ui/submit`）各自有证据，闭环没人走过 | 一条 e2e：发消息 → 杀客户端 → 重启 → 同一会话消息仍在且 `last_seq` 连续；留下录屏或截图证据 |
+| T3 | **真模型驱动的工具调用端到端**（对应 §三 A3-1 剩余半边） | 工具卡投影已接（`ToolCardProjectionTest` 12 例）；差一个真 model 模块把 `turn.tool_call` 发出来 | 真 core + 真 model 模块 + echo：模型自主调用四个工具、卡片在流中按序出现、审批卡绑到正确那张 |
+| T4 | **单会话双 attach 收口**（对应 §八 D10） | 打开会话时 loader 与 chat 历史各 attach 一次，`ui/detach` 生产调用点为 0 ⇒ 同连接 2 sink、双投递、泄漏到连接结束 | 读侧两处合并为一次 attach；离开会话时 detach；判据：同一会话 `_register_sink` 调用次数 = 1，切走后 sink 归零 |
+| T5 | **wasm 首次配对**（对应 §八 D8） | 浏览器读不到 `Set-Cookie` | 走 `POST /ui/session` 回包的 token 而非 cookie，或改用一次性 URL 换取 |
+| T6 | **取消排队回合出网**（对应 §八 D6） | `ui/queue.cancel` 未接 | 点取消 → 发 `ui/queue.cancel` → core 回 `turn.cancelled` |

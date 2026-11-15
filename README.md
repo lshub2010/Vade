@@ -146,7 +146,7 @@ export PYTHONPATH="core;protocol/core/python"
 | `base_url` | 空 | 端点根；**含 `/v1`**，core 只在后面拼 `/chat/completions` |
 | `model` | 空 | 默认模型名（如 `deepseek-chat`） |
 | `api_key_env` | 空 → 兜底 `VADE_LLM_API_KEY` | 存放密钥的**环境变量名** |
-| `default_model` | 空 | 全局默认模型（多模型时客户端默认选中它） |
+| `default_model` | 空 | 全局默认模型：会话没显式选模型时用它；会话的选择永远优先、不会被静默替换 |
 | `model_module` | 空 | `provider="module"` 时限定只问哪个模块；空 = 任何声明了 `chat` 的模块 |
 | `fallback_to_builtin` | `true` | 模块离线时是否回落到内置适配器 |
 | `capabilities` | `{}` | 声明模型能力：`display_name` / `supports_tools` / `context_window` / `input_modalities` / `max_image_bytes` / `max_image_px` / `max_images_per_turn` |
@@ -188,13 +188,14 @@ provider = "mock"
 
 同一个配置文件里的 `[usage]` 管用量：
 
-| 键 | 含义 |
-|---|---|
-| `enabled` | 是否统计 |
-| `session_tokens` / `daily_tokens` | 会话 / 每日上限 |
-| `warn_ratio` | 到多少比例告警 |
-| `include_aux` | 是否把辅助调用（标题、摘要等）计入 |
-| `enforce` | 超限时是否真的拦截（false 只记不拦） |
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `enabled` | `true` | 是否统计用量 |
+| `session_tokens` | `0` | 单会话 token 预算；**0 = 不限** |
+| `daily_tokens` | `0` | 每日 token 预算；**0 = 不限** |
+| `warn_ratio` | `0.8` | 用到预算的多少比例开始告警 |
+| `include_aux` | `true` | 辅助调用（压缩 / 记忆 / 自演化）是否也计入；`false` = 只算对话 |
+| `enforce` | `"block"` | `block` = 超预算直接拒绝 `ui/submit`（`BUDGET_EXCEEDED`）；`warn` = 只告警不拦。台账不可信时会自动降级成告警，避免误吞消息 |
 
 ## 仓库结构
 

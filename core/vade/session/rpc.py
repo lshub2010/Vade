@@ -79,8 +79,10 @@ class SessionRPC:
             "session/model.set": self.session_model_set,
             "session/usage.get": self.session_usage_get,
             # RFC-0006 §6.2/§6.3 (C-05 1.1.0). `session/fork` is deliberately
-            # absent: an unregistered method answers JSON-RPC -32601, which is
-            # more honest than defining it and returning UNSUPPORTED.
+            # absent: an unregistered method answers C-04 NOT_FOUND with an
+            # `unknown method` message (not JSON-RPC -32601, the standard form
+            # clients should also recognize), which is more honest than
+            # defining it and returning UNSUPPORTED.
             "turn/regenerate": self.turn_regenerate,
             "message/edit_resubmit": self.message_edit_resubmit,
             "turn/input": self.turn_input,

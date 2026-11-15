@@ -7,3 +7,5 @@ pyyaml==6.0.3
 # C5a admin password hashing (31-C5a §T4 ②: Argon2id m=64MiB,t=3,p=1)
 # Added by C5a after a dependency-availability check; not a C2-side change.
 argon2-cffi==25.1.0
+# 内置模型适配器（core/vade/llm/openai_compat.py 内 lazy import）；不含它则接不上模型
+httpx==0.28.1

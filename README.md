@@ -54,10 +54,22 @@ pip install -r requirements.txt
 ### 起一个 core
 
 ```bash
-python -m vade --config core.toml
+export PYTHONPATH="core;protocol/core/python"     # Linux / macOS 用冒号分隔
+.venv/Scripts/python.exe -m vade --config core.toml
 ```
 
-第一次启动会做 setup（生成密钥、设备绑定），并在终端打出 **8 位配对码**（2 汉字 + 6 位 base32，一次性、180 秒）。
+`PYTHONPATH` 里**两处都必须在**，缺一个都起不来：
+
+| 路径 | 提供什么 | 缺了会怎样 |
+|---|---|---|
+| `core` | `vade` 包本身 | `No module named vade` |
+| `protocol/core/python` | 原生绑定 `vade_protocol` | `protocol core python binding is not importable` |
+
+两条都是相对路径 ⇒ 必须先 `cd` 到仓库根（写绝对路径也行）。细节见 [`docs/PAIRING.md`](docs/PAIRING.md)。
+
+第一次启动会做 setup（生成密钥、设备绑定），并打印一行
+`pair_code=茶源-45JV2U purpose=browser expires_in=600s`：**2 汉字 + 6 位 base32，一次性、600 秒（10 分钟）有效**。
+`--no-pair-banner` 可关掉这次打印。
 
 ### 接一个客户端
 
@@ -93,6 +105,96 @@ python docs/check_docs.py               # 文档一致性（12 项）
 ```
 
 ---
+
+## 接一个模型
+
+core **自己不含模型**——它只做路由。要用真模型，两条路：
+
+### 路线 A：内置适配器（OpenAI 兼容，先走这条）
+
+任何讲 OpenAI `/v1/chat/completions` 的服务都能接：OpenAI、DeepSeek、Moonshot、通义、vLLM、Ollama、LM Studio……
+
+在 `core.toml` 里加一段 `[llm]`：
+
+```toml
+[core]
+listen   = "127.0.0.1:8443"
+data_dir = "./data"
+
+[llm]
+provider    = "openai_compatible"            # 默认值，可省略
+base_url    = "https://api.deepseek.com/v1"  # 必须写到 /v1 这一级：core 会拼 /chat/completions
+model       = "deepseek-chat"
+api_key_env = "VADE_LLM_API_KEY"             # 只写变量名，密钥本身不写进配置文件
+```
+
+密钥放进环境变量（**core 只从环境读**，不落配置、不进日志）：
+
+```bash
+export VADE_LLM_API_KEY="sk-..."        # PowerShell: $env:VADE_LLM_API_KEY="sk-..."
+export PYTHONPATH="core;protocol/core/python"
+.venv/Scripts/python.exe -m vade --config core.toml
+```
+
+起来后客户端模型 chip 里会出现 **`builtin/deepseek-chat`**（模型 id 形如 `builtin/<model>`），选中它就能对话。
+
+`[llm]` 一共只有下面 8 个键，**多一个都会拒绝启动**（拼错键名不会被默默忽略）：
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `provider` | `openai_compatible` | `openai_compatible` / `module` / `mock` |
+| `base_url` | 空 | 端点根；**含 `/v1`**，core 只在后面拼 `/chat/completions` |
+| `model` | 空 | 默认模型名（如 `deepseek-chat`） |
+| `api_key_env` | 空 → 兜底 `VADE_LLM_API_KEY` | 存放密钥的**环境变量名** |
+| `default_model` | 空 | 全局默认模型（多模型时客户端默认选中它） |
+| `model_module` | 空 | `provider="module"` 时限定只问哪个模块；空 = 任何声明了 `chat` 的模块 |
+| `fallback_to_builtin` | `true` | 模块离线时是否回落到内置适配器 |
+| `capabilities` | `{}` | 声明模型能力：`display_name` / `supports_tools` / `context_window` / `input_modalities` / `max_image_bytes` / `max_image_px` / `max_images_per_turn` |
+
+**连不上怎么查**：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 启动即报 `UNKNOWN_CONFIG_KEY: llm.xxx` | `[llm]` 里键名拼错或写多 | 只保留上表 8 个键 |
+| 回合失败 `401` | 环境变量没设，或 `api_key_env` 名字与真实变量名不一致 | `echo $VADE_LLM_API_KEY` 确认非空 |
+| 回合失败 `404` / `405` | `base_url` 少了 `/v1`（拼成了 `/v1/v1` 或根域名） | 只到 `/v1` 为止 |
+| `ImportError: httpx` | 运行环境缺 `httpx`（内置适配器才需要） | `pip install -r requirements.txt`（已包含） |
+| 请求发出但没回复 | `model` 名与端点上的名字不符 | 用端点自己列出的模型名 |
+
+### 路线 B：模型做成模块（进程隔离）
+
+模型可以完全不在 core 里，而是一个独立进程，通过契约注册进来：
+
+```toml
+[llm]
+provider            = "module"
+model_module        = "com.example.model"   # 留空 = 任何声明了 chat 的模块都可服务
+fallback_to_builtin = true                  # 模块离线时回落内置（false 则直接 turn.failed(UNAVAILABLE)）
+```
+
+模块在 manifest 的 `capabilities.models[]` 里声明它提供哪些模型（名字、上下文窗口、是否支持工具与图片），
+core 把在线模块的声明聚合成 `model/list`，客户端 chip 直接读这份列表。协议细节见 [`docs/rfc/RFC-0005-model-capabilities-usage.md`](docs/rfc/RFC-0005-model-capabilities-usage.md)。
+
+### 先不接模型：`provider = "mock"`
+
+```toml
+[llm]
+provider = "mock"
+```
+
+此时模型列表里只有 `builtin/mock`，回合不联网——用来验证「core 起没起来、客户端连没连上」，不花一分钱。
+
+### 用量与预算
+
+同一个配置文件里的 `[usage]` 管用量：
+
+| 键 | 含义 |
+|---|---|
+| `enabled` | 是否统计 |
+| `session_tokens` / `daily_tokens` | 会话 / 每日上限 |
+| `warn_ratio` | 到多少比例告警 |
+| `include_aux` | 是否把辅助调用（标题、摘要等）计入 |
+| `enforce` | 超限时是否真的拦截（false 只记不拦） |
 
 ## 仓库结构
 

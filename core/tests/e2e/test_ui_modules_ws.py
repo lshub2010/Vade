@@ -3,7 +3,9 @@
 The unit tests call the service directly, so they cannot catch the failure mode
 this file exists for: a method that is declared in `rpc.json` and implemented in
 `service.py` but never reaches a socket (the handler table is a separate object,
-and a missing entry answers `-32601`). Everything here goes over TCP + WS:
+and a missing entry answers C-04 `NOT_FOUND` with an `unknown method` message — not
+JSON-RPC `-32601`, which is only the standard form clients should also recognize).
+Everything here goes over TCP + WS:
 `module/register` on a Noise peer, `/ui/session` for the browser cookie, then
 `ui/modules` on that cookie's socket.
 """

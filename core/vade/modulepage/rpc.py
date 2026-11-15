@@ -35,7 +35,9 @@ class ModulePageRPC:
             # dict into `app.session_handlers`, which is the one table
             # `app.make_rpc_handler` reads — so registering the name here IS the
             # wire registration (a name that exists only in `rpc.json` answers
-            # -32601 on a real socket).
+            # C-04 NOT_FOUND with an `unknown method` message on a real socket; JSON-RPC
+            # -32601 is the standard form for an unregistered method and clients should
+            # recognize both).
             "ui/modules": self.modules,
         }
 

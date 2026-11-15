@@ -244,7 +244,7 @@ session/fork {session_id, from_turn_id?, from_seq?, title?}
 errors: NOT_FOUND, INVALID_ARGUMENT, UNSUPPORTED, OVERLOADED
 ```
 
-将来语义：复制 `from_seq`（缺省为当前 `last_seq`）之前的 messages/turns 到一个新 session，`forked_from` 记录源；`from_turn_id` 与 `from_seq` 二选一，同给时以 `from_turn_id` 为准（`from_seq` 取该 turn 的终态 seq）。新 session 与原 session 不共享可变状态；附件按 `file_id` 引用并增加引用计数（否则 RFC-0004 的 blob GC 会删掉被分叉引用的文件）。**v1 不把该方法加入 C-05**：FR-8.32 明确"v1 之后"，UI 无入口；客户端调用得到 JSON-RPC `-32601 method not found`，core 不返回 `UNSUPPORTED`（避免把"未实现"伪装成"已定义但能力不足"）。上限（消息数/字节/深度/引用计数）见未决 Q3。
+将来语义：复制 `from_seq`（缺省为当前 `last_seq`）之前的 messages/turns 到一个新 session，`forked_from` 记录源；`from_turn_id` 与 `from_seq` 二选一，同给时以 `from_turn_id` 为准（`from_seq` 取该 turn 的终态 seq）。新 session 与原 session 不共享可变状态；附件按 `file_id` 引用并增加引用计数（否则 RFC-0004 的 blob GC 会删掉被分叉引用的文件）。**v1 不把该方法加入 C-05**：FR-8.32 明确"v1 之后"，UI 无入口；客户端调用得到 C-04 `NOT_FOUND` + `unknown method` 消息（JSON-RPC `-32601` 是同一件事的标准形态），core 不返回 `UNSUPPORTED`（避免把"未实现"伪装成"已定义但能力不足"）。上限（消息数/字节/深度/引用计数）见未决 Q3。
 
 ### 6.6 v1 的边界：只做"新 turn + 旧 turn 标 superseded"
 
@@ -318,7 +318,7 @@ errors: NOT_FOUND, INVALID_ARGUMENT, UNSUPPORTED, OVERLOADED
 | 12 | 消息/Turn 存储 | `messages.partial`、`messages.superseded_by`、`turns.root_turn_id/parent_turn_id/version/superseded_by/superseded_reason/user_message_id/partial_message_id/user_parts` | **追加列**（Python API 尾参默认值） | 旧库读默认值；`to_dict()` 只加键 |
 | 13 | C-04 `errors.json` | **不改**：复用 `INVALID_ARGUMENT`/`NOT_FOUND`/`READ_ONLY_SESSION`/`OVERLOADED`/`PAYLOAD_TOO_LARGE`；`CONFIRM_REQUIRED` 仅为 Q2 预留，v1 不用 | **无变更** | 码表与 Rust 枚举零改动 |
 | 14 | C-06 `turn_states` | **不改**：不增 `superseded`（理由见 §6.4） | **无变更** | 旧端不认识的状态问题不存在 |
-| 15 | C-05 `session/fork` | **不加**：v1 不注册；签名仅 §6.5 预留 | **无变更** | 调用得 `-32601`，不是 `UNSUPPORTED` |
+| 15 | C-05 `session/fork` | **不加**：v1 不注册；签名仅 §6.5 预留 | **无变更** | 调用得 C-04 `NOT_FOUND`（`unknown method`），不是 `UNSUPPORTED` |
 
 ### 9.2 C-06 追加块的形状
 

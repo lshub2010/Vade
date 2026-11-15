@@ -76,7 +76,7 @@ G1–G5 是**发布级**目标（端到端 + SDK 冻结 / 审批审计闭环 / �
 | 波 | 内容 | 状态（2026-11-15 校准） |
 |---|---|---|
 | W1 | 协议补齐 + 真数据层 + 元数据/输入/用量/子代理 UI + 暗色 + 工具修复 | **已完成**：协议 **35/35**（RFC-0015 `ui/modules` 登记进 rpc 1.6.0 后）有类型封装 + 覆盖率守卫；数据层与各面板均有测试 |
-| W2 | 数据层接线到 UI（会话列表 / 聊天流 / 状态机）、模块页入口、搜索接真接口 | **部分完成**：会话列表 / 搜索 / 组名 / 活动页 / 模型页 / 聊天**读侧**（历史 + 实时事件流）/ 模块清单与页面渲染链路已接；**聊天写侧（`ui/submit`/`ui/interrupt`/`approval/decide` 出网）与元数据动作挂载未接**（§七 B1、B2） |
+| W2 | 数据层接线到 UI（会话列表 / 聊天流 / 状态机）、模块页入口、搜索接真接口 | **接近完成**：会话列表 / 搜索 / 组名 / 活动页 / 模型页 / 聊天**读侧**（历史 + 实时事件流）/ 模块清单与页面渲染链路 / **聊天写侧**（`ui/submit`、`ui/interrupt`）/ **元数据动作挂载**（长按菜单 + 分组管理 + 乐观回滚）均已接；**只剩 `approval/decide` 出网**（§七 B6，2026-11-15 在修） |
 | W3 | 打包与分发（桌面产物、版本号、关于页、启动脚本）、首次运行配对引导 | **部分完成**：产物 / 版本号 / 关于页 / 启动脚本已交付；**配对引导未做**（§七 B5） |
 | W4 | 端到端联调：本机 core + 桌面客户端真跑，逐个修阻塞项 | **进行中**：`g-live` 实跑手册（`vade-client: shots/g-live/PLAYBOOK.md`，2026-11-14 逐命令实跑）+ 两条真核 e2e（`RealCoreUiE2ETest` / `RealCoreModulePageE2ETest`）已在门禁里跑通；系统性人工联调未做（依赖 §七 阻断项收口） |
 
@@ -87,7 +87,7 @@ G1–G5 是**发布级**目标（端到端 + SDK 冻结 / 审批审计闭环 / �
 - iOS（用户 2026-11-13 决定暂缓）
 - 六个模块里除 `echo` 外的全部
 - admin-ui 前端
-- M4b 自进化
+- **M4a 记忆 + M4b 自进化**（用户 2026-11-15 拍板：**alpha 先不做记忆**）。注意口径：**设计已到实现级**（`docs/agents/43-M4-memory.md` 存储/staging/`MemoryBackend`；`docs/agents/46-M4b-evolve.md` 五个触发器、预算、晋升阀值、幂等要求），缺的是**契约文件**（C-12 `schema/memory.schema.json` 未落）与**实现**（`core/vade/memory` 不存在）——不是「没设计」，验收时别把这三层混为一谈
 - 抓包 0 泄漏的正式验收（口径 C 才做）
 
 ## 七、当前差距清单（自动校准于 2026-11-14，2026-11-15 复核）
@@ -98,11 +98,11 @@ G1–G5 是**发布级**目标（端到端 + SDK 冻结 / 审批审计闭环 / �
 |---|---|---|---|
 | ~~B1~~ | ~~**A3 模块清单**：`ui_to_core` 34 个方法里没有「列模块」~~ **已解除**（2026-11-15）：RFC-0015 `ui/modules` 登记进 rpc 1.6.0、core 实现并带真 WS e2e、客户端 codec/订阅/组合根接线全通 | N1 | **代码签名**：jpackage 产物 `.jpackage.xml` 记 `signed=false`，MSI/EXE 未签名，SmartScreen/杀软告警 |
 | ~~B1~~ | ~~**聊天写侧**~~ **已解除**（2026-11-15，`g-chat-send`）：`ChatState.submit()` 真发 `ui/submit`（`ChatState.kt:773`）、`stop()` 真发 `ui/interrupt`（`:875`）、`turn.failed` 四类可读文案 + 可重试；排队序号只认 core 的 `queue_pos`，假源出网 0 次由探针钉住。**未解除的一半**：`approval/decide` 仍无 UI 调用点（见 B6） | ~~N2~~ | ~~**Web 字体**：wasm 首帧中文豆腐块~~ **已解决**（2026-11-15，`g-font-bundle2`）：CJK 字体（`vade-sans-sc.woff2`，OFL 许可随包，`vade-client: composeApp/src/wasmJsMain/resources/fonts/`）打进 wasm 包——首帧即正确、0 个 gstatic 请求、断网输出逐字节相同（`vade-client: shots/g-font-bundle2/RESULT.md`） |
-| B2 | **元数据动作挂载**（2026-11-15 在修：`tmp/s-meta-host`）：`SessionMetaHost`（重命名/置顶/归档/删除/分组管理）仍是死代码（`g-activate` 复核结论，至今无生产挂载点）；`MetaActionsReal`/`MetaGroupEditReal` 适配器与 `SessionMetaState.forAdapters` 工厂均在（`AppShell.kt:272`），只差组合根挂载那一跳 | N3 | **无发布通道**：产物在 `build/` 下不进库，无 artifact 上传、无更新检查；alpha 只能打包机重建或手动拷贝 |
+| ~~B2~~ | ~~**元数据动作挂载**~~ **已解除**（2026-11-15，`s-meta-host` 合入客户端 `d5c0f80` + 父代补洞 `7797dcc`）：行长按 → 上下文菜单（重命名/置顶↔取消/归档/移动分组/新建分组/删除），全部经 `adapters.meta(sessionId)` 真调适配器；乐观可见 + 失败整表回滚 + 错误横条；分组编辑器（名称/39 图标/10 色盘/删组不删会话）。**父代补的洞**：抽屉路径不经过 `DestinationHost`，元数据悬浮面宿主原本只在双栏分支 ⇒ 手机上长按无任何渲染（已把 `overlayHost` 槽加进 `SessionsDrawerHost`，宿主渲染在抽屉层内）。同一提交修掉 `projectGroups` 的假空态：未同步时直通、同步后不认识的新行原样画（详见技能 §二十三） | N3 | **无发布通道**：产物在 `build/` 下不进库，无 artifact 上传、无更新检查；alpha 只能打包机重建或手动拷贝 |
 | ~~B3~~ | ~~**模块页面生产三洞**~~ **撤销（判定为假阳性，2026-11-15）**：三洞已由 `tmp/g-modulepage-wire` 全堵（能力页 `LaunchedEffect` 首拉 + `ModulePageBody` 异步取体 + `ModuleRegistryView` 真在线态）；视觉审计 G2「永远正在拉取」是**旧基点**造成的误判——真 core + 真模块 + 真 WS 的 `RealCoreModulePageE2ETest` 在合并后树上 1 test / 0 failures。父代复核结论写在 `vade-client: shots/g-audit-gaps/RESULT.md` 末节 | N4 | **ask_user 卡片未合并**：实现完成（37 条测试）在 `tmp/c-askuser`，未进 `main`（2026-11-15 复核：commonMain 仍只有协议层 `AskUser`/`InputRequired` 模型，无卡片组件） |
 | B4 | **gitleaks 定稿**：配置已定稿（`s-gitleaks-final`，**仅 4 条路径级排除、零 allowlist**，金丝雀反向自证 PASS）；但新策略把旧配置靠行级 allowlist 压住的**测试夹具**照出来了（主仓 5 / 客户端 7），故**结论仍是未通过**。正在把夹具改成**运行时拼接**（`s-gitleaks-fixtures`），口径：**工作区 0 命中**；全历史 1159 条私钥命中属存量（需重写历史，不做） | N5 | **关于页「E2E 设备标识」仍是占位**（`vade-client: shots/g-pack/RESULT.md` §5.5） |
 | ~~B5~~ | ~~**配对引导（A1-2）**~~ **已解除**（2026-11-15，`g-pair-first-run`）：三端列表顶部引导卡（一次性码输入 + 配对按钮 + 码在哪里找），提交走现有连接链且**恰好一次**；三种失败分开报（码错 / 服务端未起带启动命令 / 网络可重试）；码只走函数参数与内存，扫描守卫断言零持久化/零日志/零 URL。`vade-client: shots/g-pair-first-run/RESULT.md` | N6 | **真·干净机器未验**：A5-3 是环境隔离口径（剥离 PATH/JDK/SDK 变量），未在无 JDK 的第二台机器双击 MSI / app-image |
-| B6 | **审批决策未接线**：`approval/decide` 在 `commonMain` 只有协议层枚举与封装，**UI 零调用点** ⇒ 会话内那条内联审批卡上的批准/拒绝打不到 core，结果仍由 fixtures 决定（内联形态本身是对的，缺的是那一跳） | — | — |
+| B6 | **审批决策未接线**（2026-11-15 在修：`tmp/b6-approval`）：`approval/decide` 在 `commonMain` 只有协议层枚举与封装（`VadeClient.approvalDecide`），**`SessionSource` 缺一跳、UI 零调用点** ⇒ 内联审批卡上的批准/拒绝只写本地投影、打不到 core。修法：`SessionSource.decideApproval` + `RealSessionSource` 走 `client.approvalDecide` + **`request_id` 取自 `turn.approval_required`（不是本地 `callId`）** + 乐观回滚 + 四类错误文案 + `turn.approval_resolved` 以服务端为准 | — | — |
 | — | — | N7 | **附件上传端到端仍断**：`ui/blob.token` RPC 不存在（实读协议走 HTTP `POST /ui/blob` 三步 + `DELETE` 取消，有真适配器）；**RFC-0016 已 proposed**（`docs/rfc/`，2026-11-15 用户已拍板四项：绑设备 / 600s 可重放 / 收紧读面），实施未排 |
 | — | — | N8 | **Android 验收遗留项**：w-verify 报告记 P0=0 / P1=4 / P2=4（该报告在 worktree，未合并），无崩溃级问题 |
 

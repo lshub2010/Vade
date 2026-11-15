@@ -272,7 +272,8 @@ def test_handler_is_registered_in_the_rpc_table():
 
 
 def test_install_publishes_the_handler_into_session_handlers():
-    """`install()` is what a real core runs; without it the socket answers -32601."""
+    """`install()` is what a real core runs; without it the socket answers C-04 NOT_FOUND
+    with an `unknown method` message (not JSON-RPC -32601, though clients accept both)."""
     from types import SimpleNamespace
 
     from vade.modulepage import install

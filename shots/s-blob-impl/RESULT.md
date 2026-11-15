@@ -4,6 +4,7 @@
 
 - 分支：`tmp/s-blob-impl`（基于 `origin/dev_gingshan` @ `7941b93`）
 - 工作树：`D:/HermesWorkspace/Vade-wt/s-blob-impl`
+- 交付 commit：**`b182fe0`**（实现 + 本报告同一提交；其后仅一个 docs 提交回填两处 hash，无代码改动）
 - 未 push、未合并、未 `--amend`/`rebase`/`reset`
 - `schema/events.json`、`schema/errors.json`、`schema/manifest.schema.json`、`schema/config.schema.json`、`sdk/**`：`git diff` 为空，**逐字节未动**（机器证据见 §7）
 
@@ -127,3 +128,7 @@ worktree 没有未跟踪的构建产物 `protocol/core/python/vade_protocol.dll`
 1. vade-client：`BlobHttpChannel` 原生模式先调 `ui/blob.token`；§7.2 三态（CoreTooOld/Disabled/NoDeviceIdentity）+ `Authorization` 头不进日志 + A12 真机拖拽截图（`BlobTokenDegradeTest.kt`）。
 2. Q7 的已知代价已在代码注释与 LEDGER 写明：同一会话跨设备的 token 读面隔离后，桌面（自身 token）看不到手机上传的历史图片；若产品要跨设备可见，正解是 session 授权面收紧（另开提案），不是放宽本闸。
 3. `revoke_node`（admin）目前只关连接不触 whitelist；「解绑」的唯一权威入口仍是 `Whitelist.revoke`（token 清算已挂在其回调上）。若 admin 要提供解绑 UI，调用 `whitelist.revoke(fingerprint)` 即可复用同一链路。
+
+---
+
+> 提交记录：实现提交 **`b182fe0`**（feat(blob)…，含本报告）；其后一个 docs 提交仅回填本文件与 `docs/status.md` 里的 commit hash，无代码改动。

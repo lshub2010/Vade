@@ -1,6 +1,6 @@
 {
   "id": "C-05",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "status": "frozen",
   "frozen_at": "2026-11-14",
   "owner": "C2",
@@ -168,6 +168,19 @@
           "no event is added (C-06 stays 34 entries) and no error code is added (C-04 stays 34); a core that predates it answers -32601 — the documented degradation: the client renders the empty entry block instead of erroring"
         ],
         "rewrites": "none. One ui_to_core method appended (A3 module entry list); C-05 version 1.5.0 -> 1.6.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one, 1.6.0 one). C-06 untouched (no event), C-04 untouched (34 codes), C-03 untouched. Recorded in docs/rfc/LEDGER.md; evidence in shots/s-rfc0015-register/RESULT.md."
+      },
+      {
+        "contract": "C-05",
+        "version": "1.7.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0016-blob-token.md",
+        "adds": ["ui/blob.token"],
+        "notes": [
+          "one minting method under ui_to_core: ui/blob.token mints a device bearer bound to the calling connection's proven device_id (Noise static key -> whitelist); there is no device_id parameter — a hint from the wire would be a claim, not an identity (§5.1)",
+          "only a native (Noise) connection may mint: a cookie session is PERMISSION_DENIED with reason=\"cookie_session\" — the browser already holds a working credential and minting would upgrade an ambient, four-gate cookie into a portable bearer (§5.3)",
+          "no new error code (C-04 stays 34), no new event (C-06 stays 34), no new config key (C-18 untouched), no new table (blob_tokens already exists); the six http_endpoints routes are unchanged — this method only finally writes rows into blob_tokens (§8)"
+        ],
+        "rewrites": "none. One ui_to_core method appended (RFC-0004 §4.5 finally registered); C-05 version 1.6.0 -> 1.7.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one, 1.6.0 one, 1.7.0 one). http_endpoints.auth.device renamed the minting method (note-level string, no route/structure change). C-06 untouched (no event), C-04 untouched (34 codes), C-03/C-18 untouched. Recorded in docs/rfc/LEDGER.md; evidence in shots/s-blob-impl/RESULT.md."
       }
     ],
     "rfc0005_append": {
@@ -437,6 +450,27 @@
         "result": {"session_id": "string", "from_seq": "int", "snapshot": "object|null"},
         "errors": ["NOT_FOUND", "PERMISSION_DENIED"],
         "notes": "snapshot.session (RFC-0005 append): the session block gained `model: {model_id: string|null, source: \"session\"|\"global\"|\"priority\"|\"none\"}`, so a device that reconnects lights the FR-8.46 badge without calling session/model.get first. `snapshot` stays `object`; no key was renamed or removed. RFC-0004 §6.3: `snapshot.messages[]` carries `parts` — the minimal field set all three clients must render in the same order: `[{type:'text',text} | {type:'image',file_id,mime,name,size,width,height,sha256} | {type:'file',file_id,mime,name,size}]`. Rows written before parts existed are read back as a single `text` part synthesised from `content` (never rewritten on disk); `content` keeps carrying the text projection, so a client that ignores `parts` renders exactly as before. Attachments are referenced by `file_id` only — never a local URI (§2.3). RFC-0008 §8.2: `snapshot.pending_inputs[]` lists unanswered input requests (the `turn.input_required` row shape minus `source`/`default`), so a client that missed the replay window can still rebuild the dialog; an `input_id` that is already resolved never appears there. RFC-0007 §5.6: `snapshot.tasks` is the authoritative starting point for the activity list (all non-terminal tasks, then the newest `tasks.snapshot_finished` terminals), with `snapshot.tasks_truncated=true` when older history exists (page it with `task/list`) and `pending_approvals[].task_id` naming the task that owns a prompt. A snapshot MISSING the `tasks` key means the core predates RFC-0007 — the client shows its static empty state and must not fabricate progress. RFC-0013: `snapshot.messages[]` carries `partial` (bool, default false) — true for the persisted partial answer of an interrupted turn (`turn.interrupted.partial_message_id` points at it), so a fresh attach renders the N already-generated characters without replaying `turn.delta` (FR-8.35)."      },
+
+      "ui/blob.token": {
+        "params": {
+          "ttl_s": "int 60..900, optional, default 600 (absent -> 600; bool / float / string / null / out of range -> INVALID_ARGUMENT, data.field=\"ttl_s\", NO row written). Any other key is REFUSED with INVALID_ARGUMENT + data.field=<key>: this method mints a credential, so a silently ignored `device_id` / `read_only` would let a client believe it got something it did not."
+        },
+        "result": {
+          "token": "string (43 chars base64url = secrets.token_urlsafe(32); only sha256(token) is stored, never the token itself)",
+          "expires_at": "int (unix MILLISECONDS; mint_time + ttl_s)",
+          "max_bytes": "int (per-file ceiling baked into this token at mint time = [attach].max_bytes; NEVER null — AttachSettings.max_bytes always has a concrete value, unlike Principal.max_bytes which is int|null for cookie principals)",
+          "endpoints": {
+            "begin": "POST /ui/blob",
+            "part": "PUT /ui/blob/upload/{upload_id}?offset=N",
+            "complete": "POST /ui/blob/upload/{upload_id}/complete",
+            "abort": "DELETE /ui/blob/upload/{upload_id}",
+            "resume": "HEAD /ui/blob/upload/{upload_id}",
+            "fetch": "GET|HEAD /ui/blob/{file_id}[?v=thumb]"
+          }
+        },
+        "errors": ["INVALID_ARGUMENT", "PERMISSION_DENIED", "READ_ONLY_SESSION", "UNSUPPORTED"],
+        "notes": "RFC-0016 §4. The ONLY minting surface for a device bearer: the token is bound to the calling connection's proven `device_id` (Noise static key -> whitelist, transport/server.py:354-378); there is no `device_id` parameter and no other device to name (no oracle). Cookie sessions are refused (PERMISSION_DENIED, reason=\"cookie_session\") because they already hold a credential that works and minting would turn an ambient, four-gate cookie into a portable bearer. TTL 60..900 s, default 600; out-of-range or non-integer (including true and \"600\") is INVALID_ARGUMENT and writes NO row — the RPC layer validates and never relies on issue_token's silent clamp (service.py:184). Only sha256(token) is stored (blob_tokens), so a row survives a core restart; prune_tokens drops expired rows and revoke_device(device_id) drops the whole set. expires_at is unix ms. Expired, revoked and never-issued are indistinguishable (401 AUTH_FAILED, no oracle). The token is REPLAYABLE until it expires (an upload is 1 begin + N parts + 1 complete + 1 HEAD): it is a channel credential, not a one-shot. max_bytes is the value baked in at mint time ([attach].max_bytes) and `begin` enforces it. `endpoints` are aliases of the same listener's six routes; content-type and body limits still come from http_endpoints. Attachments disabled -> UNSUPPORTED with reason=\"attachments_disabled\" (the same code+reason ui/submit uses, session/parts.py:486-493). Explicitly read-only connection -> READ_ONLY_SESSION. No device identity -> PERMISSION_DENIED with reason=\"device_unknown\". The token authenticates HTTP only: it can never send a message."
+      },
 
       "ui/detach": {
         "params": {
@@ -1214,7 +1248,7 @@
     "note": "RFC-0004 §7.3: the attachment channel is HTTP on the core's own listener, not JSON-RPC. A 5 MiB image is ~107x the 65 519-byte transport frame (§2.1), so bytes have to enter core outside the ws control plane. Listed here because an undocumented second entry point is how 'how do I upload' gets re-invented per client.",
     "listener": "data plane (core.listen) — same process as /ws and /ui/session; /admin* is deliberately 404 here",
     "auth": {
-      "device": "Authorization: Bearer <token minted over the already-authenticated device channel>",
+      "device": "Authorization: Bearer <token minted by ui/blob.token over the already-authenticated device channel; bound to the calling connection's device_id, TTL 60..900 s>",
       "browser": "__Host-ac_ui cookie + x-vade-csrf (double submit) + exact Origin allowlist + Sec-Fetch-Site: same-origin",
       "read_only": "explicitly read-only sessions are 403 READ_ONLY_SESSION on writes only; reads stay allowed so history images render"
     },

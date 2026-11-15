@@ -478,7 +478,7 @@ def test_no_fts_infrastructure_is_required(tmp_path):
 def test_schema_and_helpers_agree_on_the_contract():
     """A1: rpc.json declares session/search at 1.5.0 with the same surface."""
     data = json.loads(SCHEMA_RPC.read_text(encoding="utf-8"))
-    assert data["version"] == "1.6.0"  # RFC-0015 owns the C-05 head
+    assert data["version"] == "1.7.0"  # RFC-0016 owns the C-05 head (RFC-0015 owned 1.6.0)
     entry = data["directions"]["ui_to_core"]["session/search"]
     assert set(entry["params"]) == {"query", "limit", "offset", "session_id"}
     assert set(entry["result"]) == {"results", "total"}

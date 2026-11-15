@@ -50,7 +50,12 @@ def _fp8(public_key: bytes) -> str:
 
 
 class Whitelist:
-    def __init__(self, path: Path | str, *, on_revoke: Callable[[str], None] | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        on_revoke: Callable[[str, tuple[str, ...]], None] | None = None,
+    ) -> None:
         self._path = Path(path)
         self._on_revoke = on_revoke
         self._entries: dict[tuple[str, str], Entry] = {}
@@ -198,12 +203,21 @@ class Whitelist:
         return entry
 
     def revoke(self, fingerprint: str) -> tuple[str, ...]:
-        """Remove every entry with this key and close the live connections."""
+        """Remove every entry with this key and close the live connections.
+
+        The callback receives `(fingerprint, removed_ids)` — RFC-0016 §5.6-17
+        (Q4 default): unbinding a device must also kill its minted blob
+        tokens, and only the callback knows who consumes that (the App wires
+        `BlobService.revoke_device`). `removed_ids` are the deleted
+        `module_id#instance_id` names, the same tuple this method returns, so
+        callers and the callback agree on one spelling of the device identity.
+        """
         removed = [key for key, entry in self._entries.items() if entry.fingerprint == fingerprint]
         for key in removed:
             del self._entries[key]
         if removed:
             self._flush()
+        removed_ids = tuple(f"{m}#{i}" for m, i in removed)
         if self._on_revoke is not None:
-            self._on_revoke(fingerprint)
-        return tuple(f"{m}#{i}" for m, i in removed)
+            self._on_revoke(fingerprint, removed_ids)
+        return removed_ids

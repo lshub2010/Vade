@@ -33,7 +33,7 @@ alpha 的含义：**协议与数据格式不稳定**，可以随时变；不要�
 ```
 
 - **core 不含任何智能**：它不知道什么是「模型」，只知道怎么把一次回合的请求路由给注册了该能力的模块。
-- **模块是进程，不是插件**：模块自己起进程、自己连 core、声明自己的能力和页面（随仓的 echo 模块是一份最小可跑样例，见 `modules/README.md`）。
+- **模块是进程，不是插件**：模块自己起进程、自己连 core、声明自己的能力和页面（参考实现是独立仓的 echo 模块；本仓 `modules/README.md` 只保留索引）。
 - **契约先于实现**：`schema/` 下的 JSON 是唯一真相，服务端与客户端都从它生成/校验。
 
 ---
@@ -91,9 +91,11 @@ adb shell am start -n vade.ui/.MainActivity --es source real --es host 127.0.0.1
 # 2) 收到 core 的 RPC 就回结果；core 不认识你现在有什么，只认 manifest
 ```
 
-参考实现见 [`modules/README.md`](modules/README.md)：随仓的 `echo` 模块已迁到独立仓
-[lshub2010/Vade-module-echo](https://github.com/lshub2010/Vade-module-echo)（四个工具 + 一个页面），
-它同时是模块协议的最小可跑样例。协议细节见 [`docs/rfc/`](docs/rfc)。
+模块按设计**不在主仓**：每个模块一个独立仓（为了避免 core 出现具体模块名，见 [`modules/README.md`](modules/README.md)）。
+写模块需要的东西都在本仓公开：模块侧 SDK 在 [`sdk/python`](sdk/python)，
+目录结构与职责约定在 [`docs/design.md`](docs/design.md) §15.1，
+需要声明什么能力/页面看 [`schema/manifest.schema.json`](schema/manifest.schema.json)，
+协议逐条在 [`docs/rfc/`](docs/rfc)（模块方向：`model/chat`、`tool/call`、`page/render` 等）。
 
 ### 常用命令
 
@@ -204,7 +206,7 @@ provider = "mock"
 ├── core/              core 进程（会话、回合、路由、密钥、审计、blob、模块页）
 ├── schema/            契约：rpc / events / errors / skill / manifest（唯一真相）
 ├── protocol/          Rust 协议 SDK（Noise + AEAD），UniFFI 导出 Kotlin/Swift/Python/JS
-├── modules/           随仓模块（echo：四工具 + 一页）
+├── modules/           模块索引（模块本身在各自的独立仓）
 ├── sdk/               模块侧 SDK（Python / Kotlin）
 ├── admin-ui/          管理面前端（core 内置托管，仅回环与 App WebView）
 ├── docs/              设计、RFC、任务书、alpha 台账

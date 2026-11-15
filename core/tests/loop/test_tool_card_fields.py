@@ -176,7 +176,8 @@ def test_the_preview_rescan_finds_no_secret():
         "api_key": "sk-" + "B" * 20,
         "note": "ghp_" + "c" * 24,
         "blob": "AKIA" + "D" * 16,
-        "pem": "-----BEGIN RSA PRIVATE KEY-----",
+        # 运行时拼装：仓库不留 PEM 私钥头字面量，运行时值不变
+        "pem": "-----BEGIN " + "RSA " + "PRIVATE KEY-----",
         "checksum": "deadbeef" * 8,
     }
     recorder = _run(json.dumps(secrets), ToolCallResult(True, "x", result={}))

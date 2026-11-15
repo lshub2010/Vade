@@ -15,6 +15,11 @@ from vade.loop.toolcard import (
     MAX_REDACTED_PATHS, PREVIEW_MAX_BYTES, SECRET_PATTERNS, build_args_preview,
 )
 
+# 夹具值运行时拼装：仓库不留 key 形字面量（gitleaks 工作区归零），运行时值与原字面量一致
+_BEARER_FIXTURE = "sk-" + "ABCDEFGHIJKLMNOP"
+_AWS_BODY = "ABCDEFGHIJKLMNOP"
+_AWS_FIXTURE = "AKIA" + _AWS_BODY
+
 
 def _rescan(preview: str) -> list[str]:
     return [p.pattern for p in SECRET_PATTERNS if p.search(preview)]
@@ -115,8 +120,9 @@ def test_url_safe_base64_is_scrubbed_too():
 
 def test_values_are_scrubbed_even_when_the_key_is_innocent():
     preview = build_args_preview(
-        {"cmd": "curl -H 'Authorization: Bearer sk-ABCDEFGHIJKLMNOP'",
-         "env": "AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP"},
+        # 夹具值运行时拼装（gitleaks 工作区归零），运行时值与原字面量一致
+        {"cmd": "curl -H 'Authorization: Bearer " + _BEARER_FIXTURE + "'",
+         "env": "AWS_ACCESS_KEY_ID=" + _AWS_FIXTURE},
         "low",
     )
     assert preview["args_preview_redacted"] == ["cmd", "env"]

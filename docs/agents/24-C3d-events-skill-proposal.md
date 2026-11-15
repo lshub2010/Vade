@@ -136,7 +136,7 @@ turn 完成 → 组装 {topic, session_id, seq_from, seq_to, payload}
 | name | `^[a-z][a-z0-9-]{1,31}$`；`create` 时 active 不得已存在 | `TOOL_CONFLICT` |
 | action=patch | 必须带 `base_revision`，且等于当前 revision | `TOOL_CONFLICT`（理由写实际 revision） |
 | 配额 | active + pending 合计 ≤ 64 | `OVERLOADED` |
-| 内容扫描 | 无 `sk-` 密钥、无 `BEGIN PRIVATE KEY` | `INVALID_ARGUMENT` |
+| 内容扫描 | 无 `sk-` 密钥、无 PEM 私钥头 | `INVALID_ARGUMENT` |
 | 路径 | 落盘路径 `realpath` 后仍在 `skills/pending/` 内 | `PERMISSION_DENIED` |
 
 落盘：`skills/pending/<name>/SKILL.md` + 同目录 `meta.json`（含 `derived_from`、`received_at`、`received_from`、`origin="proposal"`）。**必须是目录**，与安装路径共用同一布局（方案 §16.5）；单文件布局存不下资源，也无法整目录 `os.replace`。

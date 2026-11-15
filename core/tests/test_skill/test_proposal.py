@@ -156,7 +156,8 @@ def test_a_private_key_is_refused(tmp_path):
     service, _loader, root = make_service(tmp_path)
 
     with pytest.raises(VadeError) as caught:
-        create(service, content=skill_text("code-review", body_suffix="-----BEGIN RSA PRIVATE KEY-----"))
+        # 运行时拼装：仓库不留 PEM 私钥头字面量，运行时值不变
+        create(service, content=skill_text("code-review", body_suffix="-----BEGIN " + "RSA " + "PRIVATE KEY-----"))
 
     assert caught.value.code == "INVALID_ARGUMENT"
     assert not (root / "pending" / "code-review").exists()

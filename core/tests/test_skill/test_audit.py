@@ -12,7 +12,8 @@ def test_openai_like_key_is_found() -> None:
 
 
 def test_private_key_header_is_found() -> None:
-    findings = scan_secrets("-----BEGIN RSA PRIVATE KEY-----\nMIIE...")
+    # 运行时拼装：仓库不留 PEM 私钥头字面量，运行时值不变
+    findings = scan_secrets("-----BEGIN " + "RSA " + "PRIVATE KEY-----\nMIIE...")
     assert [f.kind for f in findings] == ["private_key"]
 
 

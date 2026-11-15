@@ -408,7 +408,7 @@ requires_tools: ["mcp-bridge__s_kb_recall", "mcp-bridge__s_kb_remember"]
 安全约束：
 
 - skill **只能来自本地文件**，不接受模块注册、不从网络下载——否则等于给模块开了一条 prompt 注入通道。
-- 加载时扫一遍 `sk-` 前缀、`BEGIN PRIVATE KEY`、超长 base64，命中只告警不改写（可能误报）。
+- 加载时扫一遍 `sk-` 前缀、PEM 私钥头、超长 base64，命中只告警不改写（可能误报）。
 - `scripts/` **不自动执行**。模型要跑它，只能走 `shell` 模块，风险等级等于 shell，这是刻意的。
 
 #### 2.7.3 组装管线：谁能往 prompt 里写字

@@ -59,7 +59,7 @@
         ],
         "notes": [
           "ui/attach: snapshot.turns[] and messages[].partial / messages[].superseded_by are appended keys; `snapshot` stays an object and old clients ignore them",
-          "session/fork is intentionally NOT registered in v1: clients get JSON-RPC -32601, not UNSUPPORTED",
+          "session/fork is intentionally NOT registered in v1: clients get C-04 NOT_FOUND with an `unknown method` message, not UNSUPPORTED; JSON-RPC -32601 is the standard form for an unregistered method and clients should recognize both",
           "PAYLOAD_TOO_LARGE carries error.data = {field, limit, actual, unit} (RFC-0006 §8)"
         ],
         "rewrites": "none"
@@ -104,7 +104,7 @@
         "notes": [
           "four methods under `ui_to_core`: model/list, session/model.get, session/model.set, session/usage.get",
           "`ui/attach` only gained a `notes` sentence describing the additive `snapshot.session.model` key; its params/result/errors are byte-identical",
-          "no existing method, direction or error list changed; a core without these answers -32601 and the UI degrades to a read-only badge (FR-8.46)"
+          "no existing method, direction or error list changed; a core without these answers C-04 NOT_FOUND with an `unknown method` message and the UI degrades to a read-only badge (FR-8.46); JSON-RPC -32601 is the standard form for an unregistered method and clients should recognize both"
         ],
         "rewrites": "none. Recorded in full under `x-vade.rfc0005_append`."
       },
@@ -151,7 +151,7 @@
           "one READ method under ui_to_core: session/search — titles + live message bodies (messages.content, superseded rows excluded per RFC-0006 §6.3); no existing method, error code, direction or field changed",
           "matching is a parameterized LIKE scan with %/_/\\ escaped literal (ESCAPE '\\'), ASCII case-insensitive and non-ASCII exact (SQLite LIKE semantics); no FTS5 dependency, no new table, column or index",
           "rows are deduped sessions (title hit dominates body hit), two-tier order: title hits first, then updated_at DESC, id ASC; snippets are hard-clipped to 120 code points with snippet_offset pointing into the original content — full bodies (up to 32000 code points, RFC-0006 §8) never cross the wire",
-          "a core without it answers -32601 (the documented degradation: FR-8.27's local-cached-only search with the '范围：已缓存' badge stays until the client upgrades)"
+          "a core without it answers C-04 NOT_FOUND with an `unknown method` message — the documented degradation: FR-8.27's local-cached-only search with the '范围：已缓存' badge stays until the client upgrades; JSON-RPC -32601 is the standard form for an unregistered method and clients should recognize both"
         ],
         "rewrites": "none. One ui_to_core method appended (FR-8.27); C-05 version 1.4.0 -> 1.5.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one). Recorded in core/vade/session/RESULT-rfc0014.md."
       },
@@ -165,7 +165,7 @@
           "one READ-ONLY list method under ui_to_core: ui/modules — the module entry list (modules -> pages) in one pull; no existing method, error code, direction or field changed",
           "`params` is `{}` and never gains `session_id`: the module set is a process-level fact (Registry.snapshot() takes no session) and authorization comes from the connection (`modulepage/auth.py`), never from a param the caller controls; a browser session sees ENABLED modules only, a module peer sees itself, an unresolvable caller is PERMISSION_DENIED",
           "page BODIES never cross the wire (`ui/page.get` stays the only body channel); ordering is registry order for modules and `manifest.ui.pages[]` order for pages; `revision` is the Registry revision, bumped next to every `_publish_status(...)` call, so `module.status` is the invalidation edge",
-          "no event is added (C-06 stays 34 entries) and no error code is added (C-04 stays 34); a core that predates it answers -32601 — the documented degradation: the client renders the empty entry block instead of erroring"
+          "no event is added (C-06 stays 34 entries) and no error code is added (C-04 stays 34); a core that predates it answers C-04 NOT_FOUND with an `unknown method` message — the documented degradation: the client renders the empty entry block instead of erroring; JSON-RPC -32601 is the standard form for an unregistered method and clients should recognize both"
         ],
         "rewrites": "none. One ui_to_core method appended (A3 module entry list); C-05 version 1.5.0 -> 1.6.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one, 1.6.0 one). C-06 untouched (no event), C-04 untouched (34 codes), C-03 untouched. Recorded in docs/rfc/LEDGER.md; evidence in shots/s-rfc0015-register/RESULT.md."
       }
@@ -662,7 +662,7 @@
         "params": {"if_revision": "int|null (optional)"},
         "result": {"revision": "int", "not_modified": "bool", "models": "[model]|null", "default": {"model_id": "string|null", "source": "session|global|priority|none", "resolved": "bool"}},
         "errors": ["UNAVAILABLE"],
-        "notes": "RFC-0005 append (v1.0.0 -> 1.1.0). Read-only, no side effects, no reverse RPC to modules. `if_revision == revision` returns {revision, not_modified:true, models:null} and the client keeps its cache — a client MUST NOT clear capability badges on `not_modified`. `models` is empty (never 404) when the current mode can route to nothing. Entry: {id, provider, display_name, input_modalities|null, max_image_bytes|null, max_image_px|null, max_images_per_turn|null, context_window|null, supports_tools|null, priority, available}; `null` is UNKNOWN and is never interchangeable with false/[] (no inference from the model name). Offline entries stay with available:false. A core without this method answers -32601 and the UI degrades to a read-only badge (FR-8.46), never to an empty list."
+        "notes": "RFC-0005 append (v1.0.0 -> 1.1.0). Read-only, no side effects, no reverse RPC to modules. `if_revision == revision` returns {revision, not_modified:true, models:null} and the client keeps its cache — a client MUST NOT clear capability badges on `not_modified`. `models` is empty (never 404) when the current mode can route to nothing. Entry: {id, provider, display_name, input_modalities|null, max_image_bytes|null, max_image_px|null, max_images_per_turn|null, context_window|null, supports_tools|null, priority, available}; `null` is UNKNOWN and is never interchangeable with false/[] (no inference from the model name). Offline entries stay with available:false. A core without this method answers C-04 NOT_FOUND with an `unknown method` message and the UI degrades to a read-only badge (FR-8.46), never to an empty list; JSON-RPC -32601 is the standard form for an unregistered method and clients should recognize both."
       },
       "session/model.get": {
         "params": {"session_id": "string"},
@@ -1206,7 +1206,7 @@
           "UNAVAILABLE",
           "PAYLOAD_TOO_LARGE"
         ],
-        "notes": "RFC-0015 §4. **SERVED and REGISTERED** — core implements it in `ModulePageService.list_modules()` (`core/vade/modulepage/service.py`) behind the `ui/modules` handler in `core/vade/modulepage/rpc.py`, and the contract registration is the C-05 1.6.0 append block (`x-vade.appends`, §9.2); a core that predates it answers JSON-RPC -32601 (NOT a C-04 code) and the client must degrade to the empty entry block instead of erroring (§7.1). ONE pull returns the WHOLE list because an entry list has to render on first paint. `params` is `{}` and never gains `session_id`: the module set is a process-level fact (`Registry.snapshot()` takes no session) and authorization comes from the connection (`modulepage/auth.py`, review B1), never from a param the caller controls. `pages` is `ModulePageService.pages()` verbatim (`modulepage/service.py:202-221`) — the key is `id`, because C-03 `$defs.page` and the client decoder both call it `id`; renaming it here would create a second spelling. Page BODIES never cross the wire: `ui/page.get` stays the only body channel (ref pages keep their sha256 check there). Ordering: registry order for modules, `manifest.ui.pages[]` order for pages. Callers: a browser session (`ui-...`) sees ENABLED modules only; a module peer sees only itself; an unresolvable caller is PERMISSION_DENIED. `revision` is the Registry revision (`registry/table.py:135-141`) which is bumped next to every `_publish_status(...)` call, so 'a module.status arrived' and 'the revision moved' are the same set — the client invalidates on `module.status` and re-pulls here (§5). No event is added (C-06 stays 34 entries), no error code is added (C-04 stays 34)."
+        "notes": "RFC-0015 §4. **SERVED and REGISTERED** — core implements it in `ModulePageService.list_modules()` (`core/vade/modulepage/service.py`) behind the `ui/modules` handler in `core/vade/modulepage/rpc.py`, and the contract registration is the C-05 1.6.0 append block (`x-vade.appends`, §9.2); a core that predates it answers C-04 NOT_FOUND with an `unknown method` message (not JSON-RPC -32601 — the standard form for an unregistered method, which clients should recognize as the same degradation) and the client must degrade to the empty entry block instead of erroring (§7.1). ONE pull returns the WHOLE list because an entry list has to render on first paint. `params` is `{}` and never gains `session_id`: the module set is a process-level fact (`Registry.snapshot()` takes no session) and authorization comes from the connection (`modulepage/auth.py`, review B1), never from a param the caller controls. `pages` is `ModulePageService.pages()` verbatim (`modulepage/service.py:202-221`) — the key is `id`, because C-03 `$defs.page` and the client decoder both call it `id`; renaming it here would create a second spelling. Page BODIES never cross the wire: `ui/page.get` stays the only body channel (ref pages keep their sha256 check there). Ordering: registry order for modules, `manifest.ui.pages[]` order for pages. Callers: a browser session (`ui-...`) sees ENABLED modules only; a module peer sees only itself; an unresolvable caller is PERMISSION_DENIED. `revision` is the Registry revision (`registry/table.py:135-141`) which is bumped next to every `_publish_status(...)` call, so 'a module.status arrived' and 'the revision moved' are the same set — the client invalidates on `module.status` and re-pulls here (§5). No event is added (C-06 stays 34 entries), no error code is added (C-04 stays 34)."
       }
     }
   },

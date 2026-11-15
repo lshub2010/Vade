@@ -16,9 +16,11 @@ prescribes: submit, then `ui/attach` from a FRESH connection sees the part.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import importlib.util
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -37,6 +39,44 @@ ROOT = Path(__file__).resolve().parents[3]
 MODULE_ID = "com.example.uploader"
 INSTANCE_ID = "up-1"
 DEVICE = f"{MODULE_ID}#{INSTANCE_ID}"
+
+# --- 墙钟阈值：只当**死锁保险**，不当性能断言 ------------------------------
+#
+# 第一版写的是 5 s，结果在 12 路并发抢机器的全量跑里，整份套件 18 分 19 秒，
+# 这条用例的「铸 token → 上传」腿直接 blow（单跑 8.0–12.0 s 稳定绿）。
+# 5 s 那会儿不是在测「快不快」，是在测「机器闲不闲」——那不是它该管的事。
+#
+# 现在：阈值给足（30 s），超时要**说出来是哪一段、过了多久**，因为裸的
+# `httpx.ReadTimeout` 对下一个读日志的人等于零信息。
+# 需要收紧时用环境变量，不要改默认值：`VADE_E2E_HTTP_TIMEOUT=5 pytest ...`。
+HTTP_TIMEOUT = float(os.environ.get("VADE_E2E_HTTP_TIMEOUT", "30"))
+WS_TIMEOUT = float(os.environ.get("VADE_E2E_WS_TIMEOUT", "30"))
+JOIN_TIMEOUT = float(os.environ.get("VADE_E2E_JOIN_TIMEOUT", "30"))
+
+
+def _timeout_diagnosis(fn):
+    """把裸超时换成「哪一层、过了多久、下一步查什么」的断言。
+
+    没有这层，负载下的红与真背压下的红在日志里长得一模一样——今晚已经因此
+    差点把这条用例当成「新端点坏了」去查一遍后端。
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        started = time.monotonic()
+        try:
+            return fn(*args, **kwargs)
+        except httpx.TimeoutException as exc:
+            elapsed = time.monotonic() - started
+            raise AssertionError(
+                f"{fn.__name__}: HTTP/WS 超时（已过 {elapsed:.1f}s；"
+                f"HTTP 阈值 {HTTP_TIMEOUT}s、WS 阈值 {WS_TIMEOUT}s、join {JOIN_TIMEOUT}s）。"
+                "分辨办法：单跑本文件应 8–12s 绿 ⇒ 是机器负载；"
+                "单跑仍红 ⇒ 是真背压（端点持锁读 body / provider 未排空），别调大阈值。"
+            ) from exc
+
+    return wrapper
+
 
 #: 2600 ASCII bytes → three 1024-byte parts on the default part size.
 BODY = b"vade-blob-token-e2e-" * 130
@@ -123,17 +163,18 @@ def live_core(tmp_path):
         yield app, f"http://127.0.0.1:{port}", f"ws://127.0.0.1:{port}/ws", tmp_path
     finally:
         server.should_exit = True
-        thread.join(timeout=10)
+        thread.join(timeout=JOIN_TIMEOUT)
         _teardown(app)
 
 
-def _recv_reply(ws, msg_id: int, timeout: float = 8.0) -> dict:
+def _recv_reply(ws, msg_id: int, timeout: float = WS_TIMEOUT) -> dict:
     while True:
         message = json.loads(ws.recv(timeout=timeout))
         if message.get("id") == msg_id:
             return message
 
 
+@_timeout_diagnosis
 def test_native_device_mints_uploads_submits_and_a_fresh_connection_sees_it(live_core):
     from websockets.sync.client import connect
 
@@ -165,7 +206,7 @@ def test_native_device_mints_uploads_submits_and_a_fresh_connection_sees_it(live
             headers={**auth, "Content-Type": "application/json"},
             json={"kind": "file", "sha256": DIGEST, "size": len(BODY),
                   "mime": "text/plain", "name": "up.txt"},
-            timeout=5,
+            timeout=HTTP_TIMEOUT,
         )
         assert begun.status_code in (200, 201), begun.text
         upload_id = begun.json()["upload_id"]
@@ -176,20 +217,20 @@ def test_native_device_mints_uploads_submits_and_a_fresh_connection_sees_it(live
                 params={"offset": offset},
                 headers={**auth, "Content-Type": "application/octet-stream"},
                 content=BODY[offset:offset + part_size],
-                timeout=5,
+                timeout=HTTP_TIMEOUT,
             )
             assert part.status_code == 200, part.text
         done = httpx.post(
             f"{http_url}/ui/blob/upload/{upload_id}/complete",
             headers={**auth, "Content-Type": "application/json"},
             json={"sha256": DIGEST, "size": len(BODY)},
-            timeout=5,
+            timeout=HTTP_TIMEOUT,
         )
         assert done.status_code in (200, 201), done.text
         file_id = done.json()["file_id"]
 
         # The token is replayable (拍板 Q3): fetch through it again.
-        fetched = httpx.get(f"{http_url}/ui/blob/{file_id}", headers=auth, timeout=5)
+        fetched = httpx.get(f"{http_url}/ui/blob/{file_id}", headers=auth, timeout=HTTP_TIMEOUT)
         assert fetched.status_code == 200 and fetched.content == BODY
 
         # 4. The SAME connection submits the file_id (A3: the binding that was
@@ -213,7 +254,7 @@ def test_native_device_mints_uploads_submits_and_a_fresh_connection_sees_it(live
     from vade.identity.pairing import Purpose
 
     code = app.pairing.create(Purpose.BROWSER)
-    login = httpx.post(f"{http_url}/ui/session", json={"pair_code": code}, timeout=5)
+    login = httpx.post(f"{http_url}/ui/session", json={"pair_code": code}, timeout=HTTP_TIMEOUT)
     assert login.status_code == 200, login.text
     set_cookies = login.headers.get_list("set-cookie")
     ui_cookie = next(c for c in set_cookies if c.startswith("__Host-ac_ui="))
@@ -223,7 +264,7 @@ def test_native_device_mints_uploads_submits_and_a_fresh_connection_sees_it(live
 
     # 5a. A cookie session must NOT be able to mint (拍板 Q1, over the wire).
     with connect(
-        ws_url, additional_headers={"Cookie": f"__Host-ac_ui={ui_value}"}, open_timeout=5
+        ws_url, additional_headers={"Cookie": f"__Host-ac_ui={ui_value}"}, open_timeout=HTTP_TIMEOUT
     ) as ws:
         ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ui/blob.token", "params": {}}))
         denied = _recv_reply(ws, 1)
@@ -249,7 +290,7 @@ def test_native_device_mints_uploads_submits_and_a_fresh_connection_sees_it(live
                 "Sec-Fetch-Site": "same-origin",
                 "x-vade-csrf": csrf_value,
             },
-            timeout=5,
+            timeout=HTTP_TIMEOUT,
         )
         assert got.status_code == 200, got.text
         assert got.content == BODY

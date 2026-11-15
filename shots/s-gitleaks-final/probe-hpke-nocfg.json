@@ -1,0 +1,42 @@
+[
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 77,
+  "EndLine": 77,
+  "StartColumn": 10,
+  "EndColumn": 45,
+  "Match": "private_key: REDACTED",
+  "Secret": "REDACTED",
+  "File": "D:/HermesWorkspace/Vade/Vade/.venv/Lib/site-packages/cryptography/hazmat/bindings/_rust/openssl/hpke.pyi",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 3.8279097,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": "",
+  "Tags": [],
+  "Fingerprint": "D:/HermesWorkspace/Vade/Vade/.venv/Lib/site-packages/cryptography/hazmat/bindings/_rust/openssl/hpke.pyi:generic-api-key:77"
+ },
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 101,
+  "EndLine": 101,
+  "StartColumn": 6,
+  "EndColumn": 41,
+  "Match": "private_key: REDACTED",
+  "Secret": "REDACTED",
+  "File": "D:/HermesWorkspace/Vade/Vade/.venv/Lib/site-packages/cryptography/hazmat/bindings/_rust/openssl/hpke.pyi",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 3.8279097,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": "",
+  "Tags": [],
+  "Fingerprint": "D:/HermesWorkspace/Vade/Vade/.venv/Lib/site-packages/cryptography/hazmat/bindings/_rust/openssl/hpke.pyi:generic-api-key:101"
+ }
+]

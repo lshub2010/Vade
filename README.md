@@ -47,15 +47,22 @@ Python **3.11+**（core）、SQLite（内置）。可选：Rust 1.100（重编�
 ```bash
 git clone https://github.com/lshub2010/Vade.git
 cd Vade
-python -m venv .venv && . .venv/bin/activate     # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
 ```
 
 ### 起一个 core
 
 ```bash
-export PYTHONPATH="core;protocol/core/python"     # Linux / macOS 用冒号分隔
+# Windows（git-bash / PowerShell 7）：PYTHONPATH 分隔符是分号
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements.txt
+export PYTHONPATH="core;protocol/core/python"
 .venv/Scripts/python.exe -m vade --config core.toml
+
+# Linux / macOS：分隔符是冒号
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+export PYTHONPATH="core:protocol/core/python"
+.venv/bin/python -m vade --config core.toml
 ```
 
 `PYTHONPATH` 里**两处都必须在**，缺一个都起不来：

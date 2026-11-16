@@ -102,6 +102,7 @@ class Registry:
         heartbeat_interval_s: float = 10.0,
         clock: Callable[[], float] = time.monotonic,
         close_connection: Callable[[str], None] | None = None,
+        paired_fingerprint: Callable[[str, str], str | None] | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._records: dict[tuple[str, str], NodeRecord] = {}
@@ -111,6 +112,7 @@ class Registry:
         self._heartbeat_interval = heartbeat_interval_s
         self._clock = clock
         self._close_connection = close_connection
+        self._paired_fingerprint = paired_fingerprint
         self._revoked: set[str] = set()
         self._risk_overrides: dict[tuple[str, str], str] = {}
         #: RFC-0005 §4.4: core-process monotonic counter behind `model/list`'s
@@ -175,6 +177,19 @@ class Registry:
         with self._lock:
             if fingerprint in self._revoked:
                 raise VadeError("PERMISSION_DENIED", "fingerprint revoked", fatal=True)
+            if self._paired_fingerprint is not None:
+                # The pairing table is the trust anchor: a key paired as
+                # `module_id#instance_id` may only register that exact node.
+                # Without this check a paired module A could register a
+                # manifest claiming to be module B and inherit B's tool and
+                # approval surface (review D1).
+                paired = self._paired_fingerprint(manifest.module_id, manifest.instance_id)
+                if paired is not None and paired != fingerprint:
+                    raise VadeError(
+                        "PERMISSION_DENIED",
+                        f"{manifest.module_id}#{manifest.instance_id} is paired to a different key",
+                        fatal=True,
+                    )
 
             key = (manifest.module_id, manifest.instance_id)
             existing = self._records.get(key)
@@ -467,12 +482,19 @@ class Registry:
             updated = replace(record, enabled=enabled)
             if not enabled:
                 updated = replace(updated, health=HealthState.OFFLINE, connection_id=None)
+            if enabled and updated.manifest is not None:
+                # Re-enabling must put the tools back. Rebuilding in place
+                # would skip the conflict/global-budget checks, so build the
+                # next index first (raises TOOL_CONFLICT before any mutation).
+                new_index = self._build_index(updated.manifest, exclude_instance=instance_id)
+            else:
+                # Disabling filters the whole table: the old code filtered by
+                # `module_id`, which also removed the OTHER instances of a
+                # pooled module (review P1-5).
+                new_index = self._rebuild_index()
             self._records[key] = updated
+            self._index = new_index
             self._bump()
-            if not enabled:
-                # Re-index the whole table: filtering by module_id also removed
-                # the OTHER instances of a pooled module.
-                self._index = self._rebuild_index()
         self._publish_status(updated)
         if not enabled and record.connection_id and self._close_connection:
             self._close_connection(record.connection_id)

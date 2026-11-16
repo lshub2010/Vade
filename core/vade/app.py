@@ -73,6 +73,7 @@ class App:
         self.registry = Registry(
             heartbeat_interval_s=self.heartbeat_interval_s,
             close_connection=self._close_connection,
+            paired_fingerprint=self._paired_fingerprint,
         )
         self.registry_api = RegistryAPI(self.registry)
         self.whitelist = Whitelist(data_dir / "identity" / "whitelist.json", on_revoke=self._revoke_connection)
@@ -141,6 +142,10 @@ class App:
         """Constraint 5 input: the key already paired to this module, if any."""
         return self.whitelist.fingerprint_for(module_id) if self.whitelist is not None else None
 
+    def _paired_fingerprint(self, module_id: str, instance_id: str) -> str | None:
+        """Registry trust input: the key paired to this exact node, if any."""
+        return self.whitelist.fingerprint_for(module_id, instance_id) if self.whitelist is not None else None
+
     def _revoke_connection(self, fingerprint: str, removed_ids: tuple[str, ...] = ()) -> None:
         if self.registry is not None:
             self.registry.revoke_fingerprint(fingerprint)
@@ -194,6 +199,28 @@ class App:
             return RpcError("MANIFEST_INVALID", exc.message)
         except VadeError as exc:
             return RpcError(exc.code, exc.message)
+
+        # Three identities must agree: the key that finished the handshake, the
+        # pairing record that key belongs to, and the manifest claiming a slot.
+        # `device_id` is set by the transport from the verified key, never from
+        # anything the peer sent (`transport/server.py::_bind_device_identity`).
+        # None therefore means "no pairing" and this must fail closed — a
+        # paired module A declaring itself as B would otherwise inherit B's
+        # tools and approval surface (review D1).
+        device_id = getattr(connection, "device_id", None)
+        if not device_id:
+            raise VadeError(
+                "PERMISSION_DENIED",
+                "module/register requires a paired module identity on this connection",
+                fatal=True,
+            )
+        claimed = f"{manifest.module_id}#{manifest.instance_id}"
+        if str(device_id) != claimed:
+            raise VadeError(
+                "PERMISSION_DENIED",
+                f"connection is paired as {device_id!r}, manifest claims {claimed!r}",
+                fatal=True,
+            )
 
         kind = "device" if manifest.role == "ui" else "module"
         auth_mode = "module_key"

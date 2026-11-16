@@ -13,10 +13,21 @@ Client IP: `X-Forwarded-For` is only honoured when the app is constructed with
 `trust_forwarded_for=True` (i.e. behind a proxy that overwrites the header).
 By default any client could send a fresh XFF on every request and reset the
 5/5min pair-code budget, which is the whole rate limit.
+
+Browser session lifetime: `__Host-ac_ui` carried `Max-Age=30d` while the server
+row lived forever, so the cookie — not the server — decided when a session
+ended. Any copy of the token (a backup, a leaked `Cookie` header, a browser
+profile synced to another machine) stayed valid until the process restarted.
+The table below is now the authority: every minted row carries `expires_at`,
+lookups treat an expired row as absent, and a periodic sweep (plus the sweep on
+every lookup) is what removes it. `/ui/blob` holds this same object by
+reference, so expiry is enforced for uploads too — the check lives in the
+table, not in each caller.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -25,18 +36,102 @@ import time
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError, http_status
+from ..logging import get_logger
 from .connection import Connection
 
-__all__ = ["CoreApp", "AsgiWebSocket", "CONNECTIONS"]
+__all__ = ["CoreApp", "AsgiWebSocket", "CONNECTIONS", "UiSessions", "UI_SESSION_TTL_S"]
+
+log = get_logger("vade.transport.server")
+
 
 CORE_VERSION = "0.1.0"
 
 #: A pair-code POST is a tiny JSON body; anything bigger is abuse.
 MAX_UI_SESSION_BODY = 64 * 1024
 
+#: Server-side lifetime of a browser session. The cookie's `Max-Age` is derived
+#: from this value (`_ui_session`), so the two can never disagree — a cookie
+#: that outlives the row is a token the server no longer honours.
+UI_SESSION_TTL_S = 30 * 24 * 3600
+
+#: How often the sweeper looks for expired rows. Expiry is enforced on every
+#: lookup regardless; this only bounds how long a dead row (and the socket it
+#: authenticated) keeps occupying memory.
+UI_SESSION_SWEEP_S = 60.0
+
 #: Live connections by connection_id. CoreApp registers here by default so
 #: governance hooks (`App._close_connection`) see the same objects.
 CONNECTIONS: dict[str, Connection] = {}
+
+#: Sentinel for "the token is gone", so `None` stays a legal row value.
+_MISSING = object()
+
+
+class UiSessions(dict):
+    """`token -> session row` with a hard server-side TTL.
+
+    A `dict` subclass on purpose: `vade.blob`'s `/ui/blob` gate is handed this
+    exact object by reference (`bind_sessions`) and only ever calls `.get()`.
+    Replacing the table with a wrapper would need that component's cooperation;
+    overriding the read paths means *every* reader — the WS upgrade, the blob
+    cookie gate, governance — sees the same answer for "is this token still
+    alive", with no second place to forget the check.
+
+    A row without a numeric `created_at` (only hand-built fixtures or rows
+    written by an older build) is treated as non-expiring: expiry is a function
+    of a value the mint always writes, and inventing a timestamp for a row that
+    has none would expire someone's session at process start.
+    """
+
+    def __init__(self, ttl_s: float = UI_SESSION_TTL_S, *, clock: Callable[[], float] = time.time) -> None:
+        super().__init__()
+        self.ttl_s = float(ttl_s)
+        self._clock = clock
+
+    # ------------------------------------------------------------------ queries
+    def expires_at(self, row: Mapping[str, Any] | None) -> float | None:
+        if not row:
+            return None
+        created = row.get("created_at")
+        if not isinstance(created, (int, float)) or isinstance(created, bool):
+            return None
+        return float(created) + self.ttl_s
+
+    def is_expired(self, row: Mapping[str, Any] | None) -> bool:
+        deadline = self.expires_at(row)
+        return deadline is not None and self._clock() >= deadline
+
+    def get(self, token: Any, default: Any = None) -> Any:  # type: ignore[override]
+        row = super().get(token)
+        if row is None or self.is_expired(row):
+            if row is not None:
+                # Lazy eviction: an expired token must stop working the moment
+                # it expires, not at the next sweep tick.
+                super().pop(token, None)
+            return default
+        return row
+
+    def __getitem__(self, token: Any) -> Any:  # type: ignore[override]
+        row = self.get(token, _MISSING)
+        if row is _MISSING:
+            raise KeyError(token)
+        return row
+
+    def __contains__(self, token: Any) -> bool:  # type: ignore[override]
+        return self.get(token, _MISSING) is not _MISSING
+
+    # ------------------------------------------------------------------ maintenance
+    def prune(self) -> list[str]:
+        """Drop every expired row; return the tokens that were removed."""
+        now = self._clock()
+        dead = [
+            token
+            for token, row in list(dict.items(self))
+            if (deadline := self.expires_at(row)) is not None and now >= deadline
+        ]
+        for token in dead:
+            dict.pop(self, token, None)
+        return dead
 
 
 class AsgiWebSocket:
@@ -80,6 +175,8 @@ class CoreApp:
         trust_forwarded_for: bool = False,
         connections: dict[str, Connection] | None = None,
         blob: Any | None = None,
+        ui_session_ttl_s: float = UI_SESSION_TTL_S,
+        ui_session_sweep_s: float = UI_SESSION_SWEEP_S,
     ) -> None:
         self.config = config
         self.identity = identity
@@ -97,7 +194,12 @@ class CoreApp:
         self._trust_forwarded_for = trust_forwarded_for
         self._ui_origins = tuple(config.get("server.ui_origins", []) or [])
         self._listen_hosts = tuple(config.get("server.listen_hosts", []) or [])
-        self._sessions: dict[str, dict[str, Any]] = {}
+        self._ui_session_ttl_s = float(ui_session_ttl_s)
+        self._ui_session_sweep_s = float(ui_session_sweep_s)
+        #: Browser sessions. `UiSessions` is the authority on expiry: the WS
+        #: upgrade, the blob cookie gate and `revoke_session` all read it.
+        self._sessions: UiSessions = UiSessions(self._ui_session_ttl_s)
+        self._session_sweeper: asyncio.Task[None] | None = None
         self._connections: dict[str, Connection] = CONNECTIONS if connections is None else connections
         #: RFC-0004 `/ui/blob*` sub-app, installed by `vade.blob.install(app)`.
         #: The cookie gate needs the *live* session table, so it is handed over
@@ -125,6 +227,10 @@ class CoreApp:
         contract there is no long-lived loop to create it on (the component
         scan runs outside one). Anything that matters to a sub-app with a
         `start`/`stop` pair is delegated here, in order.
+
+        The browser-session sweeper is started here for the same reason: an
+        expired `__Host-ac_ui` row must be *removed*, not merely ignored, and
+        nothing else in the process owns a loop that could do it on a timer.
         """
         blob = self._blob
         while True:
@@ -139,9 +245,13 @@ class CoreApp:
                 except Exception:  # pragma: no cover - fail closed, no silent serve
                     await send({"type": "lifespan.startup.failed", "message": "blob channel failed to start"})
                     return
+                self._session_sweeper = asyncio.create_task(self._sweep_loop(), name="ui-session-sweeper")
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 try:
+                    if self._session_sweeper is not None:
+                        self._session_sweeper.cancel()
+                        self._session_sweeper = None
                     stopper = getattr(blob, "stop", None)
                     if callable(stopper):
                         result = stopper()
@@ -222,10 +332,14 @@ class CoreApp:
         device_id = f"ui-{secrets.token_hex(8)}"
         token = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(24)
+        created_at = time.time()
         self._sessions[token] = {
             "device_id": device_id,
             "client_name": client_name,
-            "created_at": time.time(),
+            "created_at": created_at,
+            # The row, not the cookie, decides when this session ends. Written
+            # once here so nothing downstream has to recompute it.
+            "expires_at": created_at + self._ui_session_ttl_s,
             "revoked": False,
             "read_only": False,
             # RFC-0004 §8.2: the CSRF token is a double-submit value bound to
@@ -233,12 +347,11 @@ class CoreApp:
             # it because the row is new.
             "csrf_hash": hashlib.sha256(csrf.encode("utf-8")).hexdigest(),
         }
-        cookie = (
-            f"__Host-ac_ui={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={30 * 24 * 3600}"
-        )
+        max_age = int(self._ui_session_ttl_s)
+        cookie = f"__Host-ac_ui={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={max_age}"
         # Readable by the page on purpose (double-submit requires JS to echo it
         # in `x-vade-csrf`); it is useless without the session cookie.
-        csrf_cookie = f"__Host-ac_csrf={csrf}; Path=/; Secure; SameSite=Lax; Max-Age={30 * 24 * 3600}"
+        csrf_cookie = f"__Host-ac_csrf={csrf}; Path=/; Secure; SameSite=Lax; Max-Age={max_age}"
         extra = {"Set-Cookie": [cookie, csrf_cookie]}
         await self._json(send, 200, {"device_id": device_id}, cors, extra)
         _ = record
@@ -303,6 +416,8 @@ class CoreApp:
 
         headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
         token = self._cookie(headers.get("cookie", ""), "__Host-ac_ui")
+        # `UiSessions.get` is expiry-aware: an expired token is absent, exactly
+        # like an unknown one, so no downstream caller can forget the check.
         session = self._sessions.get(token) if token is not None else None
         if session is not None and session["revoked"]:
             # A revoked row is no identity at all: the same `None` path as an
@@ -396,11 +511,42 @@ class CoreApp:
         kicked every logged-in UI when one device was revoked.
         """
         tokens = {token for token, meta in self._sessions.items() if meta["device_id"] == device_id}
+        return self._drop_tokens(tokens, reason="session revoked")
+
+    def sweep_sessions(self) -> tuple[str, ...]:
+        """Remove expired browser sessions and close the sockets they own.
+
+        Expiry already *denies* an expired token on every lookup; this is what
+        also takes the row and its live socket out of the process. A socket
+        whose cookie expired mid-session must be closed for the same reason a
+        revoked one is: the identity behind it no longer exists, and leaving it
+        open would let an expired session keep receiving events.
+
+        Sync on purpose: `Registry`/governance hooks run off-loop and need to
+        call it, and the only effect is `pop` + `request_close` (thread-safe).
+        """
+        return self._drop_tokens(set(self._sessions.prune()), reason="session expired")
+
+    def _drop_tokens(self, tokens: set[str], *, reason: str) -> tuple[str, ...]:
         closed: list[str] = []
         for token in tokens:
-            del self._sessions[token]
+            dict.pop(self._sessions, token, None)
         for connection in list(self._connections.values()):
             if connection.browser_session and getattr(connection, "ui_token", None) in tokens:
                 closed.append(connection.connection_id)
-                connection.request_close(1001, "session revoked")
+                connection.request_close(1001, reason)
         return tuple(closed)
+
+    async def _sweep_loop(self) -> None:
+        """Periodic expiry sweep; the interval only bounds memory, not access."""
+        while True:
+            await asyncio.sleep(self._ui_session_sweep_s)
+            try:
+                closed = self.sweep_sessions()
+            except Exception:  # pragma: no cover - a sweeper must not die silently
+                continue
+            if closed:
+                log.info(
+                    "expired browser sessions closed",
+                    extra={"code": None, "msg": f"{len(closed)} connection(s)"},
+                )

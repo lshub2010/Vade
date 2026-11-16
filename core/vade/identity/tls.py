@@ -5,8 +5,15 @@ generation is explicitly excluded from the "no crypto in Python" rule).
 When the package is absent we do NOT silently fall back to plaintext — the
 caller gets a clear UNSUPPORTED and must supply `[tls].cert` / `[tls].key`.
 
-`fingerprint` is SHA-256 of the DER certificate. The SPKI pin required by
-`--print-tls-fingerprint` is a different value; see RESULT.md (unverified).
+Two different values live here, and mixing them is a real bug (D78):
+
+* `cert_fingerprint_hex()` — SHA-256 of the whole certificate DER. Audit and
+  backwards compatibility only; it changes on every re-issue.
+* `spki_fingerprint_hex()` — SHA-256 of the DER `SubjectPublicKeyInfo`,
+  truncated to 16 hex chars. **This is the `tls=SPKI[:16]` pin** shown by
+  `--print-tls-fingerprint` / the setup page and stored by the App. It survives
+  re-issue of a certificate that keeps the same key pair, which is why the pin
+  uses it instead of the certificate DER.
 """
 
 from __future__ import annotations
@@ -17,14 +24,44 @@ from pathlib import Path
 
 from ..errors import VadeError
 
-__all__ = ["cert_fingerprint_hex", "ensure_certificates"]
+__all__ = ["cert_fingerprint_hex", "spki_fingerprint_hex", "ensure_certificates"]
 
 
 def cert_fingerprint_hex(cert_path: Path | str) -> str:
-    """SHA-256 of the certificate DER, lowercase hex, first 16 chars for display."""
+    """SHA-256 of the certificate DER (full hex). NOT the SPKI pin."""
     pem = Path(cert_path).read_text(encoding="ascii")
     der = ssl.PEM_cert_to_DER_cert(pem)
     return hashlib.sha256(der).hexdigest()
+
+
+def spki_fingerprint_hex(cert_path: Path | str) -> str:
+    """`SHA-256(SPKI)[:16]`, lowercase hex — the TLS pin (`tls=` field, D78).
+
+    SPKI is `SubjectPublicKeyInfo`: the public key plus algorithm identifier,
+    without the certificate wrapper (serial, validity, signature). Re-issuing a
+    certificate for the same key keeps this value; the certificate DER does not.
+
+    Needs `cryptography` (Python has no SPKI parser in the stdlib). When the
+    package is missing this raises `UNSUPPORTED` — it must NOT quietly degrade
+    to the certificate DER, because that value would never match the pin the
+    App was given (a silent-rotation bug, not a fallback).
+    """
+    try:
+        from cryptography import x509  # type: ignore
+        from cryptography.hazmat.primitives import serialization  # type: ignore
+    except ImportError:
+        raise VadeError(
+            "UNSUPPORTED",
+            "SPKI fingerprint needs the `cryptography` package; "
+            "install it (the certificate DER is a different value and not a fallback)",
+        ) from None
+
+    certificate = x509.load_pem_x509_certificate(Path(cert_path).read_bytes())
+    spki = certificate.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(spki).hexdigest()[:16]
 
 
 def ensure_certificates(cert: str | None, key: str | None, data_dir: Path | str, san: list[str] | None = None) -> tuple[str, str]:

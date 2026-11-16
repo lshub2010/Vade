@@ -8,7 +8,7 @@ proposer: 编排（依据 `research/ui-decisions.md` #15 / #16、`research/ui-02
 affects: C-05 `schema/rpc.json`（追加 `model/list`、`session/model.get|set`、`session/usage.get` 与 `ui/attach` snapshot 注记）、C-03 `schema/manifest.schema.json`（`capabilities.models[]`，追加）、C-06 `schema/events.json`（只追加）、C-18 `schema/config.schema.json`（`[llm]` 4 键 + `[usage]` 6 键）；内部 `core/vade/llm/*`、`core/vade/session/*`、`core/vade/admin/app.py`
 related: RFC-0004（附件与多模态；§9 的四个能力字段是本提案的硬依赖）；AMEND-22 §8.22.2 R5；FR-6.3、FR-8.46～8.50、FR-10.3；D96（只存压缩图）、D101（会话级优先）、D102（用量两口径）
 type: 契约追加（C-03 / C-05 / C-06 / C-18）；`LLMProvider.chat` 的 Python 协议变更属 core 内部破坏性
-stage: 草稿，未实现；不与 RFC-0004 同时实现时，能力字段全 `null`，降级路径见 §9
+stage: 已实现并合并
 ---
 
 # RFC-0005 · 模型能力查询与用量
@@ -332,7 +332,7 @@ RFC-0004 §9 已把接口收敛为四个字段（`input_modalities`、`max_image
 | `session/model.set` | `{session_id, model_id: string\|null}` | `{model_id\|null, source, effective_at:"next_turn"}` | `INVALID_ARGUMENT`, `NOT_FOUND`, `UNAVAILABLE`, `READ_ONLY_SESSION` |
 | `session/usage.get` | `{session_id}` | 见 §6.3 | `NOT_FOUND`, `PERMISSION_DENIED` |
 
-`model/list` 只读、无副作用；旧 core 没有该方法时，客户端收到 JSON-RPC 的“方法不存在”（-32601），按 FR-8.46 降级为只读徽标 + “由管理员在 core 配置”，**不得**用空列表冒充“没有模型”。
+`model/list` 只读、无副作用；旧 core 没有该方法时，客户端收到 C-04 `NOT_FOUND` + `unknown method` 消息（JSON-RPC `-32601` 是同一件事的标准形态，**两者都要认**），按 FR-8.46 降级为只读徽标 + “由管理员在 core 配置”，**不得**用空列表冒充“没有模型”。
 
 ### 7.3 C-03：`capabilities.models[]`
 
@@ -395,7 +395,7 @@ A1–A12 全部要求真实执行；截图与手写记录不算证据。
 |---|---|
 | 旧会话（`sessions.model_id` NULL） | 解析从全局默认/priority 开始，不写库、不改写历史 |
 | 旧客户端 | 不调 `model/*`，忽略新键；`turn.completed.usage` 多出的键不进它的反序列化 |
-| 旧 core + 新客户端 | `model/list` 方法不存在（-32601）→ 只读徽标 + “由管理员在 core 配置”，**不出现空列表** |
+| 旧 core + 新客户端 | `model/list` 方法不存在（C-04 `NOT_FOUND` + `unknown method`；JSON-RPC `-32601` 同义）→ 只读徽标 + “由管理员在 core 配置”，**不出现空列表** |
 | 旧 core + 新模块 | `capabilities.models` 被忽略并告警，模块照常注册，模型不出现在列表 |
 | 新 core + 旧模块 | 合成 `<module_id>/*` 条目，能力全 `null`；选中后不带 `model`，模块用自己的默认 |
 | 配置降级 | 新 `core.toml` 被旧 core 读到 → `UNKNOWN_CONFIG_KEY` 拒绝启动。发布说明必须写明“回滚要同时回滚配置”，这是 root `additionalProperties:false` 的固有代价 |

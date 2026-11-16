@@ -17,7 +17,7 @@ from vade.registry.table import Registry
 from vade.router.dispatch import Router
 from vade.session.manager import SessionLog
 from vade.session.models import Turn, TurnState
-from vade.session.queue import TurnQueue
+from vade.session.queue import TurnQueue, FINALIZED_LIMIT
 from vade.session.replay import ReplayBuffer
 from vade.session.sqlite_store import SQLiteStore
 from .helpers import CollectSink, GateExecutor, make_manifest, wait_until
@@ -686,7 +686,10 @@ def test_cancel_clear_is_bound_to_its_own_turn_when_the_previous_task_is_an_orph
             flag_seen[turn.id] = turn.id in flags
             return TurnOutcome(assistant_text="done", stopped_reason="stop")
 
-        async def emit(session_id, event_type, payload=None, *, messages=()):
+        async def emit(session_id, event_type, payload=None, *, messages=(), turns=(),
+                       message_updates=()):
+            # Same keyword surface as `SessionLog.emit`: RFC-0006 makes the
+            # terminal turn row part of the event's transaction.
             payload = dict(payload or {})
             events.append((event_type, payload))
             if event_type == "turn.started" and next_turn is not None \
@@ -726,10 +729,105 @@ def test_cancel_clear_is_bound_to_its_own_turn_when_the_previous_task_is_an_orph
         assert next_turn.id not in flags, \
             f"was_cancelled({next_turn.id}) outlived the turn it belongs to"
         assert orphan_turn.id in flags, "the still-running orphan lost its flag"
-        # Per-turn bookkeeping does not outlive the turns either.
-        assert queue._finalized == set(), f"finalized markers leaked: {queue._finalized}"
+        # `_finalized` deliberately OUTLIVES the turn: the worker wakes up after
+        # an interrupt has already written the terminal event, and the marker is
+        # what refuses the second one. The leak guard is the bounded FIFO cap,
+        # not emptiness — a set cleared at worker exit is the double-terminal
+        # bug this bookkeeping exists to prevent.
+        assert set(queue._finalized) >= {orphan_turn.id, next_turn.id}
+        assert len(queue._finalized) <= FINALIZED_LIMIT
         await queue.shutdown()
 
         await asyncio.sleep(0)
 
+    asyncio.run(scenario())
+
+# ------------------------------------------------------------------ RFC-0002
+
+
+def _skills_executor(names, text="done"):
+    async def executor(turn, content):
+        return TurnOutcome(assistant_text=text, stopped_reason="stop",
+                           activated_skills=tuple(names))
+    return executor
+
+
+def _completed_payload(log, session_id):
+    completed = [e for e in log.store.read_since(session_id, 0)
+                 if e.type == "turn.completed"]
+    assert len(completed) == 1
+    return completed[0].payload
+
+
+def test_turn_completed_payload_carries_activated_skills(tmp_path):
+    """RFC-0002 SS7.2: the emitted turn.completed payload carries the turn's
+    activated skill names under `skills` -- exact spelling, order preserved,
+    frozen keys intact."""
+    async def scenario():
+        log = _log(tmp_path, _skills_executor(("kb-guide", "code-style")))
+        session = log.create_session()
+        await log.submit(session.id, [{"type": "text", "text": "go"}], "c1")
+        await log.wait_idle(session.id)
+        payload = _completed_payload(log, session.id)
+        assert payload["skills"] == ["kb-guide", "code-style"]
+        assert payload["turn_id"]
+        assert payload["state"] == "completed"
+        assert {"turn_id", "state", "usage"} <= set(payload)
+        assert payload["stopped_reason"] == "stop"
+        await log.close()
+    asyncio.run(scenario())
+
+
+def test_turn_completed_skills_is_empty_list_when_none(tmp_path):
+    """RFC-0002 SS3: `[]` when none -- present-but-empty, never omitted, never
+    null; an outcome built before this RFC (field absent) still emits `[]`."""
+    async def scenario():
+        gate = GateExecutor()
+        gate.gate.set()
+        log = _log(tmp_path, gate)
+        session = log.create_session()
+        await log.submit(session.id, [{"type": "text", "text": "hi"}], "c1")
+        await log.wait_idle(session.id)
+        payload = _completed_payload(log, session.id)
+        assert "skills" in payload
+        assert payload["skills"] == []
+        assert payload["skills"] is not None
+        await log.close()
+    asyncio.run(scenario())
+
+
+def test_turn_completed_skills_is_the_only_key_old_clients_miss(tmp_path):
+    """RFC-0002 SS4: an old client reading the frozen keys + stopped_reason is
+    unaffected -- `skills` is the only top-level key beyond the frozen shape."""
+    async def scenario():
+        log = _log(tmp_path, _skills_executor(("kb-guide",)))
+        session = log.create_session()
+        await log.submit(session.id, [{"type": "text", "text": "go"}], "c1")
+        await log.wait_idle(session.id)
+        payload = _completed_payload(log, session.id)
+        assert set(payload) == {"turn_id", "usage", "state", "stopped_reason", "skills"}
+        old_view = {k: payload[k] for k in ("turn_id", "state", "usage", "stopped_reason")}
+        assert old_view["state"] == "completed"
+        await log.close()
+    asyncio.run(scenario())
+
+
+def test_turn_failed_payload_gains_no_skills(tmp_path):
+    """RFC-0002 touches one event: turn.failed keeps its frozen payload shape --
+    no `skills` key leaks onto failure paths."""
+    async def scenario():
+        async def boom(turn, content):
+            raise VadeError("UNAVAILABLE", "no provider")
+
+        log = _log(tmp_path, boom)
+        session = log.create_session()
+        await log.submit(session.id, [{"type": "text", "text": "go"}], "c1")
+        await log.wait_idle(session.id)
+        events = log.store.read_since(session.id, 0)
+        failed = [e for e in events if e.type == "turn.failed"]
+        assert len(failed) == 1
+        assert "skills" not in failed[0].payload
+        assert set(failed[0].payload) == {"turn_id", "code", "message", "state", "usage"}
+        assert all(e.type != "turn.completed" for e in events)
+        await log.close()
     asyncio.run(scenario())

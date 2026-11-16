@@ -1,0 +1,31 @@
+# .gitleaks.toml — Vade 仓库 gitleaks 定稿配置（两仓内容一致，s-gitleaks-final）
+#
+# 定稿策略（取代 09a2ac5 的「行级 allowlist」初稿）：
+#   1. 规则集 = gitleaks 内建官方默认规则（[extend] useDefault = true），
+#      不 fork、不删减、不改写任何规则。
+#   2. 白名单【只允许路径级排除】，且仅限以下四类「从不进入版本库」的树
+#      （全部被 .gitignore 覆盖，排除它们不可能掩盖真实提交过的凭据）：
+#        - .venv/**           Python 虚拟环境：第三方 wheel / vendor 类型存根
+#        - **/build/**        构建产物：由源码与第三方拷贝生成
+#        - **/.gradle/**      Gradle 本地缓存与状态
+#        - **/node_modules/** npm 第三方依赖
+#   3. 【禁止】regex / stopword / 行特征级 allowlist：不允许用「抹具体字符串」
+#      的方式把命中悄悄归零。真命中必须照报，由人判断真/假。
+#      （gitleaks 内建默认规则自带的全局降噪项属于工具默认行为，不在此约束内。）
+#   4. 「路径级排除没有削弱扫描」由金丝雀自证：shots/s-gitleaks-final/ 归档了
+#      金丝雀仓的扫描结果——未排除路径上的假 AWS key / GitHub PAT / RSA 私钥
+#      全部命中，四个排除树里的同款饵全部不报。
+#
+# 路径正则同时兼容 / 与 \ 分隔符（Windows 工作区扫描的路径分隔符是反斜杠）。
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "仅排除不入库的依赖/构建树：.venv、build、.gradle、node_modules"
+paths = [
+  '''(^|[\\/])\.venv([\\/].*)?$''',
+  '''(^|[\\/])build([\\/].*)?$''',
+  '''(^|[\\/])\.gradle([\\/].*)?$''',
+  '''(^|[\\/])node_modules([\\/].*)?$''',
+]

@@ -95,13 +95,17 @@ def install(app) -> None:
 ### T2 · `events/subscribe`（0.5 天）
 
 ```json
-// 请求
-{"topics": ["session.turn"], "since_seq": 128, "redact": ["tool_args"]}
-// 响应
-{"accepted": ["session.turn"], "rejected": [{"topic": "session.closed", "reason": "not in manifest"}]}
+// 请求（since_seq 按会话维度）
+{"topics": ["session.turn"], "since_seq": {"sess-1": 128}, "redact": ["tool_args"]}
+// 响应（replayed = 本次补推的事件条数）
+{"accepted": ["session.turn"], "rejected": [{"topic": "session.closed", "reason": "not in manifest"}], "replayed": 2}
 ```
 
 - `since_seq` 可选：重连时从该 seq 之后补推（只对 `session.turn` 有效，`session.closed` 不补）。
+  **必须按会话给**：整数要配 `session_id`，多会话用 `{session_id: seq}` 映射；裸整数会被
+  `INVALID_ARGUMENT` 拒绝——seq 是每会话独立计数器，一个水位套所有会话会漏掉别的会话早期事件。
+- 响应带 `replayed`：本次订阅实际补推的条数（无 `since_seq` 时为 0），不是水位。
+- 补推只重放 `session.turn`；journal 里的 `session.closed` 不换 topic 补推。
 - 订阅表存内存：`{instance_id → {topics, since_seq, redact}}`，进程重启即失效（模块重连会重新订阅）。
 - 同一实例重复订阅 → 覆盖，不报错。
 
@@ -136,7 +140,7 @@ turn 完成 → 组装 {topic, session_id, seq_from, seq_to, payload}
 | name | `^[a-z][a-z0-9-]{1,31}$`；`create` 时 active 不得已存在 | `TOOL_CONFLICT` |
 | action=patch | 必须带 `base_revision`，且等于当前 revision | `TOOL_CONFLICT`（理由写实际 revision） |
 | 配额 | active + pending 合计 ≤ 64 | `OVERLOADED` |
-| 内容扫描 | 无 `sk-` 密钥、无 `BEGIN PRIVATE KEY` | `INVALID_ARGUMENT` |
+| 内容扫描 | 无 `sk-` 密钥、无 PEM 私钥头 | `INVALID_ARGUMENT` |
 | 路径 | 落盘路径 `realpath` 后仍在 `skills/pending/` 内 | `PERMISSION_DENIED` |
 
 落盘：`skills/pending/<name>/SKILL.md` + 同目录 `meta.json`（含 `derived_from`、`received_at`、`received_from`、`origin="proposal"`）。**必须是目录**，与安装路径共用同一布局（方案 §16.5）；单文件布局存不下资源，也无法整目录 `os.replace`。

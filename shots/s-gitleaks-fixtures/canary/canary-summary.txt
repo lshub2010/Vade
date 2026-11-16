@@ -1,0 +1,4 @@
+金丝雀反向自证（scratch 仓，扫后即删；报告均为 --redact 掩码版）
+dir 命中: 5 | git --log-opts=--all 命中: 5 | 两道同集: True
+根路径命中规则: aws-access-token @ canary-root.txt:1, github-pat @ canary-root.txt:2, generic-api-key @ canary-root.txt:3, curl-auth-header @ canary-root.txt:4, private-key @ canary-root.txt:5
+排除树（build/、.venv/）同款饵命中: 0（应为 0 —— 排除按路径生效、未扩大化）

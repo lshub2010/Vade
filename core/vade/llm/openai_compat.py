@@ -4,7 +4,10 @@ Rules (22-C3 §T5):
   * the key is read ONLY from the env var named in `[llm].api_key_env`;
     it is never written to config or logs;
   * retry only 429 / 5xx / connection errors, max 2, exponential + jitter;
-    4xx is never retried;
+    4xx is never retried. **Once a delta has been yielded the attempt is
+    committed**: a mid-stream failure is re-raised instead of retried, because
+    a retry replays text / tool-call fragments the caller already consumed and
+    bills the same prompt twice;
   * streamed `tool_calls[].function.arguments` fragments are concatenated by
     index — `parse_chunk` is pure and unit-tested without a network.
 """
@@ -17,7 +20,7 @@ import os
 import random
 from typing import Any, AsyncIterator, Mapping, Sequence
 
-from .base import Delta, ToolCallDelta
+from .base import Delta, ToolCallDelta, flatten_usage
 
 __all__ = ["OpenAICompatProvider", "parse_chunk", "RETRIABLE_STATUS"]
 
@@ -28,9 +31,7 @@ def parse_chunk(chunk: Mapping[str, Any]) -> Delta:
     """Translate one SSE JSON object into a Delta (pure)."""
     choices = chunk.get("choices") or []
     usage = chunk.get("usage")
-    usage_map = None
-    if isinstance(usage, Mapping):
-        usage_map = {k: v for k, v in usage.items() if isinstance(v, int)}
+    usage_map = flatten_usage(usage) if isinstance(usage, Mapping) else None
     if not choices:
         return Delta(usage=usage_map)
     choice = choices[0] or {}
@@ -82,13 +83,24 @@ class OpenAICompatProvider:
         *,
         tools: Sequence[Mapping[str, Any]] | None = None,
         stream: bool = True,
+        model: str | None = None,
+        attribution: dict[str, Any] | None = None,
     ) -> AsyncIterator[Delta]:
         import httpx  # local import: the core must start without httpx
 
-        body: dict[str, Any] = {"model": self.model, "messages": list(messages), "stream": stream}
+        # RFC-0005: a turn may be pinned to `builtin/<name>`; strip the provider
+        # prefix before it reaches the wire. `attribution` stays empty: a
+        # builtin call has no module, which is exactly what `llm.call` records.
+        requested = model.split("/", 1)[1] if model and model.startswith("builtin/") else model
+        body: dict[str, Any] = {"model": requested or self.model, "messages": list(messages), "stream": stream}
         if tools:
             body["tools"] = list(tools)
         last_error: Exception | None = None
+        #: Set on the first yielded delta. From that point a retry would send
+        #: the prompt a second time and replay fragments the caller already
+        #: accumulated (observed as `HELLOHELLOHELLO` and triple billing), so a
+        #: later failure is final; the recovery path is a new turn, not a loop.
+        committed = False
         for attempt in range(self.max_retries + 1):
             try:
                 async with httpx.AsyncClient(timeout=self.timeout_s, transport=self._transport) as client:
@@ -107,10 +119,14 @@ class OpenAICompatProvider:
                                 data = line[5:].strip()
                                 if not data or data == "[DONE]":
                                     continue
-                                yield parse_chunk(json.loads(data))
+                                delta = parse_chunk(json.loads(data))
+                                committed = True
+                                yield delta
                             return
             except (httpx.ConnectError, httpx.ReadTimeout, ConnectionError) as exc:
                 last_error = exc
+                if committed:
+                    raise
                 if attempt >= self.max_retries:
                     raise
             if attempt < self.max_retries:

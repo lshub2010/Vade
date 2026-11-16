@@ -1,0 +1,43 @@
+# 现在到哪一步了（WHERE-ARE-WE）
+
+> 可直接贴给人的口径页。基线：`tmp/w-ledger` @ `320384a`，2026-11-14。
+> 纪律：每一行带证据来源；核不出的写「未核实」；**不以「代码里存在 X」推断「X 生效」，不以计划充当现状**。
+> 完整对应关系见 `docs/rfc/LEDGER.md`（每条 RFC 一行，`tools/check_ledger.py` 可重跑自检）。
+
+## 已完成（本仓可核实）
+
+- 契约：C-05 `rpc.json` **1.5.0**，方法 **48**（ui_to_core 35 / core_to_module 7 / module_to_core 6）；C-06 `events.json` **2.0.0**，事件 **34**；C-04 **34** 错误码；append 登记 **10+8+3=21** 块（另有 `x-vade.rfc0015_pending` **1** 块，**不是** append；出处：三份 schema 文件重算，`tools/check_ledger.py` 比对通过）。
+- 服务端测试：**1089 passed**（`pytest core/tests -q`；本 worktree 复跑 `1089 passed`，基线见 `docs/rfc/LEDGER.md` §1）。
+- 契约门禁：`tools/check_contracts.py` → exit 0（`contracts: OK … RFC-0014 session search green …`）。
+- docs 门禁：`docs/check_docs.py` → exit 0（12 项，失败 0 项）。
+- RFC-0001～0009：已批准（frontmatter `approved`）且已实现合并（`docs/status.md` 各「已合并」行 + 契约 appends 登记在案 + 实现文件在仓）。
+- RFC-0010 / 0012 / 0013 / 0014：core 侧已实现（各自 `core/vade/*/RESULT-rfc*.md` + C-05 1.3.0/1.4.0/1.5.0 与 C-06 登记块）。
+- RFC-0015（`ui/modules` 模块清单通道）：**core 已实现，契约登记仍 pending**——`ModulePageService.list_modules()`（`core/vade/modulepage/service.py`）+ `ui/modules` handler（`core/vade/modulepage/rpc.py`，经 `app.session_handlers` 分发），32 条新测试含真 WS 端到端；C-05 顶部仍 **1.5.0**（升 1.6.0 实测仍红 `check_contracts` 三处版本钉，本棒不许改门禁），登记块留在 `x-vade.rfc0015_pending`，故 LEDGER 行 `impl_state=未实施` 是**契约登记口径**，不是「没写 core」；**客户端未接线 → A3（模块页入口）仍缺数据源**（§8 三处未做）。
+- RFC-0004 数据面 `/ui/blob` 六路由 + content parts 定型（`core/vade/blob/http.py`、`core/vade/session/parts.py`；RESULT-parts.md 539 passed）。
+
+## 在飞 / 有保留的「完成」
+
+- **「已实现但未批准」**：RFC-0010/0012/0013/0014 frontmatter `status: proposed` —— 代码与契约已落地，批准流程未走（出处：各 RFC frontmatter；`docs/rfc/README.md`）。
+- **文档债**：RFC-0003～0009 frontmatter `stage` 仍写「草稿，未实现」，与 status.md「已合并」矛盾——字段过时未回填（本仓不许改 RFC 正文，只能记录）。
+- **RFC-0011（InputBar 拆分）**：README 记客户端仓 vade-client `d667442` 已实现——**本仓无证据，未核实**。
+- 客户端三端（U1/U2/U3）：`ui/` 已迁出为独立仓 **`vade-client`**（本仓不可达，故本页原先只能写「status.md 均未开工」——**那个口径已过期**）。该仓 `main` @ `31f8f9a` 的真实数字：**368 tests / 0 failures**、三目标绿（`desktopTest` + `assembleDebug` + `compileKotlinWasmJs`）、APK 21,878,888 B、Wasm 链接产物 13,681,513 B、MSI 93,312,713 B。**但 UI 数据仍是 fixtures**（`App()` 默认 `FakeSessionSource()`），真连接/真聊天/模块页/ask_user 卡片均未接线——「零件齐 ≠ 能用」，口径见该仓 `docs/QUICKSTART.md` 状态表。
+- `ask_user` 内置工具（RFC-0008 §14）：已注册（`core/vade/loop/builtins.py`；RESULT-askuser-tool.md 944 passed）。
+
+## 未开始 / 未达成
+
+- RFC-0002（`turn.completed.skills`）：**未实施**（正文状态「草案」，无契约登记、无实现落点）。
+- 里程碑 G1～G5：全部「未达成」；G4（iOS）用户已裁定暂缓（出处：status.md 里程碑表与主表 U4 行）。
+- status.md 主表 23 批次中 C0a/C0b/C1/C2/C3/C3b/C3d/C4/C5a/C5b/M1–M6/U1–U3/F1 均「未开工」（出处：status.md 主表）。
+
+## 口径陷阱（已说错过的两件事 + 本次新发现）
+
+- 「代码里有 GlassSurface」≠「glass 皮肤生效」；「字符图标存在」≠「已清零」——一切以 LEDGER + 测试输出为准。
+- 「35 方法」是 ui_to_core 一个方向的数；三方向合计 **48**（说全表 35 就是错的）。其中 `ui/modules` 是**提案声明**：在 `directions` 里、不在 `appends` 里、core 未实现——「schema 里有」≠「core 在服务」。
+- 「events.json 10 条 appends」错：events.json 是 **8** 块；10 是 rpc.json 的块数。
+- RFC-0007 的 4 个 `task.*` 事件在 events.json **无 append 登记块**（rpc.json 侧有）——纪律缺口，详见 `docs/rfc/LEDGER-RESULT.md`。
+
+## 未核实清单
+
+- RFC-0011 的客户端实现与测试（vade-client 仓，本仓不可达）。
+- status.md rfc0007 行 607 passed vs RESULT-rfc0007.md 601 passed 的 6 条差异来源。
+- Android/Wasm/浏览器端运行时行为（本仓无对应测试证据）。

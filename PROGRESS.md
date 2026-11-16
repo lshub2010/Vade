@@ -40,9 +40,10 @@ modules/      只有 README 索引（模块独立仓）
 | W4 | C3d | 事件推送 + C-13/C-14 + `manifest.subscriptions`（RFC-0001）；**328 tests** | PR #8 |
 | W4 | C5a | 审批/审计/admin 后端 + C-08/C-17；**308 tests**（Argon2 拖慢） | PR #9 |
 | — | — | 模块迁出主仓（独立仓约定） | PR #7 |
+| — | rfc-wave-1014 | 2026-11-14 服务端 RFC 收口：RFC-0010 会话元数据（`session/*` 十方法，C-05 1.3.0）/ RFC-0012 子代理事件族（三事件 + 两方法，C-05 **1.4.0**）/ RFC-0013 中断留痕落库（partial 进 snapshot，**FR-8.35 可标通过**）/ RFC-0003 注入分层实现（三配置键 + C-06 两事件）/ `ask_user` 注册为 engine 内置工具（§8.14）；全量 `pytest core/tests -q` → **1041 passed**、contracts OK、docs 12/12 | `bf2080b`（链：`e200772` → `18dea95` → `4be7424` → `c8516d9` → `daa9323` → `bf2080b`） |
 | — | win-fix | 2026-11-13 换机 Windows 11 x86_64：uv 建 Python 3.12 venv、重编协议原生库 `protocol/core/python/vade_protocol.dll`、两条 POSIX 权限位断言加 `os.name != "nt"` 守卫（Linux 上仍校验）；全量 `pytest core/tests -q` → **378 passed**；环境见 `docs/dev-windows.md` | `35c4dde`（merge，含 98617b8 / ccf79f0；R1/R2 pass，报告：`../Vade-REVIEW-win-fix.md`） |
 
-当前全量：`pytest core/tests -q` → **378 passed**（Windows 11 开发机，2026-11-13 基线）。
+当前全量：`pytest core/tests -q` → **1041 passed**（Windows 11 开发机，2026-11-14 基线）。
 
 ## 三、未完成
 
@@ -95,7 +96,7 @@ Windows 11（当前开发机）：
 source D:/Hermes/tools/env/vade-env.sh
 
 # venv 由 uv 建，Python 3.12
-D:/HermesWorkspace/Vade/Vade/.venv/Scripts/python.exe -m pytest core/tests -q   # 378 passed
+D:/HermesWorkspace/Vade/Vade/.venv/Scripts/python.exe -m pytest core/tests -q   # 1041 passed
 D:/HermesWorkspace/Vade/Vade/.venv/Scripts/python.exe tools/check_contracts.py  # contracts: OK
 D:/HermesWorkspace/Vade/Vade/.venv/Scripts/python.exe docs/check_docs.py        # 12 项全 PASS
 

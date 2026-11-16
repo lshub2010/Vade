@@ -26,9 +26,12 @@ class MockLLMProvider:
         *,
         tools: Sequence[Mapping[str, Any]] | None = None,
         stream: bool = True,
+        model: str | None = None,
+        attribution: dict[str, Any] | None = None,
     ) -> AsyncIterator[Delta]:
         self.calls.append({"messages": [dict(m) for m in messages],
-                           "tools": list(tools or []), "stream": stream})
+                           "tools": list(tools or []), "stream": stream,
+                           "model": model})
         if self._index >= len(self.script):
             yield Delta(text="", finish_reason="stop")
             return

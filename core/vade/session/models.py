@@ -17,8 +17,9 @@ from typing import Any, Mapping
 from .parts import parts_text
 
 __all__ = [
-    "Message", "Role", "TurnState", "Turn", "Session", "QueueItem", "Event",
-    "TERMINAL_STATES", "new_id", "now_ms",
+    "Message", "Role", "TurnState", "Turn", "Session", "SessionGroup", "QueueItem", "Event",
+    "TERMINAL_STATES", "new_id", "now_ms", "message_ref",
+    "SubagentState", "SUBAGENT_TERMINAL_STATES", "SubagentRun", "new_run_id",
 ]
 
 
@@ -28,12 +29,16 @@ Role = str  # "system" | "user" | "assistant" | "tool"
 class TurnState(str, Enum):
     """Queue state machine (design §5, 22-C3 T2).
 
-    `waiting_approval` only blocks the head of the queue; later messages keep
-    queueing. Terminal states are never left again.
+    `waiting_approval` and `waiting_input` only block the head of the queue;
+    later messages keep queueing. They are mutually exclusive: one turn has at
+    most one blocking wait (RFC-0008 S1/S2). Terminal states are never left again.
     """
 
     QUEUED = "queued"
     WAITING_APPROVAL = "waiting_approval"
+    #: RFC-0008 §6.3. Appended right after `waiting_approval` so the schema arrays
+    #: and this enum stay in the same order (C-06 2.0.0 widened the enum).
+    WAITING_INPUT = "waiting_input"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -46,12 +51,56 @@ TERMINAL_STATES = frozenset(
 )
 
 
+class SubagentState(str, Enum):
+    """RFC-0012 §4.3: the five-value `subagent_states` (C-06 top-level key).
+
+    `spawned` (registered, loop not started) and `running` (loop in flight)
+    are deliberately separate: a parent turn can end while a run sits in
+    either, but "never started" and "halfway through" are different things to
+    observe. Terminal states are never left again.
+    """
+
+    SPAWNED = "spawned"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+#: RFC-0012 §7.2: terminal three. Declared after the enum so
+#: `tools/check_contracts.py` can assert schema == code on both sets.
+SUBAGENT_TERMINAL_STATES = frozenset(
+    {SubagentState.COMPLETED, SubagentState.FAILED, SubagentState.CANCELLED}
+)
+
+
+def new_run_id() -> str:
+    """RFC-0012 §7.1: `run_` + 32 lowercase hex.
+
+    The `run_` prefix is load-bearing: it lets `subagent/get` separate a
+    malformed id (`INVALID_ARGUMENT`) from a well-formed unknown one
+    (`NOT_FOUND`) without guessing at hex-ness.
+    """
+    return f"run_{uuid.uuid4().hex}"
+
+
 def new_id() -> str:
     return uuid.uuid4().hex
 
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def message_ref(message: Message) -> str:
+    """`msg:<hex>` pointer to a persisted message (RFC-0006 §4.3/§5.1).
+
+    One convention for every pointer the core emits (`result_ref`,
+    `partial_message_id`): the message row keeps its bare `uuid4().hex` id, the
+    pointer carries the `msg:` scheme so a client can tell a pointer from an
+    opaque id. `split(":", 1)[1]` is the snapshot key.
+    """
+    return f"msg:{message.id}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +130,12 @@ class Message:
     tool_call_id: str | None = None
     tool_calls: tuple[dict[str, Any], ...] = ()
     created_at: int = field(default_factory=now_ms)
+    #: RFC-0006 §4: an assistant message written by `interrupt`, holding the
+    #: text that had already been streamed. Never re-emitted as a delta.
+    partial: bool = False
+    #: RFC-0006 §6.3: the message that replaced this one (edit_resubmit). The
+    #: row itself is immutable — only this pointer is ever written.
+    superseded_by: str | None = None
     parts: tuple[dict[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
@@ -154,6 +209,8 @@ class Message:
             "name": self.name,
             "tool_call_id": self.tool_call_id,
             "created_at": self.created_at,
+            "partial": self.partial,
+            "superseded_by": self.superseded_by,
             "parts": self.wire_parts(),
         }
 
@@ -172,9 +229,33 @@ class Turn:
     error_message: str | None = None
     usage: Mapping[str, Any] = field(default_factory=dict)
     tool_calls: tuple[dict[str, Any], ...] = ()
+    #: RFC-0005 §5.3: the model resolved at dequeue, pinned on the turn so a
+    #: later switch cannot rewrite which model produced this usage. Internal
+    #: column, not a C-06 field.
+    model_id: str | None = None
+    # --- RFC-0006 §6.1: linear version chain (all optional, old rows read as
+    # defaults; `root_turn_id`/`version` coalesce to id/1 on read).
+    root_turn_id: str | None = None
+    parent_turn_id: str | None = None
+    version: int = 1
+    superseded_by: str | None = None
+    superseded_reason: str | None = None
+    user_message_id: str | None = None
+    #: RFC-0006 §4: the `partial=true` assistant message written on interrupt.
+    partial_message_id: str | None = None
+    #: RFC-0006 §6.2: content part types (`image`, `file`, …) this turn was
+    #: queued with, other than `text`. Only `text` is persisted as a message,
+    #: so `regenerate` cannot rebuild the rest yet and must refuse instead of
+    #: silently dropping an attachment. Empty for a text-only turn.
+    user_parts: tuple[str, ...] = ()
 
     def with_state(self, state: TurnState, **changes: Any) -> "Turn":
         return replace(self, state=state, **changes)
+
+    @property
+    def root_id(self) -> str:
+        """Coalesced root: a turn created before RFC-0006 is its own root."""
+        return self.root_turn_id or self.id
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -190,6 +271,15 @@ class Turn:
             "error_message": self.error_message,
             "usage": dict(self.usage),
             "tool_calls": list(self.tool_calls),
+            "model_id": self.model_id,
+            "root_turn_id": self.root_id,
+            "parent_turn_id": self.parent_turn_id,
+            "version": self.version or 1,
+            "superseded_by": self.superseded_by,
+            "superseded_reason": self.superseded_reason,
+            "user_message_id": self.user_message_id,
+            "partial_message_id": self.partial_message_id,
+            "user_parts": list(self.user_parts),
         }
 
 
@@ -202,9 +292,73 @@ class Session:
     state: str = "open"
     messages: tuple[Message, ...] = ()
     turns: tuple[Turn, ...] = ()
+    #: RFC-0005 §5.3: explicit per-session model override; `None` = no
+    #: override (fall through to `[llm].default_model`, then `priority`).
+    model_id: str | None = None
+    # --- RFC-0010 §4.2: user-facing metadata (server-side truth, synced to
+    # every device through `session/list` + `session.updated`). All optional;
+    # rows written before the columns existed read the documented defaults.
+    group_id: str | None = None
+    icon: str | None = None
+    color: str | None = None
+    pinned_at: int | None = None
+    archived_at: int | None = None
+    unread: int = 0
+    #: Last ACTIVITY time (a message/turn row was persisted), not a metadata
+    #: timestamp: renaming must not float a session to the top of "today".
+    #: 0 = unknown (the store coalesces to `created_at` on write and read).
+    updated_at: int = 0
 
     def message_tree(self) -> list[dict[str, Any]]:
         return [m.to_dict() for m in self.messages]
+
+    def to_wire(self) -> dict[str, Any]:
+        """RFC-0010 §4.3/§5: the `session/list` row shape (C-05 1.3.0).
+
+        Deliberately light — no messages, no turns: the list page scrolls and
+        content belongs to `ui/attach`. `updated_at` coalesces to `created_at`
+        for rows that never saw activity.
+        """
+        return {
+            "session_id": self.id,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at or self.created_at,
+            "title": self.title,
+            "icon": self.icon,
+            "color": self.color,
+            "group_id": self.group_id,
+            "pinned_at": self.pinned_at,
+            "archived_at": self.archived_at,
+            "unread": self.unread,
+            "state": self.state,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SessionGroup:
+    """RFC-0010 §4.1: one folder in the session list (one level, no nesting).
+
+    A session belongs to AT MOST one group (`sessions.group_id`), so ordering
+    has a single key and "move to group" is one column write — the folder
+    decision (§1 #1/#2), not a tagging scheme.
+    """
+
+    group_id: str
+    name: str
+    icon: str | None = None
+    color: str | None = None
+    sort_order: int = 0
+    created_at: int = field(default_factory=now_ms)
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "group_id": self.group_id,
+            "name": self.name,
+            "icon": self.icon,
+            "color": self.color,
+            "sort_order": self.sort_order,
+            "created_at": self.created_at,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,18 +384,96 @@ class QueueItem:
 
 @dataclass(frozen=True, slots=True)
 class Event:
-    """One entry of the per-session stream. `seq` is allocated by the core."""
+    """One entry of the per-session stream. `seq` is allocated by the core.
+
+    `coalesce` marks a droppable, self-contained update (RFC-0007 §5.5 R5):
+    `task.progress` is an absolute value, not a delta, so replay coverage may
+    ignore it and a client must not read a gap made only of such events as a
+    hole. It travels on the wire as `x-vade.coalesce` and is still written to
+    the `events` table — this is a coverage question, not a retention one.
+    """
 
     session_id: str
     seq: int
     type: str
     payload: Mapping[str, Any] = field(default_factory=dict)
     ts: int = field(default_factory=now_ms)
+    coalesce: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {"session_id": self.session_id, "seq": self.seq, "type": self.type,
-                "payload": dict(self.payload), "ts": self.ts}
+                "payload": dict(self.payload), "ts": self.ts, "coalesce": self.coalesce}
 
     def to_wire(self) -> dict[str, Any]:
         """Event frame shape: `{type, seq, payload}` (session known per conn)."""
-        return {"type": self.type, "seq": self.seq, "payload": dict(self.payload)}
+        frame: dict[str, Any] = {
+            "type": self.type, "seq": self.seq, "payload": dict(self.payload),
+        }
+        if self.coalesce:
+            frame["x-vade"] = {"coalesce": True}
+        return frame
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentRun:
+    """One subagent run record (RFC-0012 §4.2). Frozen: the manager swaps records.
+
+    The run is the LLM-loop sibling of `Task` (RFC-0007): it has a
+    `child_session_id` whose session runs its own turns, and its lifecycle
+    lives in `subagent_runs` + the `subagent.*` event family, never in
+    `task.*` (RFC-0012 §8). `result_digest` is the sha-256 fingerprint of the
+    full result text — the text itself lives only in the child session's
+    message stream; `result_chars` lets a client size it without reading it.
+    """
+
+    run_id: str
+    parent_session_id: str
+    label: str
+    parent_turn_id: str | None = None
+    child_session_id: str | None = None
+    state: SubagentState = SubagentState.SPAWNED
+    created_at: int = field(default_factory=now_ms)
+    finished_at: int | None = None
+    result_digest: str | None = None
+    result_chars: int | None = None
+    error_code: str | None = None
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state in SUBAGENT_TERMINAL_STATES
+
+    def duration_ms(self, now: int | None = None) -> int:
+        end = self.finished_at if self.finished_at is not None else (
+            now if now is not None else now_ms()
+        )
+        return max(0, int(end) - int(self.created_at))
+
+    def with_changes(self, **changes: Any) -> "SubagentRun":
+        return replace(self, **changes)
+
+    def to_view(self, *, now: int | None = None, result_preview: str | None = None) -> dict[str, Any]:
+        """RFC-0012 §6.1/§6.2 `SubagentRunView`. Never carries the result text:
+        `result_digest` is the fingerprint, `result_preview` a <=500-char
+        read-time projection the manager derives (absent here = null)."""
+        view: dict[str, Any] = {
+            "run_id": self.run_id,
+            "parent_session_id": self.parent_session_id,
+            "parent_turn_id": self.parent_turn_id,
+            "child_session_id": self.child_session_id,
+            "label": self.label,
+            "state": self.state.value,
+            "created_at": self.created_at,
+            "finished_at": self.finished_at,
+            "result_digest": self.result_digest,
+            "result_chars": self.result_chars,
+            "error_code": self.error_code,
+            "result_preview": result_preview,
+        }
+        if self.is_terminal:
+            view["duration_ms"] = self.duration_ms(now)
+        else:
+            view["duration_ms"] = self.elapsed_ms(now)
+        return view
+
+    def elapsed_ms(self, now: int | None = None) -> int:
+        return self.duration_ms(now)

@@ -19,7 +19,10 @@ import json
 import re
 from typing import Any, Mapping
 
-__all__ = ["SENSITIVE_KEY", "digest_args", "redact_args", "summarize_args", "MAX_STR"]
+__all__ = [
+    "SENSITIVE_KEY", "SAFE_METRIC_KEYS", "digest_args", "redact_args",
+    "summarize_args", "MAX_STR",
+]
 
 #: Field names whose *values* never reach an audit row. Over-redaction is the
 #: intended failure mode: `api_key_hint` is redacted too, and that is fine.
@@ -28,6 +31,16 @@ SENSITIVE_KEY = re.compile(
     r"api[_-]?key|access[_-]?key|auth|session[_-]?id|cookie)",
     re.IGNORECASE,
 )
+
+#: `SENSITIVE_KEY` deliberately matches any name *containing* "token", which
+#: also catches the numeric token COUNTS every `llm.call` row carries. Those
+#: counts drive the usage budget (`admin/app.py` `config_usage`), so redacting
+#: them would silently report 0 tokens used. Credentials are strings; counts
+#: are the only names allowed through the regex.
+SAFE_METRIC_KEYS = frozenset({
+    "tokens", "total_tokens", "token_count", "tokens_used", "token_usage",
+    "prompt_tokens", "completion_tokens", "cached_tokens",
+})
 
 MAX_STR = 200
 MAX_ITEMS = 32
@@ -75,7 +88,10 @@ def _redact_value(value: Any, depth: int = 0) -> Any:
                 out["..."] = f"{len(value) - MAX_ITEMS} more"
                 break
             name = str(key)
-            out[name] = REDACTED if SENSITIVE_KEY.search(name) else _redact_value(item, depth + 1)
+            if name in SAFE_METRIC_KEYS:
+                out[name] = _redact_value(item, depth + 1)
+            else:
+                out[name] = REDACTED if SENSITIVE_KEY.search(name) else _redact_value(item, depth + 1)
         return out
     if isinstance(value, (list, tuple)):
         items = [_redact_value(item, depth + 1) for item in list(value)[:MAX_ITEMS]]

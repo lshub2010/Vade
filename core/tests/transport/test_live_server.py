@@ -69,6 +69,7 @@ def live_core(tmp_path):
         identity=app.identity,
         registry=app.registry,
         pairing=app.pairing,
+        whitelist=app.whitelist,
         make_crypto=build_module_crypto(app),
         on_rpc=make_rpc_handler(app),
     )
@@ -240,6 +241,42 @@ def test_browser_session_ws_and_revoke_closes_only_that_device(live_core):
     finally:
         first.close()
         second.close()
+
+
+def test_a_real_cookie_socket_carries_the_device_identity(live_core):
+    """`POST /ui/session` → `/ws`: the live connection knows which device it is.
+
+    RFC-0004 §6.4 compares `file_id` ownership against `connection.device_id`;
+    the server used to build `Connection` without one, so the value never
+    existed on a real socket even though the RPC layer read it.
+    """
+    from websockets.sync.client import connect
+
+    app, http_url, ws_url, _tmp = live_core
+    code = app.pairing.create(Purpose.BROWSER)
+    response = httpx.post(f"{http_url}/ui/session", json={"pair_code": code}, timeout=5)
+    assert response.status_code == 200, response.text
+    device_id = response.json()["device_id"]
+    token = response.headers["set-cookie"].split("__Host-ac_ui=", 1)[1].split(";", 1)[0]
+
+    core_app = app._test_core_app  # type: ignore[attr-defined]
+    ws = connect(ws_url, additional_headers={"Cookie": f"__Host-ac_ui={token}"}, open_timeout=5)
+    try:
+        deadline = time.time() + 5
+        connection = None
+        while time.time() < deadline:
+            connection = next(
+                (c for c in core_app._connections.values()
+                 if getattr(c, "ui_token", None) == token),
+                None,
+            )
+            if connection is not None:
+                break
+            time.sleep(0.02)
+        assert connection is not None, "the browser socket must be registered"
+        assert connection.device_id == device_id
+    finally:
+        ws.close()
 
 
 def _recv_until(ws, msg_id, timeout: float = 8.0):

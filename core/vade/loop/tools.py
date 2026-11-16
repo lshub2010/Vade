@@ -3,16 +3,30 @@
 The snapshot is taken once per turn. `capabilities.update` mid-turn does not
 change what the model sees, which is what makes `agent-loop` a pure consumer of
 `snapshot` entries (and testable by grepping for concrete tool names).
+
+RFC-0003 §4.3 adds the hot/cold split on top: `resolve_hot` merges the four
+hot layers (core built-ins, loaded skills' `requires_tools`, config, session
+sticky set) against the FROZEN snapshot only, `ToolSnapshot.select` projects
+the hot set, and `with_core` grafts core-native entries on without touching
+the name map (core tools are never router-routed).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from ..router.names import ToolNameMap
 
-__all__ = ["ToolEntry", "ToolSnapshot", "build_snapshot"]
+__all__ = ["ToolEntry", "ToolSnapshot", "build_snapshot", "resolve_hot", "normalize_tool_key", "HOT_MAX_DEFAULT"]
+
+HOT_MAX_DEFAULT = 12
+
+
+def normalize_tool_key(name: str) -> str:
+    """`mcp-bridge__s_kb_recall`, `mcp_bridge/s_kb_recall` and `MCP-BRIDGE__S_KB_RECALL`
+    compare equal — the same shape the skill loader uses for `requires_tools`."""
+    return str(name or "").strip().lower().replace("/", "__").replace(".", "_").replace("-", "_")
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,11 +79,75 @@ class ToolSnapshot:
             lines.append(f"- {entry.llm_name}: {entry.description} [risk={entry.risk}]")
         return "\n".join(lines)
 
+    def select(self, names: Iterable[str]) -> "ToolSnapshot":
+        """Project the hot set (RFC-0003 §4.3). Order is preserved (entries are
+        name-sorted), so the projected schemas() diff has one insertion point."""
+        wanted = set(names or ())
+        if not wanted:
+            return ToolSnapshot(entries=(), name_map=self.name_map)
+        return ToolSnapshot(
+            entries=tuple(e for e in self.entries if e.llm_name in wanted),
+            name_map=self.name_map,
+        )
+
+    def with_core(self, extra: Sequence[ToolEntry]) -> "ToolSnapshot":
+        """Graft core-native entries (RFC-0003 §4.2.4). A name the snapshot
+        already carries is never shadowed; the merged table stays name-sorted.
+        """
+        add = tuple(e for e in (extra or ()) if self.get(e.llm_name) is None)
+        if not add:
+            return self
+        return ToolSnapshot(
+            entries=tuple(sorted(self.entries + add, key=lambda e: e.llm_name)),
+            name_map=self.name_map,
+        )
+
     def __len__(self) -> int:
         return len(self.entries)
 
     def __bool__(self) -> bool:
         return bool(self.entries)
+
+
+def resolve_hot(
+    *,
+    snapshot: ToolSnapshot,
+    core_names: Sequence[str] = (),
+    config_hot: Sequence[str] = (),
+    session_known: Sequence[str] = (),
+    skill_requires: Sequence[str] = (),
+    hot_max: int = HOT_MAX_DEFAULT,
+) -> tuple[tuple[str, ...], int]:
+    """RFC-0003 §4.3.1: merge the four hot layers against the frozen snapshot.
+
+    Priority (core > loaded-skill requires > config > session sticky) is ONLY a
+    truncation order; the returned names are sorted by `llm_name` so the tools
+    array diff has a single predictable insertion point. Everything is matched
+    through `normalize_tool_key`, so `requires_tools` may use either the LLM
+    name or the protocol `tool_id` form. Returns `(hot_names, dropped_count)`.
+    """
+    index: dict[str, ToolEntry] = {}
+    for entry in snapshot.entries:
+        keys = {normalize_tool_key(entry.llm_name), normalize_tool_key(entry.tool_id),
+                str(entry.llm_name).lower()}
+        for key in keys:
+            index.setdefault(key, entry)
+    layers = ((0, core_names), (1, skill_requires), (2, config_hot), (3, session_known))
+    ranked: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for rank, names in layers:
+        for name in names or ():
+            entry = index.get(normalize_tool_key(str(name)))
+            if entry is not None and entry.llm_name not in seen:
+                seen.add(entry.llm_name)
+                ranked.append((rank, entry.llm_name))
+    cap = max(1, int(hot_max))
+    kept = sorted(ranked)[:cap]
+    # The trailer's N counts every tool the snapshot holds that the model does
+    # NOT see: not just cap-truncation, but any tool no hot layer named. Those
+    # are exactly the tools `tools_search` can still surface (§4.3.1 trailer,
+    # §4.3.2 "只搜本轮快照").
+    return tuple(sorted(name for _, name in kept)), max(0, len(snapshot.entries) - len(kept))
 
 
 def build_snapshot(registry: Any) -> ToolSnapshot:

@@ -164,7 +164,17 @@ class AuditWriter:
     # ----------------------------------------------------------------- internal
     def _normalise(self, event: Mapping[str, Any]) -> dict[str, Any]:
         ts = float(event.get("ts") or self._clock())
-        extra = dict(event.get("extra") or {})
+        # `extra` is the free-form escape hatch, so it is also the easiest
+        # place to leak a credential (review P1-1: a setup/bearer token in
+        # `extra` was persisted verbatim and readable by read-only sessions).
+        # `redact_args` recurses, so nested dicts and bare keys both match.
+        raw_extra = event.get("extra")
+        if isinstance(raw_extra, Mapping):
+            extra = dict(redact_args(raw_extra))
+        elif raw_extra is None:
+            extra = {}
+        else:
+            extra = {"value": redact_args({"value": raw_extra})["value"]}
         row: dict[str, Any] = {
             "ts": ts,
             "kind": str(event.get("kind") or "unknown")[:64],
@@ -183,13 +193,16 @@ class AuditWriter:
             "args_redacted": None,
             "extra": extra,
         }
-        # Anything the caller did not put in a known column lands in `extra`,
-        # minus the credential-bearing keys (never persist those).
-        for key, value in event.items():
-            if key in COLUMNS or key in ("args",) or value is None:
-                continue
-            if key not in row["extra"]:
-                row["extra"][key] = value
+        # Anything the caller did not put in a known column lands in `extra`.
+        # Redact the batch as a whole so a bare top-level `token=...` keyword is
+        # caught exactly like one nested inside `extra`.
+        stray = {
+            str(key): value for key, value in event.items()
+            if key not in COLUMNS and key != "args" and value is not None
+            and str(key) not in row["extra"]
+        }
+        for key, value in redact_args(stray).items():
+            row["extra"].setdefault(key, value)
         args = event.get("args")
         if args is not None:
             row["args_redacted"] = redact_args(args) if isinstance(args, Mapping) else {"value": str(args)[:200]}

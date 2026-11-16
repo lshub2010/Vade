@@ -178,7 +178,13 @@ class BlobService:
         read_only: bool = False,
         max_bytes: int | None = None,
     ) -> dict[str, Any]:
-        """Mint a device bearer token. `ui/blob.token` (next slice) calls this."""
+        """Mint a device bearer token; `ui/blob.token` (`blob/rpc.py`) calls this.
+
+        The clamp below is an INTERNAL fallback for direct callers only: the
+        RPC surface validates `ttl_s` strictly first (RFC-0016 §5.2-6 — bool /
+        float / str / out-of-range are INVALID_ARGUMENT there) so a credential
+        lifetime is never silently corrected on the wire.
+        """
         if not device_id:
             raise VadeError("INVALID_ARGUMENT", "device_id is required", data={"field": "device_id"})
         ttl = max(TOKEN_TTL_MIN, min(int(ttl_s), TOKEN_TTL_MAX))
@@ -195,6 +201,10 @@ class BlobService:
                 max_bytes=max_bytes if max_bytes is not None else self.settings.max_bytes,
             ),
         )
+        # RFC-0016 §5.8-21: one audit row per successful mint — kind/status/
+        # device_id/expires_at only. The token itself and any prefix of its
+        # sha256 NEVER enter the audit (A10 greps the audit for the literal).
+        self._record("blob.token", device_id=device_id, expires_at=_ms(expires_at))
         return {
             "token": token,
             "expires_at": _ms(expires_at),
@@ -807,8 +817,26 @@ class BlobService:
             raise VadeError("NOT_FOUND", "file was removed by the scanner", data={"field": "file_id"})
         if not blob.pinned and blob.expires_at is not None and blob.expires_at <= self.now():
             raise VadeError("NOT_FOUND", "file expired", data={"field": "file_id"})
-        if self.settings.read_scope == "device" and blob.device_id != principal.device_id:
-            raise VadeError("PERMISSION_DENIED", "file belongs to another device", data={"field": "file_id"})
+        # RFC-0016 §11.1 Q7 (拍板 2026-11-15): a device bearer may only read
+        # blobs its own device uploaded. Deliberately INDEPENDENT of
+        # `read_scope`: `read_scope="device"` is the operator switch
+        # (RFC-0004 §8.5, default "core"), while `kind=="device"` is the token
+        # rule — tightening it only under the operator switch would silently
+        # reopen the cross-device read the 拍板 closed. Known cost (written
+        # down in §11.1, do not "fix" it here): a phone-uploaded image in a
+        # shared session will NOT render on a desktop that fetches it with its
+        # own token; if the product wants cross-device visibility, the correct
+        # fix is session-scoped authorization (a separate change), never a
+        # quiet widening here. Cookie principals keep the read_scope semantics
+        # (they are how history images render in the browser today).
+        # Fail-closed: the comparison below denies unless both sides agree.
+        if getattr(principal, "kind", None) == "device" or self.settings.read_scope == "device":
+            if blob.device_id != principal.device_id:
+                raise VadeError(
+                    "PERMISSION_DENIED",
+                    "file belongs to another device",
+                    data={"field": "file_id"},
+                )
         return blob
 
     def metadata(self, blob: BlobRecord) -> dict[str, Any]:

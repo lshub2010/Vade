@@ -25,11 +25,14 @@ from typing import Any, Mapping
 
 from .._jsonschema import SchemaError, validate as js_validate
 from ..errors import VadeError
+from ..llm.capabilities import MAX_MODELS, ModelSpec, parse_models
+from .uipage import UIPage, validate_ui
 
 __all__ = [
     "Manifest",
     "ManifestError",
     "ToolSpec",
+    "ModelSpec",
     "Limits",
     "load_schema",
     "validate_manifest",
@@ -37,6 +40,7 @@ __all__ = [
     "MAX_TOOLS_PER_MODULE",
     "MAX_TOOLS_GLOBAL",
     "MAX_FRAME_PLAINTEXT",
+    "UIPage",
 ]
 
 SCHEMA_PATH = Path(__file__).resolve().parents[3] / "schema" / "manifest.schema.json"
@@ -70,6 +74,30 @@ def load_schema(path: Path | str | None = None) -> dict[str, Any]:
     if path is None:
         _SCHEMA_CACHE = data
     return data
+
+
+def _schema_without_ui(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """`schema` with the `ui` subtree relaxed to `{}`.
+
+    RFC-0009 §7.1: a bad page is dropped with a warning, the module's tools
+    still register. Since the C-19 review, `manifest.schema.json` closes the
+    whole node tree (`$defs/node`, `$defs/uiProps`, `$defs/uiAction`), so a page
+    with `onClick` is now a schema violation — which, if it ran as step 1, would
+    turn one bad page into a failed registration. Core therefore validates
+    everything except `ui` against the file, then runs `validate_ui` per page,
+    where the same rules reject that page only.
+
+    The file keeps the closure: it is the contract a third-party consumer (SDK,
+    another language) validates against, and it is what `check_contracts.py`
+    asserts. Only core's ordering differs, and this is the one line that says so.
+    """
+    if "ui" not in (schema.get("properties") or {}):
+        return dict(schema)
+    copy = dict(schema)
+    properties = dict(copy.get("properties") or {})
+    properties["ui"] = {}
+    copy["properties"] = properties
+    return copy
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +138,21 @@ class Manifest:
     #: C-14 append (RFC-0001). Trailing default so every existing construction
     #: still type-checks and a manifest that predates the field keeps working.
     subscriptions: tuple[str, ...] = ()
+    #: RFC-0005 append: models this module serves (`capabilities.models[]`).
+    #: Empty = "declares nothing" -> core synthesises `<module_id>/*`, it is
+    #: NOT "serves no model".
+    models: tuple[ModelSpec, ...] = ()
+    #: C-19 append (RFC-0009 §4.2/§9.2). `()` means "this module has no pages" —
+    #: the entry rules (§8.2) turn that into "no entry at all", not an empty tab.
+    #: Pages that failed validation are absent, and `ui_warnings` says which.
+    ui_pages: tuple[UIPage, ...] = ()
+    ui_warnings: tuple[str, ...] = ()
+    #: C-03 top-level `display_name` (optional there, hence `None` here). RFC-0015
+    #: projects it into `ui/modules`; the schema has carried it since C-03 and
+    #: this dataclass used to drop it — the same "schema has it, `Manifest` loses
+    #: it" shape RFC-0009 §9.2 named. Trailing default keeps every existing
+    #: construction valid.
+    display_name: str | None = None
 
     @property
     def protocol_major(self) -> int:
@@ -133,8 +176,13 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
         raise ManifestError("", f"manifest must be an object, got {type(raw).__name__}")
 
     # 1. JSON Schema (structure, required fields, types, per-list caps).
+    #    The `ui` subtree is checked separately (step 6b) so that §7.1 holds:
+    #    one bad page must not kill the module's tools. `manifest.schema.json`
+    #    is strict there (closed node/props/action sets) and stays the file a
+    #    third-party consumer validates against; inside core the same rules run
+    #    per page in `validate_ui`, which drops the bad page instead of raising.
     try:
-        js_validate(raw, schema if schema is not None else load_schema())
+        js_validate(raw, _schema_without_ui(schema if schema is not None else load_schema()))
     except SchemaError as exc:
         raise ManifestError(exc.pointer, exc.message) from None
 
@@ -278,9 +326,43 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
                 f"unknown injection source {inject!r}; v1 implements only 'session_id'",
             )
 
+    # RFC-0005 append (C-03): `capabilities.models[]`. The count is a manifest
+    # error (a manifest must not become a second model directory), while a bad
+    # single entry is dropped with a warning — a typo cannot take a module
+    # offline, which is C-03's existing tolerance for unknown capabilities.
+    models_raw = raw["capabilities"].get("models")
+    if models_raw is not None:
+        if not isinstance(models_raw, list):
+            raise ManifestError(
+                "/capabilities/models",
+                f"must be an array, got {type(models_raw).__name__}",
+            )
+        if len(models_raw) > MAX_MODELS:
+            raise ManifestError(
+                "/capabilities/models",
+                f"{len(models_raw)} models declared; the limit is {MAX_MODELS}",
+            )
+    models = parse_models(models_raw)
+
+    # C-19 append (RFC-0009 §7.1): pages are validated per page. A bad page is
+    # dropped with a warning instead of failing the registration — one UI typo
+    # must not take the module's tools down with it. `validate_ui` never raises:
+    # it returns (accepted, warnings), which is why this cannot turn into a
+    # partial accept.
+    ui_pages, ui_warnings = validate_ui(
+        raw.get("ui"),
+        module_tools=tuple(spec.name for spec in tools),
+    )
+
     digest = hashlib.sha256(
         json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
+
+    # C-03 top-level `display_name` (optional, 1..64 chars when present). It used
+    # to be dropped here, so nothing downstream could project it; RFC-0015's
+    # `ui/modules` needs it verbatim, and the client uses it as the entry title
+    # ("no name -> no entry"), never as a fallback to `module_id`.
+    display_name_raw = raw.get("display_name")
 
     return Manifest(
         module_id=str(raw["module_id"]),
@@ -297,4 +379,8 @@ def validate_manifest(raw: Any, *, schema: Mapping[str, Any] | None = None) -> M
         injects=tuple(str(i) for i in injects_raw),
         digest=digest,
         subscriptions=tuple(subscriptions),
+        models=models,
+        ui_pages=ui_pages,
+        ui_warnings=ui_warnings,
+        display_name=str(display_name_raw) if display_name_raw is not None else None,
     )

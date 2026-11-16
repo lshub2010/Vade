@@ -8,7 +8,7 @@ proposer: 编排（依据 `docs/requirements.md` §8.21 FR-8.56～8.62、`resear
 affects: C-06 `schema/events.json`（追加 `task.*` 事件族与顶层 `task_states`，`turn.approval_required` / `turn.approval_resolved` 追加可选字段）、C-05 `schema/rpc.json`（`ui_to_core` 追加 4 方法、`events_core_to_ui.names` 追加）、C-18 `schema/config.schema.json`（新增 `[tasks]`）；`core/vade/session/replay.py` 的覆盖率判定（core 内部）
 related: RFC-0003（格式与章节风格来源；其 N3 明确「不做子代理（R4 另立提案）」）；RFC-0004（同批 UI 提案）；RFC-0008（ask-user；`task_states` 与其 `waiting_input` 互不依赖）
 type: 契约追加（C-06 / C-05 / C-18）+ 审批事件 payload 的可选字段追加；无破坏性改名、无枚举改写
-stage: 草稿，未实现；不新增 C-04 错误码，不改 `turn_states`，不碰 `schema/`
+stage: 已实现并合并
 ---
 
 # RFC-0007 · 子代理与后台任务

@@ -7,6 +7,8 @@ name literals (no `f`+`s__` style prefixes and no module ids).
 from __future__ import annotations
 
 import asyncio
+import json
+from dataclasses import replace
 from pathlib import Path
 
 from vade.loop.context import BlobStore, CompactionConfig, ContextBuilder
@@ -168,7 +170,8 @@ def test_no_modules_returns_readable_no_capability_message():
 
 def test_no_concrete_tool_names_in_loop_source():
     source = (Path(__file__).resolve().parents[3] / "core" / "vade" / "loop" / "engine.py").read_text()
-    for literal in ("fs__", "shell__", "com.example", "read_file"):
+    for literal in ("fs__", "shell__", "com.example", "read_file",
+                    "skill_load", "tools_search", "tools/search"):
         assert literal not in source, f"agent-loop must not know {literal!r}"
 
 
@@ -219,3 +222,110 @@ def test_context_pruning_uses_config_and_creates_blobs(tmp_path):
     assert out[-1].content == "keep me"
     assert any("blob_id=" in m.content for m in out if m.role == "tool") or not any(
         m.role == "tool" for m in out)
+
+# ------------------------------------------------------------------ RFC-0002
+
+
+def _skill_hook(names):
+    """A C3b-style prompt hook that fills PromptParts.activated_skills."""
+    async def hook(parts):
+        return replace(parts, activated_skills=tuple(names))
+    return hook
+
+
+def test_hook_activated_skills_reach_the_outcome():
+    """RFC-0002 SS2: a hook that fills `PromptParts.activated_skills` carries the
+    names through `TurnOutcome` -- names only; a body never exists there."""
+    async def scenario():
+        llm = MockLLMProvider([[Delta(text="done")]])
+        recorder = Recorder()
+        engine = LoopEngine(FakeRouter(), llm, FakeSnapshot, recorder,
+                            prompt_hooks=lambda: [_skill_hook(("kb-guide",))])
+        outcome = await engine.run_turn(_turn(), ())
+        assert outcome.activated_skills == ("kb-guide",)
+        assert all(isinstance(n, str) for n in outcome.activated_skills)
+    asyncio.run(scenario())
+
+
+def test_outcome_activated_skills_default_empty_without_hooks():
+    """RFC-0002 SS2: no hook activation means the outcome field is the tail
+    default `()`; existing constructions that never pass it keep working."""
+    async def scenario():
+        llm = MockLLMProvider([[Delta(text="done")]])
+        engine = LoopEngine(FakeRouter(), llm, FakeSnapshot, Recorder())
+        outcome = await engine.run_turn(_turn(), ())
+        assert outcome.activated_skills == ()
+        assert isinstance(outcome.activated_skills, tuple)
+    asyncio.run(scenario())
+
+
+def test_outcome_activated_skills_pass_through_verbatim():
+    """RFC-0002 SS2: run_turn records `parts.activated_skills` verbatim. The loop
+    never re-sorts, dedups or truncates -- sorted names are the loader's job
+    (core/vade/skill/loader.py is the normalization point)."""
+    names = ("kb-guide", "code-style", "alpha")
+
+    async def scenario():
+        llm = MockLLMProvider([[Delta(text="ok")]])
+        engine = LoopEngine(FakeRouter(), llm, FakeSnapshot, Recorder(),
+                            prompt_hooks=lambda: [_skill_hook(names)])
+        outcome = await engine.run_turn(_turn(), ())
+        assert outcome.activated_skills == names
+    asyncio.run(scenario())
+
+
+def test_no_capability_turn_records_no_skills():
+    """The no-capability gate returns before hooks run, so no skill can be
+    recorded -- `()` even when a hook would have activated one."""
+    async def scenario():
+        llm = MockLLMProvider([[Delta(text="unused")]])
+        engine = LoopEngine(FakeRouter(), llm, lambda: FakeSnapshot([]), Recorder(),
+                            prompt_hooks=lambda: [_skill_hook(("kb-guide",))])
+        outcome = await engine.run_turn(_turn(), ())
+        assert outcome.stopped_reason == "no_capability"
+        assert outcome.activated_skills == ()
+    asyncio.run(scenario())
+
+
+def test_schema_declares_skills_verbatim_and_required_frozen():
+    """RFC-0002 SS2/SS3: the C-06 payload line is verbatim from the RFC, the
+    `required` list stays the frozen three keys, and the append block carries a
+    `contract` key, `adds: []` and `rewrites: none`."""
+    schema = json.loads((Path(__file__).resolve().parents[3] / "schema" / "events.json")
+                        .read_text(encoding="utf-8"))
+    entry = schema["events"]["turn.completed"]
+    assert entry["payload"]["skills"] == (
+        "array<string> (activated skill names, sorted, never bodies; [] when none)")
+    assert entry["required"] == ["turn_id", "state", "usage"]
+    assert "skills" not in entry["required"]
+    blocks = [b for b in schema["x-vade"]["appends"] if "RFC-0002" in b["doc"]]
+    assert len(blocks) == 1
+    block = blocks[0]
+    assert block["contract"] == "C-06"
+    assert block["version"] == "1.3.0"
+    assert block["adds"] == []
+    assert block["fields"] == {"turn.completed": ["skills"]}
+    assert block["rewrites"].startswith("none")
+
+
+def test_skills_and_skill_catalog_payloads_do_not_cross_contaminate():
+    """RFC-0002 SS5: one truth for 'which skills ran this turn'. The names live
+    on `turn.completed.skills`; `turn.skill_catalog` keeps digest/entries/empty
+    and gains nothing -- the two payload shapes share no field names."""
+    schema = json.loads((Path(__file__).resolve().parents[3] / "schema" / "events.json")
+                        .read_text(encoding="utf-8"))
+    completed = set(schema["events"]["turn.completed"]["payload"])
+    catalog = set(schema["events"]["turn.skill_catalog"]["payload"])
+    assert "skills" in completed
+    assert not {"digest", "entries", "empty"} & completed
+    assert "skills" not in catalog
+    assert {"digest", "entries", "empty"} <= catalog
+
+
+def test_skills_addition_is_additive_for_old_clients():
+    """RFC-0002 SS4: an old client that ignores unknown keys is unaffected --
+    `skills` is the ONLY key the payload gains beyond the frozen shape."""
+    schema = json.loads((Path(__file__).resolve().parents[3] / "schema" / "events.json")
+                        .read_text(encoding="utf-8"))
+    payload = set(schema["events"]["turn.completed"]["payload"])
+    assert payload == {"turn_id", "state", "usage", "stopped_reason", "skills"}

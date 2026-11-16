@@ -1,12 +1,18 @@
 """Trusted key whitelist: `(module_id, instance_id) -> fingerprint + public key`.
 
-Two rules that are easy to get wrong and expensive to debug:
+Three rules that are easy to get wrong and expensive to debug:
 
 * Persist 0600 on every write (atomic replace), otherwise `pairing_accepted`
   survives only until the process restarts and "delete the fingerprint" in the
   config page has nothing to delete.
 * `revoke(fp)` closes the connections that are USING that key right now. A
   revoke that only affects the next handshake leaves a live attacker connected.
+* A record that carries `public_key` must PROVE its fingerprint:
+  `sha256(pub)[:16] == fingerprint`. On load such a record is dropped
+  (fail closed) and `add()` refuses the write. Otherwise `allows()` would
+  trust a name that `candidate_keys()` can never authenticate. Records without
+  a public key (written before that field existed) are loaded as-is: they can
+  still be revoked and listed, they just cannot be used for IK.
 
 Why the raw public key is stored as well as the fingerprint: IK needs the peer's
 static key *before* the first message (`FfiHandshake` refuses IK without
@@ -18,6 +24,7 @@ A fingerprint alone cannot reconstruct a public key.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -27,9 +34,10 @@ from typing import Callable
 
 from ..errors import VadeError
 
-__all__ = ["Whitelist", "Entry", "WHITELIST_FILENAME"]
+__all__ = ["Whitelist", "Entry", "WHITELIST_FILENAME", "fp8_hex"]
 
 WHITELIST_FILENAME = "whitelist.json"
+PUBLIC_KEY_LEN = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,14 +51,44 @@ class Entry:
     public_key: str | None = None
 
 
-def _fp8(public_key: bytes) -> str:
-    import hashlib
+def fp8_hex(public_key: bytes) -> str:
+    """`SHA-256(public_key)[:16]`, lowercase hex — the `fp8` humans compare.
 
+    This is the *identity* fingerprint (QR `fp`, setup page, `--print-fingerprint`).
+    It is NOT a TLS pin: the TLS pin is `SHA-256(SPKI)[:16]` over a certificate,
+    see `vade.identity.tls.spki_fingerprint_hex`. Two different values (D78).
+
+    It is also not the Rust `psk_fingerprint_hex()` (BLAKE2s-256, used as the
+    pair-code PSK's `core_pub_fp`): different hash, different value. Never
+    compare one against the other.
+    """
     return hashlib.sha256(bytes(public_key)).hexdigest()[:16]
 
 
+#: Backwards-compatible private alias; new code should import `fp8_hex`.
+_fp8 = fp8_hex
+
+
+def _key_proves_fingerprint(public_key: bytes, fingerprint: str) -> bool:
+    """`len == 32` and `sha256(pub)[:16] == fingerprint` (exact, lowercase)."""
+    return len(public_key) == PUBLIC_KEY_LEN and fp8_hex(public_key) == fingerprint
+
+
+def _stored_key_is_consistent(public_key: str, fingerprint: str) -> bool:
+    try:
+        raw = bytes.fromhex(public_key)
+    except (TypeError, ValueError):
+        return False
+    return _key_proves_fingerprint(raw, fingerprint)
+
+
 class Whitelist:
-    def __init__(self, path: Path | str, *, on_revoke: Callable[[str], None] | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        on_revoke: Callable[[str, tuple[str, ...]], None] | None = None,
+    ) -> None:
         self._path = Path(path)
         self._on_revoke = on_revoke
         self._entries: dict[tuple[str, str], Entry] = {}
@@ -62,12 +100,20 @@ class Whitelist:
             return
         data = json.loads(self._path.read_text(encoding="utf-8"))
         for item in data.get("entries", []):
+            public_key = item.get("public_key")
+            fingerprint = item["fingerprint"]
+            if public_key is not None and not _stored_key_is_consistent(public_key, fingerprint):
+                # Fail closed: a stored key that cannot prove the stored
+                # fingerprint would let `allows()` trust a key that no
+                # handshake can ever authenticate. Never rewrite the pair —
+                # re-pairing is the only way back in.
+                continue
             entry = Entry(
                 module_id=item["module_id"],
                 instance_id=item["instance_id"],
-                fingerprint=item["fingerprint"],
+                fingerprint=fingerprint,
                 added_at=float(item.get("added_at", 0)),
-                public_key=item.get("public_key"),
+                public_key=public_key,
             )
             self._entries[(entry.module_id, entry.instance_id)] = entry
         try:
@@ -108,6 +154,28 @@ class Whitelist:
     def allows(self, fingerprint: str) -> bool:
         return any(e.fingerprint == fingerprint for e in self._entries.values())
 
+    def device_for_fingerprint(self, fingerprint: str) -> str | None:
+        """The paired device that proved this key, as `module_id#instance_id`.
+
+        This is the only identity a Noise peer can offer: the handshake proves
+        possession of a static key, and the whitelist says which pairing that
+        key belongs to. There is no separate "UI device" record, so the node id
+        the rest of core already uses (`Registration.session_id`,
+        `NodeRecord`) is the canonical name.
+
+        One key may be paired under several instances (same device, several
+        node slots); the lowest `(module_id, instance_id)` is returned so the
+        answer is stable across restarts. `None` means "no pairing" — callers
+        must fail closed rather than invent an identity.
+        """
+        matches = sorted(
+            (e.module_id, e.instance_id) for e in self._entries.values()
+            if e.fingerprint == fingerprint
+        )
+        if not matches:
+            return None
+        return f"{matches[0][0]}#{matches[0][1]}"
+
     def fingerprint_for(self, module_id: str, instance_id: str | None = None) -> str | None:
         """`instance_id=None` -> the module's fingerprint when all instances agree."""
         if instance_id is not None:
@@ -146,12 +214,12 @@ class Whitelist:
         """
         if public_key is not None:
             raw = bytes(public_key)
-            if len(raw) != 32:
+            if len(raw) != PUBLIC_KEY_LEN:
                 raise VadeError("INVALID_ARGUMENT", f"module public key must be 32 bytes, got {len(raw)}")
-            if _fp8(raw) != fingerprint:
+            if not _key_proves_fingerprint(raw, fingerprint):
                 raise VadeError(
                     "INVALID_ARGUMENT",
-                    f"fingerprint {fingerprint} does not match the supplied public key ({_fp8(raw)})",
+                    f"fingerprint {fingerprint} does not match the supplied public key ({fp8_hex(raw)})",
                 )
         existing = self._entries.get((module_id, instance_id))
         if existing and existing.fingerprint != fingerprint:
@@ -176,12 +244,21 @@ class Whitelist:
         return entry
 
     def revoke(self, fingerprint: str) -> tuple[str, ...]:
-        """Remove every entry with this key and close the live connections."""
+        """Remove every entry with this key and close the live connections.
+
+        The callback receives `(fingerprint, removed_ids)` — RFC-0016 §5.6-17
+        (Q4 default): unbinding a device must also kill its minted blob
+        tokens, and only the callback knows who consumes that (the App wires
+        `BlobService.revoke_device`). `removed_ids` are the deleted
+        `module_id#instance_id` names, the same tuple this method returns, so
+        callers and the callback agree on one spelling of the device identity.
+        """
         removed = [key for key, entry in self._entries.items() if entry.fingerprint == fingerprint]
         for key in removed:
             del self._entries[key]
         if removed:
             self._flush()
+        removed_ids = tuple(f"{m}#{i}" for m, i in removed)
         if self._on_revoke is not None:
-            self._on_revoke(fingerprint)
-        return tuple(f"{m}#{i}" for m, i in removed)
+            self._on_revoke(fingerprint, removed_ids)
+        return removed_ids

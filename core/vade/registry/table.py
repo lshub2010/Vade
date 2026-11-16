@@ -102,6 +102,7 @@ class Registry:
         heartbeat_interval_s: float = 10.0,
         clock: Callable[[], float] = time.monotonic,
         close_connection: Callable[[str], None] | None = None,
+        paired_fingerprint: Callable[[str, str], str | None] | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._records: dict[tuple[str, str], NodeRecord] = {}
@@ -111,8 +112,16 @@ class Registry:
         self._heartbeat_interval = heartbeat_interval_s
         self._clock = clock
         self._close_connection = close_connection
+        self._paired_fingerprint = paired_fingerprint
         self._revoked: set[str] = set()
         self._risk_overrides: dict[tuple[str, str], str] = {}
+        #: RFC-0005 §4.4: core-process monotonic counter behind `model/list`'s
+        #: `revision`. Bumped by every mutation that can change the model list
+        #: (registration, capability update, disconnect/reject, health flip,
+        #: enable/disable, revoke). Restarting resets it to 0; clients must
+        #: treat "not equal" as "full refresh" and never assume it is monotonic
+        #: across processes.
+        self._revision = 0
         #: Sync listeners for `module.status` (C3 subscribes). Called with a
         #: C-06 payload; never awaited here because mutation may happen on the
         #: admin thread.
@@ -124,6 +133,14 @@ class Registry:
         with self._lock:
             if listener not in self._listeners:
                 self._listeners.append(listener)
+
+    def revision(self) -> int:
+        """Monotonic model-list revision (RFC-0005 §4.4)."""
+        with self._lock:
+            return self._revision
+
+    def _bump(self) -> None:
+        self._revision += 1
 
     def _record_status(self, record: NodeRecord) -> dict[str, Any]:
         return {
@@ -160,6 +177,19 @@ class Registry:
         with self._lock:
             if fingerprint in self._revoked:
                 raise VadeError("PERMISSION_DENIED", "fingerprint revoked", fatal=True)
+            if self._paired_fingerprint is not None:
+                # The pairing table is the trust anchor: a key paired as
+                # `module_id#instance_id` may only register that exact node.
+                # Without this check a paired module A could register a
+                # manifest claiming to be module B and inherit B's tool and
+                # approval surface (review D1).
+                paired = self._paired_fingerprint(manifest.module_id, manifest.instance_id)
+                if paired is not None and paired != fingerprint:
+                    raise VadeError(
+                        "PERMISSION_DENIED",
+                        f"{manifest.module_id}#{manifest.instance_id} is paired to a different key",
+                        fatal=True,
+                    )
 
             key = (manifest.module_id, manifest.instance_id)
             existing = self._records.get(key)
@@ -196,6 +226,7 @@ class Registry:
             self._cap_epoch[manifest.module_id] = self._cap_epoch.get(manifest.module_id, 0) + (
                 0 if existing else 1
             )
+            self._bump()
             registration = Registration(accepted=True, session_id=f"{manifest.module_id}#{manifest.instance_id}", tool_names=manifest.tool_names)
         self._publish_status(record)
         return registration
@@ -319,6 +350,7 @@ class Registry:
             self._records[key] = updated
             self._index = new_index
             self._cap_epoch[manifest.module_id] = self._cap_epoch.get(manifest.module_id, 0) + 1
+            self._bump()
             epoch = self._cap_epoch[manifest.module_id]
         # A new manifest version is a status change the admin surface must see.
         self._publish_status(updated)
@@ -371,6 +403,8 @@ class Registry:
             record = self._records.get(key)
             if record is None:
                 return
+            if record.health is not HealthState.ONLINE:
+                self._bump()  # availability flips back on: the list changed
             self._records[key] = replace(record, last_frame_at=self._clock(), rtt_ms=rtt_ms or record.rtt_ms, health=HealthState.ONLINE)
 
     def mark_disconnected(self, module_id: str, instance_id: str) -> None:
@@ -382,6 +416,7 @@ class Registry:
             # Record is retained so the topology can still draw a grey dotted line.
             gone = replace(record, connection_id=None, health=HealthState.OFFLINE)
             self._records[key] = gone
+            self._bump()
         self._publish_status(gone)
 
     def mark_rejected(self, module_id: str, instance_id: str, reason: str, *, fingerprint: str = "") -> NodeRecord:
@@ -401,6 +436,7 @@ class Registry:
                 rejected_reason=reason,
             )
             self._records[key] = record
+            self._bump()
         self._publish_status(record)
         return record
 
@@ -423,6 +459,8 @@ class Registry:
                     record = replace(record, health=state)
                     self._records[key] = record
                     changed.append(record)
+            if changed:
+                self._bump()
         if changed:
             self._publish_status(*changed)
 
@@ -444,11 +482,22 @@ class Registry:
             updated = replace(record, enabled=enabled)
             if not enabled:
                 updated = replace(updated, health=HealthState.OFFLINE, connection_id=None)
-            self._records[key] = updated
-            if not enabled:
-                # Re-index the whole table: filtering by module_id also removed
-                # the OTHER instances of a pooled module.
-                self._index = self._rebuild_index()
+            if enabled and updated.manifest is not None:
+                # Re-enabling must put the tools back. Rebuilding in place
+                # would skip the conflict/global-budget checks, so build the
+                # next index first (raises TOOL_CONFLICT before any mutation).
+                new_index = self._build_index(updated.manifest, exclude_instance=instance_id)
+                self._records[key] = updated
+            else:
+                # Disabling must drop this instance from routing while keeping
+                # the OTHER instances of a pooled module (review P1-5). The
+                # record has to be written BEFORE the rebuild: `_rebuild_index`
+                # reads `self._records`, so rebuilding first would re-index the
+                # still-enabled snapshot and leave the disabled node routable.
+                self._records[key] = updated
+                new_index = self._rebuild_index()
+            self._index = new_index
+            self._bump()
         self._publish_status(updated)
         if not enabled and record.connection_id and self._close_connection:
             self._close_connection(record.connection_id)
@@ -474,6 +523,8 @@ class Registry:
                     )
                     self._records[key] = revoked
                     changed.append(revoked)
+            if changed:
+                self._bump()
         if changed:
             self._publish_status(*changed)
         for connection_id in closed:

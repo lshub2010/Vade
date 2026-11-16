@@ -1,20 +1,226 @@
 {
   "id": "C-05",
-  "version": "1.1.0",
+  "version": "1.7.0",
   "status": "frozen",
   "frozen_at": "2026-11-14",
   "owner": "C2",
   "source_of_truth": "docs/design.md §2.5",
   "x-vade": {
-    "appends": "RFC-0004",
-    "notes": "1.1.0 is additive except one tightening: `ui/submit.content` goes from `[object]` to a typed part union (§6.1/§7.2), which only malformed clients notice — a legal old `[{\"type\":\"text\"}]` still passes. New top-level `http_endpoints` declares the `/ui/blob*` family that lives on the data-plane listener (§7.3). Nothing else changed; C-06 and C-04 are untouched by RFC-0004."
+    "core_reserved_tools": {
+      "contract": "C-05",
+      "version": "1.2.0",
+      "owner": "C3",
+      "doc": "docs/rfc/RFC-0003-prompt-injection-layers.md",
+      "reserved": ["skill_load", "tools_search", "tools/search"],
+      "note": "RFC-0003 §5.4: model-visible core built-ins. They are handled inside core and never routed to a module, so they are NOT methods in `directions` — this table is the registration. No manifest may declare a tool with one of these names, and no module LLM name can collide with them: module names are `{prefix}__{tool}` (always a double underscore), core names never carry one. `tools/search` is the C-05/RPC spelling of the search capability; the model-visible name is `tools_search` because an LLM function name may not contain `/`."
+    },
+    "appends": [
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0004-attachments-multimodal.md",
+        "adds": [
+          "ui/submit.content typed part union",
+          "http_endpoints"
+        ],
+        "notes": [
+          "ui/submit.content goes from `[object]` to a typed part union (§6.1/§7.2); a legal old `[{\"type\":\"text\"}]` still passes, only malformed clients notice",
+          "new top-level `http_endpoints` declares the `/ui/blob*` family that lives on the data-plane listener (§7.3)",
+          "C-06 and C-04 are untouched by RFC-0004"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0007-subagents-and-tasks.md",
+        "adds": [
+          "task/list",
+          "task/log_tail",
+          "task/cancel",
+          "subagent/message"
+        ],
+        "notes": [
+          "four observation/control methods and the four `task.*` names mirrored into `events_core_to_ui`; no existing method changed",
+          "a core that predates it answers `NOT_FOUND` (the documented UI degradation)"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0006-turn-semantics.md",
+        "adds": [
+          "turn/regenerate",
+          "message/edit_resubmit"
+        ],
+        "notes": [
+          "ui/attach: snapshot.turns[] and messages[].partial / messages[].superseded_by are appended keys; `snapshot` stays an object and old clients ignore them",
+          "session/fork is intentionally NOT registered in v1: clients get C-04 NOT_FOUND with an `unknown method` message, not UNSUPPORTED; JSON-RPC -32601 is the standard form for an unregistered method and clients should recognize both",
+          "PAYLOAD_TOO_LARGE carries error.data = {field, limit, actual, unit} (RFC-0006 §8)"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.1.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0008-ask-user-input.md",
+        "adds": [
+          "turn/input",
+          "turn/input.cancel"
+        ],
+        "snapshot_note": "`ui/attach.result.snapshot` gains an additive `pending_inputs[]` key (input_id/turn_id/kind/prompt/detail/schema/options/timeout_s/expires_at/created_at). `snapshot` stays `object`; a client that does not know the key ignores it, exactly as RFC-0007 treats `tasks`.",
+        "rewrites": "none. No existing method, error code or field changes."
+      },
+      {
+        "contract": "C-05",
+        "version": "1.2.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0009-module-ui-pages.md",
+        "adds": [
+          "ui/page.get",
+          "ui/state.get",
+          "ui/tool.call",
+          "state/get",
+          "page/get"
+        ],
+        "notes": [
+          "three ui_to_core methods (`ui/page.get`, `ui/state.get`, `ui/tool.call`) and two core_to_module methods (`state/get`, `page/get`); no existing method changed",
+          "`ui/tool.call` is the one that widens the attack surface: it removes the implicit 'a tool call always belongs to a turn' premise, so ownership, risk, approval (args-digest bound) and audit all stay in core (§10.2)",
+          "`ui/tool.call` never executes in stage one when approval is required: stage two repeats the call with `call_id` + `approval_id` and the same `args` (a different body is PERMISSION_DENIED)"
+        ],
+        "rewrites": "none"
+      },
+      {
+        "contract": "C-05",
+        "version": "1.2.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0005-model-capabilities-usage.md",
+        "adds": ["model/list", "session/model.get", "session/model.set", "session/usage.get"],
+        "notes": [
+          "four methods under `ui_to_core`: model/list, session/model.get, session/model.set, session/usage.get",
+          "`ui/attach` only gained a `notes` sentence describing the additive `snapshot.session.model` key; its params/result/errors are byte-identical",
+          "no existing method, direction or error list changed; a core without these answers C-04 NOT_FOUND with an `unknown method` message and the UI degrades to a read-only badge (FR-8.46); JSON-RPC -32601 is the standard form for an unregistered method and clients should recognize both"
+        ],
+        "rewrites": "none. Recorded in full under `x-vade.rfc0005_append`."
+      },
+      {
+        "contract": "C-05",
+        "version": "1.3.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0010-session-metadata.md",
+        "adds": ["session/list", "session/rename", "session/pin", "session/archive", "session/delete", "session/group.list", "session/group.create", "session/group.update", "session/group.delete", "session/group.assign"],
+        "rewrites": "none. Ten ui_to_core methods appended (FR-8.26 verbs + folder management); no existing method, error code, direction or field changed. session/list introduces the session_row shape — nothing else returns it. Recorded in core/vade/session/RESULT-rfc0010.md."
+      },
+      {
+        "contract": "C-05",
+        "version": "1.4.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0012-subagent-events.md",
+        "adds": ["subagent/list", "subagent/get"],
+        "notes": [
+          "two READ-ONLY observation methods; subagent/message (RFC-0007 §6.4) is untouched and remains the write channel",
+          "the run's lifetime truth is the subagent_runs table; result_preview is a read-time projection, never a persisted or broadcast field",
+          "a core without them answers NOT_FOUND (the documented degradation: the client falls back to the subagent.* event stream only)"
+        ],
+        "rewrites": "none. Two ui_to_core methods appended; no existing method, error code, direction or field changed. C-05 version 1.3.0 -> 1.4.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two). Recorded in core/vade/subagents/RESULT-rfc0012.md."
+      },
+      {
+        "contract": "C-05",
+                "version": "1.2.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0013-interrupt-persistence.md",
+        "adds": [],
+        "notes": [
+          "ui/attach: `snapshot.messages[].partial` (bool, default false) is now a documented result key — the write side landed with RFC-0006 §4 (queue.py `_partial_message` persists the interrupted answer as a partial=true assistant message in the same transaction as the interrupted turn row); RFC-0013 freezes the read side so a fresh attach shows the interrupted turn's partial text (FR-8.35/R9)",
+          "no method, error code or frozen field changed; the wire key predates this append, so old clients are unaffected and new clients key the grey 'stopped · N chars' bubble off it plus `snapshot.turns[].partial_message_id`"
+        ],
+        "rewrites": "none. The `partial` key predates this append (RFC-0006); RFC-0013 only documents it in the ui/attach result notes and this block. C-05 top-level `version` stays 1.3.0 (RFC-0010 owns it); this block continues RFC-0006's 1.1.0 partial lineage at 1.2.0 — append-level, non-breaking."
+      },
+      {
+        "contract": "C-05",
+        "version": "1.5.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0014-session-search.md",
+        "adds": ["session/search"],
+        "notes": [
+          "one READ method under ui_to_core: session/search — titles + live message bodies (messages.content, superseded rows excluded per RFC-0006 §6.3); no existing method, error code, direction or field changed",
+          "matching is a parameterized LIKE scan with %/_/\\ escaped literal (ESCAPE '\\'), ASCII case-insensitive and non-ASCII exact (SQLite LIKE semantics); no FTS5 dependency, no new table, column or index",
+          "rows are deduped sessions (title hit dominates body hit), two-tier order: title hits first, then updated_at DESC, id ASC; snippets are hard-clipped to 120 code points with snippet_offset pointing into the original content — full bodies (up to 32000 code points, RFC-0006 §8) never cross the wire",
+          "a core without it answers C-04 NOT_FOUND with an `unknown method` message — the documented degradation: FR-8.27's local-cached-only search with the '范围：已缓存' badge stays until the client upgrades; JSON-RPC -32601 is the standard form for an unregistered method and clients should recognize both"
+        ],
+        "rewrites": "none. One ui_to_core method appended (FR-8.27); C-05 version 1.4.0 -> 1.5.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one). Recorded in core/vade/session/RESULT-rfc0014.md."
+      },
+      {
+        "contract": "C-05",
+        "version": "1.6.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0015-ui-modules.md",
+        "adds": ["ui/modules"],
+        "notes": [
+          "one READ-ONLY list method under ui_to_core: ui/modules — the module entry list (modules -> pages) in one pull; no existing method, error code, direction or field changed",
+          "`params` is `{}` and never gains `session_id`: the module set is a process-level fact (Registry.snapshot() takes no session) and authorization comes from the connection (`modulepage/auth.py`), never from a param the caller controls; a browser session sees ENABLED modules only, a module peer sees itself, an unresolvable caller is PERMISSION_DENIED",
+          "page BODIES never cross the wire (`ui/page.get` stays the only body channel); ordering is registry order for modules and `manifest.ui.pages[]` order for pages; `revision` is the Registry revision, bumped next to every `_publish_status(...)` call, so `module.status` is the invalidation edge",
+          "no event is added (C-06 stays 34 entries) and no error code is added (C-04 stays 34); a core that predates it answers C-04 NOT_FOUND with an `unknown method` message — the documented degradation: the client renders the empty entry block instead of erroring; JSON-RPC -32601 is the standard form for an unregistered method and clients should recognize both"
+        ],
+        "rewrites": "none. One ui_to_core method appended (A3 module entry list); C-05 version 1.5.0 -> 1.6.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one, 1.6.0 one). C-06 untouched (no event), C-04 untouched (34 codes), C-03 untouched. Recorded in docs/rfc/LEDGER.md; evidence in shots/s-rfc0015-register/RESULT.md."
+      },
+      {
+        "contract": "C-05",
+        "version": "1.7.0",
+        "owner": "C2",
+        "doc": "docs/rfc/RFC-0016-blob-token.md",
+        "adds": ["ui/blob.token"],
+        "notes": [
+          "one minting method under ui_to_core: ui/blob.token mints a device bearer bound to the calling connection's proven device_id (Noise static key -> whitelist); there is no device_id parameter — a hint from the wire would be a claim, not an identity (§5.1)",
+          "only a native (Noise) connection may mint: a cookie session is PERMISSION_DENIED with reason=\"cookie_session\" — the browser already holds a working credential and minting would upgrade an ambient, four-gate cookie into a portable bearer (§5.3)",
+          "no new error code (C-04 stays 34), no new event (C-06 stays 34), no new config key (C-18 untouched), no new table (blob_tokens already exists); the six http_endpoints routes are unchanged — this method only finally writes rows into blob_tokens (§8)"
+        ],
+        "rewrites": "none. One ui_to_core method appended (RFC-0004 §4.5 finally registered); C-05 version 1.6.0 -> 1.7.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one, 1.6.0 one, 1.7.0 one). http_endpoints.auth.device renamed the minting method (note-level string, no route/structure change). C-06 untouched (no event), C-04 untouched (34 codes), C-03/C-18 untouched. Recorded in docs/rfc/LEDGER.md; evidence in shots/s-blob-impl/RESULT.md."
+      }
+    ],
+    "rfc0005_append": {
+      "contract": "RFC-0005",
+      "owner": "C3",
+      "frozen": "2026-11-14",
+      "doc": "docs/rfc/RFC-0005-model-capabilities-usage.md",
+      "adds": ["model/list", "session/model.get", "session/model.set", "session/usage.get"],
+      "namespaces": "`model/*` and `session/*` are new; nothing under `ui/*`, `module/*`, `tools/*`, `prompts/*` or `events/*` was renamed, moved or removed. `ui/attach` only gained a `notes` field describing the snapshot key — its params/result/errors are byte-identical to 1.0.0.",
+      "rewrites": "none. Every v1.0.0 method, direction and error list is untouched; the four new entries live under `ui_to_core` because all four are called by a device or an operator UI over the same browser_session channel, and adding a third direction would break the `for direction in directions.values()` consumers the C-05 gate relies on.",
+      "version_note": "RFC-0005 §7.1 row 1 proposes C-05 1.0.0 -> 1.1.0. The top-level `version` is NOT bumped by this RFC (it reads 1.2.0 here because RFC-0009 owns that bump): an appender may not make a frozen file claim a header it does not own, and no gate needs the bump. Recorded as a deviation in core/vade/llm/RESULT-rfc0005.md."
+    }
   },
   "transport": "JSON-RPC 2.0 over a Noise transport frame (type 0x02) or over plain text frames on the browser_session channel",
   "envelope": {
-    "request": {"jsonrpc": "2.0", "id": "int|string", "method": "string", "params": "object"},
-    "response": {"jsonrpc": "2.0", "id": "int|string", "result": "object"},
-    "error": {"jsonrpc": "2.0", "id": "int|string|null", "error": {"code": "string (C-04)", "message": "string <=300", "data": "object|null"}},
-    "notification": {"jsonrpc": "2.0", "method": "string", "params": "object"},
+    "request": {
+      "jsonrpc": "2.0",
+      "id": "int|string",
+      "method": "string",
+      "params": "object"
+    },
+    "response": {
+      "jsonrpc": "2.0",
+      "id": "int|string",
+      "result": "object"
+    },
+    "error": {
+      "jsonrpc": "2.0",
+      "id": "int|string|null",
+      "error": {
+        "code": "string (C-04)",
+        "message": "string <=300",
+        "data": "object|null"
+      }
+    },
+    "notification": {
+      "jsonrpc": "2.0",
+      "method": "string",
+      "params": "object"
+    },
     "notes": [
       "`error.code` is always a C-04 name, never a number and never a custom string.",
       "`error.data` carries structured fields only (field pointer, retry_after). Never a stack trace.",
@@ -22,73 +228,223 @@
     ]
   },
   "tool_result": {
-    "ok": {"ok": true, "result": {}, "truncated": false, "duration_ms": "int"},
-    "err": {"ok": false, "error": {"code": "C-04 name", "message": "string", "retriable": "bool"}}
+    "ok": {
+      "ok": true,
+      "result": {},
+      "truncated": false,
+      "duration_ms": "int"
+    },
+    "err": {
+      "ok": false,
+      "error": {
+        "code": "C-04 name",
+        "message": "string",
+        "retriable": "bool"
+      }
+    }
   },
   "directions": {
     "module_to_core": {
       "module/register": {
         "params": "manifest (schema/manifest.schema.json)",
-        "result": {"accepted": "bool", "session_id": "string", "tool_names": ["string"]},
-        "errors": ["MANIFEST_INVALID", "TOOL_CONFLICT", "PROTOCOL_MISMATCH", "PAYLOAD_TOO_LARGE"],
+        "result": {
+          "accepted": "bool",
+          "session_id": "string",
+          "tool_names": [
+            "string"
+          ]
+        },
+        "errors": [
+          "MANIFEST_INVALID",
+          "TOOL_CONFLICT",
+          "PROTOCOL_MISMATCH",
+          "PAYLOAD_TOO_LARGE"
+        ],
         "notes": "First RPC after handshake. Rejection never reveals other modules' data: TOOL_CONFLICT names only the conflicting tool id and the caller's own id."
       },
       "module/capabilities.update": {
         "params": "manifest (full resubmission; re-runs every T4 check)",
-        "result": {"accepted": "bool", "cap_epoch": "int", "tool_names": ["string"]},
-        "errors": ["MANIFEST_INVALID", "RISK_DOWNGRADE_FORBIDDEN", "TOOL_CONFLICT", "MODULE_DRAINING"],
+        "result": {
+          "accepted": "bool",
+          "cap_epoch": "int",
+          "tool_names": [
+            "string"
+          ]
+        },
+        "errors": [
+          "MANIFEST_INVALID",
+          "RISK_DOWNGRADE_FORBIDDEN",
+          "TOOL_CONFLICT",
+          "MODULE_DRAINING"
+        ],
         "notes": "Atomic swap on success (cap_epoch += 1), old manifest kept on failure. Any tool whose risk drops below the effective value rejects the whole update. New tools default to `high`."
       },
       "module/heartbeat": {
-        "params": {"load": "number 0..1", "inflight": "int >= 0"},
-        "result": {"ok": true, "server_time": "RFC3339 string"},
-        "errors": ["INVALID_ARGUMENT"]
+        "params": {
+          "load": "number 0..1",
+          "inflight": "int >= 0"
+        },
+        "result": {
+          "ok": true,
+          "server_time": "RFC3339 string"
+        },
+        "errors": [
+          "INVALID_ARGUMENT"
+        ]
       },
       "module/event": {
-        "params": {"topic": "string", "payload": "object"},
+        "params": {
+          "topic": "string",
+          "payload": "object"
+        },
         "result": null,
         "notification": true,
-        "errors": ["INVALID_ARGUMENT", "PERMISSION_DENIED"]
+        "errors": [
+          "INVALID_ARGUMENT",
+          "PERMISSION_DENIED"
+        ]
       },
       "events/subscribe": {
-        "params": {"topics": ["string"], "redact": ["string"]},
-        "result": {"accepted": ["string"], "rejected": ["string"]},
-        "errors": ["INVALID_ARGUMENT"],
-        "notes": "Whitelist-checked. Rejected topics are reported, not silently dropped."
+        "params": {
+          "topics": [
+            "string"
+          ],
+          "redact": [
+            "string"
+          ],
+          "session_id": "string|null",
+          "since_seq": "int|object|null"
+        },
+        "result": {
+          "accepted": [
+            "string"
+          ],
+          "rejected": [
+            "string"
+          ],
+          "replayed": "int"
+        },
+        "errors": [
+          "INVALID_ARGUMENT"
+        ],
+        "notes": "Whitelist-checked. Rejected topics are reported, not silently dropped. `since_seq` is per session: an integer requires `session_id`, several sessions take a `{session_id: seq}` object; a bare integer spanning every session is rejected because each session has its own seq counter. `replayed` is the number of journal entries pushed by that resume (0 when `since_seq` is absent); only `session.turn` is replayed."
       },
       "skill/proposal": {
-        "params": {"name": "string", "action": "create|update", "content": "string", "base_revision": "string|null", "derived_from": "object"},
-        "result": {"accepted": "bool", "path": "string"},
-        "errors": ["INVALID_ARGUMENT", "PERMISSION_DENIED", "MANIFEST_INVALID"]
+        "params": {
+          "name": "string",
+          "action": "create|update",
+          "content": "string",
+          "base_revision": "string|null",
+          "derived_from": "object"
+        },
+        "result": {
+          "accepted": "bool",
+          "path": "string"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "PERMISSION_DENIED",
+          "MANIFEST_INVALID"
+        ]
       }
     },
     "core_to_module": {
       "tools/call": {
-        "params": {"call_id": "string", "tool": "string (name only, not module_id/tool)", "args": "object", "deadline_ms": "int"},
+        "params": {
+          "call_id": "string",
+          "tool": "string (name only, not module_id/tool)",
+          "args": "object",
+          "deadline_ms": "int"
+        },
         "result": "tool_result (ok or error)",
-        "errors": ["TIMEOUT", "CANCELLED", "OVERLOADED", "UNAVAILABLE", "PERMISSION_DENIED", "INVALID_ARGUMENT"],
+        "errors": [
+          "TIMEOUT",
+          "CANCELLED",
+          "OVERLOADED",
+          "UNAVAILABLE",
+          "PERMISSION_DENIED",
+          "INVALID_ARGUMENT"
+        ],
         "notes": "The transport frame cap is 65519 bytes of plaintext. Larger args are a C3/C4 problem (no v1 fragmentation); modules should expect PAYLOAD_TOO_LARGE rather than a 1 MiB frame."
       },
       "tools/cancel": {
-        "params": {"call_id": "string"},
-        "result": {"cancelled": "bool"},
-        "errors": ["NOT_FOUND"]
+        "params": {
+          "call_id": "string"
+        },
+        "result": {
+          "cancelled": "bool"
+        },
+        "errors": [
+          "NOT_FOUND"
+        ]
       },
       "prompts/get": {
-        "params": {"id": "string"},
-        "result": {"content": "string"},
-        "errors": ["NOT_FOUND"]
+        "params": {
+          "id": "string"
+        },
+        "result": {
+          "content": "string"
+        },
+        "errors": [
+          "NOT_FOUND"
+        ]
       },
       "events/deliver": {
-        "params": {"topic": "string", "session_id": "string", "seq_from": "int", "seq_to": "int", "payload": "object"},
-        "result": {"ok": true},
-        "errors": ["PERMISSION_DENIED", "INVALID_ARGUMENT"]
+        "params": {
+          "topic": "string",
+          "session_id": "string",
+          "seq_from": "int",
+          "seq_to": "int",
+          "payload": "object"
+        },
+        "result": {
+          "ok": true
+        },
+        "errors": [
+          "PERMISSION_DENIED",
+          "INVALID_ARGUMENT"
+        ]
       },
       "module/drain": {
-        "params": {"grace_ms": "int"},
-        "result": {"accepted": true},
-        "errors": ["MODULE_DRAINING"],
+        "params": {
+          "grace_ms": "int"
+        },
+        "result": {
+          "accepted": true
+        },
+        "errors": [
+          "MODULE_DRAINING"
+        ],
         "notes": "Core stops routing new calls. In-flight calls finish or time out, then close."
+      },
+      "state/get": {
+        "params": {
+          "page_id": "string"
+        },
+        "result": {
+          "rev": "int",
+          "state": "object"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND",
+          "UNSUPPORTED"
+        ],
+        "notes": "RFC-0009 §9.3. Module side of `ui/state.get`. A module without pages answers UNSUPPORTED, which is a legal answer, not a bug."
+      },
+      "page/get": {
+        "params": {
+          "page_id": "string"
+        },
+        "result": {
+          "schema": "object"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND",
+          "UNSUPPORTED"
+        ],
+        "notes": "RFC-0009 §9.3. Module side of `ui/page.get`, only for `ref` pages. Core verifies the body against the sha256 pinned in the manifest before validating it."
       }
     },
     "ui_to_core": {
@@ -96,12 +452,39 @@
         "params": {"session_id": "string|null", "last_seq": "int|null"},
         "result": {"session_id": "string", "from_seq": "int", "snapshot": "object|null"},
         "errors": ["NOT_FOUND", "PERMISSION_DENIED"],
-        "notes": "RFC-0004 §6.3: `snapshot.messages[]` carries `parts` — the minimal field set all three clients must render in the same order: `[{type:'text',text} | {type:'image',file_id,mime,name,size,width,height,sha256} | {type:'file',file_id,mime,name,size}]`. Rows written before parts existed are read back as a single `text` part synthesised from `content` (never rewritten on disk); `content` keeps carrying the text projection, so a client that ignores `parts` renders exactly as before. Attachments are referenced by `file_id` only — never a local URI (§2.3)."
+        "notes": "snapshot.session (RFC-0005 append): the session block gained `model: {model_id: string|null, source: \"session\"|\"global\"|\"priority\"|\"none\"}`, so a device that reconnects lights the FR-8.46 badge without calling session/model.get first. `snapshot` stays `object`; no key was renamed or removed. RFC-0004 §6.3: `snapshot.messages[]` carries `parts` — the minimal field set all three clients must render in the same order: `[{type:'text',text} | {type:'image',file_id,mime,name,size,width,height,sha256} | {type:'file',file_id,mime,name,size}]`. Rows written before parts existed are read back as a single `text` part synthesised from `content` (never rewritten on disk); `content` keeps carrying the text projection, so a client that ignores `parts` renders exactly as before. Attachments are referenced by `file_id` only — never a local URI (§2.3). RFC-0008 §8.2: `snapshot.pending_inputs[]` lists unanswered input requests (the `turn.input_required` row shape minus `source`/`default`), so a client that missed the replay window can still rebuild the dialog; an `input_id` that is already resolved never appears there. RFC-0007 §5.6: `snapshot.tasks` is the authoritative starting point for the activity list (all non-terminal tasks, then the newest `tasks.snapshot_finished` terminals), with `snapshot.tasks_truncated=true` when older history exists (page it with `task/list`) and `pending_approvals[].task_id` naming the task that owns a prompt. A snapshot MISSING the `tasks` key means the core predates RFC-0007 — the client shows its static empty state and must not fabricate progress. RFC-0013: `snapshot.messages[]` carries `partial` (bool, default false) — true for the persisted partial answer of an interrupted turn (`turn.interrupted.partial_message_id` points at it), so a fresh attach renders the N already-generated characters without replaying `turn.delta` (FR-8.35)."      },
+
+      "ui/blob.token": {
+        "params": {
+          "ttl_s": "int 60..900, optional, default 600 (absent -> 600; bool / float / string / null / out of range -> INVALID_ARGUMENT, data.field=\"ttl_s\", NO row written). Any other key is REFUSED with INVALID_ARGUMENT + data.field=<key>: this method mints a credential, so a silently ignored `device_id` / `read_only` would let a client believe it got something it did not."
+        },
+        "result": {
+          "token": "string (43 chars base64url = secrets.token_urlsafe(32); only sha256(token) is stored, never the token itself)",
+          "expires_at": "int (unix MILLISECONDS; mint_time + ttl_s)",
+          "max_bytes": "int (per-file ceiling baked into this token at mint time = [attach].max_bytes; NEVER null — AttachSettings.max_bytes always has a concrete value, unlike Principal.max_bytes which is int|null for cookie principals)",
+          "endpoints": {
+            "begin": "POST /ui/blob",
+            "part": "PUT /ui/blob/upload/{upload_id}?offset=N",
+            "complete": "POST /ui/blob/upload/{upload_id}/complete",
+            "abort": "DELETE /ui/blob/upload/{upload_id}",
+            "resume": "HEAD /ui/blob/upload/{upload_id}",
+            "fetch": "GET|HEAD /ui/blob/{file_id}[?v=thumb]"
+          }
+        },
+        "errors": ["INVALID_ARGUMENT", "PERMISSION_DENIED", "READ_ONLY_SESSION", "UNSUPPORTED"],
+        "notes": "RFC-0016 §4. The ONLY minting surface for a device bearer: the token is bound to the calling connection's proven `device_id` (Noise static key -> whitelist, transport/server.py:354-378); there is no `device_id` parameter and no other device to name (no oracle). Cookie sessions are refused (PERMISSION_DENIED, reason=\"cookie_session\") because they already hold a credential that works and minting would turn an ambient, four-gate cookie into a portable bearer. TTL 60..900 s, default 600; out-of-range or non-integer (including true and \"600\") is INVALID_ARGUMENT and writes NO row — the RPC layer validates and never relies on issue_token's silent clamp (service.py:184). Only sha256(token) is stored (blob_tokens), so a row survives a core restart; prune_tokens drops expired rows and revoke_device(device_id) drops the whole set. expires_at is unix ms. Expired, revoked and never-issued are indistinguishable (401 AUTH_FAILED, no oracle). The token is REPLAYABLE until it expires (an upload is 1 begin + N parts + 1 complete + 1 HEAD): it is a channel credential, not a one-shot. max_bytes is the value baked in at mint time ([attach].max_bytes) and `begin` enforces it. `endpoints` are aliases of the same listener's six routes; content-type and body limits still come from http_endpoints. Attachments disabled -> UNSUPPORTED with reason=\"attachments_disabled\" (the same code+reason ui/submit uses, session/parts.py:486-493). Explicitly read-only connection -> READ_ONLY_SESSION. No device identity -> PERMISSION_DENIED with reason=\"device_unknown\". The token authenticates HTTP only: it can never send a message."
       },
+
       "ui/detach": {
-        "params": {"session_id": "string"},
-        "result": {"ok": true},
-        "errors": ["NOT_FOUND"]
+        "params": {
+          "session_id": "string"
+        },
+        "result": {
+          "ok": true
+        },
+        "errors": [
+          "NOT_FOUND"
+        ]
       },
       "ui/submit": {
         "params": {
@@ -117,74 +500,750 @@
                 {
                   "title": "text",
                   "type": "object",
-                  "required": ["type", "text"],
+                  "required": [
+                    "type",
+                    "text"
+                  ],
                   "properties": {
-                    "type": {"const": "text"},
-                    "text": {"type": "string", "minLength": 1, "maxLength": 32000}
+                    "type": {
+                      "const": "text"
+                    },
+                    "text": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 32000
+                    }
                   }
                 },
                 {
                   "title": "image",
                   "type": "object",
-                  "required": ["type", "file_id", "mime", "name", "size", "width", "height", "sha256"],
+                  "required": [
+                    "type",
+                    "file_id",
+                    "mime",
+                    "name",
+                    "size",
+                    "width",
+                    "height",
+                    "sha256"
+                  ],
                   "properties": {
-                    "type": {"const": "image"},
-                    "file_id": {"type": "string", "pattern": "^blb_[0-9a-z]{26}$"},
-                    "mime": {"type": "string", "enum": ["image/jpeg", "image/png", "image/webp"]},
-                    "name": {"type": "string", "minLength": 1, "maxLength": 255},
-                    "size": {"type": "integer", "minimum": 1},
-                    "width": {"type": "integer", "minimum": 1, "maximum": 2048},
-                    "height": {"type": "integer", "minimum": 1, "maximum": 2048},
-                    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                    "type": {
+                      "const": "image"
+                    },
+                    "file_id": {
+                      "type": "string",
+                      "pattern": "^blb_[0-9a-z]{26}$"
+                    },
+                    "mime": {
+                      "type": "string",
+                      "enum": [
+                        "image/jpeg",
+                        "image/png",
+                        "image/webp"
+                      ]
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 255
+                    },
+                    "size": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "width": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 2048
+                    },
+                    "height": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 2048
+                    },
+                    "sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    }
                   }
                 },
                 {
                   "title": "file",
                   "type": "object",
-                  "required": ["type", "file_id", "mime", "name", "size"],
+                  "required": [
+                    "type",
+                    "file_id",
+                    "mime",
+                    "name",
+                    "size"
+                  ],
                   "properties": {
-                    "type": {"const": "file"},
-                    "file_id": {"type": "string", "pattern": "^blb_[0-9a-z]{26}$"},
-                    "mime": {"type": "string", "minLength": 3, "maxLength": 255},
-                    "name": {"type": "string", "minLength": 1, "maxLength": 255},
-                    "size": {"type": "integer", "minimum": 1}
+                    "type": {
+                      "const": "file"
+                    },
+                    "file_id": {
+                      "type": "string",
+                      "pattern": "^blb_[0-9a-z]{26}$"
+                    },
+                    "mime": {
+                      "type": "string",
+                      "minLength": 3,
+                      "maxLength": 255
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 255
+                    },
+                    "size": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
                   }
                 },
                 {
                   "title": "audio",
                   "type": "object",
                   "description": "Reserved on purpose (§7.2 / D97): the type stays in the union so FR-8.42 is not narrowed, but v1 answers 501 UNSUPPORTED data.reason='audio_disabled'. Enabling it is a core predicate change, not a schema change.",
-                  "required": ["type", "file_id", "mime", "name", "size"],
+                  "required": [
+                    "type",
+                    "file_id",
+                    "mime",
+                    "name",
+                    "size"
+                  ],
                   "properties": {
-                    "type": {"const": "audio"},
-                    "file_id": {"type": "string", "pattern": "^blb_[0-9a-z]{26}$"},
-                    "mime": {"type": "string", "minLength": 3, "maxLength": 255},
-                    "name": {"type": "string", "minLength": 1, "maxLength": 255},
-                    "size": {"type": "integer", "minimum": 1}
+                    "type": {
+                      "const": "audio"
+                    },
+                    "file_id": {
+                      "type": "string",
+                      "pattern": "^blb_[0-9a-z]{26}$"
+                    },
+                    "mime": {
+                      "type": "string",
+                      "minLength": 3,
+                      "maxLength": 255
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 255
+                    },
+                    "size": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
                   }
                 }
               ]
             }
           }
         },
-        "result": {"turn_id": "string", "queue_pos": "int"},
-        "errors": ["INVALID_ARGUMENT", "NOT_FOUND", "PAYLOAD_TOO_LARGE", "UNSUPPORTED", "READ_ONLY_SESSION", "OVERLOADED"],
+        "result": {
+          "turn_id": "string",
+          "queue_pos": "int"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND",
+          "PAYLOAD_TOO_LARGE",
+          "UNSUPPORTED",
+          "READ_ONLY_SESSION",
+          "OVERLOADED"
+        ],
         "notes": "RFC-0004 §6.4 — the validation ORDER is contractual: (1) shape, (2) idempotency by client_msg_id, (3) part types/required fields/text budget, (4) every file_id exists + visible + owned + unexpired, (5) `attach.*` byte/pixel ceilings, (6) at least one renderable part, (7) persist + pin. A refusal carries `error.data.field` pointing at the offending part (`content[i].<key>`); `content has no renderable part` is the new wording for the old `content has no text block`, same INVALID_ARGUMENT code."
       },
       "ui/interrupt": {
-        "params": {"session_id": "string", "turn_id": "string"},
-        "result": {"ok": true},
-        "errors": ["NOT_FOUND"]
+        "params": {
+          "session_id": "string",
+          "turn_id": "string"
+        },
+        "result": {
+          "ok": true
+        },
+        "errors": [
+          "NOT_FOUND"
+        ]
       },
       "ui/queue.cancel": {
-        "params": {"session_id": "string", "turn_id": "string"},
-        "result": {"ok": true},
-        "errors": ["NOT_FOUND"]
+        "params": {
+          "session_id": "string",
+          "turn_id": "string"
+        },
+        "result": {
+          "ok": true
+        },
+        "errors": [
+          "NOT_FOUND"
+        ]
       },
       "approval/decide": {
-        "params": {"request_id": "string", "decision": "approve|deny", "scope": "once|session"},
-        "result": {"ok": true},
-        "errors": ["APPROVER_INVALID", "READ_ONLY_SESSION", "NOT_FOUND"]
+        "params": {
+          "request_id": "string",
+          "decision": "approve|deny",
+          "scope": "once|session"
+        },
+        "result": {
+          "ok": true
+        },
+        "errors": [
+          "APPROVER_INVALID",
+          "READ_ONLY_SESSION",
+          "NOT_FOUND"
+        ]
+      },
+      "model/list": {
+        "params": {"if_revision": "int|null (optional)"},
+        "result": {"revision": "int", "not_modified": "bool", "models": "[model]|null", "default": {"model_id": "string|null", "source": "session|global|priority|none", "resolved": "bool"}},
+        "errors": ["UNAVAILABLE"],
+        "notes": "RFC-0005 append (v1.0.0 -> 1.1.0). Read-only, no side effects, no reverse RPC to modules. `if_revision == revision` returns {revision, not_modified:true, models:null} and the client keeps its cache — a client MUST NOT clear capability badges on `not_modified`. `models` is empty (never 404) when the current mode can route to nothing. Entry: {id, provider, display_name, input_modalities|null, max_image_bytes|null, max_image_px|null, max_images_per_turn|null, context_window|null, supports_tools|null, priority, available}; `null` is UNKNOWN and is never interchangeable with false/[] (no inference from the model name). Offline entries stay with available:false. A core without this method answers C-04 NOT_FOUND with an `unknown method` message and the UI degrades to a read-only badge (FR-8.46), never to an empty list; JSON-RPC -32601 is the standard form for an unregistered method and clients should recognize both."
+      },
+      "session/model.get": {
+        "params": {"session_id": "string"},
+        "result": {"model_id": "string|null", "source": "session|global|priority|none", "resolved": "bool", "effective": "object|null", "global_default": "string|null", "reason": "string|null"},
+        "errors": ["NOT_FOUND", "PERMISSION_DENIED", "UNAVAILABLE"],
+        "notes": "RFC-0005 append. Resolution order (D101): explicit session choice > [llm].default_model > manifest priority (ties: freshest heartbeat, then id). `source` names the layer that won so the UI never re-derives it; `none` means no usable candidate. `resolved=false` with `reason=\"model_unavailable\"` is a DANGLING explicit choice: the UI must show the banner and must not expect a silent fallback. `effective` = {id, provider, model, available}. UNAVAILABLE only when core has no model surface wired at all."
+      },
+      "session/model.set": {
+        "params": {"session_id": "string", "model_id": "string|null"},
+        "result": {"model_id": "string|null", "source": "session|global|priority|none", "effective_at": "next_turn"},
+        "errors": ["INVALID_ARGUMENT", "NOT_FOUND", "UNAVAILABLE", "READ_ONLY_SESSION"],
+        "notes": "RFC-0005 append. `model_id: null` clears the override and falls back to the global default / priority; the returned `source` is the source AFTER clearing. Validation: must appear in the current model/list and be available=true — malformed id -> INVALID_ARGUMENT, unknown id -> NOT_FOUND (data.reason=\"unknown_model\"), known but no healthy instance -> UNAVAILABLE (data.reason=\"model_unavailable\"). A write: an explicitly read-only session gets READ_ONLY_SESSION (get and list stay readable). Takes effect at the next turn's dequeue, so a queued turn that has not started uses the new model and a running turn finishes on the old one; it never touches the queue, never rebuilds the session."
+      },
+      "session/usage.get": {
+        "params": {"session_id": "string"},
+        "result": {"session_id": "string", "chat": {"prompt_tokens": "int", "completion_tokens": "int", "total_tokens": "int", "turns": "int", "partial_turns": "int"}, "aux": {"total_tokens": "int", "calls": "int"}, "total_tokens": "int", "by_model": [{"model_id": "string|null", "total_tokens": "int", "turns": "int"}], "day": {"day": "string (UTC YYYY-MM-DD)", "core_total_tokens": "int", "core_limit": "int", "session_tokens": "int", "state": "off|ok|warn|exceeded"}, "budget": {"scope": "session", "limit": "int", "used": "int", "ratio": "number|null", "state": "off|ok|warn|exceeded", "enforced": "bool"}},
+        "errors": ["NOT_FOUND", "PERMISSION_DENIED", "UNAVAILABLE"],
+        "notes": "RFC-0005 append. One dataset, two views (D102): `chat` sums the usage of every terminal turn (completed+failed+interrupted; `partial_turns` counts those whose source=\"none\"), `aux` comes from the audit llm.call rows with purpose != \"chat\". `total_tokens` = chat + aux and is what the budget judges. `day` is UTC (same boundary as audit/writer.day_key) and gives only an aggregate for other sessions — no cross-session detail. `budget.ratio` is null when limit=0 (state=\"off\"). Two attached devices must get identical numbers and an identical `budget.state`."},
+      "turn/input": {
+        "params": {
+          "session_id": "string",
+          "input_id": "string",
+          "value": "string | string[] | bool"
+        },
+        "result": {
+          "ok": true,
+          "turn_id": "string",
+          "status": "submitted|timeout|cancelled",
+          "value": "same as params.value | null",
+          "duplicate": "bool"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND",
+          "READ_ONLY_SESSION",
+          "PAYLOAD_TOO_LARGE",
+          "OVERLOADED"
+        ],
+        "notes": "RFC-0008 §7.1. `input_id` is core-issued and is the idempotency key: same value again -> duplicate:true with the first result and NO second event; a different value -> INVALID_ARGUMENT{reason:'already_resolved'}; already timed-out/cancelled -> ok:true with that status and value:null. A rejected value leaves the turn in `waiting_input` and emits nothing. The value is only handed to the model as a tool result — it is never executed or interpolated into a command (§9.1)."
+      },
+      "turn/input.cancel": {
+        "params": {
+          "session_id": "string",
+          "input_id": "string",
+          "reason": "string<=200"
+        },
+        "result": {
+          "ok": true,
+          "turn_id": "string",
+          "status": "cancelled|submitted|timeout"
+        },
+        "errors": [
+          "NOT_FOUND",
+          "READ_ONLY_SESSION",
+          "INVALID_ARGUMENT"
+        ],
+        "notes": "RFC-0008 §7.2. Closes ONE dialog and keeps the turn running (the model receives CANCELLED and decides how to continue) — `ui/interrupt` is the one that ends the turn. Idempotent: an already-resolved id returns its current status and no second `turn.input_resolved`."
+      },
+      "turn/regenerate": {
+        "params": {
+          "session_id": "string",
+          "turn_id": "string",
+          "client_msg_id": "string"
+        },
+        "result": {
+          "turn_id": "string",
+          "root_turn_id": "string",
+          "version": "int",
+          "supersedes_turn_id": "string",
+          "queue_pos": "int"
+        },
+        "errors": [
+          "NOT_FOUND",
+          "INVALID_ARGUMENT",
+          "READ_ONLY_SESSION",
+          "OVERLOADED",
+          "UNSUPPORTED"
+        ],
+        "notes": "RFC-0006 1.1.0. New turn for the same user message; the old turn gets superseded_by and a turn.superseded event. `client_msg_id` is the idempotency key; data.reason is turn_active|not_tail|not_head|client_msg_id_conflict."
+      },
+      "message/edit_resubmit": {
+        "params": {
+          "session_id": "string",
+          "message_id": "string",
+          "content": [
+            "object"
+          ],
+          "client_msg_id": "string"
+        },
+        "result": {
+          "turn_id": "string",
+          "message_id": "string",
+          "supersedes_turn_id": "string",
+          "root_turn_id": "string",
+          "version": "int",
+          "queue_pos": "int"
+        },
+        "errors": [
+          "NOT_FOUND",
+          "INVALID_ARGUMENT",
+          "READ_ONLY_SESSION",
+          "OVERLOADED",
+          "PAYLOAD_TOO_LARGE"
+        ],
+        "notes": "RFC-0006 1.1.0. Appends a NEW user message and points the old one at it (messages are immutable); only the last user message is editable."
+      },
+      "task/list": {
+        "params": {
+          "session_id": "string|null (omitted = across sessions; NOT shared execution)",
+          "kinds": [
+            "subagent|job"
+          ],
+          "states": [
+            "task.state"
+          ],
+          "limit": "int 1..200 = 50",
+          "cursor": "string|null (opaque; clients MUST NOT parse it)"
+        },
+        "result": {
+          "tasks": "TaskView[] (RFC-0007 §5.1 fields + log_available)",
+          "next_cursor": "string|null",
+          "running_count": "int",
+          "limits": {
+            "max_concurrent": "int",
+            "max_depth": "int"
+          }
+        },
+        "errors": [
+          "INVALID_ARGUMENT"
+        ],
+        "notes": "RFC-0007 §6.1. Fixed order: non-terminal by started_at ascending first, then terminal by ended_at descending. FR-8.62's 'most recent 50' is states:[completed,failed,cancelled], limit:50 — no `order` parameter exists on purpose. `running_count` and `limits` are served so the client does not have to count tasks of sessions it never attached to. Read-only sessions may call it."
+      },
+      "task/log_tail": {
+        "params": {
+          "task_id": "string",
+          "lines": "int 1..200 = 200",
+          "max_bytes": "int 1..65536 = 65536",
+          "cursor": "string|null",
+          "follow": "bool = false",
+          "wait_ms": "int 0..30000 = 10000"
+        },
+        "result": {
+          "lines": "array of {ts:int, stream:stdout|stderr|core, text:string}",
+          "cursor": "string|null",
+          "eof": "bool",
+          "truncated": "head|line|null",
+          "lost": "bool"
+        },
+        "errors": [
+          "NOT_FOUND",
+          "INVALID_ARGUMENT"
+        ],
+        "notes": "RFC-0007 §6.2. `follow=true` is a bounded long-poll (no server push, no SSE): core may hold the call up to wait_ms, then the client immediately asks again. `eof` = the task is terminal AND the log is drained. Two caps, whichever hits first: lines <= 200 and the response payload <= 64 KiB; truncated='head' means older rows were dropped, 'line' means a single line was cut at tasks.log_line_chars. `lost=true` means the cursor is older than the ring's start (core restart or eviction) and the oldest available rows are returned instead — never pretend the log is complete. A task with log_available=false answers NOT_FOUND, not an empty list. Read-only sessions may call it."
+      },
+      "task/cancel": {
+        "params": {
+          "task_id": "string",
+          "reason": "string <=200"
+        },
+        "result": {
+          "ok": true,
+          "state": "task.state",
+          "forced": "bool"
+        },
+        "errors": [
+          "NOT_FOUND",
+          "READ_ONLY_SESSION",
+          "INVALID_ARGUMENT"
+        ],
+        "notes": "RFC-0007 §6.3. Idempotent: a terminal task returns its current terminal state, `ok:true`, and produces NO second task.finished. A live task moves to cancelling immediately; core asks cooperatively (child ui/interrupt, module tools/cancel) and forces `cancelled` with forced=true at tasks.cancel_grace_ms. The measured ceiling from this response to task.finished is 3 s (2 s default grace + scheduling). `forced` is what separates 'it really stopped' from 'we stopped waiting'."
+      },
+      "subagent/message": {
+        "params": {
+          "task_id": "string",
+          "text": "string 1..2000"
+        },
+        "result": {
+          "ok": true,
+          "turn_id": "string|null",
+          "delivery": "queued|steering"
+        },
+        "errors": [
+          "NOT_FOUND",
+          "INVALID_ARGUMENT",
+          "UNSUPPORTED",
+          "READ_ONLY_SESSION",
+          "OVERLOADED"
+        ],
+        "notes": "RFC-0007 §6.4. Only for kind=subagent with a non-null child_session_id, and only when tasks.subagent_message=true (default false → UNSUPPORTED, which is the v1 answer). delivery=queued means the child handles it as a new message after its current turn; steering (injecting a running turn) is reserved and answers UNSUPPORTED."
+      },
+      "subagent/list": {
+        "params": {
+          "session_id": "string|null (omitted = across sessions; NOT shared execution)",
+          "states": ["subagent.state"],
+          "limit": "int 1..200 = 50",
+          "cursor": "string|null (opaque; clients MUST NOT parse it)"
+        },
+        "result": {
+          "runs": "SubagentRunView[] (RFC-0012 §4.2 fields + duration_ms + result_preview)",
+          "next_cursor": "string|null"
+        },
+        "errors": [
+          "INVALID_ARGUMENT"
+        ],
+        "notes": "RFC-0012 §6.1. Fixed order: created_at ascending, run_id tiebreak, keyset cursor. `states` filters within the ordered set. The run's LIFETIME truth is the subagent_runs table — the events are increments, this is the pull. Explicitly read-only sessions may call it. SubagentRunView.result_preview (<=500 chars) is a READ-TIME projection of the child session's last assistant message, never persisted and never broadcast."
+      },
+      "subagent/get": {
+        "params": {
+          "run_id": "string (run_<32hex>)"
+        },
+        "result": {
+          "run_id": "string",
+          "parent_session_id": "string",
+          "parent_turn_id": "string|null",
+          "child_session_id": "string|null",
+          "label": "string",
+          "state": "subagent.state",
+          "created_at": "int (unix ms)",
+          "finished_at": "int|null",
+          "result_digest": "string|null (sha-256 hex of the full result text; never the text)",
+          "result_chars": "int|null",
+          "error_code": "string|null (C-04 name, set when state=failed)",
+          "result_preview": "string|null (<=500 chars, read-time projection)",
+          "duration_ms": "int"
+        },
+        "errors": [
+          "NOT_FOUND",
+          "INVALID_ARGUMENT"
+        ],
+        "notes": "RFC-0012 §6.2. A malformed run_id (not run_<32hex>) answers INVALID_ARGUMENT(data.field=run_id); a well-formed unknown one answers NOT_FOUND — the two failures are deliberately distinct. Read-only sessions may call it."
+      },
+      "ui/page.get": {
+        "params": {
+          "module_id": "string",
+          "instance_id": "string",
+          "page_id": "string"
+        },
+        "result": {
+          "schema": "object (the page body: inline tree or the ref target)",
+          "sha256": "string (64 hex)"
+        },
+        "errors": [
+          "NOT_FOUND",
+          "MANIFEST_INVALID",
+          "UNSUPPORTED",
+          "UNAVAILABLE",
+          "PERMISSION_DENIED",
+          "READ_ONLY_SESSION"
+        ],
+        "notes": "RFC-0009 §9.3/§10.2. The page must be one the module declared in `manifest.ui.pages`. **Caller authentication (C-19 review B1):** the target must be the caller's own module — a Noise peer is named by the whitelist (`module_id#instance_id` in `connection.device_id`) and a request for another module is PERMISSION_DENIED; a browser session (`ui-…`) may read the pages of ENABLED modules only. The `module_id` parameter is a locator and is never evidence of identity. For a `ref` page core fetches `page/get` from the module, enforces <=64 KiB and the sha256 pinned in the manifest, then re-runs the C-19 validator with the ref byte ceiling (not the 8 KiB inline one) — a digest mismatch, an oversize body or an unparseable tree is MANIFEST_INVALID and the entry stays greyed. Inline pages are re-validated and returned without a module round trip. A page the registration dropped is NOT_FOUND (its entry never appears, §7.4)."
+      },
+      "ui/state.get": {
+        "params": {
+          "module_id": "string",
+          "instance_id": "string",
+          "page_id": "string"
+        },
+        "result": {
+          "rev": "int (monotonic)",
+          "state": "object (flat: string|number|bool|null)",
+          "fetched_at": "int (unix seconds)",
+          "unchanged": "bool (optional; true when the module's reply was not newer than the cached one, so the cached rev/state are returned)"
+        },
+        "errors": [
+          "NOT_FOUND",
+          "UNSUPPORTED",
+          "UNAVAILABLE",
+          "TIMEOUT",
+          "PERMISSION_DENIED",
+          "READ_ONLY_SESSION"
+        ],
+        "notes": "RFC-0009 §9.3/§10.2. Read-only proxy for the module's `state/get`; core caches by (module, instance, page) for at most [ui].state_cache_s. **Caller authentication (B1):** same rule as `ui/page.get` — the caller's identity comes from the connection, so a module may read only its own page state and a browser only an enabled module's. **Staleness (B5):** the cache is compare-and-swap per page under a per-key lock; a reply whose `rev` is not greater than the cached one never overwrites it, and `rev` is never renumbered. Such a reply is returned as the cached value with `unchanged:true`. `state` is capped at 8 KiB / 64 keys; a module that does not implement `state/get` yields UNSUPPORTED, which the client shows as an unavailable banner -- never a white page (§5.4). No session_id is sent: the page reads this module's state only."
+      },
+      "ui/tool.call": {
+        "params": {
+          "module_id": "string",
+          "instance_id": "string",
+          "page_id": "string",
+          "tool": "string (must be declared in this module's capabilities.tools)",
+          "args": "object (literal / {\"bind\"} / {\"input\"} values only)",
+          "client_call_id": "string",
+          "session_id": "string|null",
+          "call_id": "string|null (second stage: the id from stage one)",
+          "approval_id": "string|null (second stage: the approval request_id)"
+        },
+        "result": {
+          "call_id": "string",
+          "status": "approval_required|denied|ok|failed",
+          "approval": {
+            "request_id": "string",
+            "tool": "string",
+            "args": "object",
+            "risk": "low|medium|high",
+            "expires_at": "int",
+            "args_digest": "string"
+          },
+          "result": "any (status=ok)",
+          "error": {
+            "code": "C-04 code",
+            "message": "string",
+            "retriable": "bool"
+          }
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND",
+          "PERMISSION_DENIED",
+          "PAYLOAD_TOO_LARGE",
+          "TIMEOUT",
+          "OVERLOADED",
+          "UNAVAILABLE",
+          "READ_ONLY_SESSION"
+        ],
+        "notes": "RFC-0009 §6.2/§9.3/§10.2. Two stages: stage one validates ownership + args against the module's `input_schema`, computes risk as max(declared, [policy.tool_risk]) and, when approval is required, mints an approval WITHOUT executing anything; it returns approval_required + the approval object. Stage two repeats the call with `call_id` + `approval_id` and exactly the same `args`; core compares the args digest (a different body is PERMISSION_DENIED), refuses an expired/pending/denied request, and only then dispatches through the SAME router path as `tools/call`. **Binding (B2):** the mint records the requesting `session_id` and `device_id`, and stage two compares both verbatim — a different session or device is PERMISSION_DENIED with `data.field` = `session_id`|`approver`, and a refused redemption does not consume the mint. **Caller authentication (B1):** the target module must be the caller's own; a browser may invoke a page tool but always through this approval flow. **Read-only (B3):** a read-only session is READ_ONLY_SESSION before anything is minted. A low-risk tool may answer `ok` in stage one. The client-supplied module_id locates the page and never authorises the call: ownership comes from the caller identity, risk and approval from core. No turn, no message, no model context."
+      },
+      "session/list": {
+        "params": {
+          "limit": "int 1..200, default 50",
+          "cursor": "int >= 0, default 0 (opaque offset; echo next_cursor to continue)",
+          "group_id": "string|null (optional; null = ungrouped only, omitted = all groups)",
+          "archived": "bool, default false"
+        },
+        "result": {
+          "sessions": [
+            {
+              "session_id": "string",
+              "created_at": "int (unix ms)",
+              "updated_at": "int (unix ms; last activity, the FR-8.26 order key)",
+              "title": "string|null",
+              "icon": "string|null (Tabler whitelist name)",
+              "color": "string|null (#RRGGBB)",
+              "group_id": "string|null",
+              "pinned_at": "int|null",
+              "archived_at": "int|null",
+              "unread": "int (0|1)",
+              "state": "open|closed"
+            }
+          ],
+          "next_cursor": "int|null (null = end of list)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (§5). The LIGHT list: metadata only, no messages/turns — content is ui/attach's job. Order is fixed (§7.4): pinned first, then updated_at DESC, created_at DESC, id ASC (stable ties). group_id is a FILTER, not a sort group — the client renders inline groups from the row (FR-8.26). Unknown group_id -> NOT_FOUND (data.reason=unknown_group). next_cursor = cursor+len(sessions) on a FULL page only; a short page is the end."
+      },
+      "session/rename": {
+        "params": {
+          "session_id": "string",
+          "title": "string 1..200 after trimming"
+        },
+        "result": {
+          "ok": "bool",
+          "session": "session_row (same shape as session/list items)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (FR-8.26 verb). Metadata only — messages/turns are untouched. Emits session.updated on the session's own stream (§6.1). An empty/blank title is INVALID_ARGUMENT (v1 has no clear-title semantics)."
+      },
+      "session/pin": {
+        "params": {
+          "session_id": "string",
+          "pinned": "bool (required; true = pin, false = unpin)"
+        },
+        "result": {
+          "ok": "bool",
+          "pinned_at": "int|null (unix ms; null after unpin)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (FR-8.26 verb). pinned_at is the list-order primary key (§7.4: pinned sessions come first, still ordered by updated_at among themselves). Emits session.updated."
+      },
+      "session/archive": {
+        "params": {
+          "session_id": "string",
+          "archived": "bool (required)"
+        },
+        "result": {
+          "ok": "bool",
+          "archived_at": "int|null (unix ms; null after unarchive)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (FR-8.26 verb). Archived sessions leave the default list (session/list defaults archived=false) and appear under the archived filter. Orthogonal to the session `state` (open/closed, RFC-0005): archiving does not close the session (RFC-0010 §10 Q5). Emits session.updated."
+      },
+      "session/delete": {
+        "params": {
+          "session_id": "string"
+        },
+        "result": {
+          "ok": "bool"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 §8.2 (FR-8.26 verb, 二次确认). Hard delete: the sessions/turns/messages/events rows are removed in one transaction — core has no trash can, the double-confirm dialog is CLIENT responsibility. Guard: queued or running turns refuse with INVALID_ARGUMENT (data.reason=turn_active); interrupt first. Broadcasts session.list_changed{change:'removed'} to every OTHER attached session (§6.2). No new C-04 code (§1 #10)."
+      },
+      "session/group.list": {
+        "params": {},
+        "result": {
+          "groups": [
+            {
+              "group_id": "string",
+              "name": "string 1..64",
+              "icon": "string|null (Tabler whitelist name)",
+              "color": "string|null (#RRGGBB)",
+              "sort_order": "int >= 0",
+              "created_at": "int (unix ms)",
+              "session_count": "int"
+            }
+          ]
+        },
+        "errors": [],
+        "notes": "RFC-0010 append (§5). Ordered by sort_order, created_at, group_id. session_count is the folded-row number; v1 emits no event for group.* changes — clients re-pull after their own mutations (RFC-0010 §10 Q4)."
+      },
+      "session/group.create": {
+        "params": {
+          "name": "string 1..64 after trimming (required)",
+          "icon": "string|null (optional, Tabler whitelist)",
+          "color": "string|null (optional, #RRGGBB)",
+          "sort_order": "int >= 0, default 0"
+        },
+        "result": {
+          "group": "group_row (same shape as session/group.list items minus session_count)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT"
+        ],
+        "notes": "RFC-0010 append (§4.1/§7.3). group_id is core-allocated (uuid4 hex). A parent_id param is INVALID_ARGUMENT with data.reason=nesting_forbidden — groups are folders, ONE level, no tree (§1 #2)."
+      },
+      "session/group.update": {
+        "params": {
+          "group_id": "string",
+          "name": "string 1..64 (optional; explicit null is INVALID_ARGUMENT — a name cannot be cleared)",
+          "icon": "string|null (optional; null = clear, omitted = keep)",
+          "color": "string|null (optional; null = clear, omitted = keep)",
+          "sort_order": "int >= 0 (optional)"
+        },
+        "result": {
+          "group": "group_row"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (§5). Partial update: only keys present in params change; at least one must be present."
+      },
+      "session/group.delete": {
+        "params": {
+          "group_id": "string"
+        },
+        "result": {
+          "ok": "bool",
+          "unassigned": "int (sessions moved back to ungrouped)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 §8.1. Deleting a group NEVER deletes sessions: every member's group_id is set to NULL in the same transaction and unassigned reports how many. A deleted conversation is never the side effect of a deleted folder."
+      },
+      "session/group.assign": {
+        "params": {
+          "session_id": "string",
+          "group_id": "string|null (null = move out of any group)"
+        },
+        "result": {
+          "ok": "bool",
+          "group_id": "string|null (echo)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0010 append (§5). The single membership column (§1 #1: folders, not tags). Unknown group -> NOT_FOUND (data.reason=unknown_group); unknown session -> NOT_FOUND. Emits session.updated on the session's own stream."
+      },
+      "session/search": {
+        "params": {
+          "query": "string 1..200 after trimming (required; absent/blank/non-string -> INVALID_ARGUMENT)",
+          "limit": "int 1..100, default 20",
+          "offset": "int >= 0, default 0",
+          "session_id": "string (optional; scopes the search to one session, unknown -> NOT_FOUND)"
+        },
+        "result": {
+          "results": [
+            {
+              "session_id": "string",
+              "title": "string|null",
+              "updated_at": "int (unix ms)",
+              "matched_in": "title|body",
+              "message_id": "string|null (set only for body hits)",
+              "snippet": "string|null (<= 120 code points incl. ellipses; null for title hits)",
+              "snippet_offset": "int|null (code-point index of the match start in the ORIGINAL content; null for title hits)",
+              "archived": "bool"
+            }
+          ],
+          "total": "int (distinct matching sessions; a session counts once even when title and body both match)"
+        },
+        "errors": [
+          "INVALID_ARGUMENT",
+          "NOT_FOUND"
+        ],
+        "notes": "RFC-0014 append (§4/§5). Scope = session titles + live message bodies (messages.content text; rows with superseded_by excluded, RFC-0006 §6.3). Matching = parameterized LIKE with %/_/\\ escaped to literals and ESCAPE '\\', ASCII case-insensitive / non-ASCII exact (SQLite LIKE semantics); no FTS5 dependency, and no new index (a leading-wildcard LIKE cannot use one). Order (§4.4): title hits before body hits, then updated_at DESC, id ASC (stable ties). A session appears at most once; total counts distinct matching sessions. Blank/absent query -> INVALID_ARGUMENT; unknown session_id -> NOT_FOUND. Snippets are clipped windows, never full bodies (bodies reach 32000 code points, RFC-0006 §8)."
+      },
+      "ui/modules": {
+        "params": {},
+        "result": {
+          "revision": "int (monotonic within one core process; the Registry revision, the same counter model/list reports)",
+          "modules": [
+            {
+              "module_id": "string (C-03 manifest.module_id)",
+              "instance_id": "string (C-03 manifest.instance_id)",
+              "display_name": "string|null (C-03 manifest.display_name; OPTIONAL in C-03, hence nullable here)",
+              "version": "string|null (C-03 manifest.version, SemVer 2.0.0; null only when the record carries no parsed manifest)",
+              "online": "bool (record.health is ONLINE and connection_id is not None — the same predicate module.status publishes)",
+              "pages": [
+                {
+                  "id": "string (C-03 $defs.page.id = UIPage.page_id; NOT `page_id`)",
+                  "title": "string (1..40)",
+                  "icon": "list|chart|settings|tool|file|none (UIPage.icon, default none)",
+                  "entry": "auto|panel|capabilities (UIPage.entry, default auto)",
+                  "version": "int >= 1 (the PAGE schema revision, not the module SemVer)",
+                  "requires": [
+                    "session"
+                  ],
+                  "refresh_s": "int >= 0 (default 0)"
+                }
+              ]
+            }
+          ]
+        },
+        "errors": [
+          "PERMISSION_DENIED",
+          "UNAVAILABLE",
+          "PAYLOAD_TOO_LARGE"
+        ],
+        "notes": "RFC-0015 §4. **SERVED and REGISTERED** — core implements it in `ModulePageService.list_modules()` (`core/vade/modulepage/service.py`) behind the `ui/modules` handler in `core/vade/modulepage/rpc.py`, and the contract registration is the C-05 1.6.0 append block (`x-vade.appends`, §9.2); a core that predates it answers C-04 NOT_FOUND with an `unknown method` message (not JSON-RPC -32601 — the standard form for an unregistered method, which clients should recognize as the same degradation) and the client must degrade to the empty entry block instead of erroring (§7.1). ONE pull returns the WHOLE list because an entry list has to render on first paint. `params` is `{}` and never gains `session_id`: the module set is a process-level fact (`Registry.snapshot()` takes no session) and authorization comes from the connection (`modulepage/auth.py`, review B1), never from a param the caller controls. `pages` is `ModulePageService.pages()` verbatim (`modulepage/service.py:202-221`) — the key is `id`, because C-03 `$defs.page` and the client decoder both call it `id`; renaming it here would create a second spelling. Page BODIES never cross the wire: `ui/page.get` stays the only body channel (ref pages keep their sha256 check there). Ordering: registry order for modules, `manifest.ui.pages[]` order for pages. Callers: a browser session (`ui-...`) sees ENABLED modules only; a module peer sees only itself; an unresolvable caller is PERMISSION_DENIED. `revision` is the Registry revision (`registry/table.py:135-141`) which is bumped next to every `_publish_status(...)` call, so 'a module.status arrived' and 'the revision moved' are the same set — the client invalidates on `module.status` and re-pulls here (§5). No event is added (C-06 stays 34 entries), no error code is added (C-04 stays 34)."
       }
     }
   },
@@ -192,25 +1251,75 @@
     "note": "RFC-0004 §7.3: the attachment channel is HTTP on the core's own listener, not JSON-RPC. A 5 MiB image is ~107x the 65 519-byte transport frame (§2.1), so bytes have to enter core outside the ws control plane. Listed here because an undocumented second entry point is how 'how do I upload' gets re-invented per client.",
     "listener": "data plane (core.listen) — same process as /ws and /ui/session; /admin* is deliberately 404 here",
     "auth": {
-      "device": "Authorization: Bearer <token minted over the already-authenticated device channel>",
+      "device": "Authorization: Bearer <token minted by ui/blob.token over the already-authenticated device channel; bound to the calling connection's device_id, TTL 60..900 s>",
       "browser": "__Host-ac_ui cookie + x-vade-csrf (double submit) + exact Origin allowlist + Sec-Fetch-Site: same-origin",
       "read_only": "explicitly read-only sessions are 403 READ_ONLY_SESSION on writes only; reads stay allowed so history images render"
     },
-    "body_max": {"begin": 65536, "part": "attach.part_size + 1024"},
+    "body_max": {
+      "begin": 65536,
+      "part": "attach.part_size + 1024"
+    },
     "content_types": {
-      "begin_complete": ["application/json"],
-      "part": ["application/octet-stream"],
-      "rejected": ["multipart/form-data", "application/x-www-form-urlencoded", "text/plain"]
+      "begin_complete": [
+        "application/json"
+      ],
+      "part": [
+        "application/octet-stream"
+      ],
+      "rejected": [
+        "multipart/form-data",
+        "application/x-www-form-urlencoded",
+        "text/plain"
+      ]
     },
     "endpoints": [
-      {"method": "POST", "path": "/ui/blob", "semantics": "begin: declare sha256/size/mime/dimensions", "idempotency": "(device_id, sha256, size)", "body_max": 65536},
-      {"method": "PUT", "path": "/ui/blob/upload/{upload_id}?offset=N", "semantics": "write one part (raw bytes, offset on a part_size boundary)", "idempotency": "(upload_id, offset)", "body_max": "attach.part_size + 1024"},
-      {"method": "HEAD", "path": "/ui/blob/upload/{upload_id}", "semantics": "received ranges / offset_next / expires_at (the resume anchor)", "idempotency": "read", "body_max": 0},
-      {"method": "POST", "path": "/ui/blob/upload/{upload_id}/complete", "semantics": "recompute size+sha256, emit file_id", "idempotency": "(upload_id)", "body_max": 65536},
-      {"method": "DELETE", "path": "/ui/blob/upload/{upload_id}", "semantics": "abort the upload session; never deletes a committed blob (204, idempotent)", "idempotency": "(upload_id)", "body_max": 0},
-      {"method": "GET|HEAD", "path": "/ui/blob/{file_id}[?v=thumb]", "semantics": "fetch bytes (single Range, immutable) / metadata + scan; ?v=thumb is the same file_id", "idempotency": "read", "body_max": 0}
+      {
+        "method": "POST",
+        "path": "/ui/blob",
+        "semantics": "begin: declare sha256/size/mime/dimensions",
+        "idempotency": "(device_id, sha256, size)",
+        "body_max": 65536
+      },
+      {
+        "method": "PUT",
+        "path": "/ui/blob/upload/{upload_id}?offset=N",
+        "semantics": "write one part (raw bytes, offset on a part_size boundary)",
+        "idempotency": "(upload_id, offset)",
+        "body_max": "attach.part_size + 1024"
+      },
+      {
+        "method": "HEAD",
+        "path": "/ui/blob/upload/{upload_id}",
+        "semantics": "received ranges / offset_next / expires_at (the resume anchor)",
+        "idempotency": "read",
+        "body_max": 0
+      },
+      {
+        "method": "POST",
+        "path": "/ui/blob/upload/{upload_id}/complete",
+        "semantics": "recompute size+sha256, emit file_id",
+        "idempotency": "(upload_id)",
+        "body_max": 65536
+      },
+      {
+        "method": "DELETE",
+        "path": "/ui/blob/upload/{upload_id}",
+        "semantics": "abort the upload session; never deletes a committed blob (204, idempotent)",
+        "idempotency": "(upload_id)",
+        "body_max": 0
+      },
+      {
+        "method": "GET|HEAD",
+        "path": "/ui/blob/{file_id}[?v=thumb]",
+        "semantics": "fetch bytes (single Range, immutable) / metadata + scan; ?v=thumb is the same file_id",
+        "idempotency": "read",
+        "body_max": 0
+      }
     ],
-    "x-vade": {"appends": "RFC-0004", "fr_exception": "FR-8.2 (AMEND-22 R1) 的唯一例外"}
+    "x-vade": {
+      "appends": "RFC-0004",
+      "fr_exception": "FR-8.2 (AMEND-22 R1) 的唯一例外"
+    }
   },
   "events_core_to_ui": {
     "note": "C-06 owns this table (schema/events.json). Listed here only so method-table consumers know the names referenced by ui/*.",
@@ -227,7 +1336,14 @@
       "turn.failed",
       "turn.interrupted",
       "queue.updated",
-      "module.status"
+      "module.status",
+      "usage.budget",
+      "turn.superseded",
+      "message.edited",
+      "task.started",
+      "task.status",
+      "task.progress",
+      "task.finished"
     ],
     "owner": "C3"
   }

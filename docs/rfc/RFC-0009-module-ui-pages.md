@@ -8,7 +8,7 @@ proposer: 编排（依据 `docs/requirements.md` §8.22.1 决策 #18 / #19、§8
 affects: C-19（新，待冻结）；C-03 `schema/manifest.schema.json` 追加 `ui.pages[]`（含 `core/vade/registry/manifest.py` 的 `Manifest` 承接，否则静默丢弃）；C-05 `schema/rpc.json` 的 `ui_to_core` 追加 `ui/tool.call` / `ui/state.get` / `ui/page.get`，`core_to_module` 追加 `state/get` / `page/get`
 related: RFC-0001（C-03 追加的正确写法，以及「`additionalProperties: true` 放行但 `Manifest` 丢弃」这个已踩过的坑）；RFC-0004 / RFC-0007（章节风格与 C-05 追加惯例来源；本文件复用 `ui/submit` 与 `approval/decide`）；AMEND-22 §8.22.3 / §8.22.6 #4（C-19 冻结时才登记进 01-contracts 契约表）
 type: 新契约（C-19）+ C-03 / C-05 追加；不改 C-04 错误码、不改 C-06 事件族、不改 C-09 组件签名、无破坏性改名
-stage: 草稿，未实现；不改 `schema/`、不改 `core/`、不改 `docs/agents/01-contracts.md`（登记会让 check_docs 的 C5「18 个契约」口径变红）
+stage: 已实现并合并
 ---
 
 # RFC-0009 · 模块 UI 页面

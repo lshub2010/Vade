@@ -9,7 +9,17 @@
     "status": "frozen",
     "frozen_at": "2026-11-13",
     "owner": "C2",
-    "consumers": ["C4", "M1", "M2", "M3", "M4a", "M4b", "M5", "M6", "C5a"],
+    "consumers": [
+      "C4",
+      "M1",
+      "M2",
+      "M3",
+      "M4a",
+      "M4b",
+      "M5",
+      "M6",
+      "C5a"
+    ],
     "limits": {
       "tools_per_module": 64,
       "tools_global": 128,
@@ -17,20 +27,51 @@
       "description_max_len": 512,
       "max_payload_ceiling": 65519,
       "timeout_ms_min": 100,
-      "timeout_ms_max": 600000
+      "timeout_ms_max": 600000,
+      "pages_per_module": 8,
+      "ui_block_max_bytes": 49152,
+      "ui_inline_max_bytes": 8192,
+      "ui_ref_max_bytes": 65536,
+      "ui_nodes_per_page": 256,
+      "ui_depth_max": 8
     },
     "appends": [
       {
         "contract": "C-14",
         "version": "1.0.0",
-        "fields": ["subscriptions"],
+        "fields": [
+          "subscriptions"
+        ],
         "doc": "docs/rfc/RFC-0001-manifest-subscriptions.md",
         "why": "C-03 shipped without the field C-14's manifest gate reads. `additionalProperties: true` let a module send it, but `Manifest` dropped it, so every real registration was rejected `not in manifest`."
+      },
+      {
+        "contract": "C-03",
+        "version": "1.0.0",
+        "fields": ["capabilities.models"],
+        "doc": "docs/rfc/RFC-0005-model-capabilities-usage.md",
+        "why": "No capability declaration surface existed, so a UI could only guess whether a model reads images (RFC-0004 §9's unknown-capability path costs a full 5 MiB upload before UNSUPPORTED). Appended only: `capabilities.required` is still `['tools']`, and an old core ignores the unknown key with a warning, exactly as C-03 promises. `core/vade/registry/manifest.py` must keep parsing it into `Manifest.models` or the schema field becomes a silently dropped key — the same failure mode as the C-14 row above."
+      },
+      {
+        "contract": "C-19",
+        "version": "1.0.0",
+        "fields": [
+          "ui"
+        ],
+        "doc": "docs/rfc/RFC-0009-module-ui-pages.md",
+        "why": "C-03 shipped without a page surface, so a module's only UI was the out-of-process `webui`. Same trap as C-14: `additionalProperties: true` lets `ui` through, but a `Manifest` that does not parse it drops it silently. The `ui` subtree is the one place where `additionalProperties` is false -- an unknown key in a page can only be a script hook."
       }
     ]
   },
   "type": "object",
-  "required": ["module_id", "instance_id", "version", "protocol", "capabilities", "limits"],
+  "required": [
+    "module_id",
+    "instance_id",
+    "version",
+    "protocol",
+    "capabilities",
+    "limits"
+  ],
   "additionalProperties": true,
   "properties": {
     "module_id": {
@@ -63,13 +104,21 @@
     "role": {
       "type": "string",
       "description": "Self-declared role. `evolve` is only honoured when the fingerprint is in core's [evolve].allowlist; otherwise it is demoted to `tool`.",
-      "enum": ["tool", "evolve", "ui"],
+      "enum": [
+        "tool",
+        "evolve",
+        "ui"
+      ],
       "default": "tool"
     },
     "concurrency": {
       "type": "string",
       "description": "exclusive: one instance per module (second registration -> TOOL_CONFLICT). pooled: up to limits.max_concurrency instances, least-inflight routing. mirrored: any number, no load, events broadcast.",
-      "enum": ["exclusive", "pooled", "mirrored"],
+      "enum": [
+        "exclusive",
+        "pooled",
+        "mirrored"
+      ],
       "default": "exclusive"
     },
     "priority": {
@@ -81,18 +130,24 @@
     },
     "capabilities": {
       "type": "object",
-      "required": ["tools"],
+      "required": [
+        "tools"
+      ],
       "additionalProperties": true,
       "properties": {
         "tools": {
           "type": "array",
           "maxItems": 64,
-          "items": {"$ref": "#/$defs/tool"}
+          "items": {
+            "$ref": "#/$defs/tool"
+          }
         },
         "prompts": {
           "type": "array",
           "maxItems": 64,
-          "items": {"$ref": "#/$defs/prompt"}
+          "items": {
+            "$ref": "#/$defs/prompt"
+          }
         },
         "events": {
           "type": "array",
@@ -102,12 +157,21 @@
             "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
             "maxLength": 64
           }
+        },
+        "models": {
+          "type": "array",
+          "description": "RFC-0005 append (§4.3). Models this module serves, one entry each; `name` is what `model/list` puts after `<module_id>/`. OPTIONAL and additive: a module that declares nothing still appears as `<module_id>/*` with every capability null (an empty array is NOT 'serves no model'). Capped at 16 so a manifest cannot become a second model directory; more than 16 is MANIFEST_INVALID, while a single bad ENTRY is dropped with a warning so one typo cannot take the module offline. Omitted capability fields are UNKNOWN (null), never false/[].",
+          "maxItems": 16,
+          "items": {"$ref": "#/$defs/model"}
         }
       }
     },
     "limits": {
       "type": "object",
-      "required": ["max_concurrency", "max_payload"],
+      "required": [
+        "max_concurrency",
+        "max_payload"
+      ],
       "additionalProperties": true,
       "properties": {
         "max_concurrency": {
@@ -130,7 +194,12 @@
       "description": "Only declared sources are injected. `session_id` is the only source implemented in v1; anything else is rejected.",
       "maxItems": 8,
       "uniqueItems": true,
-      "items": {"type": "string", "enum": ["session_id"]}
+      "items": {
+        "type": "string",
+        "enum": [
+          "session_id"
+        ]
+      }
     },
     "subscriptions": {
       "type": "array",
@@ -146,12 +215,36 @@
     "extensions": {
       "type": "object",
       "description": "Opaque to core. Never parsed, never forwarded to the admin API."
+    },
+    "ui": {
+      "type": "object",
+      "description": "C-19 append (RFC-0009 §9.2). Declarative module pages. STRICT on purpose: this is the one subtree in C-03 where `additionalProperties` is false, because an unknown key inside a page is a script hook, not forward compatibility. A page that fails validation is dropped with a warning (`Manifest.ui_warnings`); the module's tools still register. `ui.pages` missing or empty means the module has NO entry anywhere (FR-8.79 §8.2): no empty tab, no placeholder row.",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-": {}
+      },
+      "properties": {
+        "pages": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/page"
+          }
+        }
+      }
     }
   },
   "$defs": {
     "tool": {
       "type": "object",
-      "required": ["name", "description", "input_schema", "risk", "timeout_ms", "idempotent"],
+      "required": [
+        "name",
+        "description",
+        "input_schema",
+        "risk",
+        "timeout_ms",
+        "idempotent"
+      ],
       "additionalProperties": true,
       "properties": {
         "name": {
@@ -168,18 +261,28 @@
         "input_schema": {
           "type": "object",
           "description": "Any JSON Schema, but the root `type` must be `object`.",
-          "required": ["type"],
+          "required": [
+            "type"
+          ],
           "properties": {
-            "type": {"const": "object"}
+            "type": {
+              "const": "object"
+            }
           },
           "additionalProperties": true
         },
         "risk": {
           "type": "string",
           "description": "Declared risk. core adjudicates against [policy.tool_risk] and may only raise it. Unlisted tools become `high`.",
-          "enum": ["low", "medium", "high"]
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
         },
-        "idempotent": {"type": "boolean"},
+        "idempotent": {
+          "type": "boolean"
+        },
         "timeout_ms": {
           "type": "integer",
           "minimum": 100,
@@ -192,17 +295,610 @@
         }
       }
     },
+    "model": {
+      "type": "object",
+      "description": "One model a module serves (RFC-0005 §4.3). Only `name` is required; every capability is optional and an omitted one is UNKNOWN (null). `id`, `provider`, `priority` and `available` are DERIVED by core — `id` = `<module_id>/<name>`, `provider` = `module_id`, `priority` = the manifest's `priority`, `available` = at least one healthy instance — so a module cannot claim another module's namespace or invent an availability it does not have. Declaring `id`/`provider` here is ignored (additionalProperties is true by design).",
+      "required": ["name"],
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Model name as the provider knows it (e.g. `qwen2.5-vl-72b`). No `/` and no whitespace, because core splits `<provider>/<model>` at the FIRST `/` only and `parse_models` drops such an entry; a name that needs a vendor prefix must be flattened by the module. Unique within one manifest; a duplicate is dropped with a warning.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^/\\s]+$"
+        },
+        "display_name": {
+          "type": "string",
+          "description": "Shown in the model switcher; falls back to `name`.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "input_modalities": {
+          "type": "array",
+          "description": "Subset of text|image|audio|file. An unknown value is dropped with a warning; the whole field is null when nothing valid remains. null = UNKNOWN = the UI allows the pick but marks it unknown and core decides at submit (RFC-0004 §9) — it is NOT 'text only'.",
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {"type": "string", "enum": ["text", "image", "audio", "file"]}
+        },
+        "max_image_bytes": {
+          "type": "integer",
+          "description": "Post-compression per-image byte cap (RFC-0004 §9, min() with `attach.image.max_bytes`). Non-positive or non-integer -> field becomes null + warning; the manifest is still accepted.",
+          "minimum": 1
+        },
+        "max_image_px": {
+          "type": "integer",
+          "description": "LONG-EDGE pixel cap (Q6: min() with `attach.image.max_edge`, not total pixels). Non-positive -> null + warning.",
+          "minimum": 1
+        },
+        "max_images_per_turn": {
+          "type": "integer",
+          "description": "Images per turn (min() with `attach.max_per_turn`). Non-positive -> null + warning.",
+          "minimum": 1
+        },
+        "context_window": {
+          "type": "integer",
+          "description": "Context size in tokens; null = unknown, in which case the UI shows no percentage and compaction keeps using its own config.",
+          "minimum": 1
+        },
+        "supports_tools": {
+          "type": "boolean",
+          "description": "false = core does not send a `tools` array to this model. null = undeclared -> keep sending (status quo). Never inferred from the model name."
+        }
+      }
+    },
     "prompt": {
       "type": "object",
-      "required": ["id", "content"],
+      "required": [
+        "id",
+        "content"
+      ],
       "additionalProperties": true,
       "properties": {
         "id": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
         },
-        "content": {"type": "string", "minLength": 1, "maxLength": 32768},
-        "description": {"type": "string", "maxLength": 512}
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 512
+        }
+      }
+    },
+    "page": {
+      "type": "object",
+      "description": "One page declaration. `schema` is either the inline node tree (<=8 KiB serialised) or `{\"ref\": {page_id, sha256}}` (<=64 KiB, fetched through `ui/page.get`; the digest is pinned here so a page cannot be swapped after registration).",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-": {}
+      },
+      "required": [
+        "id",
+        "title",
+        "version",
+        "schema"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "icon": {
+          "enum": [
+            "list",
+            "chart",
+            "settings",
+            "tool",
+            "file",
+            "none"
+          ],
+          "default": "none"
+        },
+        "entry": {
+          "enum": [
+            "auto",
+            "panel",
+            "capabilities"
+          ],
+          "default": "auto"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "requires": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "enum": [
+              "session"
+            ]
+          }
+        },
+        "refresh_s": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600,
+          "description": "Optional client hint: how often to re-issue `ui/state.get` while the page is open. Absent = refresh on entry, on `online` and on user retry only. core's own cache ceiling is [ui].state_cache_s."
+        },
+        "schema": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/node",
+              "description": "Inline node tree root (column/row/tabs/list/text/component). Closed: see $defs/node."
+            },
+            {
+              "type": "object",
+              "required": [
+                "ref"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "ref": {
+                  "type": "object",
+                  "required": [
+                    "page_id",
+                    "sha256"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "page_id": {
+                      "type": "string",
+                      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+                    },
+                    "sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "uiProps": {
+      "type": "object",
+      "description": "RFC-0009 §4.4/§4.5: props are a CLOSED set. This union is the coarse gate — a consumer that only runs the JSON Schema still cannot smuggle `onClick`/`script`/an unknown prop through, because `additionalProperties` is false. Per-component precision (Button has no `label`, a leaf has no `children`) lives in `core/vade/registry/uipage.py`, which is the authority.",
+      "additionalProperties": false,
+      "properties": {
+        "gap": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "align": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "wrap": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "selected": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "empty_text": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "item_fields": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "text": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "style": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "max_lines": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "format": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "placeholder": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "value": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "multiline": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "max_length": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "subtitle": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "elevated": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "leading_icon": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "trailing_text": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "tool": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "state": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "args_preview": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "result_summary": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "file_id": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "mime": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "tab_title": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        }
+      }
+    },
+    "uiAction": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "description": "RFC-0009 §6: one action. The key set is closed so a `then`/`script`/`href` cannot ride along; `kind` is one of the four the host understands.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "navigate",
+            "tools/call",
+            "ui/submit",
+            "open_url"
+          ]
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "tool": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$"
+        },
+        "args": {
+          "type": "object"
+        },
+        "confirm_text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "content": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "uiOn": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "RFC-0009 §4.4: only the events a component really emits. `onClick`/`onLoad` are not events, they are script hooks.",
+      "properties": {
+        "click": {
+          "$ref": "#/$defs/uiAction"
+        },
+        "change": {
+          "$ref": "#/$defs/uiAction"
+        }
+      }
+    },
+    "uiBinding": {
+      "type": "object",
+      "required": [
+        "bind"
+      ],
+      "additionalProperties": false,
+      "description": "RFC-0009 §5.2: `{\"bind\": path, \"format\"?: name}`. No expressions.",
+      "properties": {
+        "bind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "format": {
+          "type": "string"
+        }
+      }
+    },
+    "node": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false,
+      "description": "RFC-0009 §4.3/§4.4: one node of the declarative tree. CLOSED at every level (type/component/id/visible/data_ref/props/children/on) so a consumer that only validates against this file still refuses `onClick`, `script`, `href`, a host component or an unknown prop. Node/depth/action counts and per-component prop sets are enforced in `core/vade/registry/uipage.py`.",
+      "properties": {
+        "type": {
+          "enum": [
+            "column",
+            "row",
+            "tabs",
+            "list",
+            "text",
+            "component"
+          ]
+        },
+        "component": {
+          "enum": [
+            "Button",
+            "TextField",
+            "Card",
+            "ListItem",
+            "Switch",
+            "ToolCallCard",
+            "AttachmentChip"
+          ],
+          "description": "The seven page components. The four host components (MessageBubble/InputBar/ApprovalDialog/BottomBar) are NOT in this enum: naming one is phishing."
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+        },
+        "visible": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "$ref": "#/$defs/uiBinding"
+            }
+          ]
+        },
+        "data_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "props": {
+          "$ref": "#/$defs/uiProps"
+        },
+        "children": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/node"
+          }
+        },
+        "on": {
+          "$ref": "#/$defs/uiOn"
+        }
       }
     }
   }

@@ -8,7 +8,7 @@ proposer: 编排（依据 `research/ui-decisions.md` #9 / #10、`research/ui-02-
 affects: C-05 `schema/rpc.json`（追加 `ui/blob.token` 与 `http_endpoints`，`ui/submit.content` 定型）、消息模型 `core/vade/session/models.py` + `sqlite_store.py`（`Message.content: str` → parts）、C-18 `schema/config.schema.json`（新增 `[attach]`）
 related: RFC-0003（提示词注入分层，本文件格式与章节风格来源）；AMEND-22 §8.22.2 R1（blob 例外）/ R5（单 `file_id`、只存压缩图）/ R8（Web 可写 + CSRF，`READ_ONLY_SESSION` 收窄）；AMEND-21 §8.21.2 R1；RFC-0005（模型能力查询，编号预留，**未起草**）
 type: 契约追加为主（C-05 / C-18）+ 消息模型破坏性（Python API）；线上格式对旧客户端与旧会话均为追加
-stage: 草稿，未实现；不新增 C-04 错误码，不新增 `attachment.*` 事件
+stage: 已实现并合并
 ---
 
 # RFC-0004 · 附件与多模态

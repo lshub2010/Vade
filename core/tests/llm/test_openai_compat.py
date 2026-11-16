@@ -13,6 +13,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from vade.llm.base import Delta
 from vade.llm.openai_compat import OpenAICompatProvider, parse_chunk
@@ -122,3 +123,67 @@ def test_parse_chunk_keeps_index_and_ignores_non_data_lines():
     assert delta.tool_calls[0].id is None
     # A comment/blank line is skipped by the provider, never parsed as JSON.
     assert parse_chunk({"choices": [], "usage": {"total_tokens": 1, "x": "y"}}).usage == {"total_tokens": 1}
+
+
+class _ThenError(httpx.AsyncByteStream):
+    """Deliver some bytes, then fail the way a dropped connection does."""
+
+    def __init__(self, chunks: list[bytes], exc: Exception) -> None:
+        self._chunks = chunks
+        self._exc = exc
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
+        raise self._exc
+
+
+def test_a_mid_stream_failure_after_a_delta_is_not_retried():
+    """The `HELLOHELLOHELLO` case: a retry must not replay consumed output."""
+    calls = {"n": 0}
+    partial = b'data: {"choices": [{"delta": {"content": "HE"}}]}\n\n'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  stream=_ThenError([partial], httpx.ReadTimeout("dropped")))
+        # If the adapter wrongly retried, this response would make it visible.
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=_ChunkStream([_sse({"choices": [{"delta": {"content": "HELLO"}}]})]))
+
+    async def scenario() -> list[Delta]:
+        provider = OpenAICompatProvider(base_url="http://llm.test/v1", model="m1",
+                                        api_key_env="VADE_TEST_NO_KEY",
+                                        transport=httpx.MockTransport(handler))
+        seen: list[Delta] = []
+        with pytest.raises(httpx.ReadTimeout):
+            async for delta in provider.chat([{"role": "user", "content": "hi"}]):
+                seen.append(delta)
+        return seen
+
+    deltas = asyncio.run(scenario())
+
+    assert "".join(d.text for d in deltas) == "HE"
+    assert calls["n"] == 1, "a committed stream must never be re-requested"
+
+
+def test_a_failure_before_any_delta_is_still_retried():
+    calls = {"n": 0}
+    full = _sse({"choices": [{"delta": {"content": "ok"}}]})
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(503, content=b"busy")
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=_ChunkStream([full]))
+
+    async def scenario() -> str:
+        provider = OpenAICompatProvider(base_url="http://llm.test/v1", model="m1",
+                                        api_key_env="VADE_TEST_NO_KEY",
+                                        transport=httpx.MockTransport(handler))
+        return "".join([d.text async for d in provider.chat([{"role": "user", "content": "hi"}])])
+
+    assert asyncio.run(scenario()) == "ok"
+    assert calls["n"] == 2

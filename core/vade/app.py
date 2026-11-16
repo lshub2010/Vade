@@ -73,6 +73,7 @@ class App:
         self.registry = Registry(
             heartbeat_interval_s=self.heartbeat_interval_s,
             close_connection=self._close_connection,
+            paired_fingerprint=self._paired_fingerprint,
         )
         self.registry_api = RegistryAPI(self.registry)
         self.whitelist = Whitelist(data_dir / "identity" / "whitelist.json", on_revoke=self._revoke_connection)
@@ -141,9 +142,24 @@ class App:
         """Constraint 5 input: the key already paired to this module, if any."""
         return self.whitelist.fingerprint_for(module_id) if self.whitelist is not None else None
 
-    def _revoke_connection(self, fingerprint: str) -> None:
+    def _paired_fingerprint(self, module_id: str, instance_id: str) -> str | None:
+        """Registry trust input: the key paired to this exact node, if any."""
+        return self.whitelist.fingerprint_for(module_id, instance_id) if self.whitelist is not None else None
+
+    def _revoke_connection(self, fingerprint: str, removed_ids: tuple[str, ...] = ()) -> None:
         if self.registry is not None:
             self.registry.revoke_fingerprint(fingerprint)
+        # RFC-0016 §5.6-17 / Q4 (RFC default, NOT 拍板): unbinding a device
+        # kills its minted blob tokens in the same stroke — without this the
+        # tokens of an unbound device stay valid until their TTL ceiling
+        # (900 s), and a revoked pairing could keep uploading. `removed_ids`
+        # are the deleted `module#instance` names, i.e. exactly the
+        # `device_id` values tokens were minted against (§5.1-1).
+        blob = getattr(self, "blob", None)
+        service = getattr(blob, "service", None) if blob is not None else None
+        if service is not None:
+            for device_id in removed_ids:
+                service.revoke_device(device_id)
 
     def print_fingerprint(self) -> str:
         """ONLY the core identity fp8 (`SHA-256(core_pub)[:16]`).
@@ -183,6 +199,28 @@ class App:
             return RpcError("MANIFEST_INVALID", exc.message)
         except VadeError as exc:
             return RpcError(exc.code, exc.message)
+
+        # Three identities must agree: the key that finished the handshake, the
+        # pairing record that key belongs to, and the manifest claiming a slot.
+        # `device_id` is set by the transport from the verified key, never from
+        # anything the peer sent (`transport/server.py::_bind_device_identity`).
+        # None therefore means "no pairing" and this must fail closed — a
+        # paired module A declaring itself as B would otherwise inherit B's
+        # tools and approval surface (review D1).
+        device_id = getattr(connection, "device_id", None)
+        if not device_id:
+            raise VadeError(
+                "PERMISSION_DENIED",
+                "module/register requires a paired module identity on this connection",
+                fatal=True,
+            )
+        claimed = f"{manifest.module_id}#{manifest.instance_id}"
+        if str(device_id) != claimed:
+            raise VadeError(
+                "PERMISSION_DENIED",
+                f"connection is paired as {device_id!r}, manifest claims {claimed!r}",
+                fatal=True,
+            )
 
         kind = "device" if manifest.role == "ui" else "module"
         auth_mode = "module_key"
@@ -237,7 +275,18 @@ def make_rpc_handler(app: App) -> Any:
         # socket and T6 only exists in unit tests.
         session_handlers = getattr(app, "session_handlers", None) or {}
         if method in session_handlers:
-            return await session_handlers[method](connection, params)
+            try:
+                return await session_handlers[method](connection, params)
+            except VadeError as exc:
+                # RFC-0016 (found by the e2e ws test): a provider-published
+                # handler that raises VadeError must degrade to the C-04 error
+                # envelope, exactly the way `SessionRPC.dispatch` converts its
+                # own (`session/rpc.py:61-74`, `data` rides along). Letting it
+                # propagate closes the socket (`connection.py:170` catches it
+                # one frame up) instead of answering the client — a refused
+                # mint (cookie session / no identity) would look like a
+                # dropped connection and the client would retry forever.
+                return RpcError(exc.code, exc.message, dict(exc.data) if exc.data else None)
         return RpcError("NOT_FOUND", f"unknown method {method!r}")
 
     return handler
@@ -256,6 +305,18 @@ def install_components(app: App, strict: bool) -> set[str]:
         if callable(install):
             install(app)
             present.add(name)
+
+    # Components install in **alphabetical order**, so `admin` (which installs
+    # first) cannot see `audit_writer`/`approvals` when its context is built:
+    # `audit` and `policy` install after it. Without this second pass
+    # `AdminContext.audit`/`.approvals` stayed `None` forever — the audit page
+    # was always empty and `/admin/api/approvals/decide` always answered 501
+    # (review D2). Only here does anything know every `install()` has run.
+    # `bind_ports` is idempotent and never overwrites a port a test injected.
+    admin = getattr(app, "admin", None)
+    bind_ports = getattr(admin, "bind_ports", None)
+    if callable(bind_ports):
+        bind_ports(app)
 
     missing = REQUIRED - present
     if missing and strict:

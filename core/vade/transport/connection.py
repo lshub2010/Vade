@@ -16,6 +16,25 @@ Core->module requests: `request()` allocates an id, parks a Future in
 (`_resolve_response`). Without this table every `tools/call` reply was
 dropped on the floor — C2's dispatcher returned `None` for responses and no
 one was waiting.
+
+Replies: `None` is a legal JSON result (`result: null`), so "do not answer"
+is a separate sentinel (`NO_REPLY`). A handler returning `None` for a request
+that carried an `id` still gets a reply — otherwise an RPC whose answer is
+`null` (a module acknowledging a command) leaves the peer waiting for its
+timeout. Notifications (no `id`) never get a reply, whatever the handler
+returns.
+
+Sized replies: v1 has no fragmentation (rpc.json:365), so a reply that does
+not fit one frame cannot go on the wire at all. The encoded reply is measured
+before sealing and an oversized one is answered with `PAYLOAD_TOO_LARGE`;
+raising there instead would close a connection over a module bug.
+
+Rekey (FR-3.6 / FR-3.12, D56): the sender counts sealed bytes and frames and
+rekeys at 1 GiB or 2^20 frames; 24 h of key lifetime is closed with 1012 so
+the peer performs a *new handshake*, because rekey does not refresh forward
+secrecy. Every seal runs under `_seal_lock` — `seal()` (which advances the
+send counter) and the queue put must not be split, or the peer sees a counter
+gap and drops the connection.
 """
 
 from __future__ import annotations
@@ -29,16 +48,43 @@ from typing import Any, Awaitable, Callable
 
 from ..errors import ERROR_CODES, VadeError
 from ..logging import get_logger
-from .framing import decode_handshake, encode_handshake, FrameType
+from .framing import MAX_FRAME_PLAINTEXT, decode_handshake, encode_handshake, FrameType
 
-__all__ = ["Connection", "ConnectionState", "LoopLagMonitor", "RpcError", "MAX_QUEUE_DEFAULT"]
+__all__ = [
+    "Connection",
+    "ConnectionState",
+    "LoopLagMonitor",
+    "NO_REPLY",
+    "RpcError",
+    "CLOSE_REHANDSHAKE",
+    "MAX_QUEUE_DEFAULT",
+    "MAX_REPLY_BYTES",
+]
 
 log = get_logger("vade.transport.connection")
 
 MAX_QUEUE_DEFAULT = 256
 CLOSE_NORMAL = 1000
 CLOSE_GOING_AWAY = 1001
+CLOSE_REHANDSHAKE = 1012  # service restart: come back and handshake again
 CLOSE_TRY_AGAIN = 1013
+
+#: A reply must fit one frame: 65519 bytes of plaintext (Noise MAXMSGLEN minus
+#: the 16-byte tag, C-01 §7.5). v1 has no fragmentation, so there is nothing
+#: to fall back to — see `_send_result`.
+MAX_REPLY_BYTES = MAX_FRAME_PLAINTEXT
+
+#: "This request gets no reply". `None` cannot mean that any more: it is a
+#: legal JSON result and JSON-RPC clients wait for the envelope either way.
+NO_REPLY = object()
+
+#: Sender-side rekey thresholds (D56 / FR-3.6). 24 h is not here on purpose:
+#: `rekey` keeps the same ephemeral key pair, so it cannot refresh forward
+#: secrecy. That threshold closes with 1012 and demands a new handshake.
+REKEY_BYTES_DEFAULT = 1 << 30       # 1 GiB per direction
+REKEY_FRAMES_DEFAULT = 1 << 20      # 2^20 frames per direction
+REKEY_INTERVAL_DEFAULT = 24 * 3600  # key lifetime, then re-handshake
+
 
 
 class RpcError:
@@ -109,12 +155,23 @@ class Connection:
         on_rpc: Callable[["Connection", dict[str, Any]], Awaitable[Any]] | None = None,
         on_close: Callable[["Connection"], None] | None = None,
         browser_session: bool = False,
+        device_id: str | None = None,
+        on_established: Callable[["Connection"], None] | None = None,
+        rekey_interval_s: float = REKEY_INTERVAL_DEFAULT,
+        rekey_bytes: int = REKEY_BYTES_DEFAULT,
+        rekey_frames: int = REKEY_FRAMES_DEFAULT,
     ) -> None:
         self.ws = ws
         self.crypto = crypto
         self.connection_id = connection_id
         self.state = ConnectionState.NEW
         self.browser_session = browser_session  # plain JSON, no Noise, e2e=false
+        #: The authenticated device this socket belongs to (RFC-0004 §6.4).
+        #: `None` is the fail-closed default: a submit carrying a `file_id`
+        #: cannot be attributed, so it is refused. It is set by the transport
+        #: from a credential it verified itself — never from a client claim.
+        self.device_id = device_id
+        self._on_established = on_established
         self._queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=max_queue)
         self._heartbeat_interval = heartbeat_interval_s
         self._handshake_timeout = handshake_timeout_s
@@ -129,6 +186,17 @@ class Connection:
         #: Core->module request correlation: id -> Future of the peer's `result`.
         self._pending: dict[Any, asyncio.Future[Any]] = {}
         self._request_seq = 0
+        #: Rekey accounting (FR-3.6). Counters are per send direction and reset
+        #: on every rekey that this side starts; `_established_at` is when the
+        #: key this socket runs on came into force.
+        self._seal_lock = asyncio.Lock()
+        self._rekey_interval = rekey_interval_s
+        self._rekey_bytes = rekey_bytes
+        self._rekey_frames = rekey_frames
+        self._sealed_bytes = 0
+        self._sealed_frames = 0
+        self._rekeys = 0
+        self._established_at: float | None = None
 
     # ------------------------------------------------------------------ lifecycle
     async def run(self) -> None:
@@ -145,7 +213,21 @@ class Connection:
                 self.state = ConnectionState.ESTABLISHED
             else:
                 await self._handshake_phase()
+            # Key lifetime starts when the key does: the 24 h re-handshake
+            # deadline is measured from here, not from TCP accept.
+            self._established_at = time.monotonic()
+            if self._on_established is not None:
+                try:
+                    self._on_established(self)
+                except Exception:
+                    # Identity binding is best-effort by contract: a resolver
+                    # bug must not kill a socket that already authenticated.
+                    # The connection simply keeps `device_id=None` (fail-closed)
+                    # instead of becoming an unattributable *and* broken one.
+                    log.warning("on_established hook failed", extra={
+                        "code": None, "connection_id": self.connection_id})
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name=f"hb-{self.connection_id}")
+            self._heartbeat_task.add_done_callback(self._on_heartbeat_done)
             await self._read_loop()
         except asyncio.TimeoutError:
             await self.close(CLOSE_GOING_AWAY, "handshake timeout")
@@ -212,11 +294,41 @@ class Connection:
         if self._on_rpc is None:
             return
         result = await self._on_rpc(self, message)
-        if result is not None and message.get("id") is not None:
-            if isinstance(result, RpcError):
-                await self.send_json({"jsonrpc": "2.0", "id": message["id"], "error": result.to_dict()})
-            else:
-                await self.send_json({"jsonrpc": "2.0", "id": message["id"], "result": result})
+        reply_id = message.get("id")
+        if reply_id is None:
+            # A notification: no envelope exists for it, sentinel or not.
+            return
+        if result is NO_REPLY:
+            return
+        if isinstance(result, RpcError):
+            await self.send_json({"jsonrpc": "2.0", "id": reply_id, "error": result.to_dict()})
+            return
+        # `None` is a result too (`result: null`): a module acknowledging a
+        # command answers without a payload, and the caller is still waiting.
+        await self._send_result(reply_id, result)
+
+    async def _send_result(self, reply_id: Any, result: Any) -> None:
+        """Reply with `result`, or with `PAYLOAD_TOO_LARGE` if it cannot fit.
+
+        Measured on the *encoded envelope*, not on `result`: the frame carries
+        the whole JSON line, and a result that only fits without its envelope
+        does not fit at all. The error keeps the id, so the peer stops waiting
+        and the socket stays up — a module bug must not cost the connection.
+        """
+        reply = {"jsonrpc": "2.0", "id": reply_id, "result": result}
+        encoded = _encode_json(reply)
+        if len(encoded) > MAX_REPLY_BYTES:
+            error = RpcError(
+                "PAYLOAD_TOO_LARGE",
+                f"result encodes to {len(encoded)} bytes, over the {MAX_REPLY_BYTES}-byte frame cap",
+                {"field": "result", "limit": MAX_REPLY_BYTES, "actual": len(encoded), "unit": "bytes"},
+            )
+            log.warning("reply over the frame cap", extra={
+                "code": "PAYLOAD_TOO_LARGE", "connection_id": self.connection_id,
+                "msg": f"id={reply_id!r} size={len(encoded)}"})
+            await self.send_json({"jsonrpc": "2.0", "id": reply_id, "error": error.to_dict()})
+            return
+        await self._write(FrameType.RPC, encoded)
 
     # ------------------------------------------------------------------ requests
     async def request(self, method: str, params: Any = None, *, timeout_s: float | None = None) -> Any:
@@ -272,21 +384,77 @@ class Connection:
         future.set_result(message.get("result"))
 
     async def send_json(self, obj: Any) -> None:
-        payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        await self._write(FrameType.RPC, _encode_json(obj))
+
+    async def send_event(self, obj: Any) -> None:
+        await self._write(FrameType.EVENT, _encode_json(obj))
+
+    async def _write(self, frame_type: FrameType, payload: bytes) -> None:
+        """One frame out: seal and enqueue are a single critical section.
+
+        Splitting them is a real bug, not a theoretical one: `seal()` advances
+        the send counter, so if two coroutines seal A then B and enqueue B then
+        A, the peer's replay window sees counter 2 before 1 and drops the
+        connection as a protocol violation. The browser channel has no counters
+        but uses the same path so there is one send implementation.
+        """
         if self.browser_session:
             await self._enqueue(payload)
             return
         assert self.crypto is not None
-        frame = self.crypto.seal(FrameType.RPC, payload)
-        await self._enqueue(frame)
+        async with self._seal_lock:
+            wire = self.crypto.seal(frame_type, payload)
+            self._sealed_bytes += len(payload)
+            self._sealed_frames += 1
+            await self._enqueue(wire)
+            await self._rekey_if_due_locked()
 
-    async def send_event(self, obj: Any) -> None:
-        payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        if self.browser_session:
-            await self._enqueue(payload)
-        else:
-            assert self.crypto is not None
-            await self._enqueue(self.crypto.seal(FrameType.EVENT, payload))
+    # ------------------------------------------------------------------ rekey
+    def _rekey_due(self) -> bool:
+        return self._sealed_bytes >= self._rekey_bytes or self._sealed_frames >= self._rekey_frames
+
+    async def _rekey_if_due_locked(self) -> None:
+        """Called with `_seal_lock` held: no frame may be sealed across a rekey.
+
+        `begin_rekey()` seals the `0x06` frame with the *old* key and only then
+        resets the send counter to 0, so doing it between two seals would make
+        the next frame start at generation+1/counter 1 with a gap in the old
+        generation. In here, the ordering the peer sees is exactly the ordering
+        we sealed.
+        """
+        if not self._rekey_due():
+            return
+        if self.state is not ConnectionState.ESTABLISHED:
+            return
+        assert self.crypto is not None
+        try:
+            frame = self.crypto.maybe_rekey()
+        except VadeError as exc:
+            # FR-3.6: a failed rekey means the session is not usable; do not
+            # keep sending under a key we could not rotate.
+            log.warning("rekey failed", extra={
+                "code": exc.code, "connection_id": self.connection_id, "msg": exc.message})
+            await self.close(CLOSE_GOING_AWAY, f"rekey failed: {exc.code}")
+            return
+        if frame:
+            await self._enqueue(frame)
+        self._sealed_bytes = 0
+        self._sealed_frames = 0
+        self._rekeys += 1
+        log.debug("rekeyed", extra={"code": None, "connection_id": self.connection_id,
+                                    "msg": f"rekeys={self._rekeys}"})
+
+    @property
+    def sealed_bytes(self) -> int:
+        return self._sealed_bytes
+
+    @property
+    def sealed_frames(self) -> int:
+        return self._sealed_frames
+
+    @property
+    def rekeys(self) -> int:
+        return self._rekeys
 
     async def _enqueue(self, wire: bytes) -> None:
         try:
@@ -315,16 +483,50 @@ class Connection:
             await asyncio.sleep(self._heartbeat_interval)
             if self._closed:
                 return
+            if not self.browser_session and self._key_expired():
+                # FR-3.12: rekey keeps the same ephemeral key, so it cannot
+                # refresh forward secrecy. 24 h is answered with 1012 + a new
+                # handshake, not with a rekey.
+                await self.close(CLOSE_REHANDSHAKE, "key lifetime exceeded; re-handshake required")
+                return
+            if self.browser_session:
+                # A browser socket has no protocol heartbeat: the page sends
+                # nothing on an idle connection, so "no bytes for 2×interval"
+                # is the normal state, not a dead peer. Liveness there is the
+                # TCP/TLS stack and the browser's own WS ping.
+                continue
             if time.monotonic() - self._last_rx > 2 * self._heartbeat_interval:
                 await self.close(CLOSE_GOING_AWAY, "heartbeat timeout")
                 return
-            if self.browser_session:
-                continue
             assert self.crypto is not None
             try:
-                await self._enqueue(self.crypto.seal(FrameType.HEARTBEAT, b""))
+                # Same seal path as RPC: heartbeats consume counter values too,
+                # so they must not be sealed outside `_seal_lock`.
+                await self._write(FrameType.HEARTBEAT, b"")
             except VadeError:
                 return
+
+    def _key_expired(self) -> bool:
+        if self._established_at is None:
+            return False
+        return time.monotonic() - self._established_at >= self._rekey_interval
+
+    def _on_heartbeat_done(self, task: asyncio.Task[None]) -> None:
+        """A heartbeat loop that dies must not leave a zombie socket behind.
+
+        This loop is the only place the 24 h re-handshake deadline is checked,
+        so a silent task death means a key that is never rotated and a peer
+        that is never declared gone. Closing is honest; pretending the socket
+        is healthy is not.
+        """
+        if task.cancelled() or self._closed:
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        log.warning("heartbeat loop died", extra={
+            "code": None, "connection_id": self.connection_id, "msg": repr(exc)})
+        asyncio.ensure_future(self.close(CLOSE_GOING_AWAY, "heartbeat loop failed"))
 
     # ------------------------------------------------------------------ close
     async def drain(self) -> None:
@@ -362,8 +564,12 @@ class Connection:
         self._closed = True
         self.state = ConnectionState.CLOSED
         self._fail_pending(VadeError("UNAVAILABLE", "connection closed before the reply arrived"))
+        # `close()` is reached from the heartbeat task too (timeout, 1012 key
+        # lifetime): cancelling the task we are running in would cut the socket
+        # shutdown at its next await, leaving `ws.close` and `_on_close` undone.
+        current = asyncio.current_task()
         for task in (self._heartbeat_task, self._writer_task):
-            if task is not None:
+            if task is not None and task is not current:
                 task.cancel()
         try:
             self._queue.put_nowait(None)
@@ -383,6 +589,15 @@ class Connection:
         for future in pending:
             if not future.done():
                 future.set_exception(exc)
+
+
+def _encode_json(obj: Any) -> bytes:
+    """The one encoding used for the wire — byte counts depend on it.
+
+    `separators` matters: an encoder that emits spaces reports a size that is
+    not the size of what gets sealed, and the frame cap is measured in bytes.
+    """
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def _silence_unretrieved(future: asyncio.Future[Any]) -> None:

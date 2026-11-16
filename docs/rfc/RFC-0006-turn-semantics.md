@@ -8,7 +8,7 @@ proposer: 编排（依据 `docs/requirements.md` §8.21 FR-8.30/8.31/8.32/8.35/8
 affects: C-06 `schema/events.json`（5 组字段追加 + 2 个新事件 + 注记级澄清）、C-05 `schema/rpc.json`（新增 `turn/regenerate`、`message/edit_resubmit`，`ui/attach` 的 snapshot 注记）、消息/turn 模型（`core/vade/session/models.py`、`sqlite_store.py` 追加列）、`core/vade/session/queue.py`（中断落库）、`core/vade/loop/engine.py`（工具卡字段与分段）、`core/vade/loop/context.py`（superseded 过滤）
 related: RFC-0004（content parts、单 part 32k、`attach.text_max_chars`）；RFC-0003（章节与元信息风格来源）；AMEND-21 §8.21.2 R7/R8/R9；AMEND-22 §8.22.2 R6/R8、§8.22.5；RFC-0008（ask-user，编号已由 AMEND-22 预留，与本文件无字段重叠）
 type: 契约追加（C-05/C-06）为主 + 存储列追加；所有新字段对旧客户端均为可选，`required` 数组一律不变
-stage: 草稿，未实现；不新增 C-04 错误码，不新增 `turn_states` 枚举值，不做消息树与 `session/fork`
+stage: 已实现并合并
 ---
 
 # RFC-0006 · turn 语义补充
@@ -97,8 +97,10 @@ C-06 把 turn 的**状态机**写清楚了，但没写 turn 的**内容语义**�
 
 ```json
 {"turn_id":"t_2","state":"interrupted","by":"user",
- "partial_message_id":"m_7f3a...","partial_chars":128}
+ "partial_message_id":"msg:7f3a…","partial_chars":128}
 ```
+
+> `partial_message_id` 的取值形状与 `result_ref` 一致，都是 `msg:<hex>`；消息行自身存裸 id。审查曾指出此处示例写成 `m_7f3a…` 与契约不符，已订正。
 
 - `partial_chars` 按 Unicode code point 计，与 §8 的长度单位一致；UI 的"已生成 N 字"直接用它，不再自己数 delta（自己数会与 core 差一个在途 delta）。
 - 去重规则：**部分文本以落库消息为准**。客户端如果已经按 delta 渲染了该 turn：① 本地字符数等于 `partial_chars` → 保留本地缓冲，只把气泡绑定到 `partial_message_id`；② 不等 → 说明有在途 delta 丢失，先显示"正在同步…"，重新 `ui/attach` 用 snapshot 替换该气泡后再落定；③ 本地已有该 `partial_message_id` 的消息 → 只换指针，不追加。**禁止**把事件与本地缓冲相加（事件没有文本），也禁止同时渲染两条。没有 `partial_message_id` 时保留本地缓冲。
@@ -134,7 +136,7 @@ C-06 把 turn 的**状态机**写清楚了，但没写 turn 的**内容语义**�
 ### 5.2 `args_preview` 脱敏算法（实现必须按序）
 
 1. **canonical**：只接受 `dict`；按键名排序、`ensure_ascii=false`、无空格分隔符序列化。非 dict（数组标量）包成 `{"value": ...}`。
-2. **键脱敏**：键名按 `_`/`-`/`.` 分词后做整词匹配（避免 `author` 命中 `auth`）；命中 `pass(word|phrase)?|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|authorization|auth|session[_-]?id|dsn|connection[_-]?string` 的键名与值都替换为 `"***"`，点路径记入 `args_preview_redacted`。
+2. **键脱敏**：先对**完整键名**归一化（小写、去除非字母数字）后整串匹配多词名（`apikey`/`accesskey`/`privatekey`/`sessionid`/`connectionstring`，按后缀匹配以覆盖 `x-api-key`、`AWS_SECRET_ACCESS_KEY` 这类前后缀形态），再按 `_`/`-`/`.` 分词做整词匹配（避免 `author` 命中 `auth`，并覆盖 `_token`/`_secret`/`_password` 后缀）；两阶段任一命中即视为密钥键。命中 `pass(word|phrase)?|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|authorization|auth|session[_-]?id|dsn|connection[_-]?string` 的键名与值都替换为 `"***"`，点路径记入 `args_preview_redacted`。**只做分词匹配是不合规实现**：分词后 token 内不可能还有 `_`/`-`，带分隔符的备选分支永远匹配不到。
 3. **值擦洗**：对所有字符串值做模式替换（PEM `-----BEGIN ... PRIVATE KEY-----`、`sk-[A-Za-z0-9]{16,}`、`ghp_[A-Za-z0-9]{20,}`、`xox[bap]-...`、`AKIA[0-9A-Z]{16}`、`Bearer\s+\S+`、连续 hex/base64 ≥32）→ `"***"`，路径记入 redacted。**先擦洗再截断**，避免截断把未匹配的秘密截成"看起来安全"的前缀。
 4. **形状压缩**：字符串 >80 字符 → 前 77 + `…`；数组 >8 项 → 前 8 + `"…(+N)"`；对象 >16 键 → 前 16 + `"…(+N keys)"`；递归深度 ≤3。
 5. **体积**：UTF-8 序列化后 ≤512 字节；超出则在字符边界截断并置 `args_preview_truncated=true`。
@@ -191,7 +193,7 @@ errors: NOT_FOUND, INVALID_ARGUMENT, READ_ONLY_SESSION, OVERLOADED, UNSUPPORTED
 ```
 
 - `turn_id` 必须是**尾部 root 的 head** 且处于终态（`completed|failed|interrupted|cancelled`）。`queued|running|waiting_approval` → `INVALID_ARGUMENT`，`data.reason="turn_active"`；非尾部/非 head → `data.reason="not_tail"|"not_head"`，并带 `data.head_turn_id`。
-- 新 turn 复用同一 `user_message_id`：文本从该用户消息重建；RFC-0004 的 parts 落地后按 parts 重建（附件仍指向同一 `file_id`，不重新上传）。**不新增用户消息**，因此不会出现第二个用户气泡。RFC-0004 未落地且旧 turn 含非 text part 时 → `UNSUPPORTED`（`data.capability="parts"`），不静默丢附件。
+- 新 turn 复用同一 `user_message_id`：文本从该用户消息重建；RFC-0004 的 parts 落地后按 parts 重建（附件仍指向同一 `file_id`，不重新上传）。**不新增用户消息**，因此不会出现第二个用户气泡。RFC-0004 未落地且旧 turn 含非 text part 时 → `UNSUPPORTED`（`data.capability="parts"`），不静默丢附件（turn 行用 `user_parts` 记住入队时的非 text part 类型，重启后仍能拒绝）。
 - `client_msg_id` 必填，作为幂等键：同 id 重复调用返回同一个新 turn，不产生第二个版本（并发双击只有一个赢家，另一个读到赢家）。幂等命中时还要校验该 turn 的 `parent_turn_id == turn_id`；若这个 `client_msg_id` 已被别的操作占用（例如同 id 的 `ui/submit`）→ `INVALID_ARGUMENT` + `data.reason="client_msg_id_conflict"`，不得静默返回无关 turn。
 - 旧的 assistant 消息（含 `partial=true` 的那条）保留，不删不改；旧 turn 只写 `superseded_by`/`superseded_reason`。
 - 工具是否重跑：本 RFC 不引入缓存，新 turn 按普通 turn 走 `engine`，因此**会重新执行**工具调用。是否允许对已产生副作用的工具重跑列为未决 Q2；若裁定"禁止"，只在 `turn/regenerate` 入口加 `CONFIRM_REQUIRED` 前置，不改本节的字段与事件。
@@ -242,7 +244,7 @@ session/fork {session_id, from_turn_id?, from_seq?, title?}
 errors: NOT_FOUND, INVALID_ARGUMENT, UNSUPPORTED, OVERLOADED
 ```
 
-将来语义：复制 `from_seq`（缺省为当前 `last_seq`）之前的 messages/turns 到一个新 session，`forked_from` 记录源；`from_turn_id` 与 `from_seq` 二选一，同给时以 `from_turn_id` 为准（`from_seq` 取该 turn 的终态 seq）。新 session 与原 session 不共享可变状态；附件按 `file_id` 引用并增加引用计数（否则 RFC-0004 的 blob GC 会删掉被分叉引用的文件）。**v1 不把该方法加入 C-05**：FR-8.32 明确"v1 之后"，UI 无入口；客户端调用得到 JSON-RPC `-32601 method not found`，core 不返回 `UNSUPPORTED`（避免把"未实现"伪装成"已定义但能力不足"）。上限（消息数/字节/深度/引用计数）见未决 Q3。
+将来语义：复制 `from_seq`（缺省为当前 `last_seq`）之前的 messages/turns 到一个新 session，`forked_from` 记录源；`from_turn_id` 与 `from_seq` 二选一，同给时以 `from_turn_id` 为准（`from_seq` 取该 turn 的终态 seq）。新 session 与原 session 不共享可变状态；附件按 `file_id` 引用并增加引用计数（否则 RFC-0004 的 blob GC 会删掉被分叉引用的文件）。**v1 不把该方法加入 C-05**：FR-8.32 明确"v1 之后"，UI 无入口；客户端调用得到 C-04 `NOT_FOUND` + `unknown method` 消息（JSON-RPC `-32601` 是同一件事的标准形态），core 不返回 `UNSUPPORTED`（避免把"未实现"伪装成"已定义但能力不足"）。上限（消息数/字节/深度/引用计数）见未决 Q3。
 
 ### 6.6 v1 的边界：只做"新 turn + 旧 turn 标 superseded"
 
@@ -313,10 +315,10 @@ errors: NOT_FOUND, INVALID_ARGUMENT, UNSUPPORTED, OVERLOADED
 | 9 | C-05 新方法 `turn/regenerate` | 见 §6.2 | **追加** | 旧端不调用；未知方法不影响既有方法 |
 | 10 | C-05 新方法 `message/edit_resubmit` | 见 §6.3 | **追加** | 同上 |
 | 11 | C-05 `ui/attach` 注记 | `snapshot.turns[]`、`messages[].partial`、`messages[].superseded_by` | **追加注记** | `snapshot` 仍为 `object`；旧端忽略新键 |
-| 12 | 消息/Turn 存储 | `messages.partial`、`messages.superseded_by`、`turns.root_turn_id/parent_turn_id/version/superseded_by/superseded_reason/user_message_id/partial_message_id` | **追加列**（Python API 尾参默认值） | 旧库读默认值；`to_dict()` 只加键 |
+| 12 | 消息/Turn 存储 | `messages.partial`、`messages.superseded_by`、`turns.root_turn_id/parent_turn_id/version/superseded_by/superseded_reason/user_message_id/partial_message_id/user_parts` | **追加列**（Python API 尾参默认值） | 旧库读默认值；`to_dict()` 只加键 |
 | 13 | C-04 `errors.json` | **不改**：复用 `INVALID_ARGUMENT`/`NOT_FOUND`/`READ_ONLY_SESSION`/`OVERLOADED`/`PAYLOAD_TOO_LARGE`；`CONFIRM_REQUIRED` 仅为 Q2 预留，v1 不用 | **无变更** | 码表与 Rust 枚举零改动 |
 | 14 | C-06 `turn_states` | **不改**：不增 `superseded`（理由见 §6.4） | **无变更** | 旧端不认识的状态问题不存在 |
-| 15 | C-05 `session/fork` | **不加**：v1 不注册；签名仅 §6.5 预留 | **无变更** | 调用得 `-32601`，不是 `UNSUPPORTED` |
+| 15 | C-05 `session/fork` | **不加**：v1 不注册；签名仅 §6.5 预留 | **无变更** | 调用得 C-04 `NOT_FOUND`（`unknown method`），不是 `UNSUPPORTED` |
 
 ### 9.2 C-06 追加块的形状
 

@@ -37,6 +37,23 @@ class _LazyApproval:
     async def check(self, request: Any) -> Any:
         return await self._port().check(request)
 
+    def pending(self, session_id: str) -> list[dict[str, Any]]:
+        """RFC-0007 §5.6: `snapshot.pending_approvals[]` carries `task_id`.
+
+        The port's public list is `pending_requests()` (all sessions, for the
+        admin surface); the snapshot wants this session's rows. Without this
+        delegation `hasattr(port, "pending")` is false and the snapshot is
+        always empty, so the attribution never reaches a reconnecting client.
+        """
+        port = getattr(self._app, "approval_port", None)
+        getter = getattr(port, "pending_requests", None)
+        if not callable(getter):
+            return []
+        try:
+            return [row for row in getter() if row.get("session_id") == session_id]
+        except Exception:  # pragma: no cover - approval port is C5a's
+            return []
+
     async def on_session_end(self, session_id: str) -> None:
         port = getattr(self._app, "approval_port", None)
         if port is not None and hasattr(port, "on_session_end"):
@@ -87,6 +104,7 @@ class _LazyBlobs:
 
 
 def install(app: Any) -> Any:
+    from ..loop.builtins import default_builtins
     from ..loop.context import BlobStore, CompactionConfig
     from ..loop.engine import LoopConfig, LoopEngine
     from ..loop.tools import build_snapshot
@@ -134,20 +152,56 @@ def install(app: Any) -> Any:
         compaction = CompactionConfig()
 
     llm = _build_llm(cfg, router=router, registry=getattr(app, "registry", None))
+    registry = getattr(app, "registry", None)
+    # RFC-0005: the catalog/resolver are read-only views over the registry +
+    # `[llm]`; the queue asks the resolver at dequeue (§5.3), never at submit.
+    resolver = _build_model_resolver(cfg, registry)
+    log.set_model_resolver(resolver)
+    log.set_usage_accounting(_build_usage(cfg, store, log, data_dir))
     approval = _LazyApproval(app)
     memory = _LazyMemory(app)
+
+    # RFC-0003 §7: the injection switch is a restart item, read once here.
+    # Layered wires the core tools + catalog port; legacy leaves both empty and
+    # every loop path stays the pre-RFC one (byte-identical, golden-pinned).
+    # `app.skill_loader` may not exist yet (session installs before skill), so
+    # both resolve it lazily, at call time.
+    injection = "layered" if str(cfg.get("prompt.injection", "legacy") or "").strip().lower() == "layered" else "legacy"
+    core_tools = None
+    catalog_port = None
+    if injection == "layered":
+        from ..loop.coretools import build_core_tools
+        from ..skill.port import LayeredCatalogPort
+
+        def _skill_loader():
+            return getattr(app, "skill_loader", None)
+
+        core_tools = build_core_tools(_skill_loader)
+        catalog_port = LayeredCatalogPort(_skill_loader)
+
     engine = LoopEngine(
         router, llm,
         lambda: build_snapshot(getattr(app, "registry", None)),
         log.emit,
-        history=_history_of(log),
+        history=_history_of(log, layered=(injection == "layered")),
         approval=approval,
         memory=memory,
+        # RFC-0008 §14: `ask_user` rides the input component's port; the
+        # provider is resolved per call, so install order (input < session)
+        # and a disabled input component both degrade to an immediate
+        # `UNAVAILABLE` tool result, never a hang.
+        builtins=default_builtins(lambda: getattr(app, "input_port", None)),
         prompt_hooks=lambda: getattr(app, "prompt_hooks", []),
+        audit=getattr(app, "audit", None),
         config=LoopConfig(max_steps=int(cfg.get("policy.max_steps", 8)),
-                          approval_timeout_s=int(cfg.get("policy.approval_timeout_s", 60))),
+                          approval_timeout_s=int(cfg.get("policy.approval_timeout_s", 60)),
+                          injection=injection,
+                          hot_tools=tuple(cfg.get("tools.hot") or ()),
+                          hot_max=int(cfg.get("tools.hot_max", 12))),
         compaction=compaction,
         blob_store=BlobStore(data_dir / "blobs"),
+        core_tools=core_tools,
+        catalog=catalog_port,
     )
     log.set_executor(engine.run_turn)
     log.set_cancel_hook(lambda turn_id: router.cancel_turn(turn_id) if router is not None else None)
@@ -155,8 +209,10 @@ def install(app: Any) -> Any:
         lambda turn_id: router.clear_cancelled(turn_id) if router is not None else None
     )
     log.approval_port = approval
+    log.input_port = getattr(app, "input_port", None)
 
-    rpc = SessionRPC(log, approval=lambda: getattr(app, "approval_port", None))
+    rpc = SessionRPC(log, approval=lambda: getattr(app, "approval_port", None),
+                     input_port=lambda: getattr(app, "input_port", None))
     # `module.status` rides the same seq bus; the registry (C2) is the trigger.
     from .status import ModuleStatusPublisher
 
@@ -170,6 +226,8 @@ def install(app: Any) -> Any:
     app.router = router
     app.loop = engine
     app.llm = llm
+    app.models = resolver
+    app.usage = log.usage
     app.session_rpc = rpc
     app.session_handlers = {
         name: (lambda conn, params, _name=name: rpc.dispatch(conn, _name, params))
@@ -185,10 +243,51 @@ def install(app: Any) -> Any:
     return app
 
 
-def _history_of(log: Any) -> Any:
+def _build_model_resolver(cfg: Any, registry: Any) -> Any:
+    from ..llm.catalog import ModelResolver
+
+    return ModelResolver(cfg, registry)
+
+
+def _build_usage(cfg: Any, store: Any, log: Any, data_dir: Path) -> Any:
+    from ..llm.usage import UsageAccounting
+
+    reader = getattr(log, "_audit_reader", None)
+    if reader is None:
+        try:
+            from ..audit.reader import AuditReader
+
+            # Constructed lazily by path (the reader returns [] when the file
+            # does not exist yet), so `session/usage.get` works on a core whose
+            # audit component is not installed instead of reporting 0 silently
+            # because it could not find one.
+            reader = AuditReader(data_dir / "audit" / "audit.db")
+        except Exception:  # pragma: no cover - audit package absent
+            reader = None
+    return UsageAccounting(config=cfg, store=store, audit_reader=reader, emit=log.emit)
+
+
+def _history_of(log: Any, *, layered: bool = False) -> Any:
+    from ..loop.catalog import is_catalog_message
+    from ..loop.context import filter_superseded
+
     def history(session_id: str) -> tuple[Any, ...]:
         session = log.get_session(session_id)
-        return session.messages if session is not None else ()
+        if session is None:
+            return ()
+        # RFC-0006 §6.6: drop replaced versions before anything fits the window.
+        kept = filter_superseded(session.messages, session.turns)
+        if layered:
+            # RFC-0003: the catalog message is part of the model's context.
+            return tuple(kept)
+        # RFC-0003 §7: a session that ran layered keeps its catalog messages in
+        # the log (seq and replay stay intact); legacy FILTERS them out of the
+        # model request instead of deleting them, so switching back never
+        # resurrects a durable reminder as user speech.
+        return tuple(
+            m for m in kept
+            if not (m.role == "user" and is_catalog_message(m.content))
+        )
 
     return history
 

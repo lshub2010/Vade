@@ -110,7 +110,9 @@ class Subscription:
     connection_id: str
     role: str
     topics: frozenset[str]
-    since_seq: int | None = None
+    #: `{session_id: seq}`: a resume point is per session, never one number
+    #: compared against every session's counter (see `EventBus._since_seq`).
+    since_seq: Mapping[str, int] | None = None
     redact: tuple[str, ...] = ()
     subscribed_at: float = field(default_factory=time.time)
 

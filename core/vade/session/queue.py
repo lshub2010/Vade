@@ -15,17 +15,25 @@ Guarantees:
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import OrderedDict, deque
+from dataclasses import replace
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError
-from .models import Message, QueueItem, Turn, TurnState, new_id, now_ms
+from .models import Message, QueueItem, Turn, TurnState, message_ref, new_id, now_ms
 
 __all__ = ["TurnQueue"]
 
 EmitFn = Callable[..., Awaitable[Any]]
 SaveTurnFn = Callable[[str, Turn], None]
 Executor = Callable[[Turn, tuple[dict[str, Any], ...]], Awaitable[Any]]
+
+#: Terminal turns remembered so a late finisher (the worker waking up after an
+#: interrupt already wrote the terminal event) cannot write a second one. Bounded
+#: exactly like `SessionLog._TOMBSTONE_LIMIT`: one id per turn for the life of
+#: the process is a leak, and a turn whose id fell out of the window is one that
+#: can no longer be reached by any caller.
+FINALIZED_LIMIT = 1024
 
 
 class TurnQueue:
@@ -40,6 +48,9 @@ class TurnQueue:
         cancel_clear_hook: Callable[[str], None] | None = None,
         max_pending: int = 100,
         clock: Callable[[], int] = now_ms,
+        resolve_model: Callable[[Turn], tuple[str | None, str | None]] | None = None,
+        pre_terminal_hook: Callable[[str, TurnState], Awaitable[Any]] | None = None,
+        partial_provider: Callable[[str], str] | None = None,
     ) -> None:
         self.session_id = session_id
         self._executor = executor
@@ -47,8 +58,18 @@ class TurnQueue:
         self._save_turn = save_turn
         self._cancel_hook = cancel_hook
         self._cancel_clear_hook = cancel_clear_hook
+        self._pre_terminal_hook = pre_terminal_hook
         self._max_pending = max_pending
         self._clock = clock
+        #: RFC-0005 §5.3: resolved at dequeue (`QUEUED -> RUNNING`), never at
+        #: submit, so a switch during the queue applies to the next turn and a
+        #: running turn keeps the model it started with. `None` = no resolver
+        #: installed (unit tests and an unwired core keep the old behaviour).
+        self._resolve_model = resolve_model
+        #: RFC-0006 §4.2: reads the text already streamed for a turn so an
+        #: interrupt can persist it. A callable, not a back-reference to the
+        #: engine, keeps the queue free of loop-level state.
+        self._partial_provider = partial_provider
         self._pending: deque[QueueItem] = deque()
         self._running: QueueItem | None = None
         self._worker: asyncio.Task[None] | None = None
@@ -62,10 +83,39 @@ class TurnQueue:
         #: must stay (the task does not exist yet) and is armed when it appears.
         self._release_pending: set[str] = set()
         self._finish: asyncio.Event | None = None
-        self._finalized: set[str] = set()
+        #: Turns whose terminal event is already written (bounded FIFO). The
+        #: marker OUTLIVES `_run_one`: the worker wakes up after an interrupt
+        #: has finalized the turn, and without the marker it would take the
+        #: `task.cancelled()` branch and write a SECOND terminal event.
+        self._finalized: OrderedDict[str, None] = OrderedDict()
+        #: Terminal writes in flight. Held only for the duration of `_finalize`
+        #: so a concurrent interrupt/finish cannot interleave two writes; the
+        #: pair (`_finalizing`, `_finalized`) is what makes the "exactly one
+        #: terminal event" promise independent of who calls `_finalize` first.
+        self._finalizing: set[str] = set()
         self._orphans: set[asyncio.Task[Any]] = set()
+        #: Set by `shutdown()`; makes the stop terminal (no new worker, no new
+        #: turn) and `shutdown()` itself idempotent.
+        self._stopped = False
 
     # ------------------------------------------------------------------ state
+    @property
+    def max_pending(self) -> int:
+        return self._max_pending
+
+    def has_capacity(self) -> bool:
+        """True when one more turn can be enqueued without `OVERLOADED`."""
+        return len(self._pending) < self._max_pending
+
+    def is_finalized(self, turn_id: str) -> bool:
+        return turn_id in self._finalized or turn_id in self._finalizing
+
+    def _remember_finalized(self, turn_id: str) -> None:
+        self._finalized[turn_id] = None
+        self._finalized.move_to_end(turn_id)
+        while len(self._finalized) > FINALIZED_LIMIT:
+            self._finalized.popitem(last=False)
+
     def enqueue(self, turn: Turn, content: Sequence[Mapping[str, Any]]) -> int:
         if len(self._pending) >= self._max_pending:
             raise VadeError("OVERLOADED", f"queue is full ({self._max_pending} pending turns)")
@@ -101,11 +151,32 @@ class TurnQueue:
         payload["session_id"] = self.session_id
         return payload
 
+    def state_of(self, turn_id: str) -> str | None:
+        """Live state of one turn (`running`, `waiting_input`, ...), or `None`.
+
+        RFC-0008 S2/S3 needs this: entering `waiting_input` requires the turn to
+        be `running`, and a turn already in `waiting_approval` must refuse a
+        second blocking wait. The queue is the only honest source for it.
+        """
+        item = self._running
+        if item is not None and item.turn_id == turn_id:
+            return item.turn.state.value
+        for queued in self._pending:
+            if queued.turn_id == turn_id:
+                return queued.turn.state.value
+        return None
+
     def is_idle(self) -> bool:
         return self._running is None and not self._pending and self._worker is None
 
     # ------------------------------------------------------------------ worker
     def ensure_worker(self) -> None:
+        # A queue that has been shut down never starts another worker: the
+        # `finally` in `_run_loop` used to respawn one when `_pending` was not
+        # empty, so `close()` cancelled the worker and the very next tick
+        # created a new one that ran turns into a closed store.
+        if self._stopped:
+            return
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._run_loop(), name=f"queue-{self.session_id[:8]}")
 
@@ -116,28 +187,54 @@ class TurnQueue:
                 await self._run_one(item)
         finally:
             self._worker = None
-            if self._pending:  # a submit raced the loop exit
+            if self._pending and not self._stopped:  # a submit raced the loop exit
                 self.ensure_worker()
 
     async def _run_one(self, item: QueueItem) -> None:
-        """Run one turn, then drop the `_finalized` marker it needed.
+        """Run one turn to completion.
 
-        The marker only covers the window in which the turn's terminal state
-        may still be written twice (worker vs. `interrupt`), i.e. exactly this
-        coroutine's lifetime. Leaving it in the set grows one id per turn for
-        the life of the process — the same leak class as the cancel flags.
+        The `_finalized` marker is NOT released here: `_run_one` ends when the
+        worker is done, which is strictly earlier than "no caller can still try
+        to finalize this turn" — an `interrupt` can have written the terminal
+        event and the worker then wakes up on a cancelled task. Releasing the
+        marker at worker exit made that wake-up write a second terminal event.
+        `_finalize` owns the release (it is the only writer), and it keeps the
+        id in the bounded `_finalized` FIFO so late finishers stay refused.
         """
-        try:
-            await self._execute_one(item)
-        finally:
-            self._finalized.discard(item.turn_id)
+        await self._execute_one(item)
 
     async def _execute_one(self, item: QueueItem) -> None:
         turn = item.turn.with_state(TurnState.RUNNING, started_at=self._clock())
+        model_source: str | None = None
+        if self._resolve_model is not None:
+            try:
+                model_id, model_source = self._resolve_model(turn)
+            except VadeError as exc:
+                # A dangling explicit selection must fail loudly, never quietly
+                # fall back to another model (§5.2 row 1 / A11).
+                item = item.with_turn(turn)
+                self._running = item
+                reason = "model_unavailable" if exc.code == "UNAVAILABLE" else None
+                await self._finalize(
+                    turn.with_state(TurnState.RUNNING, error_code=exc.code, error_message=exc.message),
+                    TurnState.FAILED,
+                    {"turn_id": turn.id, "code": exc.code, "message": exc.message,
+                     "state": TurnState.FAILED.value},
+                    error_code=exc.code,
+                    error_message=exc.message,
+                    usage=_unmeasured_usage(turn.model_id),
+                    data={"reason": reason} if reason else None,
+                )
+                return
+            turn = turn.with_state(TurnState.RUNNING, model_id=model_id)
         item = item.with_turn(turn)
         self._running = item
         self._save_turn(self.session_id, turn)
-        await self._emit(self.session_id, "turn.started", {"turn_id": turn.id, "state": turn.state.value})
+        started: dict[str, Any] = {"turn_id": turn.id, "state": turn.state.value}
+        if turn.model_id is not None:
+            started["model_id"] = turn.model_id
+            started["model_source"] = model_source
+        await self._emit(self.session_id, "turn.started", started)
         await self._emit(self.session_id, "queue.updated", self.state_payload())
 
         finish = asyncio.Event()
@@ -160,9 +257,7 @@ class TurnQueue:
         if turn.id in self._finalized:
             return  # interrupt/cancel already wrote the terminal state
         if task.cancelled():
-            await self._finalize(turn, TurnState.INTERRUPTED, {"turn_id": turn.id, "by": "external",
-                                                               "state": TurnState.INTERRUPTED.value},
-                                 task=task)
+            await self._finalize_interrupted(turn, by="external", task=task)
             return
         exc = task.exception()
         if exc is not None:
@@ -175,6 +270,7 @@ class TurnQueue:
                 error_code=code,
                 error_message=message,
                 task=task,
+                usage=_unmeasured_usage(turn.model_id),
             )
             return
 
@@ -197,7 +293,11 @@ class TurnQueue:
             updated,
             TurnState.COMPLETED,
             {"turn_id": turn.id, "usage": usage, "state": TurnState.COMPLETED.value,
-             "stopped_reason": stopped_reason},
+             "stopped_reason": stopped_reason,
+             # RFC-0002 §2: skill NAMES only, `[]` when none — the key is always
+             # present (never omitted, never null); a replayed old event without
+             # it is read as [] by consumers.
+             "skills": list(getattr(outcome, "activated_skills", ()) or ())},
             messages=messages,
             task=task,
         )
@@ -212,26 +312,99 @@ class TurnQueue:
         error_code: str | None = None,
         error_message: str | None = None,
         task: asyncio.Task[Any] | None = None,
+        usage: Mapping[str, Any] | None = None,
+        data: Mapping[str, Any] | None = None,
     ) -> None:
-        if turn.id in self._finalized:
+        if self.is_finalized(turn.id):
             return
-        self._finalized.add(turn.id)
-        if state is not TurnState.COMPLETED or turn.state is not TurnState.COMPLETED:
-            turn = turn.with_state(state, ended_at=turn.ended_at or self._clock())
-        self._save_turn(self.session_id, turn)
-        event_type = {
-            TurnState.COMPLETED: "turn.completed",
-            TurnState.FAILED: "turn.failed",
-            TurnState.INTERRUPTED: "turn.interrupted",
-            TurnState.CANCELLED: "turn.cancelled",
-        }[state]
-        await self._emit(self.session_id, event_type, payload, messages=messages)
-        if self._running is not None and self._running.turn_id == turn.id:
-            self._running = None
-        await self._emit(self.session_id, "queue.updated", self.state_payload())
+        # The in-flight marker is taken BEFORE the first await so a second
+        # caller (a second interrupt, or the worker waking up) is refused while
+        # this write is suspended. Ownership of the released marker lives here,
+        # not in `_run_one`: this method is the only writer of a terminal state.
+        self._finalizing.add(turn.id)
+        try:
+            # RFC-0008 S5: a pending `turn.input_resolved` must be written BEFORE the
+            # turn's terminal event, or the dialog is left open forever (C-06 forbids
+            # any `turn.*` after `turn.interrupted`). This is the only place a turn
+            # ends, so the hook lives here rather than at each caller.
+            if self._pre_terminal_hook is not None:
+                try:
+                    await self._pre_terminal_hook(turn.id, state)
+                except Exception:  # pragma: no cover - a hook must not block finalization
+                    pass
+            if state is not TurnState.COMPLETED or turn.state is not TurnState.COMPLETED:
+                turn = turn.with_state(state, ended_at=turn.ended_at or self._clock())
+            if usage is not None:
+                # RFC-0005 §6.1: a failed/interrupted turn has burned tokens too.
+                # When the provider never reported them the honest value is
+                # `source="none"` with zero counts, not an estimate.
+                turn = replace(turn, usage=dict(usage))
+                payload = {**payload, "usage": dict(usage)}
+            if data is not None:
+                payload = {**payload, "data": dict(data)}
+            event_type = {
+                TurnState.COMPLETED: "turn.completed",
+                TurnState.FAILED: "turn.failed",
+                TurnState.INTERRUPTED: "turn.interrupted",
+                TurnState.CANCELLED: "turn.cancelled",
+            }[state]
+            # RFC-0006 §4.2: the terminal turn row, the partial message and the
+            # terminal event commit in ONE transaction. `_save_turn` + `_emit` was
+            # two commits, and a crash between them left "state=interrupted" with no
+            # partial text — a state no client can explain or repair. The turn row
+            # rides `turns=` so there is exactly one write, not a duplicate
+            # `update_turn` followed by the event's own upsert.
+            await self._emit(self.session_id, event_type, payload, messages=messages,
+                             turns=(turn,))
+            if self._running is not None and self._running.turn_id == turn.id:
+                self._running = None
+            await self._emit(self.session_id, "queue.updated", self.state_payload())
+        finally:
+            self._finalizing.discard(turn.id)
+            self._remember_finalized(turn.id)
         if self._finish is not None and not self._finish.is_set():
             self._finish.set()
         self._release_cancel(turn.id, task)
+
+    def _partial_message(self, turn_id: str) -> tuple[str, Message | None]:
+        """The already-streamed text for `turn_id` and its `partial=true` row.
+
+        Empty text means "interrupted before the first delta" (or during a tool
+        step with no text): no message is created, so an interrupt can never
+        leave an empty assistant bubble behind (RFC-0006 §4.2).
+        """
+        text = ""
+        if self._partial_provider is not None:
+            try:
+                text = self._partial_provider(turn_id) or ""
+            except Exception:  # pragma: no cover - a provider must never break a stop
+                text = ""
+        if not text:
+            return "", None
+        return text, Message(
+            id=new_id(), session_id=self.session_id, turn_id=turn_id,
+            role="assistant", content=text, partial=True,
+        )
+
+    async def _finalize_interrupted(self, turn: Turn, *, by: str,
+                                    task: asyncio.Task[Any] | None = None) -> None:
+        text, message = self._partial_message(turn.id)
+        # RFC-0006 §4.3 + schema/events.json: `partial_message_id` is a
+        # `msg:<hex>` pointer, the same scheme as `result_ref` — a bare hex id
+        # made clients that split on ':' fail.
+        pointer = message_ref(message) if message is not None else None
+        payload: dict[str, Any] = {
+            "turn_id": turn.id, "by": by, "state": TurnState.INTERRUPTED.value,
+            # RFC-0006 §4.3: the event carries a pointer, never the text.
+            "partial_message_id": pointer,
+            "partial_chars": len(text),
+        }
+        if message is not None:
+            turn = turn.with_state(TurnState.INTERRUPTED, partial_message_id=pointer)
+        await self._finalize(
+            turn, TurnState.INTERRUPTED, payload,
+            messages=[message] if message is not None else (), task=task,
+        )
 
     # ------------------------------------------------------------------ cancel flag
     def _release_cancel(self, turn_id: str, task: asyncio.Task[Any] | None) -> None:
@@ -278,7 +451,7 @@ class TurnQueue:
     # ------------------------------------------------------------------ control
     async def interrupt(self, turn_id: str, *, by: str = "user") -> bool:
         item = self._running
-        if item is None or item.turn_id != turn_id or turn_id in self._finalized:
+        if item is None or item.turn_id != turn_id or self.is_finalized(turn_id):
             return False
         self._running = item.with_turn(item.turn.with_state(TurnState.INTERRUPTED))
         if self._cancel_hook is not None:
@@ -291,11 +464,7 @@ class TurnQueue:
             task.cancel()
             task.add_done_callback(self._consume_orphan)
         # Release the queue NOW; do not await the in-flight module.
-        await self._finalize(
-            item.turn, TurnState.INTERRUPTED,
-            {"turn_id": turn_id, "by": by, "state": TurnState.INTERRUPTED.value},
-            task=task,
-        )
+        await self._finalize_interrupted(item.turn, by=by, task=task)
         return True
 
     async def cancel(self, turn_id: str, *, by: str = "user") -> bool:
@@ -303,32 +472,48 @@ class TurnQueue:
             if item.turn_id == turn_id:
                 del self._pending[index]
                 turn = item.turn.with_state(TurnState.CANCELLED, ended_at=self._clock())
-                self._finalized.add(turn_id)
-                self._save_turn(self.session_id, turn)
                 await self._emit(
                     self.session_id, "turn.cancelled",
                     {"turn_id": turn_id, "by": by, "state": TurnState.CANCELLED.value},
+                    turns=(turn,),
                 )
                 await self._emit(self.session_id, "queue.updated", self.state_payload())
                 # A queued turn never reached the router, so there is no
                 # in-flight task that could still read the flag.
                 self._forget_turn(turn_id)
-                # It also never reaches `_run_one`, which is what drops the
-                # `_finalized` marker: drop it here so the set stays bounded.
-                self._finalized.discard(turn_id)
+                # It also never reaches `_finalize`, which is what records the
+                # marker: record it here so a late `interrupt` for the same id
+                # stays a no-op. Bounded (FIFO), so the set cannot grow one id
+                # per cancelled turn for the life of the process.
+                self._remember_finalized(turn_id)
                 return True
         if self._running is not None and self._running.turn_id == turn_id:
             # Running turns are stopped by interrupt, never by queue.cancel.
             raise VadeError("INVALID_ARGUMENT", "turn is running; use ui/interrupt")
         return False
 
-    async def mark_state(self, turn_id: str, state: TurnState) -> bool:
+    async def mark_state(self, turn_id: str, state: TurnState | str) -> bool:
+        """Move the running turn between blocking states (`waiting_approval`, …).
+
+        Emits `queue.updated` so the state is *observable*: `running_state` is
+        the only contract field that carries it (there is no
+        `turn.waiting_approval` event), and without the emit a client could
+        never render the approval wait — the state was reachable in the store
+        and invisible on the wire.
+        """
+        state = state if isinstance(state, TurnState) else TurnState(state)
         item = self._running
         if item is None or item.turn_id != turn_id:
             return False
+        if self.is_finalized(turn_id):
+            # A dialog answering/resolving after the turn was interrupted must
+            # not resurrect a terminal row as `running`.
+            return False
+        if item.turn.state is state:
+            return False  # idempotent: no event per re-check
         turn = item.turn.with_state(state)
         self._running = item.with_turn(turn)
-        self._save_turn(self.session_id, turn)
+        await self._emit(self.session_id, "queue.updated", self.state_payload(), turns=(turn,))
         return True
 
     async def drain(self) -> None:
@@ -339,14 +524,36 @@ class TurnQueue:
             await asyncio.shield(worker)
 
     async def shutdown(self) -> None:
+        """Stop every task this queue owns; terminal and idempotent.
+
+        The worker is awaited (as a cancelled task) so the caller — `close()` —
+        returns with the queue actually stopped. Without the join the worker
+        was free to wake up after `store.close()` and write one more terminal
+        event into a closed database. The turn tasks are cancelled but NOT
+        awaited: a module that ignores `tools/cancel` would otherwise hold up
+        process shutdown, and `_consume_orphan` already swallows whatever it
+        returns (`interrupt` arms that callback for exactly this reason).
+        """
+        if self._stopped:
+            return
+        self._stopped = True
         for task in list(self._turn_tasks.values()):
             if not task.done():
                 task.cancel()
         self._release_pending.clear()
-        if self._worker is not None:
-            self._worker.cancel()
+        worker = self._worker
+        if worker is not None and not worker.done():
+            worker.cancel()
         for task in list(self._orphans):
             task.cancel()
+        if worker is not None:
+            await asyncio.gather(worker, return_exceptions=True)
+            # A worker cancelled before its first step never enters the
+            # coroutine body, so `_run_loop`'s `finally` (which clears this
+            # reference) does not run. Own it here: a stopped queue must not
+            # report a worker, not even a dead one.
+            if self._worker is worker:
+                self._worker = None
 
     def _consume_orphan(self, task: asyncio.Task[Any]) -> None:
         """A module that ignores tools/cancel leaves a orphan task: swallow it."""
@@ -354,6 +561,19 @@ class TurnQueue:
         task.add_done_callback(self._orphans.discard)
         if not task.cancelled():
             task.exception()
+
+
+def _unmeasured_usage(model_id: str | None) -> dict[str, Any]:
+    """The usage of a turn whose provider never reported any (§6.1).
+
+    Zero counts with `source="none"` is the only honest answer: core does not
+    estimate tokens (N4/D102), and inventing a number would break the per-turn
+    reconciliation against the audit trail.
+    """
+    provider = model_id.split("/", 1)[0] if model_id else None
+    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "model_id": model_id, "provider": provider, "source": "none",
+            "steps": 0, "cached_tokens": 0, "reasoning_tokens": 0}
 
 
 def _error_of(exc: BaseException) -> tuple[str, str]:

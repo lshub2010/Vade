@@ -44,6 +44,12 @@ class FakeConnection:
         self.id = connection_id
         self.module_id = module_id
         self.instance_id = instance_id
+        # The transport binds this from the verified key, never from anything
+        # the peer sent (`transport/server.py::_bind_device_identity`).
+        # `App.register_module` compares it against `module#instance` in the
+        # manifest and fails closed when it is missing (review D1), so a fake
+        # connection has to carry the same value a paired one would.
+        self.device_id: str | None = f"{module_id}#{instance_id}"
         self.crypto = type("Crypto", (), {"remote_fingerprint": fingerprint})()
         self.frames: list[dict[str, Any]] = []
 
@@ -70,8 +76,14 @@ def add_turn(
     terminal_type: str = "turn.completed",
     tool_calls: tuple[dict[str, Any], ...] = (),
     error_code: str | None = None,
+    persist_turn: bool = True,
 ) -> dict[str, Any]:
-    """Persist one finished turn the way C3 does: queued, then terminal + messages."""
+    """Persist one finished turn the way C3 does: queued, then terminal + messages.
+
+    `persist_turn=False` reproduces the real race in which the terminal event is
+    committed before the `turns` row: the event exists, the payload cannot be
+    built yet.
+    """
     turn_id = new_id()
     queued_seq = store.next_seq(session_id)
     store.append(session_id, [], [Event(session_id=session_id, seq=queued_seq,
@@ -86,12 +98,14 @@ def add_turn(
         session_id=session_id, seq=terminal_seq, type=terminal_type,
         payload={"turn_id": turn_id, "state": state.value, "usage": {}},
     )])
-    store.update_turn(session_id, Turn(
+    turn = Turn(
         id=turn_id, session_id=session_id, state=state, user_text=user,
         tool_calls=tuple(tool_calls), usage={}, error_code=error_code,
         ended_at=now_ms(),
-    ))
-    return {"turn_id": turn_id, "seq_from": queued_seq, "seq_to": terminal_seq}
+    )
+    if persist_turn:
+        store.update_turn(session_id, turn)
+    return {"turn_id": turn_id, "seq_from": queued_seq, "seq_to": terminal_seq, "turn": turn}
 
 
 def make_bus(

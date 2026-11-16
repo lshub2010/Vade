@@ -17,6 +17,8 @@ from typing import Any, Awaitable, Callable, Mapping
 from ..errors import VadeError
 from ..transport.connection import RpcError
 from .manager import SessionLog
+from .search import LIMIT_DEFAULT, LIMIT_MAX
+from .store import UNSET
 
 __all__ = ["SessionRPC", "ConnectionSink"]
 
@@ -37,9 +39,13 @@ class ConnectionSink:
 
 
 class SessionRPC:
-    def __init__(self, log: SessionLog, approval: Callable[[], Any] | None = None) -> None:
+    def __init__(self, log: SessionLog, approval: Callable[[], Any] | None = None,
+                 input_port: Callable[[], Any] | None = None) -> None:
         self.log = log
         self._approval = approval or (lambda: None)
+        #: RFC-0008: resolved lazily for the same reason `approval` is — the
+        #: ask-user component may install before or after the session component.
+        self._input = input_port or (lambda: getattr(log, "input_port", None))
         self._sinks: dict[tuple[str, str], str] = {}
 
     # ------------------------------------------------------------------ dispatch
@@ -52,7 +58,8 @@ class SessionRPC:
         except VadeError as exc:
             # `data` is part of C-04's envelope (`error.data.field`); dropping
             # it here used to erase every field pointer between the check and
-            # the client (§6.4 / G7).
+            # the client (§6.4 / G7). RFC-0006 §8 rides on the same key:
+            # PAYLOAD_TOO_LARGE carries {field, limit, actual, unit} verbatim.
             return RpcError(exc.code, exc.message, dict(exc.data) if exc.data else None)
         except Exception:
             # C-04: message only, never a traceback across the boundary.
@@ -66,6 +73,33 @@ class SessionRPC:
             "ui/interrupt": self.ui_interrupt,
             "ui/queue.cancel": self.ui_queue_cancel,
             "approval/decide": self.approval_decide,
+            # RFC-0005 (C-05 append): read-only model surface + usage views.
+            "model/list": self.model_list,
+            "session/model.get": self.session_model_get,
+            "session/model.set": self.session_model_set,
+            "session/usage.get": self.session_usage_get,
+            # RFC-0006 §6.2/§6.3 (C-05 1.1.0). `session/fork` is deliberately
+            # absent: an unregistered method answers C-04 NOT_FOUND with an
+            # `unknown method` message (not JSON-RPC -32601, the standard form
+            # clients should also recognize), which is more honest than
+            # defining it and returning UNSUPPORTED.
+            "turn/regenerate": self.turn_regenerate,
+            "message/edit_resubmit": self.message_edit_resubmit,
+            "turn/input": self.turn_input,
+            "turn/input.cancel": self.turn_input_cancel,
+            # RFC-0010 §5 (C-05 1.3.0): session metadata — list / verbs / groups.
+            "session/list": self.session_list,
+            "session/rename": self.session_rename,
+            "session/pin": self.session_pin,
+            "session/archive": self.session_archive,
+            "session/delete": self.session_delete,
+            "session/group.list": self.session_group_list,
+            "session/group.create": self.session_group_create,
+            "session/group.update": self.session_group_update,
+            "session/group.delete": self.session_group_delete,
+            "session/group.assign": self.session_group_assign,
+            # RFC-0014 §5 (C-05 1.5.0): cross-session search — titles + bodies.
+            "session/search": self.session_search,
         }
 
     # ------------------------------------------------------------------ ui/*
@@ -101,6 +135,15 @@ class SessionRPC:
         if not isinstance(client_msg_id, str) or not client_msg_id:
             raise VadeError("INVALID_ARGUMENT", "client_msg_id is required",
                             data={"field": "client_msg_id"})
+        if self._read_only(connection):
+            # B3: `rpc.json` has declared READ_ONLY_SESSION for `ui/submit` since
+            # C-05, and this handler — the ONLY write path a message takes —
+            # never checked it. A read-only viewer could submit a turn, including
+            # through a page's `ui/submit` action, which delegates here.
+            raise VadeError(
+                "READ_ONLY_SESSION",
+                "this session is read-only; submitting a message requires a writable session",
+            )
         # RFC-0004 §6.4: shape (array, 1..20 parts) is checked once, in
         # `SessionLog.submit`, so a direct caller and the RPC surface answer the
         # same `data.field`. Only the identity of the submitting device is
@@ -124,6 +167,49 @@ class SessionRPC:
         if not await self.log.cancel(session_id, turn_id, by=self._who(connection)):
             raise VadeError("NOT_FOUND", "no queued turn with that id")
         return {"ok": True}
+
+    # ------------------------------------------------------------------ versions
+    async def turn_regenerate(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """RFC-0006 §6.2: new turn for the same user message, old one superseded."""
+        session_id, turn_id = self._ids(params)
+        client_msg_id = params.get("client_msg_id")
+        if not isinstance(client_msg_id, str) or not client_msg_id:
+            raise VadeError("INVALID_ARGUMENT", "client_msg_id is required")
+        if self._read_only(connection):
+            # A regenerate appends a turn exactly like `ui/submit`, so it is a
+            # write path: `rpc.json` has declared READ_ONLY_SESSION for it since
+            # C-05, and leaving it unchecked let a read-only viewer write by
+            # pointing at an old turn instead of submitting a message.
+            raise VadeError(
+                "READ_ONLY_SESSION",
+                "this session is read-only; regenerating a turn requires a writable session",
+            )
+        return await self.log.regenerate(session_id, turn_id, client_msg_id)
+
+    async def message_edit_resubmit(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """RFC-0006 §6.3: append a new user message, point the old one at it."""
+        session_id = params.get("session_id")
+        message_id = params.get("message_id")
+        content = params.get("content")
+        client_msg_id = params.get("client_msg_id")
+        if not isinstance(session_id, str):
+            raise VadeError("INVALID_ARGUMENT", "session_id is required")
+        if self._read_only(connection):
+            # §6.4's validation order is explicit: write permission (①) is
+            # checked before the content shape (②..⑤). An edit creates a new
+            # turn, so a read-only connection must be refused here too — it is
+            # the other half of the `ui/submit` gate above.
+            raise VadeError(
+                "READ_ONLY_SESSION",
+                "this session is read-only; editing a message requires a writable session",
+            )
+        if not isinstance(message_id, str) or not message_id:
+            raise VadeError("INVALID_ARGUMENT", "message_id is required")
+        if not isinstance(content, list):
+            raise VadeError("INVALID_ARGUMENT", "content must be an array of blocks")
+        if not isinstance(client_msg_id, str) or not client_msg_id:
+            raise VadeError("INVALID_ARGUMENT", "client_msg_id is required")
+        return await self.log.edit_resubmit(session_id, message_id, content, client_msg_id)
 
     # ------------------------------------------------------------------ approval
     async def approval_decide(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -152,17 +238,319 @@ class SessionRPC:
         ok = True
         if isinstance(resolved, tuple) and len(resolved) == 2:
             ok, resolved = resolved
-        session_id = getattr(resolved, "session_id", None)
-        turn_id = getattr(resolved, "turn_id", None)
+        # `ApprovalManager.decide` answers `(ok, dict)`; reading it with
+        # `getattr` returned None on every field, so the close event below was
+        # dead code and other devices' dialogs never closed.
+        winner: Mapping[str, Any] = resolved if isinstance(resolved, Mapping) else {}
+        session_id = winner.get("session_id")
+        turn_id = winner.get("turn_id")
+        attribution: dict[str, Any] = {}
+        # RFC-0007 §7.1: `decide()` returns the attribution it resolved, so
+        # the event that closes the dialog names the same task the prompt did.
+        for key in ("task_id", "task_name", "depth"):
+            if key in winner:
+                attribution[key] = winner[key]
         if session_id and turn_id:
             # Always close the dialog on every attached UI, even on a failed
             # first-wins race — otherwise the other devices spin forever.
+            # `decision`/`by` are the WINNER's: the manager normalizes them
+            # (`by or actor_kind`, `allow|deny`), and the wire vocabulary for
+            # this event is `approve|deny` (schema/events.json), not `allow`.
+            verdict = str(winner.get("decision") or "").lower()
             await self.log.emit(session_id, "turn.approval_resolved", {
-                "turn_id": turn_id, "request_id": request_id, "decision": decision,
-                "by": getattr(connection, "device_id", None) or "admin",
-                "scope": scope, "state": "running",
+                "turn_id": turn_id, "request_id": request_id,
+                "session_id": session_id,
+                "decision": "approve" if verdict in ("allow", "approve", "approved") else "deny",
+                "by": winner.get("by") or getattr(connection, "device_id", None) or "admin",
+                "scope": winner.get("scope") or scope,
+                "state": winner.get("state") or "running",
+                **attribution,
             })
         return {"ok": bool(ok)}
+
+    # ------------------------------------------------------------------ models
+    async def model_list(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """RFC-0005 §4: what the current mode can actually route to."""
+        resolver = getattr(self.log, "models", None)
+        if resolver is None:
+            raise VadeError("UNAVAILABLE", "the model catalog is not wired")
+        if_revision = params.get("if_revision")
+        if if_revision is not None and (not isinstance(if_revision, int) or isinstance(if_revision, bool)):
+            raise VadeError("INVALID_ARGUMENT", "if_revision must be an integer or null")
+        catalog = resolver.catalog()
+        if if_revision is not None and if_revision == catalog.revision:
+            # §4.4: the client reuses its cache; it must NOT clear the badges.
+            return {"revision": catalog.revision, "not_modified": True, "models": None}
+        default = resolver.resolve(None, catalog)
+        return {
+            "revision": catalog.revision,
+            "not_modified": False,
+            "models": catalog.to_wire(),
+            "default": {"model_id": default.model_id, "source": default.source,
+                        "resolved": default.resolved},
+        }
+
+    async def session_model_get(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str):
+            raise VadeError("INVALID_ARGUMENT", "session_id is required")
+        selection = self.log.resolve_model(session_id)
+        if selection is None:
+            raise VadeError("UNAVAILABLE", "the model catalog is not wired")
+        return selection.to_wire()
+
+    async def session_model_set(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str):
+            raise VadeError("INVALID_ARGUMENT", "session_id is required")
+        if "model_id" not in params:
+            raise VadeError("INVALID_ARGUMENT", "model_id is required (null clears the override)")
+        model_id = params.get("model_id")
+        if model_id is not None and not isinstance(model_id, str):
+            raise VadeError("INVALID_ARGUMENT", "model_id must be a string or null")
+        resolver = getattr(self.log, "models", None)
+        if resolver is None:
+            raise VadeError("UNAVAILABLE", "the model catalog is not wired")
+        session = self.log.get_session(session_id)
+        if session is None:
+            raise VadeError("NOT_FOUND", f"session {session_id!r} does not exist")
+        if model_id is not None:
+            if session.state != "open":
+                raise VadeError("READ_ONLY_SESSION", "session is closed; its model cannot be changed")
+            if "/" not in model_id or model_id.startswith("/") or model_id.endswith("/"):
+                raise VadeError("INVALID_ARGUMENT", "model_id must be <provider>/<model>")
+            entry = resolver.catalog().get(model_id)
+            if entry is None:
+                raise VadeError("NOT_FOUND", f"unknown model {model_id!r}",
+                                data={"reason": "unknown_model"})
+            if not entry.available:
+                raise VadeError("UNAVAILABLE", f"model {model_id!r} has no healthy instance",
+                                data={"reason": "model_unavailable"})
+        selection = self.log.set_session_model(session_id, model_id)
+        return {"model_id": selection.model_id, "source": selection.source,
+                "effective_at": "next_turn"}
+
+    async def session_usage_get(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str):
+            raise VadeError("INVALID_ARGUMENT", "session_id is required")
+        session = self.log.get_session(session_id)
+        if session is None:
+            raise VadeError("NOT_FOUND", f"session {session_id!r} does not exist")
+        accounting = getattr(self.log, "usage", None)
+        if accounting is None:
+            raise VadeError("UNAVAILABLE", "usage accounting is not wired")
+        return accounting.report(session)
+    # ------------------------------------------------------------------ input
+    async def turn_input(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """`turn/input`: answer one pending question (RFC-0008 §7.1).
+
+        `input_id` is the idempotency key and is core-issued; a value that fails
+        validation leaves the turn in `waiting_input` and emits nothing (§4.4).
+        """
+        session_id, input_id = self._input_ids(connection, params)
+        if "value" not in params:
+            raise VadeError("INVALID_ARGUMENT", "value is required",
+                            data={"field": "value"})
+        port: Any = self._input()
+        submit: Any = getattr(port, "submit", None) if port is not None else None
+        if not callable(submit):
+            raise VadeError("NOT_FOUND", "no ask-user channel is installed")
+        result: Any = submit(session_id=session_id, input_id=input_id,
+                             value=params.get("value"), by=self._who(connection))
+        if inspect.isawaitable(result):
+            result = await result
+        return {"ok": True, "turn_id": result["turn_id"], "status": result["status"],
+                "value": result.get("value"), "duplicate": bool(result.get("duplicate"))}
+
+    async def turn_input_cancel(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """`turn/input.cancel`: close one dialog, keep the turn running (§7.2)."""
+        session_id, input_id = self._input_ids(connection, params)
+        reason = params.get("reason", "user_cancel")
+        if reason is not None and (not isinstance(reason, str) or len(reason) > 200):
+            raise VadeError("INVALID_ARGUMENT", "reason must be a string of at most 200 characters",
+                            data={"field": "reason"})
+        port: Any = self._input()
+        cancel: Any = getattr(port, "cancel", None) if port is not None else None
+        if not callable(cancel):
+            raise VadeError("NOT_FOUND", "no ask-user channel is installed")
+        result: Any = cancel(session_id=session_id, input_id=input_id,
+                             by=self._who(connection), reason=reason or "user_cancel")
+        if inspect.isawaitable(result):
+            result = await result
+        return {"ok": True, "turn_id": result["turn_id"], "status": result["status"]}
+
+    # ------------------------------------------------------------------ RFC-0010 session metadata
+    async def session_list(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """`session/list`: one light page in FR-8.26 order (§5)."""
+        limit = params.get("limit", 50)
+        cursor = params.get("cursor", 0)
+        archived = params.get("archived", False)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+            raise VadeError("INVALID_ARGUMENT", "limit must be an integer in 1..200",
+                            data={"field": "limit"})
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+            raise VadeError("INVALID_ARGUMENT", "cursor must be a non-negative integer",
+                            data={"field": "cursor"})
+        if not isinstance(archived, bool):
+            raise VadeError("INVALID_ARGUMENT", "archived must be a boolean",
+                            data={"field": "archived"})
+        group_id: Any = UNSET
+        if "group_id" in params:
+            group_id = params.get("group_id")
+            if group_id is not None and not isinstance(group_id, str):
+                raise VadeError("INVALID_ARGUMENT",
+                                "group_id must be a string, null, or omitted",
+                                data={"field": "group_id"})
+        return self.log.list_sessions_page(limit=limit, cursor=cursor,
+                                           group_id=group_id, archived=archived)
+
+    async def session_rename(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        if "title" not in params:
+            raise VadeError("INVALID_ARGUMENT", "title is required",
+                            data={"field": "title"})
+        session = await self.log.rename_session(session_id, params.get("title"),
+                                                by=self._who(connection))
+        return {"ok": True, "session": session.to_wire()}
+
+    async def session_pin(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        if "pinned" not in params:
+            raise VadeError("INVALID_ARGUMENT", "pinned is required",
+                            data={"field": "pinned"})
+        session = await self.log.set_pinned(session_id, params.get("pinned"),
+                                            by=self._who(connection))
+        return {"ok": True, "pinned_at": session.pinned_at}
+
+    async def session_archive(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        if "archived" not in params:
+            raise VadeError("INVALID_ARGUMENT", "archived is required",
+                            data={"field": "archived"})
+        session = await self.log.set_archived(session_id, params.get("archived"),
+                                              by=self._who(connection))
+        return {"ok": True, "archived_at": session.archived_at}
+
+    async def session_delete(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """§8.2: the double-confirm dialog already happened client-side."""
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        await self.log.delete_session(session_id, by=self._who(connection))
+        return {"ok": True}
+
+    async def session_group_list(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        return {"groups": self.log.list_groups()}
+
+    async def session_group_create(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        if "parent_id" in params:
+            # §7.3: one level only — the data model has nowhere to hang a parent.
+            raise VadeError("INVALID_ARGUMENT", "groups cannot be nested",
+                            data={"field": "parent_id", "reason": "nesting_forbidden"})
+        if "name" not in params:
+            raise VadeError("INVALID_ARGUMENT", "name is required",
+                            data={"field": "name"})
+        group = self.log.create_group(
+            params.get("name"),
+            icon=params.get("icon"),
+            color=params.get("color"),
+            sort_order=params.get("sort_order", 0),
+        )
+        return {"group": group.to_wire()}
+
+    async def session_group_update(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        group_id = params.get("group_id")
+        if not isinstance(group_id, str) or not group_id:
+            raise VadeError("INVALID_ARGUMENT", "group_id is required",
+                            data={"field": "group_id"})
+        fields = {key: params[key] for key in ("name", "icon", "color", "sort_order")
+                  if key in params}
+        group = self.log.update_group(group_id, fields)
+        return {"group": group.to_wire()}
+
+    async def session_group_delete(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """§8.1: members are unassigned (the count says how many) — never deleted."""
+        group_id = params.get("group_id")
+        if not isinstance(group_id, str) or not group_id:
+            raise VadeError("INVALID_ARGUMENT", "group_id is required",
+                            data={"field": "group_id"})
+        unassigned = self.log.delete_group(group_id)
+        return {"ok": True, "unassigned": unassigned}
+
+    async def session_group_assign(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        if "group_id" not in params:
+            raise VadeError("INVALID_ARGUMENT", "group_id is required (null = ungroup)",
+                            data={"field": "group_id"})
+        group_id = params.get("group_id")
+        await self.log.assign_group(session_id, group_id, by=self._who(connection))
+        return {"ok": True, "group_id": group_id}
+
+    # ------------------------------------------------------------------ RFC-0014 session search
+    async def session_search(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """`session/search`: parameterized LIKE over titles + live bodies (§4).
+
+        The `limit` cap is enforced HERE and nowhere else, deliberately: it is
+        the single point the contract names, and a second copy in the manager
+        would let a future edit delete one and leave the mutation tests green
+        (RFC-0014 §8 mutation ②).
+        """
+        query = params.get("query")
+        if not isinstance(query, str):
+            raise VadeError("INVALID_ARGUMENT", "query is required and must be a string",
+                            data={"field": "query"})
+        limit = params.get("limit", LIMIT_DEFAULT)
+        offset = params.get("offset", 0)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= LIMIT_MAX:
+            raise VadeError("INVALID_ARGUMENT", f"limit must be an integer in 1..{LIMIT_MAX}",
+                            data={"field": "limit"})
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise VadeError("INVALID_ARGUMENT", "offset must be a non-negative integer",
+                            data={"field": "offset"})
+        session_id = params.get("session_id")
+        if session_id is not None and (not isinstance(session_id, str) or not session_id):
+            raise VadeError("INVALID_ARGUMENT", "session_id must be a non-empty string or null",
+                            data={"field": "session_id"})
+        # Read verb: a read_only connection searches exactly like it lists and
+        # attaches (§4.8) — no READ_ONLY_SESSION refusal here.
+        return self.log.search(query, limit=limit, offset=offset, session_id=session_id)
+
+    def _input_ids(self, connection: Any, params: Mapping[str, Any]) -> tuple[str, str]:
+        """Shared guard: writable session, both ids present (§7.4)."""
+        session_id, input_id = params.get("session_id"), params.get("input_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise VadeError("INVALID_ARGUMENT", "session_id is required",
+                            data={"field": "session_id"})
+        if not isinstance(input_id, str) or not input_id:
+            raise VadeError("INVALID_ARGUMENT", "input_id is required",
+                            data={"field": "input_id"})
+        if self._read_only(connection):
+            # AMEND-22 #14: only an EXPLICITLY read-only session is refused; a
+            # cookie session is writable (D100) and may answer like anyone else.
+            raise VadeError("READ_ONLY_SESSION",
+                            "this session is read-only; answering requires a writable session")
+        return session_id, input_id
+
+    @staticmethod
+    def _read_only(connection: Any) -> bool:
+        if bool(getattr(connection, "read_only", False)):
+            return True
+        principal = getattr(connection, "principal", None)
+        return bool(getattr(principal, "read_only", False))
 
     # ------------------------------------------------------------------ helpers
     @staticmethod

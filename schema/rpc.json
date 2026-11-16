@@ -321,12 +321,13 @@
           ],
           "rejected": [
             "string"
-          ]
+          ],
+          "replayed": "int"
         },
         "errors": [
           "INVALID_ARGUMENT"
         ],
-        "notes": "Whitelist-checked. Rejected topics are reported, not silently dropped. `since_seq` is per session: an integer requires `session_id`, several sessions take a `{session_id: seq}` object; a bare integer spanning every session is rejected because each session has its own seq counter."
+        "notes": "Whitelist-checked. Rejected topics are reported, not silently dropped. `since_seq` is per session: an integer requires `session_id`, several sessions take a `{session_id: seq}` object; a bare integer spanning every session is rejected because each session has its own seq counter. `replayed` is the number of journal entries pushed by that resume (0 when `since_seq` is absent); only `session.turn` is replayed."
       },
       "skill/proposal": {
         "params": {

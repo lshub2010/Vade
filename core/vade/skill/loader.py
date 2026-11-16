@@ -327,23 +327,29 @@ def _read_zip(payload: bytes, contract: Contract) -> tuple[str, dict[str, bytes]
 
 
 def _read_directory(root: Path, contract: Contract) -> tuple[str, dict[str, bytes], tuple[str, ...]]:
+    # Pre-check before `rglob`: a symlinked install source is refused outright,
+    # so the walk can never start outside the tree the caller pointed at.
+    if root.is_symlink():
+        _reject("directory install source is a symlink")
     skill_md = root / "SKILL.md"
     if not skill_md.is_file():
         _reject("directory has no SKILL.md")
     files: dict[str, bytes] = {}
     total = 0
     for path in sorted(root.rglob("*")):
+        if path.is_symlink() and path.is_dir():
+            continue                        # never walk through a symlinked dir
         if path.is_dir():
             continue
         relative = path.relative_to(root)
         if relative.parts[0] in contract.reserved_names or relative.name.startswith("."):
             continue
+        if path.is_symlink():
+            _reject(f"directory entry is a symlink: {relative.as_posix()!r}")
         name = relative.as_posix()
         reason = _forbidden_entry(name, contract)
         if reason:
             _reject(f"directory contains {reason}")
-        if path.is_symlink():
-            _reject(f"directory entry is a symlink: {name!r}")
         data = path.read_bytes()
         total += len(data)
         if total > contract.max_uncompressed_bytes:
@@ -357,6 +363,10 @@ def materialize(source: InstallSource, contract: Contract) -> Material:
     """Read a source into text + reference files. Pure read: nothing executes."""
     if source.kind == "text":
         text = source.text
+        # A raw text install has no archive header to bound it, so it gets the
+        # same 1MB ceiling as a SKILL.md inside a zip (§C3b "one size limit").
+        if len(text.encode("utf-8")) > MAX_SKILL_FILE_BYTES:
+            _reject("skill text is larger than 1MB")
         return Material(text=text, digest=_digest(text, {}), source="text")
     if source.kind == "zip":
         text, files, entries = _read_zip(source.data, contract)
@@ -582,7 +592,9 @@ class SkillLoader:
             parsed.body,
             max_chars=self.body_max_chars,
             max_lines=self.body_max_lines,
-            path=skill_md,
+            # Relative on purpose: the hint lands in the prompt, and an absolute
+            # data-dir path there is a host-layout leak. `fs` resolves it.
+            path=f"{name}/SKILL.md",
         )
         findings = skill_audit.scan_secrets(body)
         if findings:
@@ -784,7 +796,8 @@ class SkillLoader:
         if self.injection == "layered":
             return self._render_layered(parts, states, activation)
         catalog, l0_dropped = skill_render.render_catalog(
-            states, activation.names, token_budget=self.l0_token_budget
+            states, activation.names, token_budget=self.l0_token_budget,
+            hits=activation.hits,
         )
         bodies, injected, l1_dropped = skill_render.render_bodies(
             states, activation.names, budget_chars=self.body_budget_chars
@@ -888,7 +901,8 @@ class SkillLoader:
             raise VadeError("UNAVAILABLE", f"skill body unreadable: {name}: {type(exc).__name__}") from exc
         cap = self.body_max_chars if budget_chars is None else max(0, min(int(budget_chars), self.body_max_chars))
         body, truncated, _reason = truncate_body(
-            parsed.body, max_chars=cap, max_lines=self.body_max_lines, path=path,
+            parsed.body, max_chars=cap, max_lines=self.body_max_lines,
+            path=f"{name}/SKILL.md",      # relative: the hint reaches the prompt
         )
         self._note_used([name])
         return body, int(state.revision), bool(truncated)

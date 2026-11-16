@@ -10,9 +10,13 @@ Fixed shape (docs/agents/23 §T3):
     <body, verbatim>
 
 Determinism is a feature: lines and bodies are emitted in **name order**, the
-budget is spent in **priority order** (activated first, then trigger hits, then
-name), and no dictionary iteration order ever reaches the output. Same input ->
-byte-identical prompt -> the upstream prompt cache keeps hitting.
+budget is spent in **priority order** (activated first, then trigger hit count
+descending, then name), and no dictionary iteration order ever reaches the
+output. Same input -> byte-identical prompt -> the upstream prompt cache keeps
+hitting.
+
+Nothing that identifies the host may reach the prompt: a truncation hint says
+what was cut, never where the file lives on disk (`state.path` is internal).
 
 Deliberately no relevance re-ranking, no XML wrappers (models follow tags
 inconsistently), and no "name-only" fallback for a dropped line: a name without
@@ -22,7 +26,7 @@ a description tells the model nothing.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 __all__ = ["CATALOG_HEADER", "Rendered", "estimate_tokens", "render_catalog", "render_bodies", "render_content"]
 
@@ -55,8 +59,31 @@ def _catalog_line(state: object) -> str:
     return f"{line} {marker}" if marker else line
 
 
-def _priority(states: Sequence[object], activated: Sequence[str]) -> list[object]:
-    """Build order: activated (rank order), then hit count desc, then name."""
+def _hit_count(hits: Mapping[str, int] | None, name: str) -> int:
+    """Trigger-hit count for `name`; 0 when unknown (never a reason to drop)."""
+    getter = getattr(hits, "get", None)
+    if not callable(getter):
+        return 0
+    value = getter(name)
+    if value is None:
+        value = getter(name.lower())
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _priority(
+    states: Sequence[object],
+    activated: Sequence[str],
+    hits: Mapping[str, int] | None = None,
+) -> list[object]:
+    """Build order: activated (rank order), then hit count desc, then name.
+
+    `hits` is `Activation.hits` (docs/agents/23 §T3). Skills that matched
+    triggers but lost the `max_activated` cut keep their hit count here, so the
+    L0 budget trims the least relevant line first instead of the last name.
+    """
     by_name = {str(getattr(s, "name")): s for s in states}
     ordered: list[object] = []
     seen: set[str] = set()
@@ -64,7 +91,10 @@ def _priority(states: Sequence[object], activated: Sequence[str]) -> list[object
         if name in by_name and name not in seen:
             ordered.append(by_name[name])
             seen.add(name)
-    rest = [s for n, s in sorted(by_name.items()) if n not in seen]
+    rest = sorted(
+        (s for n, s in by_name.items() if n not in seen),
+        key=lambda s: (-_hit_count(hits, str(getattr(s, "name"))), str(getattr(s, "name"))),
+    )
     ordered.extend(rest)
     return ordered
 
@@ -74,10 +104,14 @@ def render_catalog(
     activated: Sequence[str],
     *,
     token_budget: int,
+    hits: Mapping[str, int] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     """Return `(catalog_text, dropped_names)`.
 
     `states` must be the catalog-visible set (invalid/pending never reach here).
+    `activated` is priority-ordered (`Activation.names`); `hits` is
+    `Activation.hits`, which is what orders the *non*-activated remainder
+    (docs/agents/23 §T3: activated, hit count desc, name).
     """
     if not states:
         return "", ()
@@ -86,7 +120,7 @@ def render_catalog(
     kept: list[str] = []
     dropped: list[str] = []
     used = len(header) + 1
-    for state in _priority(states, activated):
+    for state in _priority(states, activated, hits):
         line = _catalog_line(state)
         cost = len(line) + 1
         if used + cost > budget:
@@ -131,7 +165,9 @@ def render_bodies(
             continue
         room = budget - used - len(header) - 2
         if room >= MIN_BODY_CHARS and len(body) > room:
-            hint = f"\n\n[... truncated, use fs to read {getattr(state, 'path', '')} ...]"
+            # Never interpolate `state.path` here: the prompt is not the place
+            # to disclose the host's filesystem layout (or the data dir).
+            hint = "\n\n[... truncated, remaining text omitted ...]"
             cut = body[: max(0, room - len(hint))].rstrip()
             chunks[name] = header + cut + hint
             used = budget

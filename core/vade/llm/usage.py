@@ -212,18 +212,51 @@ class UsageAccounting:
     def _trusted(self, session: Session) -> bool:
         """Is this session's ledger trustworthy? (§6.4)
 
-        Only the last measured turn matters: if its `source` is `none` the
-        provider does not report usage, so blocking on the number would be
-        blocking on a number core made up. A turn that recorded no `source` at
-        all (a pre-RFC-0005 row, a provider that never filled it) is just as
-        unmeasured — "unknown" must not be read as "trustworthy".
+        Trust is a property of the *provider*, so only turns that could have
+        carried a measurement count as evidence. Walk the terminal turns from
+        newest to oldest:
+
+        * a turn with a real `source` (anything but `none`) proves the provider
+          reports usage -> trustworthy, even if a later turn failed before it
+          could be measured (a network error is not "this provider never
+          reports"; letting one failure poison the ledger would silently turn
+          the hard block off for the rest of the session);
+        * a *completed* turn whose `source` is missing or `none` is evidence
+          that the provider did not report -> untrustworthy. A pre-RFC-0005 row
+          (no `source` at all) is just as unmeasured: "unknown" must never be
+          read as "trustworthy";
+        * a failed/interrupted turn with no measurement says nothing about the
+          provider — skip it and keep looking;
+        * no evidence at all (an empty session) is trusted: there is nothing to
+          block and nothing to invent.
         """
         measured = [t for t in session.turns if t.state in TERMINAL_MEASURED]
         if not measured:
             return True
-        usage = dict(measured[-1].usage or {})
-        source = usage.get("source")
-        return source is not None and source != "none"
+        for turn in reversed(measured):
+            usage = dict(turn.usage or {})
+            source = usage.get("source")
+            if source is not None and source != "none":
+                return True
+            if turn.state is TurnState.COMPLETED:
+                return False
+        return False
+
+    @staticmethod
+    def _candidate_rank(candidate: tuple[str, str, int, int]) -> tuple[int, float, int]:
+        """Order gate candidates: severity, then how far past the limit, then day.
+
+        `max()` alone returns the first candidate on a tie, i.e. it always
+        reported `session` when both scopes were `exceeded` — a user starting a
+        new session while the day budget was the binding limit got told the
+        wrong scope. The overrun ratio is the closest honest answer to "which
+        limit is actually holding the turn back"; an exact tie goes to `day`
+        because a daily limit refuses every session, not just this one.
+        """
+        scope, state, used, limit = candidate
+        severity = {"off": 0, "ok": 0, "warn": 1, "exceeded": 2}
+        ratio = (used / limit) if limit > 0 else 0.0
+        return (severity.get(state, 0), ratio, 1 if scope == "day" else 0)
 
     async def gate(self, session: Session) -> dict[str, Any]:
         """Submit-time budget decision (§6.4).
@@ -240,8 +273,7 @@ class UsageAccounting:
             ("session", session_budget["state"], session_budget["used"], session_budget["limit"]),
             ("day", day["state"], day["core_total_tokens"], day["core_limit"]),
         ]
-        severity = {"off": 0, "ok": 0, "warn": 1, "exceeded": 2}
-        scope, state, used, limit = max(candidates, key=lambda c: severity.get(c[1], 0))
+        scope, state, used, limit = max(candidates, key=self._candidate_rank)
         if state == "warn":
             # `warn` never blocks and is never `degraded` (§7.4): nothing was
             # suppressed, so there is nothing to disclose.

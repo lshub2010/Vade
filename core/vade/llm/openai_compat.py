@@ -33,6 +33,11 @@ def parse_chunk(chunk: Mapping[str, Any]) -> Delta:
     usage = chunk.get("usage")
     usage_map = flatten_usage(usage) if isinstance(usage, Mapping) else None
     if not choices:
+        # `stream_options.include_usage` appends one usage-only chunk after the
+        # last content chunk (`choices: []` + `usage`). It carries no content,
+        # so it is a Delta whose only payload is the measurement — dropping it
+        # (or treating `choices: []` as end-of-stream) loses the whole point of
+        # asking for it.
         return Delta(usage=usage_map)
     choice = choices[0] or {}
     delta = choice.get("delta") or {}
@@ -93,6 +98,12 @@ class OpenAICompatProvider:
         # builtin call has no module, which is exactly what `llm.call` records.
         requested = model.split("/", 1)[1] if model and model.startswith("builtin/") else model
         body: dict[str, Any] = {"model": requested or self.model, "messages": list(messages), "stream": stream}
+        if stream:
+            # RFC-0005 §6.1: OpenAI-compatible servers report no usage for a
+            # streamed completion unless asked. Without this every turn lands
+            # as `source="none"`, `_trusted()` says the ledger is a guess and
+            # the hard budget block degrades to a warning forever (§6.4).
+            body["stream_options"] = {"include_usage": True}
         if tools:
             body["tools"] = list(tools)
         last_error: Exception | None = None

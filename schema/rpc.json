@@ -311,7 +311,9 @@
           ],
           "redact": [
             "string"
-          ]
+          ],
+          "session_id": "string|null",
+          "since_seq": "int|object|null"
         },
         "result": {
           "accepted": [
@@ -324,7 +326,7 @@
         "errors": [
           "INVALID_ARGUMENT"
         ],
-        "notes": "Whitelist-checked. Rejected topics are reported, not silently dropped."
+        "notes": "Whitelist-checked. Rejected topics are reported, not silently dropped. `since_seq` is per session: an integer requires `session_id`, several sessions take a `{session_id: seq}` object; a bare integer spanning every session is rejected because each session has its own seq counter."
       },
       "skill/proposal": {
         "params": {

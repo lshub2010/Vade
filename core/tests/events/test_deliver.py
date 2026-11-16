@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 
-from vade.session.models import TurnState
+import pytest
+
+from vade.errors import VadeError
+from vade.events.deliver import DeliveryQueue
+from vade.session.models import Session, TurnState, now_ms
 
 from .helpers import (
     FakeConnection, evolve_connection, make_bus, make_store, add_turn, pump,
@@ -117,7 +121,8 @@ def test_reconnect_with_since_seq_fills_the_gap_without_duplicates(tmp_path):
     second, record2 = evolve_connection("c2", instance_id="evo-1")
     registry.records[:] = [record2]
     bus._connections["c2"] = second
-    result = subscribe(bus, second, {"topics": ["session.turn"], "since_seq": turn1["seq_to"]})
+    result = subscribe(bus, second, {"topics": ["session.turn"], "session_id": "s1",
+                                     "since_seq": turn1["seq_to"]})
 
     assert result["replayed"] == 2
     replayed = second.delivered()
@@ -140,7 +145,8 @@ def test_since_seq_replay_from_the_journal_on_a_fresh_subscribe(tmp_path):
     add_turn(store)
     pump(bus)                         # journaled even though nobody subscribed yet
 
-    result = subscribe(bus, connection, {"topics": ["session.turn"], "since_seq": 0})
+    result = subscribe(bus, connection, {"topics": ["session.turn"], "session_id": "s1",
+                                         "since_seq": 0})
 
     assert result["replayed"] == 1
     assert connection.delivered()[0]["payload"]["user_text"] == "how do I roll back?"
@@ -255,3 +261,198 @@ def test_skill_proposed_is_metadata_only(tmp_path):
     assert params["seq_from"] == params["seq_to"] == 0
     assert set(params["payload"]) == {"name", "origin", "revision", "base_revision", "status"}
     assert "content" not in params["payload"]
+
+
+# ---------------------------------------------------------------- bounded retry
+
+
+def test_a_turn_row_that_lands_late_is_delivered_once(tmp_path):
+    """The normal C3 race: terminal event first, `turns` row a moment later."""
+    store = make_store(tmp_path)
+    connection, record = evolve_connection()
+    bus, _ = make_bus(store, records=[record], connections={"c1": connection})
+    subscribe(bus, connection, {"topics": ["session.turn"]})
+
+    turn = add_turn(store, user="late", persist_turn=False)
+    assert pump(bus) == 0                    # held at the terminal event
+    store.update_turn("s1", turn["turn"])
+
+    assert pump(bus) == 1
+    assert pump(bus) == 0
+    frames = connection.delivered()
+    assert [f["payload"]["user_text"] for f in frames] == ["late"]
+    assert frames[0]["seq_from"] == turn["seq_from"]
+    assert not [r for r in bus.audit_records() if r["event"] == "events.turn_missing"]
+
+
+def test_a_turn_row_that_never_lands_is_audited_and_does_not_stall_the_session(tmp_path):
+    store = make_store(tmp_path)
+    connection, record = evolve_connection()
+    bus, _ = make_bus(store, records=[record], connections={"c1": connection})
+    subscribe(bus, connection, {"topics": ["session.turn"]})
+
+    add_turn(store, user="ghost", persist_turn=False)   # no row will ever arrive
+    add_turn(store, user="later")
+
+    for _ in range(3):                       # bounded retries, then give up
+        assert pump(bus) == 0
+    assert pump(bus) == 1                    # the later turn is not blocked forever
+
+    assert [f["payload"]["user_text"] for f in connection.delivered()] == ["later"]
+    missing = [r for r in bus.audit_records() if r["event"] == "events.turn_missing"]
+    assert missing and missing[0]["session_id"] == "s1"
+    assert missing[0]["ok"] is False
+
+
+class _ExplodingLoad:
+    """A store whose `load()` fails for one session only."""
+
+    def __init__(self, store, bad: str) -> None:
+        self._store = store
+        self._bad = bad
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def load(self, session_id):
+        if session_id == self._bad:
+            raise RuntimeError("broken session")
+        return self._store.load(session_id)
+
+
+def test_one_broken_session_does_not_stop_the_others(tmp_path):
+    store = make_store(tmp_path)
+    store.create_session(Session(id="s2", created_at=now_ms() + 10))
+    connection, record = evolve_connection()
+    bus, _ = make_bus(store, records=[record], connections={"c1": connection})
+    subscribe(bus, connection, {"topics": ["session.turn"]})
+    add_turn(store, session_id="s1", user="fine")
+    add_turn(store, session_id="s2", user="broken")
+    bus._store = _ExplodingLoad(store, "s2")
+
+    assert pump(bus) == 1
+
+    assert [f["payload"]["user_text"] for f in connection.delivered()] == ["fine"]
+    failed = [r for r in bus.audit_records() if r["event"] == "events.pump_failed"]
+    assert {r["session_id"] for r in failed} == {"s2"}
+
+
+# ------------------------------------------------------------ since_seq scope
+
+
+def test_since_seq_replays_only_the_sessions_it_names(tmp_path):
+    store = make_store(tmp_path)
+    store.create_session(Session(id="s2", created_at=now_ms() + 10))
+    first, record = evolve_connection("c1")
+    bus, registry = make_bus(store, records=[record], connections={"c1": first})
+
+    subscribe(bus, first, {"topics": ["session.turn"]})
+    add_turn(store, session_id="s1", user="s1-only")
+    s2_first = add_turn(store, session_id="s2", user="s2-first")
+    s2_second = add_turn(store, session_id="s2", user="s2-second")
+    pump(bus)
+    assert len(first.delivered()) == 3
+    asyncio.run(bus.on_disconnect(first))
+
+    second, record2 = evolve_connection("c2")
+    registry.records[:] = [record2]
+    bus._connections["c2"] = second
+    result = subscribe(bus, second, {"topics": ["session.turn"],
+                                     "since_seq": {"s2": s2_first["seq_to"]}})
+
+    assert result["replayed"] == 1
+    frames = second.delivered()
+    assert [f["session_id"] for f in frames] == ["s2"]
+    assert frames[0]["payload"]["user_text"] == "s2-second"
+    assert frames[0]["seq_from"] == s2_second["seq_from"]
+    # s1 was not named, so its history is not invented for this connection.
+    assert all(f["session_id"] != "s1" for f in frames)
+
+
+def test_since_seq_accepts_session_id_with_an_integer(tmp_path):
+    store = make_store(tmp_path)
+    store.create_session(Session(id="s2", created_at=now_ms() + 10))
+    connection, record = evolve_connection("c1")
+    bus, _ = make_bus(store, records=[record], connections={"c1": connection})
+    add_turn(store, session_id="s1", user="s1-only")
+    add_turn(store, session_id="s2", user="s2-only")
+    pump(bus)                               # journal both
+
+    result = subscribe(bus, connection, {"topics": ["session.turn"],
+                                         "session_id": "s2", "since_seq": 0})
+
+    assert result["replayed"] == 1
+    assert [f["session_id"] for f in connection.delivered()] == ["s2"]
+
+
+def test_since_seq_without_a_session_is_rejected(tmp_path):
+    """One bare watermark for every session is the bug, not a shorthand."""
+    store = make_store(tmp_path)
+    connection, record = evolve_connection()
+    bus, _ = make_bus(store, records=[record], connections={"c1": connection})
+
+    with pytest.raises(VadeError) as caught:
+        subscribe(bus, connection, {"topics": ["session.turn"], "since_seq": 3})
+
+    assert caught.value.code == "INVALID_ARGUMENT"
+    assert "session_id" in caught.value.message
+
+
+def test_replay_never_relabels_session_closed_as_a_turn(tmp_path):
+    store = make_store(tmp_path)
+    first, record = evolve_connection("c1")
+    bus, registry = make_bus(store, records=[record], connections={"c1": first})
+    subscribe(bus, first, {"topics": ["session.turn", "session.closed"]})
+    add_turn(store)
+    pump(bus)
+    asyncio.run(bus.on_disconnect(first))
+    bus.emit_closed("s1")                   # journaled, deliberately not replayable
+
+    second, record2 = evolve_connection("c2")
+    registry.records[:] = [record2]
+    bus._connections["c2"] = second
+    result = subscribe(bus, second, {"topics": ["session.turn", "session.closed"],
+                                     "since_seq": {"s1": 0}})
+
+    assert result["replayed"] == 1
+    frames = second.delivered()
+    assert [f["topic"] for f in frames] == ["session.turn"]
+    assert "turns_total" not in frames[0]["payload"]
+    assert "tail" not in frames[0]["payload"]
+
+
+# ------------------------------------------------------------------ accounting
+
+
+def test_offer_audits_the_envelope_it_actually_drops():
+    records: list[dict] = []
+    queue = DeliveryQueue(instance_id="i1", connection_id="c1", capacity=1,
+                          _audit=lambda event, **fields: records.append({"event": event, **fields}))
+    first = {"topic": "session.turn", "session_id": "s1", "seq_from": 1, "seq_to": 2, "payload": {}}
+    second = {"topic": "session.turn", "session_id": "s2", "seq_from": 1, "seq_to": 2, "payload": {}}
+
+    assert queue.offer(first) is True
+    assert queue.offer(second) is True
+    assert queue.pending() == 1
+
+    dropped = [r for r in records if r["event"] == "events.delivery_dropped"]
+    assert [r["session_id"] for r in dropped] == ["s1"]   # the one that left, not the arrival
+
+
+def test_a_closed_queue_is_not_counted_as_sent(tmp_path):
+    store = make_store(tmp_path)
+    connection, record = evolve_connection()
+    bus, _ = make_bus(store, records=[record], connections={"c1": connection})
+    subscribe(bus, connection, {"topics": ["session.turn"]})
+    sub = bus.table.get("c1")
+    assert sub is not None
+    queue = bus._queue_for(sub)
+    assert queue is not None
+    queue.close()
+
+    add_turn(store)
+
+    assert bus.pump() == 0                   # dispatch refused, so nothing was sent
+    assert bus.stats()["dropped"] == 1
+    dropped = [r for r in bus.audit_records() if r["event"] == "events.delivery_dropped"]
+    assert dropped and dropped[0]["reason"] == "queue closed"

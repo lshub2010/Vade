@@ -95,13 +95,16 @@ def install(app) -> None:
 ### T2 · `events/subscribe`（0.5 天）
 
 ```json
-// 请求
-{"topics": ["session.turn"], "since_seq": 128, "redact": ["tool_args"]}
+// 请求（since_seq 按会话维度）
+{"topics": ["session.turn"], "since_seq": {"sess-1": 128}, "redact": ["tool_args"]}
 // 响应
 {"accepted": ["session.turn"], "rejected": [{"topic": "session.closed", "reason": "not in manifest"}]}
 ```
 
 - `since_seq` 可选：重连时从该 seq 之后补推（只对 `session.turn` 有效，`session.closed` 不补）。
+  **必须按会话给**：整数要配 `session_id`，多会话用 `{session_id: seq}` 映射；裸整数会被
+  `INVALID_ARGUMENT` 拒绝——seq 是每会话独立计数器，一个水位套所有会话会漏掉别的会话早期事件。
+- 补推只重放 `session.turn`；journal 里的 `session.closed` 不换 topic 补推。
 - 订阅表存内存：`{instance_id → {topics, since_seq, redact}}`，进程重启即失效（模块重连会重新订阅）。
 - 同一实例重复订阅 → 覆盖，不报错。
 

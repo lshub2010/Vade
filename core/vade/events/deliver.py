@@ -18,9 +18,19 @@ Decisions worth knowing before reading the code:
 * **Best-effort, resumable.** A slow instance gets its oldest queued envelope
   dropped (`delivery_dropped`), never a stalled session. A disconnected one
   loses the live push, but every `session.turn` is also kept in a bounded
-  journal, so `events/subscribe(since_seq=N)` fills the gap without duplicates.
-  `session.closed` is deliberately not replayable (one lost evolution beat is
-  cheaper than delivery semantics on a best-effort channel).
+  journal, so `events/subscribe(since_seq=...)` fills the gap without
+  duplicates. `since_seq` is **per session** (`session_id` + int, or a
+  `{session_id: seq}` map): sequence numbers live in per-session counters, so
+  one watermark compared against every session both skips earlier events of the
+  other sessions and mis-orders them. `session.closed` is deliberately not
+  replayable (one lost evolution beat is cheaper than delivery semantics on a
+  best-effort channel) and a journal entry never changes topic on the way out.
+* **A turn row can land after its terminal event.** C3 appends the event first
+  and writes the `turns` row right after, so `turn_payload() is None` is
+  usually a race, not a hole. It is retried a bounded number of times; when the
+  budget is spent the turn is audited (`events.turn_missing`) and the watermark
+  moves past it. Never retry forever: one malformed event would otherwise pin
+  the watermark and silently stop every later turn of that session.
 * **Audit carries metadata only** (`module_id, instance_id, session_id, turns,
   bytes, ok`). The transcript never reaches a log line.
 """
@@ -49,6 +59,10 @@ DEFAULT_TIMEOUT_S = 5.0        # C-14: a send that takes longer is a failure
 JOURNAL_SIZE = 512             # per session, for since_seq replay
 SEEN_TURNS = 2048              # per session; older ids cannot come back (seq only grows)
 AUDIT_RECORDS = 256
+#: How many pumps a terminal event may wait for its `turns` row before the
+#: event is declared broken (audited, watermark advanced). C3 writes the event
+#: first and the row immediately after, so 2 misses are normal; 3 are not.
+TURN_INVISIBLE_RETRIES = 3
 
 
 @dataclass(slots=True)
@@ -75,11 +89,16 @@ class DeliveryQueue:
         """Enqueue; when full, the OLDEST entry goes (a slow module never blocks)."""
         if self._closed:
             self.dropped += 1
+            self._emit_audit("events.delivery_dropped", envelope, ok=False,
+                             reason="queue closed")
             return False
         if len(self._items) >= self.capacity:
-            self._items.popleft()
+            # `oldest` is the envelope that actually leaves. Auditing the
+            # incoming one points an operator at a turn that was delivered and
+            # hides the one that was lost.
+            oldest = self._items.popleft()
             self.dropped += 1
-            self._emit_audit("events.delivery_dropped", envelope, ok=False, reason="queue full")
+            self._emit_audit("events.delivery_dropped", oldest, ok=False, reason="queue full")
         self._items.append(dict(envelope))
         self._ensure_worker()
         if self._wake is not None:
@@ -195,6 +214,7 @@ class EventBus:
         capacity: int = DEFAULT_CAPACITY,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         journal_size: int = JOURNAL_SIZE,
+        turn_retries: int = TURN_INVISIBLE_RETRIES,
     ) -> None:
         self._store = store
         self._app = app
@@ -203,6 +223,7 @@ class EventBus:
         self._clock = clock
         self.capacity = int(capacity)
         self.timeout_s = float(timeout_s)
+        self.turn_retries = max(1, int(turn_retries))
         self.table = SubscriptionTable(
             allow_transcript=allow_transcript, allowlist=allowlist, redact=redact, clock=clock
         )
@@ -211,6 +232,12 @@ class EventBus:
         self._journal_size = int(journal_size)
         self._watermarks: dict[str, int] = {}
         self._seen: dict[str, OrderedDict[str, None]] = {}
+        #: (session_id, turn_id) -> how many pumps have missed the turn row.
+        self._turn_attempts: dict[tuple[str, str], int] = {}
+        #: (session_id, turn_id) -> seq of its first event, kept across retries:
+        #: the retry pass reads from a watermark that already sits past
+        #: `turn.queued`, so recomputing `seq_from` there would be wrong.
+        self._turn_first_seq: dict[tuple[str, str], int] = {}
         self._closed_sessions: set[str] = set()
         #: Fallback only: `identify()` reads `record.manifest.subscriptions`
         #: first (C-03 append, RFC-0001). This map is for a registry that does
@@ -305,7 +332,10 @@ class EventBus:
             raise VadeError("INVALID_ARGUMENT", "topics must be a non-empty array of topic names")
         if any(not isinstance(t, str) for t in topics):
             raise VadeError("INVALID_ARGUMENT", "topics must contain strings only")
-        since_seq = self._since_seq(params.get("since_seq"))
+        session_id = params.get("session_id")
+        if session_id is not None and (not isinstance(session_id, str) or not session_id):
+            raise VadeError("INVALID_ARGUMENT", "session_id must be a non-empty string")
+        since_seq = self._since_seq(params.get("since_seq"), session_id)
         fields, override = self.table.resolve_redact(params.get("redact"), present="redact" in params)
         who = self.identify(connection)
         accepted, rejected = self.table.evaluate(
@@ -341,12 +371,41 @@ class EventBus:
         self.table.drop(cid)
 
     @staticmethod
-    def _since_seq(value: Any) -> int | None:
+    def _seq_int(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise VadeError("INVALID_ARGUMENT",
+                            "since_seq values must be non-negative integers")
+        return int(value)
+
+    @classmethod
+    def _since_seq(cls, value: Any, session_id: Any = None) -> dict[str, int] | None:
+        """Normalise `since_seq` into `{session_id: seq}`.
+
+        A seq belongs to one session's counter, so a bare integer only means
+        something together with `session_id`; a single watermark applied to
+        every journal compares unrelated counters and both skips other
+        sessions' early events and replays them out of order. A mapping is the
+        only shape that can carry a whole reconnect position.
+        """
         if value is None:
             return None
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise VadeError("INVALID_ARGUMENT", "since_seq must be a non-negative integer or null")
-        return value
+        if isinstance(value, Mapping):
+            out: dict[str, int] = {}
+            for key, seq in value.items():
+                if not isinstance(key, str) or not key:
+                    raise VadeError("INVALID_ARGUMENT",
+                                    "since_seq keys must be session ids")
+                out[key] = cls._seq_int(seq)
+            return out or None
+        seq = cls._seq_int(value)
+        sid = str(session_id or "")
+        if not sid:
+            raise VadeError(
+                "INVALID_ARGUMENT",
+                "since_seq needs a session: pass session_id with an integer, "
+                "or a {session_id: seq} object for several sessions",
+            )
+        return {sid: seq}
 
     # --------------------------------------------------------------- delivery
     def _queue_for(self, sub: Subscription) -> DeliveryQueue | None:
@@ -389,26 +448,38 @@ class EventBus:
             queue = self._queue_for(sub)
             if queue is None:
                 continue
-            queue.offer(self._envelope(topic, session_id, seq_from, seq_to, body))
-            sent += 1
+            # Count frames the queue actually took: a closed queue refuses and
+            # `offer` audits it as dropped, so counting the attempt would report
+            # a delivery that never happened.
+            if queue.offer(self._envelope(topic, session_id, seq_from, seq_to, body)):
+                sent += 1
         return sent
 
     def _replay(self, sub: Subscription) -> int:
-        """Fill `since_seq+1 ..` from the journal. Only `session.turn` is replayed."""
-        if "session.turn" not in sub.topics or sub.since_seq is None:
+        """Fill `seq+1 ..` per session from the journal. Only `session.turn`.
+
+        `sub.since_seq` is already a `{session_id: seq}` map; each session is
+        compared against its own counter. A journal entry keeps its topic on the
+        way out: `session.closed` is not replayable by design, and re-labelling
+        it as `session.turn` would hand the consumer a payload whose shape does
+        not match the topic it arrived under.
+        """
+        if "session.turn" not in sub.topics or not sub.since_seq:
             return 0
         queue = self._queue_for(sub)
         if queue is None:
             return 0
         sent = 0
-        for session_id in sorted(self._journal):
-            for entry in list(self._journal[session_id]):
-                if entry["seq_to"] <= sub.since_seq:
+        for session_id, since in sub.since_seq.items():
+            for entry in list(self._journal.get(session_id, ())):
+                if entry.get("topic") != "session.turn":
+                    continue
+                if entry["seq_to"] <= since:
                     continue
                 body, _hit = tx.redact_payload(entry["payload"], sub.redact or self.table.redact)
-                queue.offer(self._envelope("session.turn", session_id, entry["seq_from"],
-                                           entry["seq_to"], body))
-                sent += 1
+                if queue.offer(self._envelope(entry["topic"], session_id,
+                                              entry["seq_from"], entry["seq_to"], body)):
+                    sent += 1
         return sent
 
     # ------------------------------------------------------------------- pump
@@ -426,7 +497,11 @@ class EventBus:
                 session_ids = sorted(self._watermarks)
         emitted = 0
         for sid in session_ids:
-            emitted += self._pump_one(store, sid)
+            try:
+                emitted += self._pump_one(store, sid)
+            except Exception as exc:  # one broken session must not silence the rest
+                self._audit("events.pump_failed", session_id=sid, ok=False,
+                            reason=type(exc).__name__)
         return emitted
 
     def _pump_one(self, store: Any, session_id: str) -> int:
@@ -455,17 +530,62 @@ class EventBus:
             if self._seen_turn(session_id, turn_id):
                 continue
             payload = tx.turn_payload(store, session_id, turn_id, state=payload_in.get("state"))
+            key = (session_id, turn_id)
             if payload is None:
-                # The turn row is not visible yet: stop here so this event is retried
-                # instead of silently skipped (a turn that never arrives is a hole).
-                self._watermarks[session_id] = max(watermark, int(event.seq) - 1)
-                return emitted
+                if not self._session_present(store, session_id):
+                    # Definitively absent: the session itself is gone, so no
+                    # `turns` row can ever appear for this event.
+                    self._give_up_turn(session_id, turn_id,
+                                       "session vanished before its turn row landed")
+                    continue
+                if self._retry_missing_turn(session_id, turn_id):
+                    # Temporarily invisible: hold the watermark just before
+                    # this event so the next pump retries it.
+                    self._turn_first_seq.setdefault(key, first_seq.get(turn_id, int(event.seq)))
+                    self._watermarks[session_id] = max(watermark, int(event.seq) - 1)
+                    return emitted
+                # Bounded retries spent: audit, remember the turn so a later
+                # event cannot resurrect it, and advance -- one broken turn may
+                # not stop the whole session.
+                self._give_up_turn(session_id, turn_id,
+                                   f"turn row absent after {self.turn_retries + 1} pumps")
+                continue
+            self._turn_attempts.pop(key, None)
             self._remember_turn(session_id, turn_id)
-            emitted += self._dispatch("session.turn", session_id,
-                                      first_seq.get(turn_id, int(event.seq)),
+            seq_from = self._turn_first_seq.pop(key, first_seq.get(turn_id, int(event.seq)))
+            emitted += self._dispatch("session.turn", session_id, seq_from,
                                       int(event.seq), payload)
         self._watermarks[session_id] = int(events[-1].seq)
         return emitted
+
+    def _retry_missing_turn(self, session_id: str, turn_id: str) -> bool:
+        """True while the `turns` row may still land; False once the budget is spent."""
+        key = (session_id, turn_id)
+        attempts = self._turn_attempts.get(key, 0) + 1
+        if attempts <= self.turn_retries:
+            self._turn_attempts[key] = attempts
+            return True
+        return False
+
+    def _give_up_turn(self, session_id: str, turn_id: str, reason: str) -> None:
+        """Stop retrying one turn: audit it and never build a payload for it again."""
+        key = (session_id, turn_id)
+        self._turn_attempts.pop(key, None)
+        self._turn_first_seq.pop(key, None)
+        self._remember_turn(session_id, turn_id)
+        self._audit("events.turn_missing", session_id=session_id, ok=False, reason=reason)
+
+    @staticmethod
+    def _session_present(store: Any, session_id: str) -> bool:
+        """False only when the session row is gone -- then no turn row can arrive.
+
+        A read error is not proof of absence: it keeps the bounded-retry path so
+        a transient store failure cannot silently drop a real turn.
+        """
+        try:
+            return store.load(session_id) is not None
+        except Exception:
+            return True
 
     def _seen_turn(self, session_id: str, turn_id: str) -> bool:
         seen = self._seen.get(session_id)

@@ -125,6 +125,87 @@ def test_parse_chunk_keeps_index_and_ignores_non_data_lines():
     assert parse_chunk({"choices": [], "usage": {"total_tokens": 1, "x": "y"}}).usage == {"total_tokens": 1}
 
 
+def test_a_streamed_request_asks_for_the_usage_chunk():
+    """`stream_options.include_usage` is what makes a provider report at all."""
+    seen: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=_ChunkStream([_sse({"choices": [{"delta": {"content": "ok"}}]})]))
+
+    async def scenario() -> list[Delta]:
+        provider = OpenAICompatProvider(base_url="http://llm.test/v1", model="m1",
+                                        api_key_env="VADE_TEST_NO_KEY",
+                                        transport=httpx.MockTransport(handler))
+        return [d async for d in provider.chat([{"role": "user", "content": "hi"}], stream=True)]
+
+    deltas = asyncio.run(scenario())
+    assert "".join(d.text for d in deltas) == "ok"
+    assert seen["body"]["stream"] is True
+    assert seen["body"]["stream_options"] == {"include_usage": True}, (
+        "without this a chat-completions stream carries no usage, so every turn "
+        "is recorded as source=none and the budget can never hard-block"
+    )
+
+
+def test_a_non_streamed_request_does_not_send_stream_options():
+    """`stream_options` on a non-stream request is a 400 on strict servers."""
+    seen: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=_ChunkStream([_sse({"choices": [{"delta": {"content": "ok"}}]})]))
+
+    async def scenario() -> None:
+        provider = OpenAICompatProvider(base_url="http://llm.test/v1", model="m1",
+                                        api_key_env="VADE_TEST_NO_KEY",
+                                        transport=httpx.MockTransport(handler))
+        [d async for d in provider.chat([{"role": "user", "content": "hi"}], stream=False)]
+
+    asyncio.run(scenario())
+    assert seen["body"]["stream"] is False
+    assert "stream_options" not in seen["body"]
+
+
+def test_the_trailing_usage_only_chunk_survives_the_whole_stream_path():
+    """`choices: []` + `usage` is a measurement, not an empty end-of-stream.
+
+    The chunk arrives after `finish_reason`; a consumer that stops at the finish
+    chunk (or drops a delta with no text/tool calls) loses the only real number
+    in the response.
+    """
+    payload = _sse(
+        {"choices": [{"delta": {"content": "hi"}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 4,
+                                  "total_tokens": 13,
+                                  "completion_tokens_details": {"reasoning_tokens": 2}}},
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=_ChunkStream([payload]))
+
+    async def scenario() -> list[Delta]:
+        provider = OpenAICompatProvider(base_url="http://llm.test/v1", model="m1",
+                                        api_key_env="VADE_TEST_NO_KEY",
+                                        transport=httpx.MockTransport(handler))
+        return [d async for d in provider.chat([{"role": "user", "content": "hi"}])]
+
+    deltas = asyncio.run(scenario())
+    text, _calls, usage, finish = _accumulate(deltas)
+    assert text == "hi"
+    assert finish == "stop"
+    assert usage == {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13,
+                     "reasoning_tokens": 2}
+    measurement = deltas[-1]
+    assert measurement.text == "" and measurement.tool_calls == (), (
+        "the usage delta must not invent content"
+    )
+
+
 class _ThenError(httpx.AsyncByteStream):
     """Deliver some bytes, then fail the way a dropped connection does."""
 

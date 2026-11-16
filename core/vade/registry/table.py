@@ -487,12 +487,15 @@ class Registry:
                 # would skip the conflict/global-budget checks, so build the
                 # next index first (raises TOOL_CONFLICT before any mutation).
                 new_index = self._build_index(updated.manifest, exclude_instance=instance_id)
+                self._records[key] = updated
             else:
-                # Disabling filters the whole table: the old code filtered by
-                # `module_id`, which also removed the OTHER instances of a
-                # pooled module (review P1-5).
+                # Disabling must drop this instance from routing while keeping
+                # the OTHER instances of a pooled module (review P1-5). The
+                # record has to be written BEFORE the rebuild: `_rebuild_index`
+                # reads `self._records`, so rebuilding first would re-index the
+                # still-enabled snapshot and leave the disabled node routable.
+                self._records[key] = updated
                 new_index = self._rebuild_index()
-            self._records[key] = updated
             self._index = new_index
             self._bump()
         self._publish_status(updated)

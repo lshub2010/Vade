@@ -244,6 +244,10 @@ class SQLiteStore(SessionStore):
             # the column is really missing). NULL = "no override".
             self._ensure_column("sessions", "model_id", "model_id TEXT")
             self._ensure_column("turns", "model_id", "model_id TEXT")
+            # RFC-0007 §5.5 R5: the `coalesce` flag must survive a reload, or
+            # replay coverage (and attach sizing) cannot tell a droppable
+            # progress row from a real event.
+            self._ensure_column("events", "coalesce", "coalesce INTEGER NOT NULL DEFAULT 0")
             # RFC-0006: appended columns (`messages.partial`,
             # `messages.superseded_by`, the turn version chain).
             self._ensure_columns()
@@ -389,9 +393,9 @@ class SQLiteStore(SessionStore):
                 )
             if events:
                 conn.executemany(
-                    "INSERT INTO events(session_id, seq, type, payload, ts) VALUES(?,?,?,?,?)",
+                    "INSERT INTO events(session_id, seq, type, payload, ts, coalesce) VALUES(?,?,?,?,?,?)",
                     [(e.session_id, e.seq, e.type, json.dumps(dict(e.payload), ensure_ascii=False),
-                      e.ts) for e in events],
+                      e.ts, 1 if e.coalesce else 0) for e in events],
                 )
 
     def _upsert_turn(self, conn: sqlite3.Connection, sess_id: str, turn: Turn) -> None:
@@ -474,7 +478,7 @@ class SQLiteStore(SessionStore):
     def read_since(self, sess_id: str, seq: int) -> list[Event]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT session_id, seq, type, payload, ts FROM events"
+                "SELECT session_id, seq, type, payload, ts, coalesce FROM events"
                 " WHERE session_id=? AND seq>? ORDER BY seq",
                 (sess_id, seq),
             ).fetchall()
@@ -482,6 +486,7 @@ class SQLiteStore(SessionStore):
             Event(
                 session_id=r["session_id"], seq=r["seq"], type=r["type"],
                 payload=json.loads(r["payload"]), ts=r["ts"],
+                coalesce=bool(r["coalesce"]),
             )
             for r in rows
         ]

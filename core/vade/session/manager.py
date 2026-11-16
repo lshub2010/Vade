@@ -715,7 +715,12 @@ class SessionLog:
             session = self._require_session(session_id)
 
         if last_seq is not None and last_seq >= 0 and self.replay.covers(session_id, last_seq):
+            # Coalesced rows are droppable by contract (RFC-0007 §5.5 R5):
+            # they must not force a snapshot, and they must not consume sink
+            # queue slots. `result.replay` still reports the full row set so
+            # callers can audit what was skipped.
             replay_events = tuple(self.store.read_since(session_id, last_seq))
+            replay_frames = sum(1 for event in replay_events if not event.coalesce)
             # Capacity FIRST: the sink's outbound queue is bounded, and
             # `SinkWorker.offer` drops the worker (and unregisters it) the
             # moment it overflows. Replaying a backlog larger than the queue
@@ -723,12 +728,14 @@ class SessionLog:
             # client believed it had caught up and the history was gone for
             # good. A backlog that cannot fit behind live traffic is answered
             # with a snapshot instead — slower, but never lossy.
-            if len(replay_events) <= self._sink_queue - ATTACH_REPLAY_RESERVE:
+            if replay_frames <= self._sink_queue - ATTACH_REPLAY_RESERVE:
                 worker = self._register_sink(session_id, sink)
                 # Replay first, on the same per-connection queue as live events,
                 # so the sink can never observe `session.attached` before the
                 # backlog.
                 for replayed in replay_events:
+                    if replayed.coalesce:
+                        continue  # droppable state; never occupies a queue slot
                     worker.offer(replayed.to_wire())
                 event = await self.emit(
                     session_id,

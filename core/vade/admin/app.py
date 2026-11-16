@@ -125,7 +125,12 @@ class AdminConfig:
     @classmethod
     def from_app(cls, app: Any) -> "AdminConfig":
         data_dir = Path(str(app.config.get("core.data_dir", "./data")))
-        admin_host = str(app.config.get("admin.admin_host", "127.0.0.1:8444"))
+        # `core.admin_host` is the only config leaf for this (there is no
+        # `[admin]` section in config.schema.json). Reading `admin.admin_host`
+        # always fell back to the default, so `--admin-bind` and a remote
+        # `core.admin_host` never reached the Host allow-list and every remote
+        # request was 403 ORIGIN_MISMATCH (review P1-4).
+        admin_host = str(app.config.get("core.admin_host", "127.0.0.1:8444"))
         hosts = app.config.get("admin.allowed_hosts", None) or [admin_host, "127.0.0.1:8444", "localhost:8444"]
         return cls(
             data_dir=data_dir, admin_host=admin_host, allowed_hosts=frozenset(hosts),
@@ -154,6 +159,9 @@ class AdminContext:
     version: str = "1.0.0"
     e2e_enabled: bool = False
     allow_remote_readonly: bool = True
+    #: The assembled `App`, kept only so `bind_ports()` can resolve components
+    #: installed AFTER this one (alphabetical order: admin < audit < policy).
+    _app: Any = None
     #: unlock cookies are process-local (10 min); they die with a restart, which
     #: is the right failure mode for a QR gate.
     _unlocks: dict[str, float] = field(default_factory=dict)
@@ -186,11 +194,36 @@ class AdminContext:
             version=config.version,
             e2e_enabled=config.e2e_enabled,
             allow_remote_readonly=config.allow_remote_readonly,
+            _app=app,
         )
+
+    def bind_ports(self, app: Any | None = None) -> None:
+        """Resolve ports owned by components that install after `admin`.
+
+        `install_components()` is alphabetical, so `audit_writer` and
+        `approvals` do not exist when this context is built. Without a second
+        pass `ctx.audit`/`ctx.approvals` stayed `None` forever: the audit page
+        was always empty and `approval/decide` always answered 501 (review D2).
+        Idempotent, and it never overwrites a port a test injected directly.
+        """
+        source = app if app is not None else self._app
+        if source is None:
+            return
+        if self.registry is None:
+            self.registry = getattr(source, "registry", None)
+        if self.registry_api is None:
+            self.registry_api = getattr(source, "registry_api", None)
+        if self.audit is None:
+            self.audit = getattr(source, "audit_writer", None)
+        if self.approvals is None:
+            self.approvals = getattr(source, "approvals", None)
+        if self.pairing is None:
+            self.pairing = getattr(source, "pairing", None)
 
     def __post_init__(self) -> None:
         self.sessions.set_device_checker(self.devices.is_active)
         self._load_overrides()
+        self.bind_ports()
 
     # --------------------------------------------------------------- overrides
     @property

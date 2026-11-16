@@ -4,11 +4,12 @@ Format is `acs_` + base64url(32 random bytes) = 47 chars. Not a uuid, not
 base32: the prefix makes it greppable in a log-scrubbing pass, and 256 bits is
 why the rate limit is log hygiene rather than a security boundary.
 
-Precedence implemented here (and tested): **file > env > generate**. The
-task table in 31-C5a ② says env is consulted before the file, but the
-acceptance row "同时存在文件与 VADE_SETUP_TOKEN 且值不同 → 文件生效" is
-explicit, and a file wins is also what makes "env pinned ⇒ never rotates"
-true across restarts.
+Precedence implemented here (and tested): **env pin > fresh generate**. The
+task table in 31-C5a ② says env is consulted on every start; a non-empty
+`VADE_SETUP_TOKEN` is written back verbatim (the operator pinned it), while
+without it every start of an uninitialised core mints a new value (D59). A
+leftover file from a previous run is deliberately NOT reused: otherwise a
+token copied out by `docker cp` or a backup would stay valid forever.
 """
 
 from __future__ import annotations
@@ -69,9 +70,12 @@ def ensure_setup_token(
 
     * initialized → any leftover file is unlinked (a stale token is a key to a
       door that no longer exists, but leaving it invites confusion);
-    * file exists → keep it (never rotate a value the user may have pinned);
-    * else env → persist it, so the next restart keeps the same value;
-    * else → generate a fresh one (D59: restart means rotate).
+    * env non-empty → persist it and keep it (an operator who pinned
+      `VADE_SETUP_TOKEN` must not be rotated out from under a deployment);
+    * else → generate a fresh token, **overwriting** any file from a previous
+      run. "Keep the file if it exists" would make a token copied by
+      `docker cp`, a backup or a mis-mounted volume valid forever, and this
+      token is the key to becoming the administrator (review P1-3 / D59).
     """
     path = token_path(data_dir)
     if initialized:
@@ -80,9 +84,6 @@ def ensure_setup_token(
         except FileNotFoundError:
             pass
         return None
-    current = read_token(data_dir)
-    if current:
-        return current
     env_value = (env if env is not None else os.environ).get("VADE_SETUP_TOKEN")
     if env_value:
         # Risk note: /proc/<pid>/environ, `docker inspect` and some orchestrator

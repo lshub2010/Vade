@@ -24,6 +24,7 @@ import pytest_asyncio
 
 from vade.app import App, install_components, make_rpc_handler
 from vade.config import load_config
+from vade.errors import VadeError
 from vade.registry.manifest import ManifestError, validate_manifest
 from vade.session.models import Session, now_ms
 from tests.events.helpers import ALLOWED_FP, FakeConnection, add_turn
@@ -65,8 +66,9 @@ async def app(tmp_path):
     await instance.shutdown()
 
 
-def _connection(app: App, connection_id: str = "c-evo") -> FakeConnection:
-    connection = FakeConnection(connection_id)
+def _connection(app: App, connection_id: str = "c-evo", *,
+                module_id: str = MODULE, instance_id: str = "evo-1") -> FakeConnection:
+    connection = FakeConnection(connection_id, module_id=module_id, instance_id=instance_id)
     # `App._connections()` prefers a transport dict; a dict here is the same
     # shape `_serve` publishes, minus the socket.
     app.transport = {"connections": {connection_id: connection}}
@@ -129,7 +131,7 @@ async def test_real_registration_chain_delivers_a_turn(app: App) -> None:
 @pytest.mark.asyncio
 async def test_manifest_without_subscriptions_is_still_rejected(app: App) -> None:
     """Fail-closed: the gate is driven by the manifest, not by the request."""
-    connection = _connection(app, "c-other")
+    connection = _connection(app, "c-other", module_id=OTHER, instance_id="other-1")
     await _register(app, connection, manifest_dict(
         module_id=OTHER, instance_id="other-1", subscriptions=[],
     ))
@@ -164,6 +166,38 @@ async def test_capabilities_update_can_add_a_subscription(app: App) -> None:
     accepted = await handler(connection, {"method": "events/subscribe",
                                           "params": {"topics": ["session.closed"]}})
     assert accepted["accepted"] == ["session.closed"]
+
+
+@pytest.mark.asyncio
+async def test_registration_refuses_a_connection_paired_as_another_node(app: App) -> None:
+    """Review D1: key, pairing record and manifest must name the same node.
+
+    `device_id` comes from the verified key, never from the manifest; without
+    the comparison a paired module A could register as B and inherit B's tools.
+    """
+    connection = _connection(app)  # paired as `com.example.evolve#evo-1`
+    handler = make_rpc_handler(app)
+    with pytest.raises(VadeError) as excinfo:
+        await handler(connection, {
+            "method": "module/register",
+            "params": manifest_dict(module_id=OTHER, instance_id="other-1"),
+        })
+    assert excinfo.value.code == "PERMISSION_DENIED"
+    assert excinfo.value.fatal is True
+    assert app.registry is not None
+    assert app.registry.get(OTHER, "other-1") is None
+
+
+@pytest.mark.asyncio
+async def test_registration_fails_closed_without_a_paired_identity(app: App) -> None:
+    """No pairing ⇒ no registration, even with a perfectly valid manifest."""
+    connection = _connection(app, "c-anon")
+    connection.device_id = None
+    handler = make_rpc_handler(app)
+    with pytest.raises(VadeError) as excinfo:
+        await handler(connection, {"method": "module/register", "params": manifest_dict()})
+    assert excinfo.value.code == "PERMISSION_DENIED"
+    assert excinfo.value.fatal is True
 
 
 def test_subscriptions_shape_is_enforced_by_the_schema() -> None:

@@ -394,7 +394,10 @@ class _CoreProcess:
         self.lines: list[str] = []
         self.errors: list[str] = []
         self.proc = subprocess.Popen(
-            [sys.executable, "-m", "vade", "--bind", f"127.0.0.1:{port}", *extra],
+            [sys.executable, "-m", "vade", "--bind", f"127.0.0.1:{port}",
+             # The core now also starts the admin listener; port 0 keeps this
+             # test from colliding with a real core (or a parallel test) on 8444.
+             "--admin-bind", "127.0.0.1:0", *extra],
             cwd=str(tmp_path),
             env=env,
             stdout=subprocess.PIPE,

@@ -4,7 +4,10 @@ Rules (22-C3 §T5):
   * the key is read ONLY from the env var named in `[llm].api_key_env`;
     it is never written to config or logs;
   * retry only 429 / 5xx / connection errors, max 2, exponential + jitter;
-    4xx is never retried;
+    4xx is never retried. **Once a delta has been yielded the attempt is
+    committed**: a mid-stream failure is re-raised instead of retried, because
+    a retry replays text / tool-call fragments the caller already consumed and
+    bills the same prompt twice;
   * streamed `tool_calls[].function.arguments` fragments are concatenated by
     index — `parse_chunk` is pure and unit-tested without a network.
 """
@@ -93,6 +96,11 @@ class OpenAICompatProvider:
         if tools:
             body["tools"] = list(tools)
         last_error: Exception | None = None
+        #: Set on the first yielded delta. From that point a retry would send
+        #: the prompt a second time and replay fragments the caller already
+        #: accumulated (observed as `HELLOHELLOHELLO` and triple billing), so a
+        #: later failure is final; the recovery path is a new turn, not a loop.
+        committed = False
         for attempt in range(self.max_retries + 1):
             try:
                 async with httpx.AsyncClient(timeout=self.timeout_s, transport=self._transport) as client:
@@ -111,10 +119,14 @@ class OpenAICompatProvider:
                                 data = line[5:].strip()
                                 if not data or data == "[DONE]":
                                     continue
-                                yield parse_chunk(json.loads(data))
+                                delta = parse_chunk(json.loads(data))
+                                committed = True
+                                yield delta
                             return
             except (httpx.ConnectError, httpx.ReadTimeout, ConnectionError) as exc:
                 last_error = exc
+                if committed:
+                    raise
                 if attempt >= self.max_retries:
                     raise
             if attempt < self.max_retries:

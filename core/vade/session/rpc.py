@@ -175,6 +175,15 @@ class SessionRPC:
         client_msg_id = params.get("client_msg_id")
         if not isinstance(client_msg_id, str) or not client_msg_id:
             raise VadeError("INVALID_ARGUMENT", "client_msg_id is required")
+        if self._read_only(connection):
+            # A regenerate appends a turn exactly like `ui/submit`, so it is a
+            # write path: `rpc.json` has declared READ_ONLY_SESSION for it since
+            # C-05, and leaving it unchecked let a read-only viewer write by
+            # pointing at an old turn instead of submitting a message.
+            raise VadeError(
+                "READ_ONLY_SESSION",
+                "this session is read-only; regenerating a turn requires a writable session",
+            )
         return await self.log.regenerate(session_id, turn_id, client_msg_id)
 
     async def message_edit_resubmit(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -185,6 +194,15 @@ class SessionRPC:
         client_msg_id = params.get("client_msg_id")
         if not isinstance(session_id, str):
             raise VadeError("INVALID_ARGUMENT", "session_id is required")
+        if self._read_only(connection):
+            # §6.4's validation order is explicit: write permission (①) is
+            # checked before the content shape (②..⑤). An edit creates a new
+            # turn, so a read-only connection must be refused here too — it is
+            # the other half of the `ui/submit` gate above.
+            raise VadeError(
+                "READ_ONLY_SESSION",
+                "this session is read-only; editing a message requires a writable session",
+            )
         if not isinstance(message_id, str) or not message_id:
             raise VadeError("INVALID_ARGUMENT", "message_id is required")
         if not isinstance(content, list):
@@ -220,22 +238,33 @@ class SessionRPC:
         ok = True
         if isinstance(resolved, tuple) and len(resolved) == 2:
             ok, resolved = resolved
-        session_id = getattr(resolved, "session_id", None)
-        turn_id = getattr(resolved, "turn_id", None)
+        # `ApprovalManager.decide` answers `(ok, dict)`; reading it with
+        # `getattr` returned None on every field, so the close event below was
+        # dead code and other devices' dialogs never closed.
+        winner: Mapping[str, Any] = resolved if isinstance(resolved, Mapping) else {}
+        session_id = winner.get("session_id")
+        turn_id = winner.get("turn_id")
         attribution: dict[str, Any] = {}
-        if isinstance(resolved, Mapping):
-            # RFC-0007 §7.1: `decide()` returns the attribution it resolved, so
-            # the event that closes the dialog names the same task the prompt did.
-            for key in ("task_id", "task_name", "depth"):
-                if key in resolved:
-                    attribution[key] = resolved[key]
+        # RFC-0007 §7.1: `decide()` returns the attribution it resolved, so
+        # the event that closes the dialog names the same task the prompt did.
+        for key in ("task_id", "task_name", "depth"):
+            if key in winner:
+                attribution[key] = winner[key]
         if session_id and turn_id:
             # Always close the dialog on every attached UI, even on a failed
             # first-wins race — otherwise the other devices spin forever.
+            # `decision`/`by` are the WINNER's: the manager normalizes them
+            # (`by or actor_kind`, `allow|deny`), and the wire vocabulary for
+            # this event is `approve|deny` (schema/events.json), not `allow`.
+            verdict = str(winner.get("decision") or "").lower()
             await self.log.emit(session_id, "turn.approval_resolved", {
-                "turn_id": turn_id, "request_id": request_id, "decision": decision,
-                "by": getattr(connection, "device_id", None) or "admin",
-                "scope": scope, "state": "running", **attribution,
+                "turn_id": turn_id, "request_id": request_id,
+                "session_id": session_id,
+                "decision": "approve" if verdict in ("allow", "approve", "approved") else "deny",
+                "by": winner.get("by") or getattr(connection, "device_id", None) or "admin",
+                "scope": winner.get("scope") or scope,
+                "state": winner.get("state") or "running",
+                **attribution,
             })
         return {"ok": bool(ok)}
 

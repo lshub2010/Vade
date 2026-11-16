@@ -94,6 +94,9 @@ class TurnQueue:
         #: terminal event" promise independent of who calls `_finalize` first.
         self._finalizing: set[str] = set()
         self._orphans: set[asyncio.Task[Any]] = set()
+        #: Set by `shutdown()`; makes the stop terminal (no new worker, no new
+        #: turn) and `shutdown()` itself idempotent.
+        self._stopped = False
 
     # ------------------------------------------------------------------ state
     @property
@@ -168,6 +171,12 @@ class TurnQueue:
 
     # ------------------------------------------------------------------ worker
     def ensure_worker(self) -> None:
+        # A queue that has been shut down never starts another worker: the
+        # `finally` in `_run_loop` used to respawn one when `_pending` was not
+        # empty, so `close()` cancelled the worker and the very next tick
+        # created a new one that ran turns into a closed store.
+        if self._stopped:
+            return
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._run_loop(), name=f"queue-{self.session_id[:8]}")
 
@@ -178,7 +187,7 @@ class TurnQueue:
                 await self._run_one(item)
         finally:
             self._worker = None
-            if self._pending:  # a submit raced the loop exit
+            if self._pending and not self._stopped:  # a submit raced the loop exit
                 self.ensure_worker()
 
     async def _run_one(self, item: QueueItem) -> None:
@@ -515,14 +524,36 @@ class TurnQueue:
             await asyncio.shield(worker)
 
     async def shutdown(self) -> None:
+        """Stop every task this queue owns; terminal and idempotent.
+
+        The worker is awaited (as a cancelled task) so the caller — `close()` —
+        returns with the queue actually stopped. Without the join the worker
+        was free to wake up after `store.close()` and write one more terminal
+        event into a closed database. The turn tasks are cancelled but NOT
+        awaited: a module that ignores `tools/cancel` would otherwise hold up
+        process shutdown, and `_consume_orphan` already swallows whatever it
+        returns (`interrupt` arms that callback for exactly this reason).
+        """
+        if self._stopped:
+            return
+        self._stopped = True
         for task in list(self._turn_tasks.values()):
             if not task.done():
                 task.cancel()
         self._release_pending.clear()
-        if self._worker is not None:
-            self._worker.cancel()
+        worker = self._worker
+        if worker is not None and not worker.done():
+            worker.cancel()
         for task in list(self._orphans):
             task.cancel()
+        if worker is not None:
+            await asyncio.gather(worker, return_exceptions=True)
+            # A worker cancelled before its first step never enters the
+            # coroutine body, so `_run_loop`'s `finally` (which clears this
+            # reference) does not run. Own it here: a stopped queue must not
+            # report a worker, not even a dead one.
+            if self._worker is worker:
+                self._worker = None
 
     def _consume_orphan(self, task: asyncio.Task[Any]) -> None:
         """A module that ignores tools/cancel leaves a orphan task: swallow it."""

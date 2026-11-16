@@ -150,6 +150,68 @@ def test_reject_moves_pending_to_rejected(tmp_path: Path) -> None:
     assert list((tmp_path / ".rejected").iterdir())
 
 
+def test_install_refuses_a_reserved_name(tmp_path: Path) -> None:
+    """C-11: "Reserved install directories are not legal names" — `pending` fits
+    the name pattern and is also the pending root."""
+    loader = make_loader(tmp_path)
+    source = InstallSource("text", text=_text("pending"))
+
+    with pytest.raises(VadeError) as excinfo:
+        loader.install(source, loader.preview(source).preview_token)
+
+    assert excinfo.value.code == "INVALID_ARGUMENT"
+    assert not (tmp_path / "pending" / "pending").exists()
+
+
+def test_approve_refuses_pending_content_changed_after_intake(tmp_path: Path) -> None:
+    """docs/agents/24 §T5: the admin API calls `SkillLoader.approve` directly, so
+    the digest check cannot live only in the C-13 proposal wrapper."""
+    loader = make_loader(tmp_path)
+    source = InstallSource("text", text=_text())
+    loader.install(source, loader.preview(source).preview_token)
+    pending = tmp_path / "pending" / "kb-guide" / "SKILL.md"
+    pending.write_text(pending.read_text(encoding="utf-8") + "\nedited after intake\n",
+                       encoding="utf-8")
+
+    with pytest.raises(VadeError) as excinfo:
+        loader.approve("kb-guide")
+
+    assert excinfo.value.code == "TOOL_CONFLICT"
+    assert "resubmit" in excinfo.value.message
+    assert not (tmp_path / "kb-guide").exists()
+    assert pending.is_file()
+    assert loader.get("kb-guide") is None
+    assert not (tmp_path / ".history").exists()
+
+
+def test_approve_without_a_recorded_digest_still_works(tmp_path: Path) -> None:
+    """A pending directory from before `meta.json` carried `sha256` has nothing to
+    compare against; refusing it would strand every older install."""
+    loader = make_loader(tmp_path)
+    source = InstallSource("text", text=_text())
+    loader.install(source, loader.preview(source).preview_token)
+    meta_path = tmp_path / "pending" / "kb-guide" / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.pop("sha256")
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    state = loader.approve("kb-guide")
+
+    assert state.status == "active" and (tmp_path / "kb-guide" / "SKILL.md").is_file()
+
+
+def test_approve_parks_superseded_files_in_trash(tmp_path: Path) -> None:
+    loader = make_loader(tmp_path)
+    source = InstallSource("text", text=_text())
+    loader.install(source, loader.preview(source).preview_token)
+    (tmp_path / "pending" / "kb-guide" / "SKILL.md.superseded").write_text("old", encoding="utf-8")
+
+    loader.approve("kb-guide")
+
+    assert not list((tmp_path / "kb-guide").glob("*.superseded"))
+    assert any(p.name.startswith("kb-guide-SKILL.md.superseded") for p in (tmp_path / ".trash").iterdir())
+
+
 def test_pending_ttl_expiry_on_reload(tmp_path: Path) -> None:
     loader = make_loader(tmp_path)
     source = InstallSource("text", text=_text())

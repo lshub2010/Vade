@@ -118,6 +118,28 @@ def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
+def _bad_name(name: Any, reserved: frozenset[str] | set[str] = frozenset()) -> str:
+    """Why `name` cannot be one directory under the skills root ('' = fine).
+
+    A name is a single path component or it is nothing. `..` is refused anywhere
+    (not just as a whole segment) so `foo..bar` fails like `../x`; a leading dot
+    is refused so a name cannot select a dot-directory the scanner skips; the
+    reserved names are refused because `skills/pending` is not a skill.
+    """
+    if not isinstance(name, str) or not name:
+        return "name is empty"
+    if name.startswith("."):
+        return "name may not start with a dot"
+    if ".." in name:
+        return "name may not contain '..'"
+    for token in ("/", "\\", "\x00"):
+        if token in name:
+            return f"name may not contain {token!r}"
+    if name in reserved:
+        return f"{name!r} is reserved for the skill store"
+    return ""
+
+
 def _atomic_write(path: Path, data: bytes, *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f".{path.name}.tmp-{secrets.token_hex(4)}")
@@ -644,6 +666,36 @@ class SkillLoader:
         payload = json.dumps(state.meta_json(), ensure_ascii=False, indent=2) + "\n"
         _atomic_write(path, payload.encode("utf-8"))
 
+    # ------------------------------------------------------------------ names
+    def _require_name(self, name: str) -> str:
+        """Refuse a name that is not one directory under the skills root.
+
+        Every lifecycle method that composes a path from a caller-supplied name
+        runs this first (`approve`, `reject`, `uninstall`, `rollback`). Without
+        it `reject("../../x")` was an `os.replace` of an arbitrary directory
+        into `.rejected/`, and `approve("pending")` renamed the pending root —
+        with every other proposal in it — into `.trash`. The check lives here,
+        not only in the C-13 wrapper, because the admin API calls these methods
+        directly and a guard on one caller protects nobody else.
+        """
+        reason = _bad_name(name, self.contract.reserved_names)
+        if reason:
+            raise VadeError("PERMISSION_DENIED", f"skill {reason}")
+        return name
+
+    def _contained(self, directory: Path, root: Path) -> Path:
+        """`directory` must resolve inside `root` (a symlinked leaf is refused)."""
+        try:
+            root_real = os.path.realpath(root)
+            real = os.path.realpath(directory)
+        except OSError as exc:  # pragma: no cover - unreadable data dir
+            raise VadeError("PERMISSION_DENIED",
+                            f"cannot resolve the skill path: {type(exc).__name__}") from exc
+        if real == root_real or not _within(real, root_real):
+            raise VadeError("PERMISSION_DENIED",
+                            f"skill path escapes {root.name}/: {directory.name}")
+        return directory
+
     # ---------------------------------------------------------------- queries
     def _visible(self) -> list[SkillState]:
         return [self._states[name] for name in sorted(self._states)]
@@ -927,6 +979,10 @@ class SkillLoader:
             _reject("invalid skill: " + "; ".join(problems)[:240])
         if name != preview.name or material.digest != preview.digest:
             _reject("preview_token does not match this content")
+        reason = _bad_name(name, self.contract.reserved_names)
+        if reason:
+            # C-11: "Reserved install directories are not legal names."
+            _reject(f"invalid skill name: {reason}")
 
         pending_root = self.skills_dir / "pending"
         # mkdir's mode is masked by umask and only applies to the leaf, so both
@@ -972,14 +1028,30 @@ class SkillLoader:
 
     # ------------------------------------------------------------ lifecycle
     def approve(self, name: str) -> SkillState:
+        """Promote `pending/<name>` to `skills/<name>` — if the bytes still match.
+
+        Two gates before anything moves:
+
+        * the name must be one path component (`_require_name`), because the
+          directory is renamed with `os.replace`;
+        * `meta.json`'s `sha256` must equal the file's digest. `docs/agents/24
+          §T5` forbids approving a pending file that changed after intake: the
+          reviewer approved the bytes they were shown, not whatever is on disk
+          now. This is the *only* implementation of approve, so the check has to
+          be here — `ProposalReview.approve` is a wrapper, not a second gate.
+        """
+        self._require_name(name)
         pending = self._pending.get(name)
         if pending is None:
             raise VadeError("NOT_FOUND", f"no pending skill named {name!r}")
-        source_dir = self.skills_dir / "pending" / name
+        source_dir = self._contained(self.skills_dir / "pending" / name,
+                                    self.skills_dir / "pending")
         if not source_dir.is_dir():
             raise VadeError("NOT_FOUND", f"pending directory for {name!r} is gone")
+        self._verify_pending_digest(name, source_dir)
         target = self.skills_dir / name
         previous = self._states.get(name)
+        parked = self._park_superseded(source_dir, name)
         if target.exists():
             self._move_to(self.skills_dir / ".trash", target,
                           reason=f"replaced-rev{previous.revision if previous else 0}")
@@ -993,11 +1065,52 @@ class SkillLoader:
         self._pending.pop(name, None)
         self._fail_counts.pop(name, None)
         self.reload()
-        self._audit("skill.approve", name=name, revision=revision, origin=approved.origin)
+        self._audit("skill.approve", name=name, revision=revision, origin=approved.origin,
+                    superseded_parked=len(parked) or None)
         return self.get(name) or approved
 
+    def _verify_pending_digest(self, name: str, source_dir: Path) -> None:
+        """Refuse to promote bytes that no longer match the intake record."""
+        try:
+            data = json.loads((source_dir / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return                      # no record (legacy install): nothing to compare
+        declared = data.get("sha256") if isinstance(data, Mapping) else None
+        if not isinstance(declared, str) or not declared:
+            return
+        try:
+            current = hashlib.sha256((source_dir / "SKILL.md").read_bytes()).hexdigest()
+        except OSError as exc:
+            raise VadeError("NOT_FOUND", f"pending SKILL.md for {name!r} is gone") from exc
+        if current != declared:
+            raise VadeError("TOOL_CONFLICT",
+                            f"pending content for {name!r} changed since intake; resubmit the proposal")
+
+    def _park_superseded(self, source_dir: Path, name: str) -> tuple[str, ...]:
+        """Move `*.superseded` out of the pending dir before it is promoted.
+
+        Intake keeps the previous proposal as `SKILL.md.superseded`; renaming the
+        directory would carry those files into `skills/<name>/`, where they are
+        not content but history. `.trash` keeps them restorable.
+        """
+        parked: list[str] = []
+        for stale in sorted(source_dir.glob("*.superseded")):
+            trash = self.skills_dir / ".trash"
+            trash.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(trash, 0o700)
+            destination = trash / f"{name}-{stale.name}-{int(self._clock())}"
+            suffix = 1
+            while destination.exists():
+                destination = trash / f"{name}-{stale.name}-{int(self._clock())}-{suffix}"
+                suffix += 1
+            os.replace(stale, destination)
+            parked.append(str(destination))
+        return tuple(parked)
+
     def reject(self, name: str, reason: str = "") -> None:
-        pending_dir = self.skills_dir / "pending" / name
+        self._require_name(name)
+        pending_dir = self._contained(self.skills_dir / "pending" / name,
+                                     self.skills_dir / "pending")
         if not pending_dir.is_dir():
             raise VadeError("NOT_FOUND", f"no pending skill named {name!r}")
         self._move_to(self.skills_dir / ".rejected", pending_dir, reason=reason or "rejected")
@@ -1005,6 +1118,7 @@ class SkillLoader:
         self._audit("skill.reject", name=name)
 
     def uninstall(self, name: str) -> None:
+        self._require_name(name)
         target = self.skills_dir / name
         pending_dir = self.skills_dir / "pending" / name
         moved = False
@@ -1039,6 +1153,7 @@ class SkillLoader:
         whose bytes equal revision 1's. Nothing is overwritten, so the mistake
         that prompted the rollback stays auditable.
         """
+        self._require_name(name)
         current = self._states.get(name)
         if current is None:
             raise VadeError("NOT_FOUND", f"no skill named {name!r}")

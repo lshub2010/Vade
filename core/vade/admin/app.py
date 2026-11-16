@@ -413,9 +413,15 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
             raise VadeError("NOT_FOUND", "admin plane is already initialised")
         ip = _client(request)
         if not _loopback(request):
-            if len(limiter._bucket(f"unlock:{ip}", 300)) >= 5:
-                raise VadeError("ADMIN_LOCKED", "too many unlock attempts")
-            limiter.hit(f"unlock:{ip}", 300)
+            # Share the pairing ledger so setup-token guessing and pair-code
+            # guessing draw from the same per-IP and global budget.
+            pairing = getattr(ctx, "pairing", None)
+            if pairing is not None and hasattr(pairing, "begin_setup_attempt"):
+                pairing.begin_setup_attempt(ip)
+            else:
+                if len(limiter._bucket(f"unlock:{ip}", 300)) >= 5:
+                    raise VadeError("ADMIN_LOCKED", "too many unlock attempts")
+                limiter.hit(f"unlock:{ip}", 300)
         body = await _json(request)
         provided = body.get("setup_token")
         payload = ctx.setup.unlock(provided if isinstance(provided, str) else "")
@@ -438,7 +444,11 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         body = await _json(request)
         loopback = _loopback(request)
         if not loopback:
-            limiter.hit(f"setup:{_client(request)}", 300)
+            pairing = getattr(ctx, "pairing", None)
+            if pairing is not None and hasattr(pairing, "begin_setup_attempt"):
+                pairing.begin_setup_attempt(_client(request))
+            else:
+                limiter.hit(f"setup:{_client(request)}", 300)
         try:
             result = ctx.setup.initialize(
                 password=str(body.get("password") or ""),

@@ -50,6 +50,9 @@ class FakeConnection:
         # manifest and fails closed when it is missing (review D1), so a fake
         # connection has to carry the same value a paired one would.
         self.device_id: str | None = f"{module_id}#{instance_id}"
+        #: The callback `Connection.close()` invokes; the transport installs the
+        #: real one (`CoreApp._forget`). Fakes that test disconnect set it.
+        self._on_close: Any = None
         self.crypto = type("Crypto", (), {"remote_fingerprint": fingerprint})()
         self.frames: list[dict[str, Any]] = []
 

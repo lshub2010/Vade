@@ -11,8 +11,17 @@ Four independent permissions, all of which must hold for `session.turn` /
 3. core's config has `[evolve] allow_transcript = true`;
 4. its role is `evolve` (a tool/ui module never sees a transcript).
 
-`skill.proposed` is metadata only, so it needs (1), (2) and role `ui|admin`,
-not the transcript switch.
+`skill.proposed` is metadata only, so gate (2) plus role `ui|admin` is the
+whole check: it is a front-end beat, not a transcript, so neither the evolve
+allowlist (1) nor the transcript switch (3) applies. A module that is not
+allowlisted can still receive it when its manifest declares it and its role is
+`ui` or `admin`; a tool/ui module can never receive `session.*`.
+
+A request may name at most `MAX_TOPICS` (64) topics. A longer list is
+`INVALID_ARGUMENT` before any gate runs -- the gate walks the request once, and
+an unbounded array is a cheap way to spend core's time. Repeated topics collapse
+to one row in `accepted` and one in `rejected`, so the response length follows
+the distinct request, not how many times a client repeated itself.
 
 Failures are `rejected: [{topic, reason}]`, never a dropped connection: an
 evolve module that may not read transcripts can still use tools.
@@ -31,13 +40,20 @@ from typing import Any, Iterable, Mapping, Sequence
 from ..errors import VadeError
 
 __all__ = [
-    "TOPICS", "EVOLVE_TOPICS", "ADMIN_TOPICS", "REASONS",
+    "TOPICS", "EVOLVE_TOPICS", "ADMIN_TOPICS", "REASONS", "MAX_TOPICS",
     "Subscription", "SubscriptionTable", "parse_allowlist", "fingerprint_matches",
+    "validate_topics",
 ]
 
 EVOLVE_TOPICS: frozenset[str] = frozenset({"session.turn", "session.closed"})
 ADMIN_TOPICS: frozenset[str] = frozenset({"skill.proposed"})
 TOPICS: frozenset[str] = EVOLVE_TOPICS | ADMIN_TOPICS
+
+#: One `events/subscribe` may name at most this many topics. The channel has
+#: three, so anything near this is a client bug or an attempt to make core walk
+#: an unbounded array; refuse it before the per-topic gate runs.
+MAX_TOPICS = 64
+
 
 #: Exact strings that appear in `events/subscribe` rejections. A test pins them:
 #: an operator greps for these, so they may not drift into prose.
@@ -99,6 +115,23 @@ def fingerprint_matches(actual: str, expected: str) -> bool:
     if len(expected_n) >= 16:
         return actual_n == expected_n or actual_n.startswith(expected_n)
     return actual_n == expected_n
+
+
+def validate_topics(topics: Any) -> tuple[str, ...]:
+    """Validate `events/subscribe`'s `topics` field; raise `INVALID_ARGUMENT`.
+
+    Shape, then element type, then count. The count check is a refusal, not a
+    truncation: silently dropping the 65th topic would tell a client it
+    subscribed to something it did not.
+    """
+    if not isinstance(topics, (list, tuple)) or not topics:
+        raise VadeError("INVALID_ARGUMENT", "topics must be a non-empty array of topic names")
+    if any(not isinstance(topic, str) for topic in topics):
+        raise VadeError("INVALID_ARGUMENT", "topics must contain strings only")
+    if len(topics) > MAX_TOPICS:
+        raise VadeError("INVALID_ARGUMENT",
+                        f"topics may contain at most {MAX_TOPICS} entries")
+    return tuple(topics)
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,13 +213,19 @@ class SubscriptionTable:
         declared_set = {str(t) for t in declared or ()}
         role_n = str(role or "")
         accepted: list[str] = []
+        accepted_seen: set[str] = set()
         rejected: list[dict[str, str]] = []
+        rejected_seen: set[str] = set()
         for topic in topics:
             reason = self._reject_reason(topic, declared_set, role_n, module_id, fingerprint)
             if reason is None:
-                if topic not in accepted:
+                if topic not in accepted_seen:
+                    accepted_seen.add(topic)
                     accepted.append(topic)
-            else:
+            elif topic not in rejected_seen:
+                # One row per topic: a client that repeats a bad name gets the
+                # same answer once, not an N-times-duplicated rejection list.
+                rejected_seen.add(topic)
                 rejected.append({"topic": topic, "reason": reason})
         return accepted, rejected
 

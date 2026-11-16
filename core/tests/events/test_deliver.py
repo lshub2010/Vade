@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import pytest
 
 from vade.errors import VadeError
-from vade.events.deliver import DeliveryQueue
+from vade.events.deliver import SESSION_PAGE_SIZE, DeliveryQueue, EventBus
 from vade.session.models import Session, TurnState, now_ms
 
 from .helpers import (
-    FakeConnection, evolve_connection, make_bus, make_store, add_turn, pump,
+    ALLOWED_FP, FakeConnection, FakeRegistry, evolve_connection,
+    make_bus, make_store, add_turn, pump,
 )
 
 
@@ -456,3 +458,163 @@ def test_a_closed_queue_is_not_counted_as_sent(tmp_path):
     assert bus.stats()["dropped"] == 1
     dropped = [r for r in bus.audit_records() if r["event"] == "events.delivery_dropped"]
     assert dropped and dropped[0]["reason"] == "queue closed"
+
+
+# ------------------------------------------------------- disconnect lifetime
+
+
+def _with_close_hook(connection):
+    """Give a fake socket the callback `Connection.close()` would invoke."""
+    calls: list[object] = []
+
+    def closed(conn):
+        calls.append(conn)
+
+    connection._on_close = closed
+    return calls
+
+
+def test_a_closed_socket_drops_its_subscription_and_queue(tmp_path):
+    store = make_store(tmp_path)
+    connection, record = evolve_connection("c1")
+    transport_calls = _with_close_hook(connection)
+    bus, _ = make_bus(store, records=[record], connections={"c1": connection})
+    subscribe(bus, connection, {"topics": ["session.turn"]})
+    add_turn(store)
+    bus.pump()                               # one frame queued, not drained
+
+    assert bus.stats()["queued"] == 1
+
+    connection._on_close(connection)         # exactly what Connection.close() does
+
+    # The transport's own sweep still runs, and the bus forgot the socket.
+    assert transport_calls == [connection]
+    assert bus.table.get("c1") is None
+    assert bus.stats()["subscribers"] == 0
+    assert bus.stats()["queued"] == 0        # the dead queue does not hold frames
+    assert any(r["event"] == "events.subscriber_gone" for r in bus.audit_records())
+
+    add_turn(store)
+    assert bus.pump() == 0                   # nothing is offered to a socket that is gone
+
+
+def test_on_disconnect_is_idempotent(tmp_path):
+    store = make_store(tmp_path)
+    connection, record = evolve_connection("c1")
+    bus, _ = make_bus(store, records=[record], connections={"c1": connection})
+    subscribe(bus, connection, {"topics": ["session.turn"]})
+
+    asyncio.run(bus.on_disconnect(connection))
+    asyncio.run(bus.on_disconnect(connection))
+
+    assert bus.table.get("c1") is None
+    assert bus.stats()["subscribers"] == 0
+    gone = [r for r in bus.audit_records() if r["event"] == "events.subscriber_gone"]
+    assert len(gone) == 1                    # a second report is not a second event
+
+
+class _Config:
+    def __init__(self, values):
+        self._values = dict(values)
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+
+class _FakeApp:
+    """Only the attributes `events.install()` reaches for."""
+
+    event_bus: Any
+    on_disconnect: list[Any]
+
+    def __init__(self, connection, store, registry):
+        self.config = _Config({
+            "evolve.allow_transcript": True,
+            "evolve.allowlist": [("com.example.evolve", ALLOWED_FP)],
+            "evolve.redact": [],
+        })
+        self.session_store = store
+        self.registry = registry
+        self.session_handlers: dict[str, object] = {}
+        self.prompt_hooks: list[object] = []
+        self.on_session_end: list[object] = []
+        self.handler_providers: list[object] = []
+        self._connections = lambda: {"c1": connection}
+
+
+def test_install_publishes_the_disconnect_slot_and_hooks_live_sockets(tmp_path):
+    from vade import events
+
+    store = make_store(tmp_path)
+    connection, record = evolve_connection("c1")
+    transport_calls = _with_close_hook(connection)
+    app = _FakeApp(connection, store, FakeRegistry([record]))
+
+    events.install(app)
+
+    bus = app.event_bus
+    assert app.on_disconnect == [bus.connection_closed]
+    assert bus._hooked.get("c1") is connection
+
+    asyncio.run(bus.on_subscribe(connection, {"topics": ["session.turn"]}))
+    add_turn(store)
+    bus.pump()
+    assert bus.stats()["queued"] == 1
+
+    connection._on_close(connection)
+
+    assert transport_calls == [connection]
+    assert bus.table.get("c1") is None
+    assert bus.stats()["queued"] == 0
+
+
+# --------------------------------------------------------- full session walk
+
+
+def test_pump_reaches_sessions_past_the_first_page(tmp_path):
+    """The old `list_sessions(limit=50)` never saw session #51."""
+    store = make_store(tmp_path)             # s1 is the oldest
+    for i in range(SESSION_PAGE_SIZE):
+        store.create_session(Session(id=f"bulk-{i:04d}", created_at=now_ms() + 1 + i))
+    connection, record = evolve_connection()
+    bus, _ = make_bus(store, records=[record], connections={"c1": connection})
+    subscribe(bus, connection, {"topics": ["session.turn"]})
+    add_turn(store, user="in the oldest session")
+
+    assert pump(bus) == 1
+
+    assert [f["payload"]["user_text"] for f in connection.delivered()] == \
+        ["in the oldest session"]
+
+
+def test_pump_includes_archived_sessions(tmp_path):
+    store = make_store(tmp_path)
+    store.update_session_meta("s1", {"archived_at": now_ms()})
+    connection, record = evolve_connection()
+    bus, _ = make_bus(store, records=[record], connections={"c1": connection})
+    subscribe(bus, connection, {"topics": ["session.turn"]})
+    add_turn(store)
+
+    assert pump(bus) == 1
+
+
+def test_session_ids_falls_back_when_the_store_has_no_light_pager(tmp_path):
+    """A pre-RFC-0010 store keeps working: grow `list_sessions(limit)` instead."""
+    store = make_store(tmp_path)
+    for i in range(SESSION_PAGE_SIZE):
+        store.create_session(Session(id=f"bulk-{i:04d}", created_at=now_ms() + 1 + i))
+
+    class _NoPager:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            if name == "list_session_rows":
+                raise AttributeError(name)
+            return getattr(self._inner, name)
+
+    ids = EventBus._session_ids(_NoPager(store))
+
+    assert len(ids) == SESSION_PAGE_SIZE + 1
+    assert "s1" in ids
+

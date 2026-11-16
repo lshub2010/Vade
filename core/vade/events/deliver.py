@@ -31,6 +31,18 @@ Decisions worth knowing before reading the code:
   budget is spent the turn is audited (`events.turn_missing`) and the watermark
   moves past it. Never retry forever: one malformed event would otherwise pin
   the watermark and silently stop every later turn of that session.
+* **A closed socket is gone immediately.** C3's transport has no app-level
+  "socket closed" slot; the real callback is `Connection._on_close` (the sweep
+  `CoreApp` installs on every socket). The bus chains onto it, so a disconnect
+  drops that connection's subscription and queue instead of leaving a dead
+  subscriber that keeps auditing drops forever. `install()` also publishes
+  `connection_closed` on `app.on_disconnect` for a transport that grows such a
+  slot, and hooks sockets already in the live table.
+* **Every session, not the newest page.** `pump()` walks the store's light
+  session rows to the end (archived included) instead of taking
+  `list_sessions(limit=50)`: a turn in session number 51 used to be persisted
+  and never delivered. Paging is metadata-only; the only full `load()` is the
+  per-turn payload the channel already builds.
 * **Audit carries metadata only** (`module_id, instance_id, session_id, turns,
   bytes, ok`). The transcript never reaches a log line.
 """
@@ -48,9 +60,12 @@ from typing import Any, Deque, Iterable, Mapping
 from ..errors import VadeError
 from ..logging import get_logger
 from . import transcript as tx
-from .subscribe import EVOLVE_TOPICS, Subscription, SubscriptionTable
+from .subscribe import (
+    EVOLVE_TOPICS, Subscription, SubscriptionTable, validate_topics,
+)
 
-__all__ = ["DeliveryQueue", "EventBus", "DEFAULT_CAPACITY", "DEFAULT_TIMEOUT_S", "JOURNAL_SIZE"]
+__all__ = ["DeliveryQueue", "EventBus", "DEFAULT_CAPACITY", "DEFAULT_TIMEOUT_S",
+           "JOURNAL_SIZE", "SESSION_PAGE_SIZE"]
 
 log = get_logger("vade.events")
 
@@ -59,6 +74,12 @@ DEFAULT_TIMEOUT_S = 5.0        # C-14: a send that takes longer is a failure
 JOURNAL_SIZE = 512             # per session, for since_seq replay
 SEEN_TURNS = 2048              # per session; older ids cannot come back (seq only grows)
 AUDIT_RECORDS = 256
+#: Light session rows per page while `pump()` walks the store. Metadata only,
+#: so a few hundred rows cost far less than one full `Session` load. Chosen so
+#: a workspace of a few thousand sessions is a handful of small queries per
+#: pump, not one query per session.
+SESSION_PAGE_SIZE = 200
+
 #: How many pumps a terminal event may wait for its `turns` row before the
 #: event is declared broken (audited, watermark advanced). C3 writes the event
 #: first and the row immediately after, so 2 misses are normal; 3 are not.
@@ -109,7 +130,9 @@ class DeliveryQueue:
         return len(self._items)
 
     def close(self) -> None:
+        """Stop the worker and release queued frames: a closed queue holds nothing."""
         self._closed = True
+        self._items.clear()
         worker, self._worker = self._worker, None
         if worker is not None:
             worker.cancel()
@@ -239,6 +262,10 @@ class EventBus:
         #: `turn.queued`, so recomputing `seq_from` there would be wrong.
         self._turn_first_seq: dict[tuple[str, str], int] = {}
         self._closed_sessions: set[str] = set()
+        #: connection_id -> the socket object whose `_on_close` we chained.
+        #: Kept per bus (not an attribute on the socket): two buses in one
+        #: process -- tests, a dev reload -- each need their own cleanup.
+        self._hooked: dict[str, Any] = {}
         #: Fallback only: `identify()` reads `record.manifest.subscriptions`
         #: first (C-03 append, RFC-0001). This map is for a registry that does
         #: not retain the manifest -- tests, or a future remote table.
@@ -254,12 +281,21 @@ class EventBus:
     def registry(self) -> Any:
         return self._registry if self._registry is not None else getattr(self._app, "registry", None)
 
-    def _connection_table(self) -> Mapping[str, Any]:
-        provider = self._connections
+    def _connection_table(self) -> Mapping[str, Any] | None:
+        """The live socket table, or `None` when no provider exists.
+
+        `None` and `{}` must stay distinguishable: an empty table means every
+        connection is gone, while no table means "nothing to compare against"
+        (a unit test constructing a bus without a transport). Cleanup must not
+        treat the second as the first.
+        """
+        provider: Any = self._connections
         if provider is None:
             provider = getattr(self._app, "_connections", None)
-        table = provider() if callable(provider) else provider
-        return table or {}
+        if provider is None:
+            return None
+        table: Any = provider() if callable(provider) else provider
+        return table if table is not None else None
 
     # ------------------------------------------------------------------ audit
     def _audit(self, event: str, **fields: Any) -> None:
@@ -291,7 +327,7 @@ class EventBus:
         self._declared[(str(module_id), str(instance_id))] = tuple(str(t) for t in topics or ())
 
     def identify(self, connection: Any) -> "EventBus.Who":
-        cid = str(getattr(connection, "connection_id", None) or getattr(connection, "id", None) or "")
+        cid = self._connection_id(connection)
         crypto = getattr(connection, "crypto", None)
         fingerprint = str(getattr(crypto, "remote_fingerprint", "") or "") if crypto is not None else ""
         record = None
@@ -327,11 +363,7 @@ class EventBus:
     async def on_subscribe(self, connection: Any, params: Mapping[str, Any] | None) -> dict[str, Any]:
         """`events/subscribe`: accepted/rejected per topic; never closes the socket."""
         params = dict(params or {})
-        topics = params.get("topics")
-        if not isinstance(topics, (list, tuple)) or not topics:
-            raise VadeError("INVALID_ARGUMENT", "topics must be a non-empty array of topic names")
-        if any(not isinstance(t, str) for t in topics):
-            raise VadeError("INVALID_ARGUMENT", "topics must contain strings only")
+        topics = validate_topics(params.get("topics"))
         session_id = params.get("session_id")
         if session_id is not None and (not isinstance(session_id, str) or not session_id):
             raise VadeError("INVALID_ARGUMENT", "session_id must be a non-empty string")
@@ -352,23 +384,119 @@ class EventBus:
             subscribed_at=float(self._clock()),
         )
         self.table.put(subscription)
-        replayed = self._replay(subscription) if since_seq is not None else 0
-        queue = self._queue_for(subscription)
-        if queue is not None:
-            await queue.drain()
+        # A subscription is a queue with a lifetime; the socket's close hook is
+        # the only reliable end-of-lifetime signal the transport exposes. Do it
+        # after `put`, so a socket that is already closed drops this record
+        # instead of the record resurrecting a dead queue.
+        self.watch(connection)
+        if self.table.get(who.connection_id) is subscription:
+            replayed = self._replay(subscription) if since_seq is not None else 0
+            queue = self._queue_for(subscription)
+            if queue is not None:
+                await queue.drain()
+        else:
+            replayed = 0
         self._audit("events.subscribe", module_id=who.module_id or None,
                     instance_id=who.instance_id or None, ok=bool(accepted),
                     accepted=len(accepted), rejected=len(rejected), replayed=replayed)
         return {"accepted": accepted, "rejected": rejected, "replayed": replayed}
 
+    # ------------------------------------------------------------ disconnect
+    @staticmethod
+    def _connection_id(connection: Any) -> str:
+        return str(getattr(connection, "connection_id", None)
+                   or getattr(connection, "id", None) or "")
+
+    def watch(self, connection: Any) -> bool:
+        """Chain the bus onto the close hook the transport already owns.
+
+        `CoreApp` passes `on_close=self._forget` to every `Connection`, and
+        `Connection.close()` calls it exactly once, from the loop that owns the
+        socket. That is the real disconnect seam; there is no app-level one.
+        Without chaining it, a module that subscribed and then vanished keeps a
+        `Subscription` and a `DeliveryQueue` alive: every later turn is offered
+        and audited as dropped for a socket that is gone.
+
+        Idempotent per bus; the transport's own callback always still runs
+        (even if our cleanup raises), so governance's table sweep is untouched.
+        A duck-typed sink without `_on_close` is skipped -- it has no lifetime
+        to follow, and `on_disconnect` remains the explicit path for it.
+        """
+        cid = self._connection_id(connection)
+        if not cid or self._hooked.get(cid) is connection:
+            return False
+        if getattr(connection, "_closed", False):
+            # The socket closed before anyone subscribed (or between the RPC
+            # and this hook): its `close()` will never fire again, so hooking it
+            # would pin a subscription that can never be delivered to.
+            self.drop_connection(cid, reason="connection already closed")
+            return False
+        if not hasattr(connection, "_on_close"):
+            return False
+        original = getattr(connection, "_on_close", None)
+        bus = self
+
+        def _closed(conn: Any) -> None:
+            try:
+                bus.connection_closed(conn)
+            except Exception:  # teardown must never break the socket's close
+                log.warning("event disconnect cleanup failed",
+                            extra={"code": None, "connection_id": cid})
+            if callable(original):
+                original(conn)
+
+        try:
+            connection._on_close = _closed
+        except Exception:  # frozen/slotted sink: keep the explicit path only
+            return False
+        self._hooked[cid] = connection
+        return True
+
+    def watch_connections(self, connections: Mapping[str, Any] | None = None) -> int:
+        """Hook every live socket now; `install()` uses this for sockets already up."""
+        table = connections if connections is not None else self._connection_table()
+        hooked = 0
+        for connection in list((table or {}).values()):
+            cid = self._connection_id(connection)
+            fresh = bool(cid) and self._hooked.get(cid) is not connection
+            if self.watch(connection) and fresh:
+                hooked += 1
+        return hooked
+
+    def connection_closed(self, connection: Any) -> int:
+        """Sync teardown, safe to call from a transport close callback."""
+        cid = self._connection_id(connection)
+        self._hooked.pop(cid, None)
+        return self.drop_connection(cid, reason="connection closed")
+
+    def drop_connection(self, connection_id: str, *, reason: str = "disconnect") -> int:
+        """Forget one socket: no live subscription, no queue, no queued frames.
+
+        Idempotent -- a transport may report the close and an operator may also
+        call `on_disconnect`. The journal is untouched: `since_seq` is how a
+        reconnecting module recovers the gap.
+        """
+        if not connection_id:
+            return 0
+        instance = ""
+        dropped = 0
+        for key, queue in list(self._queues.items()):
+            if queue.connection_id != connection_id:
+                continue
+            instance = instance or queue.instance_id
+            queue.close()
+            self._queues.pop(key, None)
+            dropped += 1
+        had_subscription = self.table.get(connection_id) is not None
+        self.table.drop(connection_id)
+        if dropped or had_subscription:
+            self._audit("events.subscriber_gone", instance_id=instance or None,
+                        ok=True, reason=reason)
+        return dropped
+
     async def on_disconnect(self, connection: Any) -> None:
         """Drop the live subscription; the journal keeps the gap recoverable."""
-        cid = str(getattr(connection, "connection_id", None) or getattr(connection, "id", None) or "")
-        for key, queue in list(self._queues.items()):
-            if queue.connection_id == cid:
-                queue.close()
-                self._queues.pop(key, None)
-        self.table.drop(cid)
+        self.connection_closed(connection)
 
     @staticmethod
     def _seq_int(value: Any) -> int:
@@ -411,17 +539,21 @@ class EventBus:
     def _queue_for(self, sub: Subscription) -> DeliveryQueue | None:
         if not sub.connection_id:
             return None
+        sink = (self._connection_table() or {}).get(sub.connection_id)
+        if sink is not None:
+            self.watch(sink)
+            if self.table.get(sub.connection_id) is None:
+                return None          # the socket was already closed: no queue
         key = (sub.instance_id, sub.connection_id)
         queue = self._queues.get(key)
         if queue is None:
-            sink = self._connection_table().get(sub.connection_id)
             queue = DeliveryQueue(
                 instance_id=sub.instance_id, connection_id=sub.connection_id, sink=sink,
                 capacity=self.capacity, timeout_s=self.timeout_s, _audit=self._audit_delivery,
             )
             self._queues[key] = queue
         elif queue.sink is None:
-            queue.sink = self._connection_table().get(sub.connection_id)
+            queue.sink = sink
         return queue
 
     def _audit_delivery(self, event: str, **fields: Any) -> None:
@@ -492,8 +624,9 @@ class EventBus:
             session_ids = [session_id]
         else:
             try:
-                session_ids = [str(s.id) for s in store.list_sessions(limit=50)]
-            except Exception:
+                session_ids = self._session_ids(store)
+            except Exception as exc:  # a broken listing must not kill the tick
+                self._audit("events.pump_failed", ok=False, reason=type(exc).__name__)
                 session_ids = sorted(self._watermarks)
         emitted = 0
         for sid in session_ids:
@@ -503,6 +636,42 @@ class EventBus:
                 self._audit("events.pump_failed", session_id=sid, ok=False,
                             reason=type(exc).__name__)
         return emitted
+
+    @staticmethod
+    def _session_ids(store: Any) -> list[str]:
+        """Every session id -- archived included -- not just the newest 50.
+
+        `list_session_rows` is the light page (metadata only, no messages or
+        turns), so walking it to the end is cheap enough for a per-turn tick.
+        `list_sessions` is the legacy fallback: its default limit is what hid
+        every session past #50, so it is called with a growing limit until the
+        store returns a short page. Full `Session` loads there are the price of
+        a store that predates RFC-0010, and correctness wins over that cost.
+        """
+        pager = getattr(store, "list_session_rows", None)
+        ids: list[str] = []
+        if callable(pager):
+            try:
+                for archived in (False, True):
+                    offset = 0
+                    while True:
+                        page = list(pager(limit=SESSION_PAGE_SIZE, offset=offset,
+                                          archived=archived) or ())
+                        ids.extend(str(row.id) for row in page)
+                        if len(page) < SESSION_PAGE_SIZE:
+                            break
+                        offset += len(page)
+                return list(dict.fromkeys(ids))
+            except TypeError:
+                ids = []          # older store signature: fall through
+        limit = SESSION_PAGE_SIZE
+        while True:
+            page = list(store.list_sessions(limit=limit) or ())
+            ids.extend(str(session.id) for session in page)
+            if len(page) < limit:
+                break
+            limit *= 2
+        return list(dict.fromkeys(ids))
 
     def _pump_one(self, store: Any, session_id: str) -> int:
         watermark = self._watermarks.get(session_id, 0)
@@ -665,3 +834,4 @@ class EventBus:
         for queue in list(self._queues.values()):
             queue.close()
         self._queues.clear()
+        self._hooked.clear()

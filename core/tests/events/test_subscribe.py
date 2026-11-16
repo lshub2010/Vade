@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from vade.errors import VadeError
+from vade.events.subscribe import MAX_TOPICS
 
 from .helpers import (
     ALLOWED_FP, FakeConnection, FakeManifest, FakeRecord, evolve_connection,
@@ -177,6 +178,38 @@ def test_topics_must_be_a_non_empty_string_array(tmp_path):
         with pytest.raises(VadeError) as caught:
             subscribe(bus, connection, params)
         assert caught.value.code == "INVALID_ARGUMENT"
+
+
+def test_rejected_topics_are_deduplicated(tmp_path):
+    store = make_store(tmp_path)
+    connection, record = evolve_connection()
+    bus, _ = make_bus(store, records=[record], connections={connection.connection_id: connection})
+
+    result = subscribe(bus, connection,
+                       {"topics": ["nope", "session.turn", "nope", "session.turn", "nope"]})
+
+    assert result["accepted"] == ["session.turn"]
+    assert result["rejected"] == [{"topic": "nope", "reason": "unknown topic"}]
+
+
+def test_the_topic_cap_is_a_refusal_not_a_truncation(tmp_path):
+    """64 topics is the ceiling; 65 is INVALID_ARGUMENT, never a silent trim."""
+    store = make_store(tmp_path)
+    connection, record = evolve_connection()
+    bus, _ = make_bus(store, records=[record], connections={connection.connection_id: connection})
+
+    at_cap = subscribe(bus, connection, {"topics": ["nope"] * MAX_TOPICS})
+    assert at_cap["accepted"] == []
+    assert at_cap["rejected"] == [{"topic": "nope", "reason": "unknown topic"}]
+
+    with pytest.raises(VadeError) as caught:
+        subscribe(bus, connection, {"topics": ["nope"] * (MAX_TOPICS + 1)})
+
+    assert caught.value.code == "INVALID_ARGUMENT"
+    assert str(MAX_TOPICS) in caught.value.message
+    # The refused request did not overwrite the subscription that was there.
+    kept = bus.table.get(connection.connection_id)
+    assert kept is not None and kept.topics == frozenset()
 
 
 def test_declare_is_the_seam_when_the_manifest_is_not_surfaced(tmp_path):

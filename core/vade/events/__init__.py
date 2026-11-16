@@ -22,6 +22,11 @@ Two integration facts shape this package:
   handlers through `app.handler_providers`: a provider list C3 drains when it
   builds `app.session_handlers`. That is one appended callback, no logic change
   in `session/` -- the same pattern the task book uses for `on_session_end`.
+* **Disconnects are per socket.** Today's transport has no app-level close slot;
+  `CoreApp` passes `on_close` per `Connection`. `install()` publishes
+  `EventBus.connection_closed` on `app.on_disconnect` for a transport that grows
+  one, hooks the sockets already up, and every later socket is hooked by
+  `on_subscribe`. A closed socket loses its subscription and queue at once.
 """
 
 from __future__ import annotations
@@ -29,12 +34,15 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from .deliver import DeliveryQueue, EventBus
-from .subscribe import REASONS, TOPICS, Subscription, SubscriptionTable
+from .subscribe import (
+    MAX_TOPICS, REASONS, TOPICS, Subscription, SubscriptionTable, validate_topics,
+)
 from . import transcript
 
 __all__ = [
     "install", "wire", "EventBus", "DeliveryQueue", "Subscription",
-    "SubscriptionTable", "TOPICS", "REASONS", "transcript",
+    "SubscriptionTable", "TOPICS", "REASONS", "MAX_TOPICS", "validate_topics",
+    "transcript",
 ]
 
 #: Topics the bus serves. Kept here so a typo in a config check fails a test,
@@ -124,6 +132,23 @@ def install(app: Any) -> None:
         app.on_session_end = on_end
     if not any(getattr(h, "__self__", None) is bus for h in on_end):
         on_end.append(bus.emit_closed)
+
+    # Disconnect slot: the transport owns the sockets, so its close path is the
+    # only place that knows a subscription died. `CoreApp` has no app-level
+    # callback today (it passes `on_close` per `Connection`), so this list is
+    # the explicit seam for a transport that grows one; the per-socket chain
+    # below is what actually runs now.
+    disconnects = getattr(app, "on_disconnect", None)
+    if disconnects is None:
+        disconnects = []
+        app.on_disconnect = disconnects
+    if isinstance(disconnects, list) and not any(
+            getattr(h, "__self__", None) is bus for h in disconnects):
+        disconnects.append(bus.connection_closed)
+    connections = getattr(app, "_connections", None)
+    live: Any = connections() if callable(connections) else connections
+    if live:
+        bus.watch_connections(live)
 
     # C3d also owns the proposal intake; it publishes through the same channel.
     from ..skill.proposal import ProposalService

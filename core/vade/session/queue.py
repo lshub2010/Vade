@@ -15,7 +15,7 @@ Guarantees:
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import replace
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
@@ -27,6 +27,13 @@ __all__ = ["TurnQueue"]
 EmitFn = Callable[..., Awaitable[Any]]
 SaveTurnFn = Callable[[str, Turn], None]
 Executor = Callable[[Turn, tuple[dict[str, Any], ...]], Awaitable[Any]]
+
+#: Terminal turns remembered so a late finisher (the worker waking up after an
+#: interrupt already wrote the terminal event) cannot write a second one. Bounded
+#: exactly like `SessionLog._TOMBSTONE_LIMIT`: one id per turn for the life of
+#: the process is a leak, and a turn whose id fell out of the window is one that
+#: can no longer be reached by any caller.
+FINALIZED_LIMIT = 1024
 
 
 class TurnQueue:
@@ -76,10 +83,39 @@ class TurnQueue:
         #: must stay (the task does not exist yet) and is armed when it appears.
         self._release_pending: set[str] = set()
         self._finish: asyncio.Event | None = None
-        self._finalized: set[str] = set()
+        #: Turns whose terminal event is already written (bounded FIFO). The
+        #: marker OUTLIVES `_run_one`: the worker wakes up after an interrupt
+        #: has finalized the turn, and without the marker it would take the
+        #: `task.cancelled()` branch and write a SECOND terminal event.
+        self._finalized: OrderedDict[str, None] = OrderedDict()
+        #: Terminal writes in flight. Held only for the duration of `_finalize`
+        #: so a concurrent interrupt/finish cannot interleave two writes; the
+        #: pair (`_finalizing`, `_finalized`) is what makes the "exactly one
+        #: terminal event" promise independent of who calls `_finalize` first.
+        self._finalizing: set[str] = set()
         self._orphans: set[asyncio.Task[Any]] = set()
+        #: Set by `shutdown()`; makes the stop terminal (no new worker, no new
+        #: turn) and `shutdown()` itself idempotent.
+        self._stopped = False
 
     # ------------------------------------------------------------------ state
+    @property
+    def max_pending(self) -> int:
+        return self._max_pending
+
+    def has_capacity(self) -> bool:
+        """True when one more turn can be enqueued without `OVERLOADED`."""
+        return len(self._pending) < self._max_pending
+
+    def is_finalized(self, turn_id: str) -> bool:
+        return turn_id in self._finalized or turn_id in self._finalizing
+
+    def _remember_finalized(self, turn_id: str) -> None:
+        self._finalized[turn_id] = None
+        self._finalized.move_to_end(turn_id)
+        while len(self._finalized) > FINALIZED_LIMIT:
+            self._finalized.popitem(last=False)
+
     def enqueue(self, turn: Turn, content: Sequence[Mapping[str, Any]]) -> int:
         if len(self._pending) >= self._max_pending:
             raise VadeError("OVERLOADED", f"queue is full ({self._max_pending} pending turns)")
@@ -135,6 +171,12 @@ class TurnQueue:
 
     # ------------------------------------------------------------------ worker
     def ensure_worker(self) -> None:
+        # A queue that has been shut down never starts another worker: the
+        # `finally` in `_run_loop` used to respawn one when `_pending` was not
+        # empty, so `close()` cancelled the worker and the very next tick
+        # created a new one that ran turns into a closed store.
+        if self._stopped:
+            return
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._run_loop(), name=f"queue-{self.session_id[:8]}")
 
@@ -145,21 +187,21 @@ class TurnQueue:
                 await self._run_one(item)
         finally:
             self._worker = None
-            if self._pending:  # a submit raced the loop exit
+            if self._pending and not self._stopped:  # a submit raced the loop exit
                 self.ensure_worker()
 
     async def _run_one(self, item: QueueItem) -> None:
-        """Run one turn, then drop the `_finalized` marker it needed.
+        """Run one turn to completion.
 
-        The marker only covers the window in which the turn's terminal state
-        may still be written twice (worker vs. `interrupt`), i.e. exactly this
-        coroutine's lifetime. Leaving it in the set grows one id per turn for
-        the life of the process — the same leak class as the cancel flags.
+        The `_finalized` marker is NOT released here: `_run_one` ends when the
+        worker is done, which is strictly earlier than "no caller can still try
+        to finalize this turn" — an `interrupt` can have written the terminal
+        event and the worker then wakes up on a cancelled task. Releasing the
+        marker at worker exit made that wake-up write a second terminal event.
+        `_finalize` owns the release (it is the only writer), and it keeps the
+        id in the bounded `_finalized` FIFO so late finishers stay refused.
         """
-        try:
-            await self._execute_one(item)
-        finally:
-            self._finalized.discard(item.turn_id)
+        await self._execute_one(item)
 
     async def _execute_one(self, item: QueueItem) -> None:
         turn = item.turn.with_state(TurnState.RUNNING, started_at=self._clock())
@@ -273,44 +315,53 @@ class TurnQueue:
         usage: Mapping[str, Any] | None = None,
         data: Mapping[str, Any] | None = None,
     ) -> None:
-        if turn.id in self._finalized:
+        if self.is_finalized(turn.id):
             return
-        self._finalized.add(turn.id)
-        # RFC-0008 S5: a pending `turn.input_resolved` must be written BEFORE the
-        # turn's terminal event, or the dialog is left open forever (C-06 forbids
-        # any `turn.*` after `turn.interrupted`). This is the only place a turn
-        # ends, so the hook lives here rather than at each caller.
-        if self._pre_terminal_hook is not None:
-            try:
-                await self._pre_terminal_hook(turn.id, state)
-            except Exception:  # pragma: no cover - a hook must not block finalization
-                pass
-        if state is not TurnState.COMPLETED or turn.state is not TurnState.COMPLETED:
-            turn = turn.with_state(state, ended_at=turn.ended_at or self._clock())
-        if usage is not None:
-            # RFC-0005 §6.1: a failed/interrupted turn has burned tokens too.
-            # When the provider never reported them the honest value is
-            # `source="none"` with zero counts, not an estimate.
-            turn = replace(turn, usage=dict(usage))
-            payload = {**payload, "usage": dict(usage)}
-        if data is not None:
-            payload = {**payload, "data": dict(data)}
-        self._save_turn(self.session_id, turn)
-        event_type = {
-            TurnState.COMPLETED: "turn.completed",
-            TurnState.FAILED: "turn.failed",
-            TurnState.INTERRUPTED: "turn.interrupted",
-            TurnState.CANCELLED: "turn.cancelled",
-        }[state]
-        # RFC-0006 §4.2: the terminal turn row, the partial message and the
-        # terminal event commit in ONE transaction. `_save_turn` + `_emit` was
-        # two commits, and a crash between them left "state=interrupted" with no
-        # partial text — a state no client can explain or repair.
-        await self._emit(self.session_id, event_type, payload, messages=messages,
-                         turns=(turn,))
-        if self._running is not None and self._running.turn_id == turn.id:
-            self._running = None
-        await self._emit(self.session_id, "queue.updated", self.state_payload())
+        # The in-flight marker is taken BEFORE the first await so a second
+        # caller (a second interrupt, or the worker waking up) is refused while
+        # this write is suspended. Ownership of the released marker lives here,
+        # not in `_run_one`: this method is the only writer of a terminal state.
+        self._finalizing.add(turn.id)
+        try:
+            # RFC-0008 S5: a pending `turn.input_resolved` must be written BEFORE the
+            # turn's terminal event, or the dialog is left open forever (C-06 forbids
+            # any `turn.*` after `turn.interrupted`). This is the only place a turn
+            # ends, so the hook lives here rather than at each caller.
+            if self._pre_terminal_hook is not None:
+                try:
+                    await self._pre_terminal_hook(turn.id, state)
+                except Exception:  # pragma: no cover - a hook must not block finalization
+                    pass
+            if state is not TurnState.COMPLETED or turn.state is not TurnState.COMPLETED:
+                turn = turn.with_state(state, ended_at=turn.ended_at or self._clock())
+            if usage is not None:
+                # RFC-0005 §6.1: a failed/interrupted turn has burned tokens too.
+                # When the provider never reported them the honest value is
+                # `source="none"` with zero counts, not an estimate.
+                turn = replace(turn, usage=dict(usage))
+                payload = {**payload, "usage": dict(usage)}
+            if data is not None:
+                payload = {**payload, "data": dict(data)}
+            event_type = {
+                TurnState.COMPLETED: "turn.completed",
+                TurnState.FAILED: "turn.failed",
+                TurnState.INTERRUPTED: "turn.interrupted",
+                TurnState.CANCELLED: "turn.cancelled",
+            }[state]
+            # RFC-0006 §4.2: the terminal turn row, the partial message and the
+            # terminal event commit in ONE transaction. `_save_turn` + `_emit` was
+            # two commits, and a crash between them left "state=interrupted" with no
+            # partial text — a state no client can explain or repair. The turn row
+            # rides `turns=` so there is exactly one write, not a duplicate
+            # `update_turn` followed by the event's own upsert.
+            await self._emit(self.session_id, event_type, payload, messages=messages,
+                             turns=(turn,))
+            if self._running is not None and self._running.turn_id == turn.id:
+                self._running = None
+            await self._emit(self.session_id, "queue.updated", self.state_payload())
+        finally:
+            self._finalizing.discard(turn.id)
+            self._remember_finalized(turn.id)
         if self._finish is not None and not self._finish.is_set():
             self._finish.set()
         self._release_cancel(turn.id, task)
@@ -400,7 +451,7 @@ class TurnQueue:
     # ------------------------------------------------------------------ control
     async def interrupt(self, turn_id: str, *, by: str = "user") -> bool:
         item = self._running
-        if item is None or item.turn_id != turn_id or turn_id in self._finalized:
+        if item is None or item.turn_id != turn_id or self.is_finalized(turn_id):
             return False
         self._running = item.with_turn(item.turn.with_state(TurnState.INTERRUPTED))
         if self._cancel_hook is not None:
@@ -421,7 +472,6 @@ class TurnQueue:
             if item.turn_id == turn_id:
                 del self._pending[index]
                 turn = item.turn.with_state(TurnState.CANCELLED, ended_at=self._clock())
-                self._finalized.add(turn_id)
                 await self._emit(
                     self.session_id, "turn.cancelled",
                     {"turn_id": turn_id, "by": by, "state": TurnState.CANCELLED.value},
@@ -431,22 +481,39 @@ class TurnQueue:
                 # A queued turn never reached the router, so there is no
                 # in-flight task that could still read the flag.
                 self._forget_turn(turn_id)
-                # It also never reaches `_run_one`, which is what drops the
-                # `_finalized` marker: drop it here so the set stays bounded.
-                self._finalized.discard(turn_id)
+                # It also never reaches `_finalize`, which is what records the
+                # marker: record it here so a late `interrupt` for the same id
+                # stays a no-op. Bounded (FIFO), so the set cannot grow one id
+                # per cancelled turn for the life of the process.
+                self._remember_finalized(turn_id)
                 return True
         if self._running is not None and self._running.turn_id == turn_id:
             # Running turns are stopped by interrupt, never by queue.cancel.
             raise VadeError("INVALID_ARGUMENT", "turn is running; use ui/interrupt")
         return False
 
-    async def mark_state(self, turn_id: str, state: TurnState) -> bool:
+    async def mark_state(self, turn_id: str, state: TurnState | str) -> bool:
+        """Move the running turn between blocking states (`waiting_approval`, …).
+
+        Emits `queue.updated` so the state is *observable*: `running_state` is
+        the only contract field that carries it (there is no
+        `turn.waiting_approval` event), and without the emit a client could
+        never render the approval wait — the state was reachable in the store
+        and invisible on the wire.
+        """
+        state = state if isinstance(state, TurnState) else TurnState(state)
         item = self._running
         if item is None or item.turn_id != turn_id:
             return False
+        if self.is_finalized(turn_id):
+            # A dialog answering/resolving after the turn was interrupted must
+            # not resurrect a terminal row as `running`.
+            return False
+        if item.turn.state is state:
+            return False  # idempotent: no event per re-check
         turn = item.turn.with_state(state)
         self._running = item.with_turn(turn)
-        self._save_turn(self.session_id, turn)
+        await self._emit(self.session_id, "queue.updated", self.state_payload(), turns=(turn,))
         return True
 
     async def drain(self) -> None:
@@ -457,14 +524,36 @@ class TurnQueue:
             await asyncio.shield(worker)
 
     async def shutdown(self) -> None:
+        """Stop every task this queue owns; terminal and idempotent.
+
+        The worker is awaited (as a cancelled task) so the caller — `close()` —
+        returns with the queue actually stopped. Without the join the worker
+        was free to wake up after `store.close()` and write one more terminal
+        event into a closed database. The turn tasks are cancelled but NOT
+        awaited: a module that ignores `tools/cancel` would otherwise hold up
+        process shutdown, and `_consume_orphan` already swallows whatever it
+        returns (`interrupt` arms that callback for exactly this reason).
+        """
+        if self._stopped:
+            return
+        self._stopped = True
         for task in list(self._turn_tasks.values()):
             if not task.done():
                 task.cancel()
         self._release_pending.clear()
-        if self._worker is not None:
-            self._worker.cancel()
+        worker = self._worker
+        if worker is not None and not worker.done():
+            worker.cancel()
         for task in list(self._orphans):
             task.cancel()
+        if worker is not None:
+            await asyncio.gather(worker, return_exceptions=True)
+            # A worker cancelled before its first step never enters the
+            # coroutine body, so `_run_loop`'s `finally` (which clears this
+            # reference) does not run. Own it here: a stopped queue must not
+            # report a worker, not even a dead one.
+            if self._worker is worker:
+                self._worker = None
 
     def _consume_orphan(self, task: asyncio.Task[Any]) -> None:
         """A module that ignores tools/cancel leaves a orphan task: swallow it."""

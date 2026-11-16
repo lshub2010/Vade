@@ -58,7 +58,12 @@ class ModuleStatusPublisher:
         emitted = 0
         for session_id in self._log.attached_sessions():
             try:
-                await self._log.emit(session_id, "module.status", dict(payload))
+                # `coalesce=True`: this event is a re-pull trigger, not state a
+                # late client has to replay. Counting it as a continuity witness
+                # let a burst of module churn exhaust the replay window and turn
+                # every reconnect into a full snapshot (RFC-0007 §5.5 R5).
+                await self._log.emit(session_id, "module.status", dict(payload),
+                                     coalesce=True)
                 emitted += 1
             except VadeError as exc:  # session deleted mid-flight
                 log.warning("module.status dropped", extra={"code": exc.code, "session_id": session_id,

@@ -32,6 +32,13 @@ def install(app: Any) -> None:
     manager = ApprovalManager(
         timeout_s=timeout_s, engine=engine, audit=getattr(app, "audit", None),
     )
+    # `waiting_approval` is only observable if somebody writes it: the queue
+    # owns turn state, so the hook is the same seam `input` uses. It is resolved
+    # through `app.session_log` at CALL time — `policy` installs before
+    # `session` (alphabetical), so capturing the log here would capture None.
+    manager.set_state_hook(lambda session_id, turn_id, state: _mark_state(
+        app, session_id, turn_id, state
+    ))
     adapter = PolicyAdapter(manager)
     app.approval_port = adapter
     app.policy = engine
@@ -50,3 +57,24 @@ def install(app: Any) -> None:
     hooks = getattr(app, "on_session_end", None)
     if isinstance(hooks, list):
         hooks.append(_session_closed)
+
+
+async def _mark_state(app: Any, session_id: str, turn_id: str, state: str) -> None:
+    """Write one turn state into the queue, which persists and broadcasts it.
+
+    Mirrors `vade.input._mark_state`: the policy component must not import the
+    session log at install time, and an unknown/failed state must never abort an
+    approval wait — the request is still answerable over `approval/decide`.
+    """
+    log: Any = getattr(app, "session_log", None)
+    mark: Any = getattr(log, "mark_state", None)
+    if not callable(mark):
+        return
+    from ..session.models import TurnState
+
+    try:
+        result: Any = mark(session_id, turn_id, TurnState(state))
+        if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+            await result
+    except Exception:  # pragma: no cover - a state write is best effort
+        return

@@ -107,6 +107,10 @@ class ApprovalManager:
         self._grants: dict[tuple[str, str, str], float] = {}
         self._lock = asyncio.Lock()
         self._ui_count = 0
+        #: Writes the turn state to the queue (which persists + broadcasts it).
+        #: Same seam as `InputManager.set_state_hook`: a plain
+        #: `(session_id, turn_id, state)` callable, possibly a coroutine.
+        self._state_hook: Callable[[str, str, str], Any] | None = None
 
     # ---------------------------------------------------------------- approvers
     def note_ui_attached(self, delta: int = 1) -> None:
@@ -122,6 +126,21 @@ class ApprovalManager:
 
     def set_approver_probe(self, probe: Callable[[], bool] | None) -> None:
         self._approver_probe = probe
+
+    def set_state_hook(self, hook: Callable[[str, str, str], Any] | None) -> None:
+        """Writes the turn state to the queue (which persists it)."""
+        self._state_hook = hook
+
+    async def _set_state(self, pending: PendingApproval, state: str) -> None:
+        """Best effort: a state write must never break an approval wait."""
+        if self._state_hook is None:
+            return
+        try:
+            result = self._state_hook(pending.session_id, pending.turn_id, state)
+            if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+                await result
+        except Exception:  # pragma: no cover - the hook is an external seam
+            return
 
     # ------------------------------------------------------------------ request
     async def open_request(self, req: ApprovalRequest) -> tuple[PendingApproval | None, str]:
@@ -223,6 +242,10 @@ class ApprovalManager:
         )
         risk = pending.risk
         pending.awaited = True
+        # The turn is blocked on a human now. Without this the queue kept it
+        # `running` for up to `timeout_s`, so the only state a UI could render
+        # was a turn that looked alive but emitted nothing.
+        await self._set_state(pending, "waiting_approval")
         try:
             # `shield` is load-bearing: plain `wait_for` cancels the very future
             # the approver resolves, so a decision landing at the deadline used
@@ -257,6 +280,9 @@ class ApprovalManager:
                     duration_ms=elapsed,
                     reason=f"审批超时（{self.timeout_s:g}s 内无人确认）", scope="once",
                 )
+                # The wait is over, so the turn is running again even though the
+                # tool call was refused.
+                await self._set_state(pending, "running")
                 return ApprovalDecision(
                     False, reason=f"审批超时（{self.timeout_s:g}s 内无人确认，approval_timeout）",
                     request_id=rid, scope="once", by="system",
@@ -269,7 +295,11 @@ class ApprovalManager:
                     pending.future.cancel()
                 self._resolved[rid] = "cancelled"
                 self._pending.pop(rid, None)
+            # Deliberately no `running` write here: the turn is being torn down
+            # and the queue is about to publish its terminal state. Resurrecting
+            # `running` first would emit a transition the user never caused.
             raise
+        await self._set_state(pending, "running")
         if not allowed:
             return ApprovalDecision(False, reason=reason or "denied", request_id=rid, scope=scope, by=by)
         return ApprovalDecision(True, reason=reason, request_id=rid, scope=scope, by=by,
@@ -407,6 +437,10 @@ class ApprovalManager:
         resolved = {
             "request_id": request_id, "decision": "allow" if allow else "deny",
             "by": by or actor_kind, "scope": scope, "state": "running",
+            # The turn this request belonged to. `approval/decide` needs both
+            # ids to write the `turn.approval_resolved` that closes every other
+            # attached dialog; without them it has no stream to emit on.
+            "session_id": pending.session_id, "turn_id": pending.turn_id,
             # §7.1: the same attribution the prompt carried, so a device that
             # missed `turn.approval_required` can still close the right card.
             "task_id": pending.task_id, "task_name": pending.task_name,

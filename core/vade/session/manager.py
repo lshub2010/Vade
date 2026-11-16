@@ -20,6 +20,7 @@ on.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import time
 from collections import OrderedDict
@@ -27,6 +28,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError
+from ..logging import get_logger
 from .limits import check_content_limits, content_text
 from .search import LIMIT_DEFAULT, validate_query
 from .models import (
@@ -55,16 +57,28 @@ __all__ = ["SessionLog", "SinkWorker", "AttachResult", "EventSink",
 
 EventSink = Any  # duck-typed: async send(dict) -> None
 
+log = get_logger("vade.session.manager")
+
 #: C-06 rule 4: payload-only events. After a terminal event for a turn, these
 #: are dropped on arrival (RFC-0006 §4.2 tombstone) instead of being appended
 #: after `turn.interrupted` — a late delta must not reopen a closed turn.
 PAYLOAD_ONLY_EVENTS = frozenset({"turn.delta", "turn.tool_call", "turn.tool_result"})
+#: `turn.approval_resolved` is dropped for the same reason even though it is a
+#: state-change event: a device that answers a dialog after the turn was
+#: interrupted must not reopen it (C-06: no `turn.*` after the terminal event).
+TOMBSTONED_EVENTS = PAYLOAD_ONLY_EVENTS | frozenset({"turn.approval_resolved"})
 TERMINAL_EVENT_TYPES = frozenset(
     {"turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"}
 )
 #: Terminal turns kept for the tombstone check. Bounded so the set cannot grow
 #: one id per turn for the life of the process.
 _TOMBSTONE_LIMIT = 1024
+#: Room a replay must leave behind in the bounded per-connection sink queue:
+#: `session.attached` plus one live event. A backlog that does not fit is
+#: answered with a snapshot instead of a replay the sink worker would silently
+#: drop (`SinkWorker.drop()` also unregisters itself, so the client would end up
+#: attached to nothing).
+ATTACH_REPLAY_RESERVE = 2
 
 #: RFC-0006 §6.4 reasons carried on `turn.queued` / `turn.superseded`.
 REASON_SUBMIT = "submit"
@@ -274,6 +288,12 @@ class SessionLog:
         #: the subagents component is absent and turns end exactly as before.
         self.subagents: Any = None
         self._closed = False
+        #: `app.on_session_end` hooks (C3d's `session.closed` beat, C5a's grant
+        #: cleanup). Stored by REFERENCE: components append after this install.
+        self._session_end_hooks: list[Any] = []
+        #: Sessions whose end beat already fired (`close()` is called once per
+        #: process, but a second close must not double-publish).
+        self._ended: set[str] = set()
         #: RFC-0006 §4.2: the text already streamed for a live turn. The queue
         #: reads it through `partial_text()` when it finalizes an interrupt, so
         #: the partial message is the *same* text the client was rendered.
@@ -304,6 +324,15 @@ class SessionLog:
         not grow for the life of the process.
         """
         self._cancel_clear_hook = fn
+
+    def set_session_end_hooks(self, hooks: Sequence[Any]) -> None:
+        """`app.on_session_end` (RFC: the list every component appends to).
+
+        Without this the list was never traversed, so C3d's `session.closed`
+        beat and C5a's grant cleanup never fired for any session. The list is
+        kept by reference, not copied: `skill`/`subagents` may append later.
+        """
+        self._session_end_hooks = hooks  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ sessions
     def create_session(self, *, session_id: str | None = None, title: str | None = None) -> Session:
@@ -413,6 +442,13 @@ class SessionLog:
         await self._fanout_session_list_changed(session_id, "removed", by=by)
         await self.detach(session_id)
         self._queues.pop(session_id, None)
+        # The seq space is gone: keeping its replay window is a per-session
+        # leak (one buffer + one emit lock per deleted id), and a later session
+        # that reuses the id would inherit a coverage claim over events that no
+        # longer exist.
+        self.replay.discard(session_id)
+        self._emit_locks.pop(session_id, None)
+        self._ended.discard(session_id)
 
     async def _fanout_session_list_changed(
         self, session_id: str, change: str, *, by: str = "system",
@@ -606,7 +642,7 @@ class SessionLog:
         kept: list[tuple[str, dict[str, Any]]] = []
         for event_type, payload in events:
             body = dict(payload or {})
-            if event_type in PAYLOAD_ONLY_EVENTS and body.get("turn_id") in self._terminal:
+            if event_type in TOMBSTONED_EVENTS and body.get("turn_id") in self._terminal:
                 continue  # tombstone: the turn is closed, drop the late write
             kept.append((event_type, body))
         if not kept:
@@ -680,26 +716,36 @@ class SessionLog:
 
         if last_seq is not None and last_seq >= 0 and self.replay.covers(session_id, last_seq):
             replay_events = tuple(self.store.read_since(session_id, last_seq))
-            worker = self._register_sink(session_id, sink)
-            # Replay first, on the same per-connection queue as live events, so
-            # the sink can never observe `session.attached` before the backlog.
-            for replayed in replay_events:
-                worker.offer(replayed.to_wire())
-            event = await self.emit(
-                session_id,
-                "session.attached",
-                {
-                    "session_id": session_id,
-                    "from_seq": last_seq + 1,
-                    "state": "open",
-                    "snapshot": False,
-                    "replay_count": len(replay_events),
-                },
-            )
-            assert event is not None
-            return AttachResult(session_id, event.seq, None, replay_events, worker.sink_id)
+            # Capacity FIRST: the sink's outbound queue is bounded, and
+            # `SinkWorker.offer` drops the worker (and unregisters it) the
+            # moment it overflows. Replaying a backlog larger than the queue
+            # therefore used to return "ok + snapshot=null + zero events": the
+            # client believed it had caught up and the history was gone for
+            # good. A backlog that cannot fit behind live traffic is answered
+            # with a snapshot instead — slower, but never lossy.
+            if len(replay_events) <= self._sink_queue - ATTACH_REPLAY_RESERVE:
+                worker = self._register_sink(session_id, sink)
+                # Replay first, on the same per-connection queue as live events,
+                # so the sink can never observe `session.attached` before the
+                # backlog.
+                for replayed in replay_events:
+                    worker.offer(replayed.to_wire())
+                event = await self.emit(
+                    session_id,
+                    "session.attached",
+                    {
+                        "session_id": session_id,
+                        "from_seq": last_seq + 1,
+                        "state": "open",
+                        "snapshot": False,
+                        "replay_count": len(replay_events),
+                    },
+                )
+                assert event is not None
+                return AttachResult(session_id, event.seq, None, replay_events, worker.sink_id)
 
-        # Not covered (or a fresh client): snapshot is the only honest answer.
+        # Not covered (or a fresh client, or a backlog too large for the sink
+        # queue): snapshot is the only honest answer.
         snapshot = self.snapshot(session_id)
         worker = self._register_sink(session_id, sink)
         event = await self.emit(
@@ -822,6 +868,122 @@ class SessionLog:
             self._queues[session_id] = q
         return q
 
+    @staticmethod
+    def _overloaded(queue: TurnQueue) -> VadeError:
+        """The one `OVERLOADED` refusal (pre-check and rollback say the same).
+
+        One message source matters: `data.reason` is what the client keys its
+        "wait for a turn to finish" hint off, and a queue-full raised from two
+        places with two shapes is a contract drift nobody notices.
+        """
+        return VadeError(
+            "OVERLOADED",
+            f"queue is full ({queue.max_pending} pending turns); wait for a turn to finish",
+            data={"reason": "queue_full"},
+        )
+
+    def _queue_for_new_turn(self, session_id: str) -> TurnQueue:
+        """Resolve the queue AND check it can take one more turn.
+
+        Called BEFORE the first write of `submit`/`regenerate`/`edit_resubmit`.
+        Persisting `turn.queued` first and then raising `OVERLOADED` from
+        `enqueue` left a turn stuck in `queued` for the life of the process: the
+        client showed it forever, `regenerate`/`edit` refused with `turn_active`
+        and the idempotent retry handed the same corpse back. The pre-check is
+        not enough on its own — the emit above it yields to the loop, so a
+        concurrent submit can still fill the queue — which is why the callers
+        also roll the turn back to a terminal state (`_enqueue_or_rollback`).
+        """
+        queue = self._queue(session_id)
+        if not queue.has_capacity():
+            raise self._overloaded(queue)
+        return queue
+
+    async def _enqueue_or_rollback(
+        self,
+        session_id: str,
+        queue: TurnQueue,
+        turn: Turn,
+        content: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Enqueue a turn whose `turn.queued` is already on the wire.
+
+        The pre-check cannot close the window by itself: the emit between it and
+        here yields to the loop, so a concurrent submit can take the last slot.
+        `enqueue` then refuses, and the turn row is already `queued` — the
+        zombie this path exists to kill (a `queued` turn is never dequeued, so
+        it shows forever and blocks the version chain with `turn_active`). Roll
+        it to `failed{OVERLOADED}` — a terminal event the client can render and
+        retry with a new `client_msg_id` — before re-raising the refusal.
+        """
+        try:
+            return queue.enqueue(turn, content)
+        except VadeError as exc:
+            if exc.code != "OVERLOADED":
+                raise
+            refusal = self._overloaded(queue)
+            await self._rollback_unstarted(
+                session_id, turn, code=refusal.code, message=refusal.message,
+                reason="queue_full",
+            )
+            raise refusal from exc
+
+    async def _rollback_unstarted(
+        self, session_id: str, turn: Turn, *, code: str, message: str, reason: str,
+    ) -> None:
+        """End a turn that was announced but never entered the queue.
+
+        `turn.queued` is already on the wire (and the row is persisted), so the
+        only honest repair is a terminal event: a `failed` turn the UI can show
+        and the user can retry with a new `client_msg_id`. Silence here is what
+        made the turn a zombie.
+        """
+        failed = replace(
+            turn, state=TurnState.FAILED, ended_at=now_ms(),
+            error_code=code, error_message=message,
+        )
+        await self.emit(
+            session_id, "turn.failed",
+            {
+                "turn_id": failed.id, "code": code, "message": message,
+                "state": TurnState.FAILED.value,
+                # No provider ran, so the only honest usage is "unmeasured".
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                          "model_id": failed.model_id, "provider": None,
+                          "source": "none", "steps": 0, "cached_tokens": 0,
+                          "reasoning_tokens": 0},
+                "data": {"reason": reason},
+            },
+            turns=(failed,),
+        )
+        log.warning("turn announced but not queued", extra={
+            "code": code, "session_id": session_id, "turn_id": failed.id,
+            "msg": message,
+        })
+
+    async def reconcile_restarts(self) -> int:
+        """Startup: non-terminal turns from a dead process are `interrupted`.
+
+        The queue lives in memory only, so a row left in `running`/`queued`/
+        `waiting_*` by the previous process can never finish: `session/list`
+        and every snapshot would advertise a turn that runs forever and the
+        version chain would refuse `regenerate`/`edit` with `turn_active`.
+        Called once from `install()`, before any client can attach.
+        """
+        reconcile = getattr(self.store, "reconcile_unfinished_turns", None)
+        if not callable(reconcile):
+            return 0
+        try:
+            count = int(reconcile(reason="restart") or 0)  # type: ignore[arg-type]
+        except Exception as exc:  # pragma: no cover - startup must not fail here
+            log.warning("turn reconcile failed", extra={"code": "INTERNAL", "msg": str(exc)})
+            return 0
+        if count:
+            log.warning("turns left running by a previous process", extra={
+                "code": None, "msg": f"reconciled={count} state=interrupted reason=restart",
+            })
+        return count
+
     async def submit(
         self,
         session_id: str,
@@ -902,6 +1064,9 @@ class SessionLog:
             )
 
         # 7. Persist: turn row, message (+ its parts), pinned blobs, one emit.
+        #    Capacity is checked BEFORE that write: a queue that cannot take the
+        #    turn must refuse without leaving a `queued` row behind.
+        queue = self._queue_for_new_turn(session_id)
         turn_id = new_id()
         message_id = new_id()
         turn = Turn(
@@ -936,8 +1101,7 @@ class SessionLog:
             # storage that no future session can free.
             self._unpin(pinned)
             raise
-        queue = self._queue(session_id)
-        pos = queue.enqueue(turn, parts)
+        pos = await self._enqueue_or_rollback(session_id, queue, turn, parts)
         await self.emit(session_id, "queue.updated", queue.state_payload())
         queue.ensure_worker()
         return turn, pos
@@ -1035,6 +1199,10 @@ class SessionLog:
                       "parts": list(old.user_parts)},
             )
 
+        # Capacity before `turn.superseded` is persisted: a refusal must not
+        # leave the old turn pointing at a version that never entered the queue.
+        # The emit below yields, so `_enqueue_or_rollback` still covers a race.
+        queue = self._queue_for_new_turn(session_id)
         new_turn_id = new_id()
         new_turn = Turn(
             id=new_turn_id, session_id=session_id, state=TurnState.QUEUED,
@@ -1056,8 +1224,10 @@ class SessionLog:
             ],
             turns=[superseded, new_turn],
         )
-        queue = self._queue(session_id)
-        pos = queue.enqueue(new_turn, [{"type": "text", "text": user_message.content}])
+        pos = await self._enqueue_or_rollback(
+            session_id, queue, new_turn,
+            [{"type": "text", "text": user_message.content}],
+        )
         await self.emit(session_id, "queue.updated", queue.state_payload())
         queue.ensure_worker()
         return {
@@ -1132,6 +1302,10 @@ class SessionLog:
             raise VadeError("INVALID_ARGUMENT", "turn has already been superseded",
                             data={"reason": "not_head", "head_turn_id": old_turn.superseded_by})
 
+        # Capacity before `message.edited`/`turn.superseded` are persisted: a
+        # refusal here must not tombstone the old message for a version that
+        # never entered the queue.
+        queue = self._queue_for_new_turn(session_id)
         new_message_id = new_id()
         new_turn_id = new_id()
         edition = Message(
@@ -1167,8 +1341,7 @@ class SessionLog:
             turns=[superseded, new_turn],
             message_updates=[(message_id, new_message_id)],
         )
-        queue = self._queue(session_id)
-        pos = queue.enqueue(new_turn, blocks)
+        pos = await self._enqueue_or_rollback(session_id, queue, new_turn, blocks)
         await self.emit(session_id, "queue.updated", queue.state_payload())
         queue.ensure_worker()
         return {
@@ -1227,10 +1400,24 @@ class SessionLog:
         q = self._queues.get(session_id)
         return q.state() if q is not None else {"running": None, "pending": []}
 
-    async def mark_state(self, session_id: str, turn_id: str, state: TurnState) -> None:
+    async def mark_state(
+        self, session_id: str, turn_id: str, state: TurnState | str,
+    ) -> bool:
+        """Forward the queue's verdict for a blocking-state move.
+
+        `state` is accepted as the enum or as its wire string: the RFC-0008
+        input channel calls the state hook with `"waiting_input"` while the
+        approval path passes `TurnState.WAITING_APPROVAL`, and both must land.
+
+        The bool is returned, not swallowed: callers ask "did the turn actually
+        move?" (a dialog that opened on a turn which was interrupted a tick
+        earlier must not report success). `False` also covers a session with no
+        live queue — nothing is running, so nothing moved.
+        """
         q = self._queues.get(session_id)
-        if q is not None:
-            await q.mark_state(turn_id, state)
+        if q is None:
+            return False
+        return bool(await q.mark_state(turn_id, state))
 
     def turn_state(self, session_id: str, turn_id: str) -> str | None:
         """Live state of one turn for RFC-0008's single-slot gate (S2/S3/S6).
@@ -1257,11 +1444,12 @@ class SessionLog:
 
         The queue calls this with `(turn_id, state)`; the session id is bound
         here because the queue is per-session. Order is contractual: the
-        RFC-0008 input dialog closes first, then every unfinished subagent run
-        of the ending turn is cancelled — so `subagent.result(cancelled)` rows
-        land before `turn.completed` / `turn.failed` / `turn.interrupted` /
-        `turn.cancelled`, and a client never sees a finished parent with a
-        running child. The subagents component is duck-typed (`log.subagents`,
+        RFC-0008 input dialog closes first, then every approval still pending on
+        this turn is denied, then every unfinished subagent run of the ending
+        turn is cancelled — so `subagent.result(cancelled)` rows land before
+        `turn.completed` / `turn.failed` / `turn.interrupted` / `turn.cancelled`,
+        and a client never sees a finished parent with a running child or an
+        open dialog. The subagents component is duck-typed (`log.subagents`,
         set by `vade.subagents.install()`): a core without that component
         still ends turns exactly as before. Errors must not block
         finalization — `_finalize` already guards the whole hook.
@@ -1269,6 +1457,11 @@ class SessionLog:
 
         async def hook(turn_id: str, state: TurnState) -> None:
             await self._input_pre_terminal(turn_id, state)
+            # C-06: no `turn.*` may follow the terminal event, and a dialog left
+            # open behind it can never be closed (the tool call is gone; only a
+            # 60s deadline would reap it). Publish the deny here, while the
+            # tombstone still accepts the event.
+            await self._approval_pre_terminal(session_id, turn_id, state)
             runs: Any = getattr(self, "subagents", None)
             sweep: Any = getattr(runs, "cancel_for_turn", None)
             if callable(sweep):
@@ -1296,23 +1489,85 @@ class SessionLog:
             reason, target = "superseded", state.value
         await resolver(turn_id, reason=reason, state=target)
 
+    async def _approval_pre_terminal(
+        self, session_id: str, turn_id: str, state: TurnState,
+    ) -> None:
+        """Close every approval dialog still open on a turn that is ending.
+
+        The approval table is C5a's and in memory only; nothing in it is keyed
+        to the turn's end. A stopped turn therefore left its
+        `turn.approval_required` card on every attached device with no signal
+        that would ever close it — the tool call is gone, and the other devices
+        only learn about a decision through `turn.approval_resolved`.
+
+        One `{decision: deny, state: interrupted}` per still-pending request is
+        the only honest and contract-legal close: the turn stopped, nobody
+        approved, so the call did not run. `by: "system"` says the channel
+        decided, not a person (a device answering after this event is refused
+        by the tombstone instead of reopening a closed turn).
+        """
+        port: Any = self.approval_port
+        lister: Any = getattr(port, "pending", None)
+        if not callable(lister):
+            return
+        try:
+            rows = list(lister(session_id))
+        except Exception:  # pragma: no cover - approval port is C5a's
+            return
+        target = (
+            "interrupted"
+            if state in (TurnState.INTERRUPTED, TurnState.CANCELLED)
+            else state.value
+        )
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if row.get("turn_id") != turn_id:
+                continue
+            request_id = row.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                continue
+            payload: dict[str, Any] = {
+                "turn_id": turn_id, "request_id": request_id,
+                "decision": "deny", "by": "system", "scope": "once",
+                "state": target, "session_id": session_id,
+            }
+            # RFC-0007 §7.1: a device that missed the prompt still closes the
+            # right card only if the resolution names the same task.
+            for key in ("task_id", "task_name", "depth"):
+                if key in row:
+                    payload[key] = row[key]
+            await self.emit(session_id, "turn.approval_resolved", payload)
+
     async def wait_idle(self, session_id: str, timeout: float = 5.0) -> None:
         q = self._queues.get(session_id)
         if q is not None:
             await asyncio.wait_for(q.drain(), timeout)
 
     async def close(self) -> None:
+        """End every session this process owns, then stop the machinery.
+
+        Order is contractual and each step needs the one before it alive:
+          1. `app.on_session_end` hooks — C3d's `session.closed` beat and C5a's
+             grant cleanup. The beat reads the transcript from the store and
+             emits onto the seq bus, so it must run while the store is open and
+             the sinks are still attached.
+          2. the RFC-0008 dialog closer — `turn.input_resolved{session_closed}`
+             has to reach the devices before their socket goes away.
+          3. `queue.shutdown()` — cancel the running turn and the worker, and
+             await it, or a worker wake-up can still finalize a turn into a
+             closed store.
+          4. `detach()` — stop the sink workers, drop the connections.
+          5. the store — last, it is what everything above wrote through.
+
+        Idempotent: a transport teardown racing `App.shutdown` must not
+        re-publish `session.closed` or close the store twice.
+        """
+        if self._closed:
+            return
         self._closed = True
-        # RFC-0008 §5.3 "等待中会话关闭": close the dialogs while the sinks are
-        # still attached, so `turn.input_resolved{session_closed}` reaches them
-        # before `session.closed`/the socket goes away.
-        closer: Any = getattr(self.input_port, "on_session_end", None)
-        if callable(closer):
-            for session_id in list(self._queues):
-                try:
-                    await closer(session_id)
-                except Exception:  # pragma: no cover - closing must not raise
-                    pass
+        for session_id in list(dict.fromkeys([*self._queues, *self._sinks])):
+            await self._end_session(session_id)
         for q in list(self._queues.values()):
             await q.shutdown()
         for session_id in list(self._sinks):
@@ -1320,6 +1575,36 @@ class SessionLog:
         close = getattr(self.store, "close", None)
         if callable(close):
             close()
+
+    async def _end_session(self, session_id: str) -> None:
+        """Fire the end beat + close the dialogs of one session, exactly once.
+
+        `_ended` is checked BEFORE the hooks run so a hook that re-enters
+        (`session.closed` delivering into a handler that calls back) cannot
+        publish the beat twice; `delete_session` drops the id from the set
+        because that session's end belongs to the delete, not to shutdown.
+        """
+        if session_id in self._ended:
+            return
+        self._ended.add(session_id)
+        for hook in list(self._session_end_hooks):
+            try:
+                result = hook(session_id)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:  # pragma: no cover - closing must not raise
+                log.warning("session end hook failed", extra={
+                    "code": "INTERNAL", "session_id": session_id, "msg": str(exc),
+                })
+        closer: Any = getattr(self.input_port, "on_session_end", None)
+        if not callable(closer):
+            return
+        try:
+            result = closer(session_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # pragma: no cover - closing must not raise
+            pass
 
 
 def _require_client_msg_id(client_msg_id: Any) -> None:

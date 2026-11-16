@@ -17,7 +17,7 @@ from vade.registry.table import Registry
 from vade.router.dispatch import Router
 from vade.session.manager import SessionLog
 from vade.session.models import Turn, TurnState
-from vade.session.queue import TurnQueue
+from vade.session.queue import TurnQueue, FINALIZED_LIMIT
 from vade.session.replay import ReplayBuffer
 from vade.session.sqlite_store import SQLiteStore
 from .helpers import CollectSink, GateExecutor, make_manifest, wait_until
@@ -729,8 +729,13 @@ def test_cancel_clear_is_bound_to_its_own_turn_when_the_previous_task_is_an_orph
         assert next_turn.id not in flags, \
             f"was_cancelled({next_turn.id}) outlived the turn it belongs to"
         assert orphan_turn.id in flags, "the still-running orphan lost its flag"
-        # Per-turn bookkeeping does not outlive the turns either.
-        assert queue._finalized == set(), f"finalized markers leaked: {queue._finalized}"
+        # `_finalized` deliberately OUTLIVES the turn: the worker wakes up after
+        # an interrupt has already written the terminal event, and the marker is
+        # what refuses the second one. The leak guard is the bounded FIFO cap,
+        # not emptiness — a set cleared at worker exit is the double-terminal
+        # bug this bookkeeping exists to prevent.
+        assert set(queue._finalized) >= {orphan_turn.id, next_turn.id}
+        assert len(queue._finalized) <= FINALIZED_LIMIT
         await queue.shutdown()
 
         await asyncio.sleep(0)

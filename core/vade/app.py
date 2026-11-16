@@ -75,6 +75,10 @@ class App:
             close_connection=self._close_connection,
             paired_fingerprint=self._paired_fingerprint,
         )
+        # Every revoke path — the whitelist callback and the admin route that
+        # calls the registry directly — must close handshaken-but-unregistered
+        # sockets too. The registry cannot see them; this wrapper can.
+        self._install_revoke_sweep()
         self.registry_api = RegistryAPI(self.registry)
         self.whitelist = Whitelist(data_dir / "identity" / "whitelist.json", on_revoke=self._revoke_connection)
         self.pairing = PairingStore(
@@ -146,9 +150,80 @@ class App:
         """Registry trust input: the key paired to this exact node, if any."""
         return self.whitelist.fingerprint_for(module_id, instance_id) if self.whitelist is not None else None
 
-    def _revoke_connection(self, fingerprint: str, removed_ids: tuple[str, ...] = ()) -> None:
+    def _close_matching_connections(self, fingerprint: str, *, skip: set[str] | None = None) -> list[str]:
+        """Close every live socket whose handshake proved `fingerprint`.
+
+        `Connection.crypto` is attached before `run()` and
+        `remote_fingerprint` is set by the handshake, so this table is the
+        complete answer — registered or not. Browsers have no crypto and are
+        skipped: a cookie session is not a key.
+        """
+        closed: list[str] = []
+        skipped = skip or set()
+        for connection_id, connection in list(self._connections().items()):
+            if connection_id in skipped:
+                continue
+            crypto = getattr(connection, "crypto", None)
+            remote = getattr(crypto, "remote_fingerprint", None) if crypto is not None else None
+            if not remote or str(remote) != fingerprint:
+                continue
+            closer = getattr(connection, "request_close", None)
+            if callable(closer):
+                closer(1001, "fingerprint revoked")
+                closed.append(connection_id)
+        return closed
+
+    def _install_revoke_sweep(self) -> None:
+        """Make `registry.revoke_fingerprint(fp)` sweep unregistered sockets.
+
+        `/admin/api/nodes/{id}/revoke` calls the registry directly, and the
+        registry only knows nodes that finished `module/register`. A peer that
+        handshook and is about to register is invisible there but fully
+        authenticated here, so the sweep is attached to the call every revoke
+        entry point already goes through. Idempotent: installing twice keeps
+        the first wrapper, never a chain of them.
+        """
+        registry = self.registry
+        if registry is None or getattr(registry, "_vade_revoke_sweep_installed", False):
+            return
+        original = registry.revoke_fingerprint
+
+        def revoke_and_sweep(fingerprint: str) -> tuple[str, ...]:
+            closed = tuple(original(fingerprint))
+            self._close_matching_connections(fingerprint, skip=set(closed))
+            return closed
+
+        registry.revoke_fingerprint = revoke_and_sweep  # type: ignore[method-assign]
+        registry._vade_revoke_sweep_installed = True  # type: ignore[attr-defined]
+
+    def _revoke_live(self, fingerprint: str) -> list[str]:
+        """Registry revoke + the sockets the registry cannot see, exactly once.
+
+        When the sweep wrapper is installed, `revoke_fingerprint` already does
+        the second half; sweeping again would just call `request_close` twice.
+        """
+        closed: list[str] = []
         if self.registry is not None:
-            self.registry.revoke_fingerprint(fingerprint)
+            closed = [str(cid) for cid in self.registry.revoke_fingerprint(fingerprint)]
+        if not getattr(self.registry, "_vade_revoke_sweep_installed", False):
+            closed += self._close_matching_connections(fingerprint, skip=set(closed))
+        return closed
+
+    def _revoke_connection(self, fingerprint: str, removed_ids: tuple[str, ...] = ()) -> None:
+        """Unbind a key: close every live socket that proved it, right now.
+
+        The registry only knows *registered* nodes. A socket that has finished
+        the Noise handshake but has not sent `module/register` yet owns no
+        `NodeRecord`, so iterating the registry alone left exactly the most
+        dangerous peer connected: authenticated, holding a session key, not yet
+        visible in the table an operator revokes from.
+        """
+        closed = self._revoke_live(fingerprint)
+        if closed:
+            log.info(
+                "revoked fingerprint closed live connections",
+                extra={"code": None, "msg": f"fingerprint={fingerprint[:16]} connections={len(closed)}"},
+            )
         # RFC-0016 §5.6-17 / Q4 (RFC default, NOT 拍板): unbinding a device
         # kills its minted blob tokens in the same stroke — without this the
         # tokens of an unbound device stay valid until their TTL ceiling

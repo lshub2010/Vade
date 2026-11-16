@@ -103,18 +103,36 @@ impl Identity {
         hex::encode(self.public)
     }
 
-    /// `BLAKE2s-256(public_key)` — the whitelist key (`module_id → 公钥指纹`, FR-4.1)
-    /// and the `core_pub_fp` input of the pair-code PSK (C-15).
+    /// `BLAKE2s-256(public_key)` — the whitelist key (`module_id → 公钥指纹`,
+    /// FR-4.1) and the `core_pub_fp` input of the pair-code PSK (C-15).
+    ///
+    /// Named `psk_` because that is the only job of this value; it is *not* a
+    /// TLS pin (that one is `SHA-256(SPKI)` over a certificate, D78).
     #[must_use]
-    pub fn fingerprint(&self) -> Vec<u8> {
+    pub fn psk_fingerprint(&self) -> Vec<u8> {
         let mut hasher = Blake2s256::new();
         hasher.update(self.public);
         hasher.finalize().to_vec()
     }
 
+    /// Hex form of [`Identity::psk_fingerprint`].
+    #[must_use]
+    pub fn psk_fingerprint_hex(&self) -> String {
+        hex::encode(self.psk_fingerprint())
+    }
+
+    /// Backwards-compatible alias; new code should use
+    /// [`Identity::psk_fingerprint`].
+    #[must_use]
+    pub fn fingerprint(&self) -> Vec<u8> {
+        self.psk_fingerprint()
+    }
+
+    /// **Do not rename.** This is the uniffi-exported method name the generated
+    /// bindings key their checksum table on; renaming it breaks every binding.
     #[must_use]
     pub fn fingerprint_hex(&self) -> String {
-        hex::encode(self.fingerprint())
+        self.psk_fingerprint_hex()
     }
 }
 
@@ -133,8 +151,8 @@ impl Drop for Identity {
     }
 }
 
-/// `BLAKE2s-256` fingerprint of a 32-byte public key.
-pub fn fingerprint_of(public_key: &[u8]) -> Result<Vec<u8>> {
+/// `BLAKE2s-256` fingerprint of a 32-byte public key — the psk/whitelist value.
+pub fn psk_fingerprint_of(public_key: &[u8]) -> Result<Vec<u8>> {
     if public_key.len() != KEY_LEN {
         return Err(perr(
             ErrorCode::InvalidArgument,
@@ -144,6 +162,11 @@ pub fn fingerprint_of(public_key: &[u8]) -> Result<Vec<u8>> {
     let mut hasher = Blake2s256::new();
     hasher.update(public_key);
     Ok(hasher.finalize().to_vec())
+}
+
+/// Backwards-compatible alias; new code should use [`psk_fingerprint_of`].
+pub fn fingerprint_of(public_key: &[u8]) -> Result<Vec<u8>> {
+    psk_fingerprint_of(public_key)
 }
 
 #[cfg(test)]
@@ -158,6 +181,23 @@ mod tests {
         assert_eq!(a.public_key(), b.public_key());
         assert_eq!(a.fingerprint_hex(), b.fingerprint_hex());
         assert_eq!(a.fingerprint().len(), 32);
+    }
+
+    #[test]
+    fn psk_fingerprint_names_are_the_same_value() {
+        let id = Identity::from_secret_bytes(&[7u8; KEY_LEN]).unwrap();
+        assert_eq!(id.psk_fingerprint(), id.fingerprint());
+        assert_eq!(id.psk_fingerprint_hex(), id.fingerprint_hex());
+        assert_eq!(id.psk_fingerprint_hex(), hex::encode(id.psk_fingerprint()));
+        assert_eq!(id.psk_fingerprint_hex().len(), 64);
+        assert_eq!(
+            psk_fingerprint_of(&id.public_key()).unwrap(),
+            id.psk_fingerprint()
+        );
+        assert_eq!(
+            fingerprint_of(&id.public_key()).unwrap(),
+            id.psk_fingerprint()
+        );
     }
 
     #[test]

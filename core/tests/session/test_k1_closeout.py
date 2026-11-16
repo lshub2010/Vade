@@ -292,10 +292,9 @@ def test_close_does_not_respawn_the_worker_for_a_pending_turn(tmp_path):
 
         assert queue._stopped is True
         assert queue._worker is None
-        assert "turn.started" not in [
-            e.type for e in _events(log, session.id)
-            if e.payload.get("turn_id") == second.id
-        ]
+        # The store is closed now, so assert the in-memory queue state instead of
+        # re-reading events: the queued turn must still be pending and untouched.
+        assert [item.turn.id for item in queue._pending] == [second.id]
         queue.ensure_worker()
         assert queue._worker is None
 

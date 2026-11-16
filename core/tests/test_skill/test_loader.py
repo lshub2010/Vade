@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from vade.errors import VadeError
 from vade.skill.loader import SkillLoader
 
 from .helpers import make_loader, skill_text, write_skill
@@ -223,3 +224,40 @@ def test_missing_skills_root_is_empty_not_an_error(tmp_path: Path) -> None:
     assert loader.list_all() == []
     assert loader.render(__import__("vade.loop.prompt", fromlist=["PromptParts"]).PromptParts(
         persona="p", tool_block="t", user_message="@kb-guide")).skill_catalog == ""
+
+
+def test_lifecycle_methods_refuse_a_path_component(tmp_path: Path) -> None:
+    """`reject`/`uninstall` are `os.replace` calls: an unvalidated name moves or
+    deletes whatever directory it resolves to, so the guard is per-method."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "SKILL.md").write_text(skill_text("victim"), encoding="utf-8")
+    loader = make_loader(tmp_path)
+
+    for name in ("../victim", "../../tmp", "a/b", "a\\b", ".hidden", ".."):
+        for call in (lambda n=name: loader.reject(n),
+                     lambda n=name: loader.approve(n),
+                     lambda n=name: loader.uninstall(n),
+                     lambda n=name: loader.rollback(n, 1)):
+            with pytest.raises(VadeError) as excinfo:
+                call()
+            assert excinfo.value.code == "PERMISSION_DENIED", name
+
+    assert (victim / "SKILL.md").is_file()
+    assert not (tmp_path / ".rejected").exists()
+    assert not (tmp_path / ".trash").exists()
+
+
+def test_reserved_directory_names_are_refused(tmp_path: Path) -> None:
+    """`uninstall("pending")` used to move every pending proposal to `.trash`."""
+    loader = make_loader(tmp_path)
+    directory = write_skill(tmp_path / "pending", "draft")
+    assert (directory / "SKILL.md").is_file()
+
+    for call in (lambda: loader.uninstall("pending"), lambda: loader.reject("pending"),
+                 lambda: loader.approve("pending")):
+        with pytest.raises(VadeError) as excinfo:
+            call()
+        assert excinfo.value.code == "PERMISSION_DENIED"
+
+    assert (directory / "SKILL.md").is_file()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -142,6 +143,76 @@ def test_a_second_proposal_supersedes_the_old_pending_file(tmp_path):
     assert [p.name for p in (root / "pending").iterdir()] == ["code-review"]
 
 
+def test_a_failed_write_leaves_the_previous_proposal_untouched(tmp_path, monkeypatch):
+    """The old code moved the old files aside *before* writing: one ENOSPC and
+    the proposal was gone, with `state()` reporting `missing` for a name that had
+    a proposal a second earlier."""
+    service, loader, root = make_service(tmp_path)
+    first = skill_text("code-review", description="first")
+    create(service, content=first)
+
+    real = proposal_module._atomic_write
+
+    def broken(path, data, **kwargs):
+        if path.name == "meta.json":
+            raise OSError(28, "No space left on device")
+        return real(path, data, **kwargs)
+
+    monkeypatch.setattr(proposal_module, "_atomic_write", broken)
+    with pytest.raises(OSError):
+        create(service, content=skill_text("code-review", description="second"))
+    monkeypatch.undo()
+
+    pending = root / "pending" / "code-review"
+    assert (pending / "SKILL.md").read_text(encoding="utf-8") == first
+    assert not (pending / "SKILL.md.superseded").exists()
+    assert not list(pending.glob(".staging-*"))
+    assert service.state("code-review") == "pending"
+    assert json.loads((pending / "meta.json").read_text(encoding="utf-8"))["sha256"] == \
+        proposal_module._sha(first)
+
+
+def test_a_failed_swap_restores_the_previous_proposal(tmp_path, monkeypatch):
+    service, _loader, root = make_service(tmp_path)
+    first = skill_text("code-review", description="first")
+    create(service, content=first)
+    old_meta = (root / "pending" / "code-review" / "meta.json").read_text(encoding="utf-8")
+
+    real_replace = os.replace
+
+    def flaky(src, dst, *args, **kwargs):
+        # Only the staging -> pending promotion of the second file fails.
+        if Path(dst).name == "meta.json" and ".staging-" in str(src):
+            raise OSError(5, "Input/output error")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    with pytest.raises(OSError):
+        create(service, content=skill_text("code-review", description="second"))
+    monkeypatch.undo()
+
+    pending = root / "pending" / "code-review"
+    assert (pending / "SKILL.md").read_text(encoding="utf-8") == first
+    assert (pending / "meta.json").read_text(encoding="utf-8") == old_meta
+    assert not list(pending.glob("*.superseded"))     # the swap was undone
+    assert not list(pending.glob(".staging-*"))
+
+
+def test_approve_does_not_promote_superseded_files(tmp_path):
+    service, loader, root = make_service(tmp_path)
+    create(service)
+    create(service, content=skill_text("code-review", description="second"))
+    assert (root / "pending" / "code-review" / "SKILL.md.superseded").is_file()
+
+    service.review.approve("code-review")
+
+    active = root / "code-review"
+    assert sorted(p.name for p in active.iterdir() if p.is_file()) == ["SKILL.md", "meta.json"]
+    assert not list(active.glob("*.superseded"))
+    assert any(root.joinpath(".trash").iterdir())     # parked, restorable
+    assert "second" in (active / "SKILL.md").read_text(encoding="utf-8")
+
+
 def test_a_secret_in_the_content_is_refused(tmp_path):
     service, _loader, root = make_service(tmp_path)
 
@@ -171,6 +242,73 @@ def test_a_traversal_name_is_permission_denied(tmp_path):
             service.validate({"name": name, "action": "create", "content": skill_text("x")})
         assert caught.value.code == "PERMISSION_DENIED", name
     assert not (tmp_path / "core.toml").exists()
+
+
+def test_every_review_entry_point_refuses_a_path_component(tmp_path):
+    """The guard is not intake-only: reject/approve/state used to build a path
+    straight from the name, and `reject` is a rename of whatever it resolves to."""
+    service, loader, root = make_service(tmp_path)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "SKILL.md").write_text(skill_text("victim"), encoding="utf-8")
+
+    for name in ("../../victim", "../victim", "a/b", ".hidden", ".."):
+        for call in (
+            lambda n=name: service.review.approve(n),
+            lambda n=name: service.review.reject(n),
+            lambda n=name: service.review.rollback(n, 1),
+            lambda n=name: service.state(n),
+            lambda n=name: service.meta(n),
+        ):
+            with pytest.raises(VadeError) as caught:
+                call()
+            assert caught.value.code == "PERMISSION_DENIED", name
+
+    assert (victim / "SKILL.md").is_file()
+    assert not (root / ".rejected").exists()
+
+    # ... and the loader, which the admin API calls without this wrapper.
+    for call in (lambda: loader.reject("../../victim"),
+                 lambda: loader.approve("../../victim"),
+                 lambda: loader.uninstall("../../victim")):
+        with pytest.raises(VadeError) as caught:
+            call()
+        assert caught.value.code == "PERMISSION_DENIED"
+    assert (victim / "SKILL.md").is_file()
+
+
+def test_a_symlinked_pending_dir_is_permission_denied(tmp_path):
+    """`realpath` containment: a link at `pending/<name>` must not be written
+    through, even though the name itself is perfectly legal."""
+    service, _loader, root = make_service(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "pending").mkdir(parents=True)
+    os.symlink(outside, root / "pending" / "code-review")
+
+    with pytest.raises(VadeError) as caught:
+        create(service)
+
+    assert caught.value.code == "PERMISSION_DENIED"
+    assert list(outside.iterdir()) == []
+
+
+def test_a_reserved_directory_cannot_be_proposed_or_reviewed(tmp_path):
+    """`pending` matches C-13's name pattern *and* is the pending root itself."""
+    service, loader, root = make_service(tmp_path)
+    create(service, name="other")
+
+    with pytest.raises(VadeError) as caught:
+        create(service, name="pending")
+    assert caught.value.code == "PERMISSION_DENIED"
+    assert not (root / "pending" / "pending").exists()
+
+    # The old approve("pending") renamed `skills/pending` — every other
+    # proposal included — into `.trash` before failing on the moved source.
+    with pytest.raises(VadeError) as caught:
+        loader.approve("pending")
+    assert caught.value.code == "PERMISSION_DENIED"
+    assert (root / "pending" / "other" / "SKILL.md").is_file()
 
 
 def test_a_bad_name_is_a_conflict(tmp_path):
@@ -289,6 +427,50 @@ def test_reject_moves_the_pending_directory(tmp_path):
     assert not (root / "pending" / "code-review").exists()
     assert list((root / ".rejected").iterdir())
     assert loader.catalog() == ()
+    assert service.state("code-review") == "rejected"
+
+
+def test_a_rejection_is_matched_by_name_not_by_prefix(tmp_path):
+    """`.rejected/foo-bar-1712…` used to answer `state("foo")` with `rejected`."""
+    service, _loader, root = make_service(tmp_path)
+    create(service, name="foo-bar")
+    service.review.reject("foo-bar")
+
+    assert service.state("foo-bar") == "rejected"
+    assert service.state("foo") == "missing"
+    assert service.state("foo-b") == "missing"
+    assert service.state("foo-bar-baz") == "missing"
+
+
+def test_reject_then_resubmit_then_approve_is_not_rejected(tmp_path):
+    """`.rejected/` is append-only: after a later approval the old rejection
+    directory is still on disk and must not win."""
+    service, loader, root = make_service(tmp_path)
+    create(service)
+    service.review.reject("code-review")
+    assert service.state("code-review") == "rejected"
+
+    create(service, content=skill_text("code-review", description="second"))
+    assert service.state("code-review") == "pending"
+
+    service.review.approve("code-review")
+
+    assert service.state("code-review") == "approved"
+    assert list((root / ".rejected").iterdir())      # the history is still there
+    assert [s.name for s in loader.catalog()] == ["code-review"]
+
+
+def test_an_active_skill_outranks_an_older_rejection(tmp_path):
+    """Precedence is pending -> approved -> rejected -> missing: a rejection only
+    describes a name with nothing active, which is the only actionable case."""
+    service, _loader, root = make_service(tmp_path)
+    create(service)
+    service.review.approve("code-review")
+    create(service, content=skill_text("code-review", description="v2"), base_revision=1,
+           action="patch")
+    service.review.reject("code-review")
+
+    assert service.state("code-review") == "approved"
 
 
 def test_rollback_goes_through_the_loader(tmp_path):

@@ -136,8 +136,8 @@ def test_each_announcement_mints_a_fresh_code(tmp_path):
         first = mint_browser_pair_code(store)
         second = mint_browser_pair_code(store)
         assert first != second
-        assert store.consume(first, Purpose.BROWSER).purpose is Purpose.BROWSER
-        assert store.consume(second, Purpose.BROWSER).purpose is Purpose.BROWSER
+        assert store.consume(first, Purpose.BROWSER, ip="127.0.0.1").purpose is Purpose.BROWSER
+        assert store.consume(second, Purpose.BROWSER, ip="127.0.0.1").purpose is Purpose.BROWSER
     finally:
         store.close()
 
@@ -159,7 +159,15 @@ async def _post_session(app: CoreApp, code: str) -> tuple[dict[str, Any], dict[s
         frames.append(message)
 
     await app(
-        {"type": "http", "method": "POST", "path": "/ui/session", "headers": []},
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/ui/session",
+            "headers": [],
+            # A source address is mandatory now: `ip is None` is refused
+            # (fail closed), so a scope without one can never redeem a code.
+            "client": ("127.0.0.1", 54321),
+        },
         receive,
         send,
     )
@@ -196,9 +204,9 @@ def test_printed_code_is_single_use_at_the_store(tmp_path):
     store = _store(tmp_path)
     try:
         code = mint_browser_pair_code(store)
-        assert store.consume(code, Purpose.BROWSER)
+        assert store.consume(code, Purpose.BROWSER, ip="127.0.0.1")
         with pytest.raises(VadeError) as excinfo:
-            store.consume(code, Purpose.BROWSER)
+            store.consume(code, Purpose.BROWSER, ip="127.0.0.1")
         assert excinfo.value.code == "CODE_INVALID"
     finally:
         store.close()
@@ -212,7 +220,7 @@ def test_printed_code_expires_after_its_ttl(tmp_path):
         code = mint_browser_pair_code(store, ttl=600)
         clock.advance(601)
         with pytest.raises(VadeError) as excinfo:
-            store.consume(code, Purpose.BROWSER)
+            store.consume(code, Purpose.BROWSER, ip="127.0.0.1")
         assert excinfo.value.code == "CODE_EXPIRED"
     finally:
         store.close()
@@ -228,7 +236,7 @@ def test_zero_ttl_banner_code_is_dead_on_the_next_tick(tmp_path):
         assert _parse_banner(out.getvalue().splitlines()[0]).group("ttl") == "0"
         clock.advance(1)
         with pytest.raises(VadeError) as excinfo:
-            store.consume(code, Purpose.BROWSER)
+            store.consume(code, Purpose.BROWSER, ip="127.0.0.1")
         assert excinfo.value.code == "CODE_EXPIRED"
     finally:
         store.close()
@@ -240,7 +248,7 @@ def test_browser_code_cannot_be_consumed_as_a_module_code(tmp_path):
     try:
         code = mint_browser_pair_code(store)
         with pytest.raises(VadeError) as excinfo:
-            store.consume(code, Purpose.MODULE, fingerprint="a" * 16)
+            store.consume(code, Purpose.MODULE, ip="127.0.0.1", fingerprint="a" * 16)
         assert excinfo.value.code == "CODE_INVALID"
     finally:
         store.close()
@@ -251,7 +259,7 @@ def test_module_code_is_not_accepted_as_a_browser_code(tmp_path):
     try:
         code = store.create(Purpose.MODULE, module_id="com.example.fs")
         with pytest.raises(VadeError) as excinfo:
-            store.consume(code, Purpose.BROWSER)
+            store.consume(code, Purpose.BROWSER, ip="127.0.0.1")
         assert excinfo.value.code == "CODE_INVALID"
     finally:
         store.close()

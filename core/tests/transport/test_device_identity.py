@@ -143,7 +143,17 @@ async def _login(app: CoreApp, code: str) -> tuple[str, str]:
             return {"type": "http.request", "body": body, "more_body": False}
         return {"type": "http.disconnect"}
 
-    await app({"type": "http", "method": "POST", "path": "/ui/session", "headers": []}, receive, sock.send)
+    await app(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/ui/session",
+            "headers": [],
+            "client": ("127.0.0.1", 54321),
+        },
+        receive,
+        sock.send,
+    )
     start, payload = sock.frames[0], sock.frames[1]
     assert start["status"] == 200, payload["body"]
     cookie = next(

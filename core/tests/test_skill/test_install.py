@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from vade.errors import VadeError
-from vade.skill.loader import InstallSource, SkillLoader
+from vade.skill.loader import MAX_SKILL_FILE_BYTES, InstallSource, SkillLoader
 
 from .helpers import make_loader, skill_text, write_skill, zip_bytes, zip_with_skill
 
@@ -330,3 +330,37 @@ def _parts(message: str):
     from vade.loop.prompt import PromptParts
 
     return PromptParts(persona="p", tool_block="t", user_message=message)
+
+
+def test_text_install_has_the_same_1mb_ceiling_as_a_zip_entry(tmp_path: Path) -> None:
+    """A raw text install has no archive header; the ceiling is enforced anyway."""
+    loader = make_loader(tmp_path)
+    huge = _text() + "\n" + "x" * (MAX_SKILL_FILE_BYTES + 1)
+    with pytest.raises(VadeError) as excinfo:
+        loader.preview(InstallSource("text", text=huge))
+    assert "1MB" in excinfo.value.message
+    assert not (tmp_path / "pending").exists()
+
+
+def test_directory_install_refuses_a_symlinked_source(tmp_path: Path) -> None:
+    """The walk must not start outside the tree the caller pointed at."""
+    outside = tmp_path / "outside"
+    write_skill(outside, "kb-guide")
+    link = tmp_path / "linked"
+    os.symlink(outside, link)
+    loader = make_loader(tmp_path / "skills")
+    with pytest.raises(VadeError) as excinfo:
+        loader.preview(InstallSource("path", path=link))
+    assert "symlink" in excinfo.value.message
+
+
+def test_directory_install_skips_symlinked_subdirectories(tmp_path: Path) -> None:
+    source = write_skill(tmp_path, "src")
+    secret = tmp_path / "secret"
+    secret.mkdir()
+    (secret / "notes.md").write_text("outside the skill\n", encoding="utf-8")
+    os.symlink(secret, source / "references")
+    loader = make_loader(tmp_path / "skills")
+    preview = loader.preview(InstallSource("path", path=source))
+    assert preview.valid is True
+    assert preview.files == (), "a symlinked directory must contribute no entries"

@@ -181,6 +181,12 @@ def parse_models(raw: Any, *, warnings: list[str] | None = None) -> tuple[ModelS
             _warning(warnings, f"{where}: expected an object, got {type(item).__name__}; entry dropped")
             continue
         name = item.get("name")
+        if isinstance(name, str) and name.strip() == "*":
+            # `*` is the module-wide default entry the catalog synthesises for a
+            # chat module that declares nothing (§4.3). A declared `*` would
+            # collide with it and be read as "any model", so it is dropped.
+            _warning(warnings, f"{where}.name: '*' is reserved for the synthesised module default; entry dropped")
+            continue
         if (
             not isinstance(name, str)
             or not name.strip()

@@ -44,6 +44,12 @@ class FakeConnection:
         self.id = connection_id
         self.module_id = module_id
         self.instance_id = instance_id
+        # The transport binds this from the verified key, never from anything
+        # the peer sent (`transport/server.py::_bind_device_identity`).
+        # `App.register_module` compares it against `module#instance` in the
+        # manifest and fails closed when it is missing (review D1), so a fake
+        # connection has to carry the same value a paired one would.
+        self.device_id: str | None = f"{module_id}#{instance_id}"
         self.crypto = type("Crypto", (), {"remote_fingerprint": fingerprint})()
         self.frames: list[dict[str, Any]] = []
 

@@ -306,6 +306,18 @@ def install_components(app: App, strict: bool) -> set[str]:
             install(app)
             present.add(name)
 
+    # Components install in **alphabetical order**, so `admin` (which installs
+    # first) cannot see `audit_writer`/`approvals` when its context is built:
+    # `audit` and `policy` install after it. Without this second pass
+    # `AdminContext.audit`/`.approvals` stayed `None` forever — the audit page
+    # was always empty and `/admin/api/approvals/decide` always answered 501
+    # (review D2). Only here does anything know every `install()` has run.
+    # `bind_ports` is idempotent and never overwrites a port a test injected.
+    admin = getattr(app, "admin", None)
+    bind_ports = getattr(admin, "bind_ports", None)
+    if callable(bind_ports):
+        bind_ports(app)
+
     missing = REQUIRED - present
     if missing and strict:
         raise SystemExit(f"missing core components: {sorted(missing)}")

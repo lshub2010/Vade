@@ -16,6 +16,11 @@ What is enforced here (order matters, first failure wins, nothing lands):
 6. secret scan              -> INVALID_ARGUMENT
 7. frontmatter / body size  -> MANIFEST_INVALID
 
+Step 2 is not intake-only: `meta`, `state`, `approve`, `reject` and `rollback`
+all run the same `_target_dir` guard before they touch a path, because every
+one of them turns a caller-supplied name into `skills/.../name`. A guard that
+only covers `submit` protects the one caller that already validates its payload.
+
 `base_revision` is the revision the author wrote against: the ACTIVE revision in
 `<data_dir>/skills/<name>/meta.json`. A pending proposal never advances it, so
 two proposals against revision 3 both say 3 and the second supersedes the first
@@ -28,6 +33,8 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -72,6 +79,38 @@ _SECRETS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("sk- key", re.compile(r"sk-[A-Za-z0-9_\-]{4,}")),
     ("private key", re.compile(r"BEGIN [A-Z ]*PRIVATE KEY")),
 )
+
+#: Mirror of `skills.reserved_names` in the loader contract. `pending` matches
+#: C-13's name pattern and is also the pending root itself: a proposal by that
+#: name would land in `skills/pending/pending`, and approving it would rename
+#: `skills/pending` (every other proposal) into `.trash`.
+_RESERVED_NAMES = frozenset({"pending", ".history", ".trash", ".rejected"})
+
+_COMPONENT_TOKENS: tuple[tuple[str, str], ...] = (
+    ("/", "a slash"), ("\\", "a backslash"), ("\x00", "a NUL"),
+)
+
+
+def _bad_component(name: Any) -> str:
+    """Why `name` cannot be one directory under `skills/pending/` ('' = fine).
+
+    A name is a single path component or it is nothing: `..` anywhere (not just
+    as a segment) is refused so `foo..bar` and `../../core.toml` fail the same
+    way, and dots are refused in the leading position so `.`/`..hidden` cannot
+    name a dot-directory the loader skips.
+    """
+    if not isinstance(name, str) or not name:
+        return "name is empty"
+    if name.startswith("."):
+        return "name may not start with a dot"
+    if ".." in name:
+        return "name may not contain '..'"
+    for token, label in _COMPONENT_TOKENS:
+        if token in name:
+            return f"name may not contain {label}"
+    if name in _RESERVED_NAMES:
+        return f"name {name!r} is reserved for the skill store"
+    return ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,19 +404,32 @@ class ProposalService:
 
     # ------------------------------------------------------------------ paths
     def _target_dir(self, name: str) -> Path:
-        if (not name or name.startswith(".") or "/" in name or "\\" in name
-                or ".." in name or "\x00" in name):
-            raise VadeError("PERMISSION_DENIED",
-                            "proposal name may not contain a path component")
+        """`skills/pending/<name>`, or PERMISSION_DENIED before anything else.
+
+        Every entry point that turns a name into a path calls this first: the
+        intake (`submit`/`validate`), the read side (`meta`, `state`) and the
+        review side (`approve`, `reject`, `rollback`). `reject("../../x")` used
+        to reach `SkillLoader.reject`, which is a rename of whatever directory
+        the name resolved to.
+        """
+        reason = _bad_component(name)
+        if reason:
+            raise VadeError("PERMISSION_DENIED", f"proposal {reason}")
         target = self.pending_root / name
+        self._assert_inside(target, self.pending_root)
+        return target
+
+    @staticmethod
+    def _assert_inside(target: Path, root: Path) -> None:
+        """`realpath` containment: a symlinked leaf must not point outside."""
         try:
-            root_real = os.path.realpath(self.pending_root)
+            root_real = os.path.realpath(root)
             target_real = os.path.realpath(target)
         except OSError as exc:  # pragma: no cover - unreadable data dir
-            raise VadeError("PERMISSION_DENIED", f"cannot resolve the pending path: {type(exc).__name__}") from exc
-        if target_real != root_real and not target_real.startswith(root_real + os.sep):
+            raise VadeError("PERMISSION_DENIED",
+                            f"cannot resolve the pending path: {type(exc).__name__}") from exc
+        if target_real == root_real or not target_real.startswith(root_real.rstrip(os.sep) + os.sep):
             raise VadeError("PERMISSION_DENIED", "proposal path escapes skills/pending/")
-        return target
 
     # ----------------------------------------------------------------- submit
     def submit(self, params: Mapping[str, Any], *, connection: Any = None,
@@ -386,7 +438,6 @@ class ProposalService:
         sender = received_from if received_from is not None else self._identity(connection)
         proposal = self.validate(params, received_from=sender)
         target = self._target_dir(proposal.name)
-        self._supersede(target)
         self._write(proposal, target)
         self._reload()
         payload = {
@@ -410,17 +461,42 @@ class ProposalService:
         return payload
 
     def _supersede(self, target: Path) -> None:
-        """One pending file per name: the old one is kept as `*.superseded`."""
+        """One pending file per name: the old one is kept as `*.superseded`.
+
+        Only ever called *after* the replacement is fully written (`_write`):
+        the old bytes stay readable at `SKILL.md.superseded` for the whole
+        operation, so no window exists where this proposal has neither a
+        complete old nor a complete new file. `SkillLoader.approve` parks these
+        files in `.trash` before the directory is promoted, so they never reach
+        `skills/<name>/`.
+        """
         if not target.is_dir():
             return
         for filename in ("SKILL.md", "meta.json"):
             path = target / filename
-            if path.is_file():
+            if path.is_file() or path.is_symlink():
                 os.replace(path, target / f"{filename}.superseded")
 
     def _write(self, proposal: SkillProposal, target: Path) -> None:
+        """Land the new snapshot, then retire the old one.
+
+        Order matters twice over:
+
+        1. the new bytes are written *and fsynced* into `.staging-*` before the
+           previous files move to `*.superseded` — a failed write therefore
+           leaves the old proposal exactly where it was;
+        2. the swap is undone if it fails part-way, so a half-written pair
+           (`SKILL.md` new, `meta.json` old) never becomes the pending state.
+
+        The first version of this method did the rename first: one ENOSPC wiped
+        a proposal no reviewer had seen yet, and `state()` then reported
+        `missing` for a name that had a proposal a second earlier.
+        """
         target.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(target, 0o700)
+        self._assert_inside(target, self.pending_root)
+        for stale in target.glob(".staging-*"):     # a crash left one behind
+            shutil.rmtree(stale, ignore_errors=True)
         meta = {
             "name": proposal.name,
             "revision": proposal.revision,
@@ -433,9 +509,44 @@ class ProposalService:
             "received_from": proposal.received_from or None,
             "sha256": proposal.sha256,
         }
-        _atomic_write(target / "SKILL.md", proposal.content.encode("utf-8"))
-        _atomic_write(target / "meta.json",
-                      (json.dumps(meta, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        payload: dict[str, bytes] = {
+            "SKILL.md": proposal.content.encode("utf-8"),
+            "meta.json": (json.dumps(meta, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        }
+        staging = target / f".staging-{secrets.token_hex(4)}"
+        staging.mkdir(mode=0o700)
+        try:
+            for filename, data in payload.items():
+                _atomic_write(staging / filename, data)
+            moved: list[str] = []
+            try:
+                self._supersede(target)
+                for filename in payload:
+                    os.replace(staging / filename, target / filename)
+                    moved.append(filename)
+            except OSError:
+                # Covers a failure in either half: `_supersede` moving the old
+                # files aside, or the swap bringing the new ones in.
+                self._restore(target, payload, moved)
+                raise
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    @staticmethod
+    def _restore(target: Path, payload: Mapping[str, bytes], moved: Iterable[str]) -> None:
+        """Undo a failed swap: the old snapshot wins, the new bytes are dropped."""
+        for filename in payload:
+            backup = target / f"{filename}.superseded"
+            live = target / filename
+            try:
+                if backup.exists():
+                    os.replace(backup, live)
+                elif filename in moved and live.exists():
+                    live.unlink()
+            except OSError as exc:      # pragma: no cover - restore is best effort
+                log.error("skill proposal restore failed",
+                          extra={"event": "skill.proposal.restore_failed",
+                                 "file": filename, "error": type(exc).__name__})
 
     def _reload(self) -> None:
         reload = getattr(self.loader, "reload", None)
@@ -457,7 +568,7 @@ class ProposalService:
 
     # -------------------------------------------------------------- review api
     def meta(self, name: str) -> dict[str, Any]:
-        path = self.pending_root / name / "meta.json"
+        path = self._target_dir(name) / "meta.json"
         if not path.is_file():
             return {}
         try:
@@ -466,17 +577,40 @@ class ProposalService:
             return {}
         return dict(data) if isinstance(data, Mapping) else {}
 
+    def _rejected_at(self, name: str) -> int | None:
+        """Newest rejection stamp for exactly `name`, or None.
+
+        `.rejected/<name>-<epoch>[-<n>]` is what `SkillLoader._move_to` writes,
+        so the name is matched with both delimiters intact. `startswith(name +
+        '-')` used to make `foo` inherit `foo-bar`'s rejection — the two skills
+        are unrelated and only one of them was ever reviewed.
+        """
+        directory = self.skills_dir / ".rejected"
+        if not directory.is_dir():
+            return None
+        pattern = re.compile(rf"^{re.escape(name)}-(\d+)(?:-\d+)?$")
+        stamps = [int(match.group(1))
+                  for match in (pattern.fullmatch(entry.name) for entry in directory.iterdir())
+                  if match is not None]
+        return max(stamps) if stamps else None
+
     def state(self, name: str) -> str:
-        """`pending` while the directory exists, then whatever the loader decided."""
-        if (self.pending_root / name).is_dir():
+        """`pending` while the directory exists, then what the loader decided.
+
+        Precedence: pending -> approved -> rejected -> missing. The active skill
+        is checked *before* a rejection on purpose: `.rejected/` is append-only,
+        so after "reject -> resubmit -> approve" the old rejection directory is
+        still there and answering from it would report a live skill as rejected
+        forever. A rejection therefore only describes a name that has nothing
+        active — which is also the only case where it is actionable.
+        """
+        target = self._target_dir(name)
+        if target.is_dir():
             return PENDING
-        if (self.skills_dir / ".rejected").is_dir():
-            for entry in (self.skills_dir / ".rejected").iterdir():
-                if entry.name.startswith(f"{name}-"):
-                    return REJECTED
-        active = self._active(self.loader, name)
-        if active is not None:
+        if self._active(self.loader, name) is not None:
             return APPROVED
+        if self._rejected_at(name) is not None:
+            return REJECTED
         return MISSING
 
 
@@ -496,10 +630,11 @@ class ProposalReview:
 
     def approve(self, name: str, *, actor: str = "admin") -> SkillState:
         service = self.service
+        target = service._target_dir(name)      # PERMISSION_DENIED before any read
         meta = service.meta(name)
         if not meta:
             raise VadeError("NOT_FOUND", f"no pending proposal named {name!r}")
-        path = service.pending_root / name / "SKILL.md"
+        path = target / "SKILL.md"
         try:
             current = _sha(path.read_text(encoding="utf-8"))
         except OSError as exc:
@@ -507,6 +642,8 @@ class ProposalReview:
         if meta.get("sha256") and current != meta.get("sha256"):
             # Edited after intake: that is a new proposal, not an approval. An
             # approval would otherwise bless bytes no reviewer ever saw.
+            # `SkillLoader.approve` repeats the check for callers that skip this
+            # wrapper (the admin API calls the loader directly).
             raise VadeError("TOOL_CONFLICT",
                             f"pending content for {name!r} changed since intake; resubmit the proposal")
         approved = service.loader.approve(name)
@@ -516,7 +653,8 @@ class ProposalReview:
 
     def reject(self, name: str, *, reason: str = "", actor: str = "admin") -> None:
         service = self.service
-        if not (service.pending_root / name).is_dir():
+        target = service._target_dir(name)      # PERMISSION_DENIED before any move
+        if not target.is_dir():
             raise VadeError("NOT_FOUND", f"no pending proposal named {name!r}")
         service.loader.reject(name, reason)
         service._audit("skill.proposal.rejected", name=name, actor=actor,
@@ -524,6 +662,7 @@ class ProposalReview:
 
     def rollback(self, name: str, revision: int, *, actor: str = "admin") -> SkillState:
         service = self.service
+        service._target_dir(name)               # the name reaches `skills/<name>/`
         state = service.loader.rollback(name, int(revision))
         service._audit("skill.proposal.rolled_back", name=name, revision=state.revision,
                        from_revision=int(revision), actor=actor, ok=True)

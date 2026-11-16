@@ -111,6 +111,32 @@ def test_l0_budget_drops_whole_lines_never_name_only() -> None:
     assert all(": " in line and len(line) > 20 for line in kept)
 
 
+def test_l0_priority_is_activated_then_hit_count_then_name() -> None:
+    """docs/agents/23 §T3: `(激活优先, hit_count 降序, name 字典序)` decides the cut."""
+    class Row:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.description = "d" * 40
+            self.marker = ""
+
+    rows = [Row("alpha"), Row("beta"), Row("gamma")]
+
+    # 120 chars: header + one 49-char line. The activated skill wins outright.
+    text, dropped = render_catalog(rows, ["gamma"], token_budget=30, hits={"beta": 9})
+    assert [line.split(":")[0] for line in text.splitlines()[1:]] == ["- gamma"]
+    assert dropped == ("alpha", "beta")
+
+    # 160 chars: activation, then the trigger hit count (beta over alpha).
+    text, dropped = render_catalog(rows, ["gamma"], token_budget=40, hits={"beta": 2})
+    assert [line.split(":")[0] for line in text.splitlines()[1:]] == ["- beta", "- gamma"]
+    assert dropped == ("alpha",)
+
+    # No hits: the remainder falls back to name order, byte-stable.
+    text, dropped = render_catalog(rows, [], token_budget=40)
+    assert [line.split(":")[0] for line in text.splitlines()[1:]] == ["- alpha", "- beta"]
+    assert dropped == ("gamma",)
+
+
 def test_l1_budget_cuts_from_the_priority_tail_and_marks_truncated() -> None:
     class Row:
         def __init__(self, name: str) -> None:
@@ -124,6 +150,28 @@ def test_l1_budget_cuts_from_the_priority_tail_and_marks_truncated() -> None:
     assert dropped == ("gamma",)
     assert "truncated" in text
     assert len(text) <= 9000
+
+
+def test_render_bodies_never_embeds_the_absolute_skill_path() -> None:
+    """The prompt must not disclose the host's data-dir layout."""
+    class Row:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.body = "b" * 6000
+            self.path = f"/home/alice/.vade/data/skills/{name}/SKILL.md"
+
+    text, injected, dropped = render_bodies([Row("alpha")], ["alpha"], budget_chars=1000)
+    assert injected == ("alpha",) and dropped == ()
+    assert "truncated" in text
+    assert "/home/alice" not in text and "/data/skills" not in text
+
+
+def test_a_truncated_body_hint_hands_out_a_relative_reference(tmp_path: Path) -> None:
+    write_skill(tmp_path, "long", body_suffix="y" * 12_000)
+    loader = make_loader(tmp_path)
+    parts = loader.render(_parts("@long"))
+    assert "use fs to read long/SKILL.md" in parts.skill_bodies
+    assert str(tmp_path) not in parts.skill_bodies
 
 
 def test_secret_warning_does_not_rewrite_the_body(tmp_path: Path) -> None:

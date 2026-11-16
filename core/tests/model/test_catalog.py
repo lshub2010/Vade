@@ -124,6 +124,16 @@ def test_a_field_the_schema_rejected_cannot_poison_the_entry():
     assert specs[0].input_modalities == ("text",)
 
 
+def test_a_declared_star_model_name_is_dropped_before_it_collides():
+    """`*` is the synthesised module default (§4.3), never a declared model."""
+    from vade.llm.capabilities import parse_models
+
+    warnings: list[str] = []
+    specs = parse_models([{"name": "*"}, {"name": " * "}, {"name": "real"}], warnings=warnings)
+    assert [spec.name for spec in specs] == ["real"]
+    assert sum("'*' is reserved" in warning for warning in warnings) == 2
+
+
 def test_a_chat_module_that_declares_nothing_appears_as_a_star_entry(tmp_path):
     """`capabilities.models` omitted != "serves no model" (§4.3)."""
     registry = registry_of(

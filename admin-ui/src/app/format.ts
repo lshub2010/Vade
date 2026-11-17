@@ -40,3 +40,11 @@ export function formatFingerprint(fp8: string | null): string {
 export function shortId(id: string): string {
   return id.length > 28 ? `${id.slice(0, 12)}…${id.slice(-8)}` : id;
 }
+
+/** 剩余秒数 → `9:58`。倒计时与绑定票共用一种写法。 */
+export function formatCountdown(totalSeconds: number): string {
+  const safe = Math.max(0, Math.floor(totalSeconds));
+  const minutes = Math.floor(safe / 60);
+  const seconds = safe % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}

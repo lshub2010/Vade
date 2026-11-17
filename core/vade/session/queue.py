@@ -15,12 +15,15 @@ Guarantees:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import OrderedDict, deque
 from dataclasses import replace
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError
 from .models import Message, QueueItem, Turn, TurnState, message_ref, new_id, now_ms
+
+_log = logging.getLogger(__name__)
 
 __all__ = ["TurnQueue"]
 
@@ -392,8 +395,11 @@ class TurnQueue:
             if self._pre_terminal_hook is not None:
                 try:
                     await self._pre_terminal_hook(turn.id, state, reason)
-                except Exception:  # pragma: no cover - a hook must not block finalization
-                    pass
+                except Exception:  # a hook must not block finalization…
+                    # …but never silently: a signature drift here once disabled
+                    # every approval close on interrupt (caught only by tests).
+                    _log.warning("pre-terminal hook failed for turn %s", turn.id,
+                                 exc_info=True)
             if state is not TurnState.COMPLETED or turn.state is not TurnState.COMPLETED:
                 turn = turn.with_state(state, ended_at=turn.ended_at or self._clock())
             if usage is not None:

@@ -1450,7 +1450,9 @@ class SessionLog:
 
         return hook
 
-    async def _input_pre_terminal(self, turn_id: str, state: TurnState) -> None:
+    async def _input_pre_terminal(
+        self, turn_id: str, state: TurnState, reason: str | None = None,
+    ) -> None:
         """RFC-0008 S5: close pending inputs before the terminal event is written.
 
         `TurnQueue._finalize` awaits this first, so a dialog is never left open
@@ -1460,7 +1462,11 @@ class SessionLog:
         resolver: Any = getattr(port, "resolve_turn", None)
         if not callable(resolver):
             return
-        if state is TurnState.INTERRUPTED:
+        if reason == "shutdown":
+            # RFC-0008 close-order table: a session going away closes its dialogs
+            # as `session_closed`, not as an ordinary turn interrupt.
+            reason, target = "session_closed", "interrupted"
+        elif state is TurnState.INTERRUPTED:
             reason, target = "turn_interrupted", "interrupted"
         elif state is TurnState.CANCELLED:
             reason, target = "session_closed", "interrupted"
@@ -1472,6 +1478,7 @@ class SessionLog:
 
     async def _approval_pre_terminal(
         self, session_id: str, turn_id: str, state: TurnState,
+        reason: str | None = None,
     ) -> None:
         """Close every approval dialog still open on a turn that is ending.
 

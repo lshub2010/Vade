@@ -150,6 +150,36 @@ def test_reject_moves_pending_to_rejected(tmp_path: Path) -> None:
     assert list((tmp_path / ".rejected").iterdir())
 
 
+def test_rejected_ttl_purges_stale_entries_on_reload(tmp_path: Path) -> None:
+    """C-11 / design §16.5: `.rejected/<name>-<ts>/` is cleaned after 7 days.
+
+    The clock starts at **rejection**, not at intake: a proposal can sit in
+    `pending/` for weeks, so `reject()` stamps the moved directory's mtime
+    (a bare rename would carry the old pending mtime over). A fresh rejection
+    must survive the same pass.
+    """
+    loader = make_loader(tmp_path)
+    for name in ("kb-guide", "other-guide"):
+        source = InstallSource("text", text=_text(name))
+        loader.install(source, loader.preview(source).preview_token)
+    old = 1_700_000_000
+    for name in ("kb-guide", "other-guide"):
+        os.utime(tmp_path / "pending" / name, (old, old))
+
+    loader.reject("kb-guide", "not wanted")
+    loader.reject("other-guide", "not wanted either")
+
+    stale = next(p for p in (tmp_path / ".rejected").iterdir() if p.name.startswith("kb-guide-"))
+    assert stale.stat().st_mtime > old + 86_400, "reject() must stamp the rejection time"
+
+    os.utime(stale, (old, old))
+    loader.reload()
+
+    assert not stale.exists()
+    survivors = [p.name for p in (tmp_path / ".rejected").iterdir()]
+    assert len(survivors) == 1 and survivors[0].startswith("other-guide-")
+
+
 def test_install_refuses_a_reserved_name(tmp_path: Path) -> None:
     """C-11: "Reserved install directories are not legal names" — `pending` fits
     the name pattern and is also the pending root."""

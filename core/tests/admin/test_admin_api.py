@@ -13,6 +13,7 @@ import pytest
 
 from vade.admin.app import create_admin_app, login_message
 from vade.admin import setup_token
+from vade.admin.devices import DeviceStore
 from vade.errors import VadeError
 from vade.identity.pairing import PairingStore
 from vade.registry.api import RegistryAPI
@@ -360,6 +361,34 @@ def test_device_list_never_returns_public_keys(ctx, app):
         [item] = response.json()["items"]
         assert "pubkey" not in item
         assert len(item["fp8"]) == 16
+        # §7.12.3 ③: the self-claim and "not verified" travel together so the UI
+        # can label the row without guessing from a missing key.
+        assert item["hardware_backed"] is True and item["attested"] is False
+
+    asyncio.run(scenario())
+
+
+def test_attested_is_persisted_false_and_survives_a_reload(ctx, app):
+    """design §7.12.3 ③ stores `{hardware_backed, attested:false}`.
+
+    `attested` must be on disk (not inferred from absence): the field is what
+    tells the UI a row is a device's own claim, and it is never an auth input.
+    """
+    async def scenario():
+        device, key = new_device(ctx, hardware_backed=True)
+        assert device.attested is False
+        path = ctx.config.data_dir / "admin" / "devices.json"
+        [entry] = json.loads(path.read_text(encoding="utf-8"))["devices"]
+        assert entry["hardware_backed"] is True
+        assert entry["attested"] is False
+
+        reloaded = DeviceStore(path).get(device.device_id)
+        assert reloaded is not None and reloaded.attested is False
+
+        client = client_for(app)
+        token = (await login_with_device(client, ctx, device, key)).json()["access_token"]
+        [item] = (await client.get("/admin/api/devices", headers=bearer(token))).json()["items"]
+        assert item["attested"] is False
 
     asyncio.run(scenario())
 

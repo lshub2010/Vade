@@ -1533,13 +1533,13 @@ class SessionLog:
         finalization — `_finalize` already guards the whole hook.
         """
 
-        async def hook(turn_id: str, state: TurnState) -> None:
-            await self._input_pre_terminal(turn_id, state)
+        async def hook(turn_id: str, state: TurnState, reason: str | None = None) -> None:
+            await self._input_pre_terminal(turn_id, state, reason)
             # C-06: no `turn.*` may follow the terminal event, and a dialog left
             # open behind it can never be closed (the tool call is gone; only a
             # 60s deadline would reap it). Publish the deny here, while the
             # tombstone still accepts the event.
-            await self._approval_pre_terminal(session_id, turn_id, state)
+            await self._approval_pre_terminal(session_id, turn_id, state, reason)
             runs: Any = getattr(self, "subagents", None)
             sweep: Any = getattr(runs, "cancel_for_turn", None)
             if callable(sweep):
@@ -1651,18 +1651,24 @@ class SessionLog:
             await asyncio.wait_for(q.drain(), timeout)
 
     async def close(self) -> None:
-        """End every session this process owns, then stop the machinery.
+        """End every turn and session this process owns, then stop the machinery.
 
         Order is contractual and each step needs the one before it alive:
-          1. `app.on_session_end` hooks — C3d's `session.closed` beat and C5a's
+          1. `queue.shutdown()` — every running/queued turn gets its terminal
+             `turn.interrupted{by: system, data.reason: shutdown}` while the
+             store, the sink workers and the seq bus are still up. A client that
+             received `session.closed` before this could never learn its turn
+             ended: the queue was only cancelled, so the row stayed
+             `running`/`queued` and the terminal event was never written.
+             (`_finalize` is the sole terminal writer, so a turn that was
+             interrupted a moment earlier is refused, not written twice.)
+          2. `app.on_session_end` hooks — C3d's `session.closed` beat and C5a's
              grant cleanup. The beat reads the transcript from the store and
              emits onto the seq bus, so it must run while the store is open and
-             the sinks are still attached.
-          2. the RFC-0008 dialog closer — `turn.input_resolved{session_closed}`
+             the sinks are still attached — and AFTER step 1, so its `seq_to`
+             covers the terminal events it now describes.
+          3. the RFC-0008 dialog closer — `turn.input_resolved{session_closed}`
              has to reach the devices before their socket goes away.
-          3. `queue.shutdown()` — cancel the running turn and the worker, and
-             await it, or a worker wake-up can still finalize a turn into a
-             closed store.
           4. `detach()` — stop the sink workers, drop the connections.
           5. the store — last, it is what everything above wrote through.
 
@@ -1672,10 +1678,11 @@ class SessionLog:
         if self._closed:
             return
         self._closed = True
-        for session_id in list(dict.fromkeys([*self._queues, *self._sinks])):
-            await self._end_session(session_id)
+        session_ids = list(dict.fromkeys([*self._queues, *self._sinks]))
         for q in list(self._queues.values()):
             await q.shutdown()
+        for session_id in session_ids:
+            await self._end_session(session_id)
         for session_id in list(self._sinks):
             await self.detach(session_id)
         close = getattr(self.store, "close", None)

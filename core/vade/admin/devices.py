@@ -57,6 +57,7 @@ class DeviceStore:
         self._wall = wall
         self._lock = threading.RLock()
         self._devices: dict[str, Device] | None = None
+        self._revoked: set[str] | None = None
         self._version = 0
 
     # ------------------------------------------------------------------ storage
@@ -80,15 +81,23 @@ class DeviceStore:
                         continue
                     items[device.device_id] = device
             self._devices = items
+            self._revoked = {str(item) for item in doc.get("revoked", []) if item}
             self._version = int(doc.get("version", 0)) if isinstance(doc, dict) else 0
             return items
 
     def _save(self) -> None:
         assert self._devices is not None
+        assert self._revoked is not None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(self.path.parent, 0o700)
         self._version += 1
-        doc = {"version": self._version, "devices": [asdict(d) for d in self._devices.values()]}
+        doc = {
+            "version": self._version,
+            "devices": [asdict(d) for d in self._devices.values()],
+            # Revoked keys stay on disk (§7.12.3 ④d): popping the entry alone
+            # would let the same key re-bind with a fresh ticket.
+            "revoked": sorted(self._revoked),
+        }
         tmp = self.path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
@@ -119,6 +128,16 @@ class DeviceStore:
     def is_active(self, device_id: str) -> bool:
         return device_id in self._load()
 
+    def is_revoked(self, pubkey: bytes) -> bool:
+        """True iff this exact key was revoked before (survives restarts).
+
+        `POST /admin/bind` refuses it with the generic 401 (§7.12.3 ④d);
+        `add()` refuses it too so the step-up API cannot re-enrol it either.
+        """
+        self._load()
+        assert self._revoked is not None
+        return hashlib.sha256(pubkey).hexdigest()[:16] in self._revoked
+
     # ------------------------------------------------------------------ mutation
     def add(self, *, pubkey_b64: str, alg: str, label: str, ip: str | None,
             hardware_backed: bool = False) -> Device:
@@ -128,6 +147,9 @@ class DeviceStore:
                 raise VadeError("BIND_DEVICE_LIMIT", f"at most {self.max_devices} devices per account")
             raw = base64.b64decode(pubkey_b64 + "=" * (-len(pubkey_b64) % 4))
             device_id = hashlib.sha256(raw).hexdigest()[:16]
+            assert self._revoked is not None
+            if device_id in self._revoked:
+                raise VadeError("INVALID_ARGUMENT", "this public key has been revoked")
             if device_id in devices:
                 raise VadeError("INVALID_ARGUMENT", "this public key is already registered")
             device = Device(
@@ -147,6 +169,8 @@ class DeviceStore:
             if device_id not in devices:
                 return False
             devices.pop(device_id)
+            assert self._revoked is not None
+            self._revoked.add(device_id)
             self._save()
             return True
 

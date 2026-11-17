@@ -49,7 +49,7 @@ class TurnQueue:
         max_pending: int = 100,
         clock: Callable[[], int] = now_ms,
         resolve_model: Callable[[Turn], tuple[str | None, str | None]] | None = None,
-        pre_terminal_hook: Callable[[str, TurnState], Awaitable[Any]] | None = None,
+        pre_terminal_hook: Callable[[str, TurnState, "str | None"], Awaitable[Any]] | None = None,
         partial_provider: Callable[[str], str] | None = None,
     ) -> None:
         self.session_id = session_id
@@ -182,7 +182,10 @@ class TurnQueue:
 
     async def _run_loop(self) -> None:
         try:
-            while self._pending:
+            # `_stopped` in the condition: `shutdown()` empties `_pending` and
+            # finalizes each turn, but a worker resumed in between must never
+            # dequeue one and announce `turn.started` after its terminal event.
+            while self._pending and not self._stopped:
                 item = self._pending.popleft()
                 await self._run_one(item)
         finally:
@@ -314,6 +317,7 @@ class TurnQueue:
         task: asyncio.Task[Any] | None = None,
         usage: Mapping[str, Any] | None = None,
         data: Mapping[str, Any] | None = None,
+        reason: str | None = None,
     ) -> None:
         if self.is_finalized(turn.id):
             return
@@ -326,10 +330,12 @@ class TurnQueue:
             # RFC-0008 S5: a pending `turn.input_resolved` must be written BEFORE the
             # turn's terminal event, or the dialog is left open forever (C-06 forbids
             # any `turn.*` after `turn.interrupted`). This is the only place a turn
-            # ends, so the hook lives here rather than at each caller.
+            # ends, so the hook lives here rather than at each caller. `reason`
+            # tells the hook *why* the turn is ending (`shutdown` closes dialogs
+            # as `session_closed`, per RFC-0008's close-order table).
             if self._pre_terminal_hook is not None:
                 try:
-                    await self._pre_terminal_hook(turn.id, state)
+                    await self._pre_terminal_hook(turn.id, state, reason)
                 except Exception:  # pragma: no cover - a hook must not block finalization
                     pass
             if state is not TurnState.COMPLETED or turn.state is not TurnState.COMPLETED:
@@ -387,7 +393,8 @@ class TurnQueue:
         )
 
     async def _finalize_interrupted(self, turn: Turn, *, by: str,
-                                    task: asyncio.Task[Any] | None = None) -> None:
+                                    task: asyncio.Task[Any] | None = None,
+                                    reason: str | None = None) -> None:
         text, message = self._partial_message(turn.id)
         # RFC-0006 §4.3 + schema/events.json: `partial_message_id` is a
         # `msg:<hex>` pointer, the same scheme as `result_ref` — a bare hex id
@@ -399,11 +406,18 @@ class TurnQueue:
             "partial_message_id": pointer,
             "partial_chars": len(text),
         }
+        if reason is not None:
+            # `data.reason` is the machine answer to "who stopped this turn":
+            # `reconcile_unfinished_turns` already writes `restart` this way, so
+            # a shutdown writes `shutdown` and a client can tell the two apart.
+            payload["data"] = {"reason": reason}
+            turn = replace(turn, stopped_reason=reason)
         if message is not None:
             turn = turn.with_state(TurnState.INTERRUPTED, partial_message_id=pointer)
         await self._finalize(
             turn, TurnState.INTERRUPTED, payload,
             messages=[message] if message is not None else (), task=task,
+            reason=reason,
         )
 
     # ------------------------------------------------------------------ cancel flag
@@ -524,19 +538,36 @@ class TurnQueue:
             await asyncio.shield(worker)
 
     async def shutdown(self) -> None:
-        """Stop every task this queue owns; terminal and idempotent.
+        """Terminate every turn this queue owns, THEN stop every task.
 
-        The worker is awaited (as a cancelled task) so the caller — `close()` —
-        returns with the queue actually stopped. Without the join the worker
-        was free to wake up after `store.close()` and write one more terminal
-        event into a closed database. The turn tasks are cancelled but NOT
-        awaited: a module that ignores `tools/cancel` would otherwise hold up
-        process shutdown, and `_consume_orphan` already swallows whatever it
-        returns (`interrupt` arms that callback for exactly this reason).
+        Order is contractual. A turn is given its terminal `turn.interrupted`
+        while the store, the sinks and the seq bus are still up — `close()`
+        calls this before `session.closed`, before `detach()` and before the
+        store closes — and only then is its task cancelled. Cancelling first
+        (the old order) killed the turn before `_execute_one` could resume, so
+        a client that had already received `session.closed` waited forever for
+        a terminal `turn.*` that never came. `_finalize` is the only terminal
+        writer, so "exactly one" holds even when an `interrupt` — or the
+        worker waking up on the cancelled task — races this method.
+
+        The worker is awaited (as a cancelled task) so the caller returns with
+        the queue actually stopped: without the join the worker was free to
+        wake up after `store.close()` and write one more terminal event into a
+        closed database. The turn tasks are cancelled but NOT awaited: a module
+        that ignores `tools/cancel` would hold up process shutdown, and
+        `_consume_orphan` already swallows whatever it returns.
+
+        Idempotent: `_stopped` makes the second call a no-op, and every
+        `_finalize` is refused by the `_finalized` marker, so a double shutdown
+        writes no second event.
         """
         if self._stopped:
             return
         self._stopped = True
+        # 1. Terminal states first — the event must exist before the socket
+        #    learns the session is over.
+        await self._terminate_turns()
+        # 2. Then the tasks behind them.
         for task in list(self._turn_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -554,6 +585,51 @@ class TurnQueue:
             # report a worker, not even a dead one.
             if self._worker is worker:
                 self._worker = None
+
+    async def _terminate_turns(self) -> None:
+        """Write `turn.interrupted{by: system, data.reason: shutdown}` per turn.
+
+        The running turn first (it owns the head of the queue and any
+        streamed text), then every queued one in arrival order. Queued turns
+        never reached the router, so they get no `tools/cancel` and no partial
+        message: their row moves `queued -> interrupted` in the same
+        transaction as the event.
+
+        `_pending` is emptied BEFORE the writes: a worker waking up mid-way
+        must not dequeue a turn that is already terminal and announce
+        `turn.started` after its `turn.interrupted` (C-06 forbids any `turn.*`
+        after the terminal one).
+        """
+        running = self._running
+        if running is not None and not self.is_finalized(running.turn_id):
+            task = self._turn_tasks.get(running.turn_id)
+            if task is not None and not task.done():
+                # Same courtesy `interrupt` pays: tell the module to stop
+                # before the turn is closed under it. Sync + non-blocking.
+                if self._cancel_hook is not None:
+                    try:
+                        self._cancel_hook(running.turn_id)
+                    except Exception:  # pragma: no cover - cancel must never raise
+                        pass
+            await self._finalize_interrupted(
+                running.turn, by="system", task=task, reason="shutdown",
+            )
+        queued = list(self._pending)
+        self._pending.clear()
+        for item in queued:
+            if self.is_finalized(item.turn_id):
+                continue
+            turn = replace(item.turn, stopped_reason="shutdown")
+            await self._finalize(
+                turn, TurnState.INTERRUPTED,
+                {"turn_id": item.turn_id, "by": "system",
+                 "state": TurnState.INTERRUPTED.value,
+                 "partial_message_id": None, "partial_chars": 0},
+                data={"reason": "shutdown"}, reason="shutdown",
+            )
+            # A queued turn has no executor task: `_finalize` saw `task=None`
+            # and armed `_release_pending` for a task that will never exist.
+            self._forget_turn(item.turn_id)
 
     def _consume_orphan(self, task: asyncio.Task[Any]) -> None:
         """A module that ignores tools/cancel leaves a orphan task: swallow it."""

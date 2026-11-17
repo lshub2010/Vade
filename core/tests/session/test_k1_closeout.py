@@ -22,6 +22,7 @@ left behind:
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from typing import Any
 
 import pytest
@@ -404,13 +405,21 @@ class _FakeInputPort:
         self.sessions.append(session_id)
 
 
-def test_close_runs_hooks_dialogs_queue_then_detach_and_is_idempotent(tmp_path):
+def test_close_terminates_turns_then_runs_hooks_dialogs_then_detach(tmp_path):
+    """Order: turn terminals → `session.closed` hooks → dialog sweep → detach.
+
+    The queue used to be shut down LAST, so every client received
+    `session.closed` while its turn was still `running`: no terminal `turn.*`
+    ever followed and the device waited forever.
+    """
+
     async def scenario():
         executor = GateExecutor()
         log = _log(tmp_path, executor, max_pending=4)
         session = log.create_session()
         order: list[str] = []
         attached_during_hook: list[int] = []
+        states_during_hook: list[str] = []
         seen: list[str] = []
 
         def sync_hook(session_id: str) -> None:
@@ -419,6 +428,10 @@ def test_close_runs_hooks_dialogs_queue_then_detach_and_is_idempotent(tmp_path):
             # The end beat reads the store and emits onto the seq bus: the sink
             # must still be there, so hooks run before `detach`.
             attached_during_hook.append(log.attached_count(session_id))
+            # And the turn must already be terminal, or the beat describes a
+            # session whose turn can never end.
+            row = log.store.load(session_id)
+            states_during_hook.extend(t.state.value for t in (row.turns if row else ()))
 
         async def async_hook(session_id: str) -> None:
             order.append("hook:async")
@@ -444,30 +457,39 @@ def test_close_runs_hooks_dialogs_queue_then_detach_and_is_idempotent(tmp_path):
         log.store.close = lambda: (closes.append(1), original_close())  # type: ignore[method-assign]
 
         await log.close()
-        assert order == ["hook:sync", "hook:async", "dialog", "shutdown"]
+        assert order == ["shutdown", "hook:sync", "hook:async", "dialog"]
         assert seen == [session.id, session.id]
         assert attached_during_hook == [1]
         assert input_port.sessions == [session.id]
         assert log.attached_count(session.id) == 0
         assert queue._worker is None and queue._stopped is True
         assert closes == [1]
+        # The turn was already terminal when the hooks ran: `session.closed`
+        # describes a session whose turn ended, not one still running.
+        assert states_during_hook == [TurnState.INTERRUPTED.value]
 
         # A second close (a transport teardown racing app shutdown) must not
         # re-publish the beat or touch the already-closed store.
         await log.close()
-        assert order == ["hook:sync", "hook:async", "dialog", "shutdown"]
+        assert order == ["shutdown", "hook:sync", "hook:async", "dialog"]
         assert closes == [1]
 
     asyncio.run(scenario())
 
 
 def test_close_does_not_respawn_the_worker_for_a_pending_turn(tmp_path):
-    """`_run_loop`'s `finally` used to start a new worker right after cancel."""
+    """`_run_loop`'s `finally` used to start a new worker right after cancel.
+
+    The queued turn is no longer left behind either: `close()` terminates it
+    (`turn.interrupted{reason: shutdown}`) instead of dropping it silently.
+    """
 
     async def scenario():
         executor = GateExecutor()
         log = _log(tmp_path, executor, max_pending=2)
         session = log.create_session()
+        sink = CollectSink()
+        await log.attach(session.id, None, sink)
         first, _ = await log.submit(session.id, [{"type": "text", "text": "one"}], "s1")
         assert await wait_until(lambda: log.queue_state(session.id)["running"] == first.id)
         second, _ = await log.submit(session.id, [{"type": "text", "text": "two"}], "s2")
@@ -479,9 +501,20 @@ def test_close_does_not_respawn_the_worker_for_a_pending_turn(tmp_path):
 
         assert queue._stopped is True
         assert queue._worker is None
-        # The store is closed now, so assert the in-memory queue state instead of
-        # re-reading events: the queued turn must still be pending and untouched.
-        assert [item.turn.id for item in queue._pending] == [second.id]
+        # The store is closed now, so assert through the events the attached
+        # sink saw: both turns got exactly one terminal write, and the queued
+        # one is gone from the queue instead of being re-dequeued forever.
+        interrupts = [
+            event for event in sink.events
+            if event["type"] == "turn.interrupted"
+            and event["payload"].get("data", {}).get("reason") == "shutdown"
+        ]
+        assert sorted(event["payload"]["turn_id"] for event in interrupts) == sorted(
+            [first.id, second.id]
+        )
+        assert queue._pending == deque()
+        assert queue.state_of(second.id) is None
+        assert {first.id, second.id} <= set(queue._finalized)
         queue.ensure_worker()
         assert queue._worker is None
 

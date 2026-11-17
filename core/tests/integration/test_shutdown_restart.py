@@ -1,4 +1,4 @@
-"""Review P0-2: the close path is real, wired and restart-safe.
+"""Review P0-2 + P2-3: the close path is real, wired and restart-safe.
 
 Three separate holes, one file each so a regression names its own bug:
 
@@ -10,6 +10,12 @@ Three separate holes, one file each so a regression names its own bug:
 * `reconcile_restarts()` had no `SQLiteStore.reconcile_unfinished_turns` to
   call: rows a dead process left in `running`/`waiting_*` stayed non-terminal
   forever, advertising a turn that runs for the life of the next process.
+
+Review P2-3 adds the fourth: a graceful `App.shutdown()` only *cancelled* the
+queue, so the turn row stayed `running`/`queued` while `session.closed` was
+published — the client waited forever for a terminal `turn.*`. The shutdown now
+writes `turn.interrupted{by: system, data.reason: shutdown}` for every live turn
+BEFORE the closing beat, and the restart below proves it is not repaired twice.
 
 The tests drive the **real** assembly (`App.startup()` + `install_components()`)
 rather than hand-built objects: a fixture that injects a fake session would
@@ -23,7 +29,7 @@ from typing import Any
 
 from vade.app import App, install_components
 from vade.config import load_config
-from vade.session.models import TERMINAL_STATES, Session, Turn, TurnState, now_ms
+from vade.session.models import Session, Turn, TurnState, now_ms
 from vade.session.sqlite_store import SQLiteStore
 
 from ..session.helpers import CollectSink, GateExecutor, wait_until
@@ -46,6 +52,14 @@ def _closed_beats(app: App, session_id: str) -> int:
     """`session.closed` entries the evolve bus journalled for one session."""
     journal = app.event_bus._journal.get(session_id) or ()
     return sum(1 for entry in journal if entry["topic"] == "session.closed")
+
+
+def _closed_entry(app: App, session_id: str) -> dict[str, Any] | None:
+    journal = app.event_bus._journal.get(session_id) or ()
+    for entry in journal:
+        if entry["topic"] == "session.closed":
+            return dict(entry)
+    return None
 
 
 def test_shutdown_closes_the_session_layer_and_publishes_the_end_beat_once(tmp_path) -> None:
@@ -77,63 +91,91 @@ def test_shutdown_closes_the_session_layer_and_publishes_the_end_beat_once(tmp_p
     asyncio.run(scenario())
 
 
-def test_a_turn_cut_by_shutdown_is_repaired_by_the_next_startup(tmp_path) -> None:
-    """The real crash story: kill mid-turn, restart, the row is `interrupted`.
+def test_shutdown_terminates_live_turns_before_the_closing_beat(tmp_path) -> None:
+    """Review P2-3: a live turn used to be cancelled without a terminal row.
 
-    A cancelled worker stops without writing a terminal row (`_execute_one`
-    never resumes), which is exactly what a killed process leaves behind. The
-    repair therefore has to happen on the NEXT startup — reconcile is the only
-    thing that can see it.
+    `App.shutdown()` only cancelled the queue, so a turn that was `running` (or
+    still `queued` behind it) kept its non-terminal row while `session.closed`
+    went out — the client had no terminal `turn.*` to wait for and hung
+    forever. The terminal event must exist, be exactly one, and take its seq
+    BEFORE the closing beat's `seq_to`.
     """
 
     async def scenario() -> None:
         app = await _boot(tmp_path)
         session = app.session.create_session()
+        sink = CollectSink()
+        await app.session.attach(session.id, None, sink)
         gate = GateExecutor()
         app.session.set_executor(gate)
         turn, _ = await app.session.submit(
             session.id, [{"type": "text", "text": "long job"}], "c1"
         )
         assert await wait_until(lambda: app.session.queue_state(session.id)["running"] == turn.id)
+        # A second turn queued behind it: shutdown must terminate that too, or
+        # the device waits on a row that can never leave `queued`.
+        queued, _ = await app.session.submit(
+            session.id, [{"type": "text", "text": "next"}], "c2"
+        )
+        assert app.session.queue_state(session.id)["pending"][0]["turn_id"] == queued.id
 
         await app.shutdown()
+        await asyncio.sleep(0.05)  # let the sink writer drain its queue
 
-        # What the dead process left on disk: no terminal row, no terminal event.
-        # (Asserted as "non-terminal", not "running": a future `close()` that
-        # finalizes live turns itself is an improvement, and reconcile must
-        # cover it either way.)
-        before = SQLiteStore(tmp_path / "sessions.db")
+        store = SQLiteStore(tmp_path / "sessions.db")
         try:
-            leftover = before.find_turn(session.id, turn.id)
-            assert leftover is not None
-            assert leftover.state not in TERMINAL_STATES
-            assert "turn.interrupted" not in [e.type for e in before.read_since(session.id, 0)]
-            seq_before = before.last_seq(session.id)
-        finally:
-            before.close()
+            stored = store.read_since(session.id, 0)
+            interrupts = [event for event in stored if event.type == "turn.interrupted"]
+            assert [event.payload["turn_id"] for event in interrupts] == [turn.id, queued.id]
+            for event in interrupts:
+                payload = dict(event.payload)
+                assert payload["by"] == "system"       # nobody pressed stop
+                assert payload["state"] == "interrupted"
+                assert payload["data"] == {"reason": "shutdown"}
+            # Seq is the same counter the client replays: contiguous, no gap and
+            # no second write behind the terminal ones.
+            assert [event.seq for event in stored] == list(range(1, len(stored) + 1))
 
-        # Restart on the same data dir: `install()` reconciles before serving.
+            for turn_id in (turn.id, queued.id):
+                row = store.find_turn(session.id, turn_id)
+                assert row is not None
+                assert row.state is TurnState.INTERRUPTED
+                assert row.ended_at is not None
+                assert row.stopped_reason == "shutdown"
+            interrupted_seq = max(event.seq for event in interrupts)
+        finally:
+            store.close()
+
+        # The wire told the same story: the terminal frame reached the attached
+        # device, and it is the last `turn.*` for that turn.
+        assert "turn.interrupted" in sink.types()
+        closed = _closed_entry(app, session.id)
+        assert closed is not None
+        # `session.closed` reports `seq_to = last_seq()`, so a covered terminal
+        # event is exactly what proves the beat came after it.
+        assert closed["seq_to"] >= interrupted_seq
+
+        # Idempotent: the transport teardown racing `App.shutdown` — and a
+        # second queue shutdown — must not write a second terminal event.
+        await app.session.close()
+        await app.session._queues[session.id].shutdown()
+        again = SQLiteStore(tmp_path / "sessions.db")
+        try:
+            events = again.read_since(session.id, 0)
+            assert [e.type for e in events].count("turn.interrupted") == 2
+            seq_after = again.last_seq(session.id)
+        finally:
+            again.close()
+
+        # A restart repairs nothing (both rows are terminal) and writes nothing:
+        # the "interrupted by shutdown" story survives the process.
         restarted = await _boot(tmp_path)
         try:
-            repaired = restarted.session_store.find_turn(session.id, turn.id)
-            assert repaired is not None
-            assert repaired.state is TurnState.INTERRUPTED
-            assert repaired.ended_at is not None
-            assert repaired.stopped_reason == "restart"
-
-            events = restarted.session_store.read_since(session.id, 0)
-            interrupts = [e for e in events if e.type == "turn.interrupted"]
-            assert len(interrupts) == 1
-            payload = dict(interrupts[0].payload)
-            assert payload["turn_id"] == turn.id
-            assert payload["state"] == "interrupted"
-            # `by: "system"`, not "user": nobody pressed stop.
-            assert payload["by"] == "system"
-            assert payload["data"] == {"reason": "restart"}
-            # The terminal event took a real seq on the same counter the
-            # client's replay uses — no gap, no collision.
-            assert interrupts[0].seq == seq_before + 1
-            assert restarted.session_store.last_seq(session.id) == seq_before + 1
+            for turn_id in (turn.id, queued.id):
+                row = restarted.session_store.find_turn(session.id, turn_id)
+                assert row is not None and row.state is TurnState.INTERRUPTED
+                assert row.stopped_reason == "shutdown"
+            assert restarted.session_store.last_seq(session.id) == seq_after
         finally:
             await restarted.shutdown()
 

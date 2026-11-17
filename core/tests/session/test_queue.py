@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 
 import pytest
 
@@ -830,4 +831,73 @@ def test_turn_failed_payload_gains_no_skills(tmp_path):
         assert set(failed[0].payload) == {"turn_id", "code", "message", "state", "usage"}
         assert all(e.type != "turn.completed" for e in events)
         await log.close()
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------- shutdown (P2-3)
+def test_shutdown_terminates_running_and_queued_turns_before_cancelling(tmp_path):
+    """A graceful stop must not leave a `running`/`queued` row behind.
+
+    Order is the whole bug: cancelling the tasks first (the old behaviour) meant
+    `_execute_one` never resumed, so no terminal `turn.*` was ever written while
+    the session's closing beat had already gone out. Every turn gets exactly one
+    `turn.interrupted{by: system, data.reason: shutdown}`, the seq stays
+    contiguous, and a second stop writes nothing.
+    """
+
+    async def scenario():
+        gate = GateExecutor()
+        log = _log(tmp_path, gate)
+        session = log.create_session()
+        sink = CollectSink()
+        await log.attach(session.id, None, sink)
+        first, _ = await log.submit(session.id, [{"type": "text", "text": "one"}], "s1")
+        assert await wait_until(lambda: log.queue_state(session.id)["running"] == first.id)
+        second, _ = await log.submit(session.id, [{"type": "text", "text": "two"}], "s2")
+        third, _ = await log.submit(session.id, [{"type": "text", "text": "three"}], "s3")
+
+        queue = log._queues[session.id]
+        assert [item.turn_id for item in queue._pending] == [second.id, third.id]
+
+        await queue.shutdown()
+        await asyncio.sleep(0.02)  # let the sink writer drain
+
+        events = log.store.read_since(session.id, 0)
+        interrupts = [event for event in events if event.type == "turn.interrupted"]
+        assert [event.payload["turn_id"] for event in interrupts] == [
+            first.id, second.id, third.id,
+        ]
+        for event in interrupts:
+            assert event.payload["by"] == "system"
+            assert event.payload["state"] == "interrupted"
+            assert event.payload["data"] == {"reason": "shutdown"}
+        # Contiguous seq: no gap, no collision with the events before it.
+        assert [event.seq for event in events] == list(range(1, len(events) + 1))
+        # The turn row and the event commit together, and `ended_at` is stamped.
+        for turn_id in (first.id, second.id, third.id):
+            row = log.store.find_turn(session.id, turn_id)
+            assert row is not None and row.state is TurnState.INTERRUPTED
+            assert row.ended_at is not None
+            assert row.stopped_reason == "shutdown"
+            # C-06: the terminal event is the last one for that turn.
+            own = [event for event in events if event.payload.get("turn_id") == turn_id]
+            assert own[-1].type == "turn.interrupted"
+        # The wire carries the terminal frames too, and the queue is empty.
+        assert sink.types().count("turn.interrupted") == 3
+        assert queue._pending == deque()
+        assert queue._running is None
+        assert queue._worker is None and queue._stopped is True
+
+        # Idempotent: a second stop (a transport teardown racing App.shutdown)
+        # must not write a second terminal event.
+        settled = len(log.store.read_since(session.id, 0))
+        await queue.shutdown()
+        assert len(log.store.read_since(session.id, 0)) == settled
+        assert sum(1 for event in log.store.read_since(session.id, 0)
+                   if event.type == "turn.interrupted") == 3
+        # And a stopped queue never starts another worker.
+        queue.ensure_worker()
+        assert queue._worker is None
+        await log.close()
+
     asyncio.run(scenario())

@@ -14,7 +14,8 @@ Boundaries this file keeps (docs/agents/23-C3b-skill-loader.md):
 
 The four directories under the skills root are reserved and never scanned:
 `pending/` (installs + C3d proposals), `.history/` (revisions), `.trash/`
-(uninstall/expiry, restorable), `.rejected/` (rejected proposals).
+(uninstall/expiry, restorable), `.rejected/` (rejected proposals, purged after
+`REJECTED_TTL_DAYS` by directory mtime — C-11's "7 天清理").
 """
 
 from __future__ import annotations
@@ -62,6 +63,10 @@ log = get_logger("vade.skill")
 MAX_SKILL_FILE_BYTES = 1_000_000
 MAX_URL_BYTES = 1_048_576
 PREVIEW_TTL_S = 60
+#: C-11 / design §16.5: `.rejected/<name>-<ts>/` is purged after 7 days. The
+#: age comes from the directory's mtime, which `reject()` stamps at rejection
+#: time (`os.replace` would otherwise carry the pending directory's mtime over).
+REJECTED_TTL_DAYS = 7
 
 
 # --------------------------------------------------------------------- payloads
@@ -536,6 +541,7 @@ class SkillLoader:
         if not root.is_dir():
             return
         self._expire_pending(root)
+        self._expire_rejected(root)
         for entry in sorted(root.iterdir(), key=lambda p: p.name):
             if entry.name in self.contract.reserved_names:
                 continue
@@ -1212,7 +1218,13 @@ class SkillLoader:
                                          self.skills_dir / "pending")
             if not pending_dir.is_dir():
                 raise VadeError("NOT_FOUND", f"no pending skill named {name!r}")
-            self._move_to(self.skills_dir / ".rejected", pending_dir, reason=reason or "rejected")
+            parked = self._move_to(self.skills_dir / ".rejected", pending_dir,
+                                   reason=reason or "rejected")
+            # `os.replace` keeps the pending directory's mtime, which can predate the
+            # rejection by the whole review period. `_expire_rejected` measures "7
+            # days after rejection", so stamp the moment it was rejected.
+            now = self._clock()
+            os.utime(parked, (now, now))
             self._pending.pop(name, None)
             self._audit("skill.reject", name=name)
 
@@ -1318,4 +1330,35 @@ class SkillLoader:
             if mtime < cutoff:
                 self._move_to(root / ".trash", entry, reason="pending_expired")
                 self._audit("skill.pending_expired", name=entry.name)
+
+    def _expire_rejected(self, root: Path) -> None:
+        """Purge `.rejected/<name>-<ts>/` older than REJECTED_TTL_DAYS.
+
+        Rejection is terminal, so these are deleted rather than moved to
+        `.trash` (which is the restorable bin for uninstall/pending expiry).
+        Age is the directory mtime, which `reject()` stamps at rejection time.
+
+        Runs in the same `reload()` pass as `_expire_pending`, so a core that
+        is restarted rarely still collects on the next start/SIGHUP instead of
+        growing `.rejected/` forever (C-11 promised "7 days").
+        """
+        rejected_root = root / ".rejected"
+        if not rejected_root.is_dir():
+            return
+        cutoff = self._clock() - REJECTED_TTL_DAYS * 86_400
+        for entry in sorted(rejected_root.iterdir(), key=lambda p: p.name):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= cutoff:
+                continue
+            try:
+                shutil.rmtree(entry)
+            except OSError as exc:
+                self._warn(f"stale rejected skill not removed: {entry.name}: {type(exc).__name__}")
+                continue
+            self._audit("skill.rejected_expired", name=entry.name)
 

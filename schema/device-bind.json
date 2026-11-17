@@ -68,7 +68,7 @@
     "BIND_FINGERPRINT_MISMATCH": "the App's pinned fp8 differs from this core",
     "BIND_HELLO_SIG_INVALID": "hello_sig did not verify against the pinned core_pub",
     "BIND_DEVICE_LIMIT": "5 devices per account; nothing is evicted automatically",
-    "BIND_CLOCK_SKEW": "ct.ts outside +/-300s",
+    "BIND_CLOCK_SKEW": "ct.ts outside +/-120s (§7.12.3 ④b; same window as core/vade/admin/bind.py MAX_SKEW_S)",
     "BIND_KEY_UNSUPPORTED": "alg missing or key encoding malformed",
     "BIND_SETUP_LOCKED": "setup is in progress in another session"
   },

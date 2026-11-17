@@ -341,6 +341,13 @@ class App:
             )
         except VadeError as exc:
             return RpcError(exc.code, exc.message)
+        # A successful register is a new link: clear the old failure window so a
+        # reconnect after a restart is not refused by a circuit opened during
+        # the outage (see CircuitBreaker.reset).
+        router = getattr(self, "router", None)
+        breaker = getattr(router, "breaker", None)
+        if breaker is not None:
+            breaker.reset(manifest.module_id, manifest.instance_id)
         return {
             "accepted": registration.accepted,
             "session_id": registration.session_id,

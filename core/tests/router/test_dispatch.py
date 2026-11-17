@@ -189,6 +189,36 @@ def test_breaker_opens_after_five_timeouts_and_half_opens_after_30s():
     asyncio.run(scenario())
 
 
+def test_breaker_reset_clears_an_open_window_for_a_reconnected_module():
+    """A module that re-registers after a restart gets a fresh link.
+
+    Reproduced for real by `sdk/python/tests/e2e_real_core.py`: during the
+    restart the router records five UNAVAILABLEs, the breaker opens for 30s,
+    and the module's first post-reconnect call is refused with
+    "all instances ... are circuit-open" even though it is registered again.
+    `App.register_module` now calls `reset`.
+    """
+    async def scenario():
+        breaker = CircuitBreaker()
+        for _ in range(5):
+            breaker.record_failure("com.example.echo", "main")
+        assert breaker.state("com.example.echo", "main") == "open"
+        assert breaker.allow("com.example.echo", "main") is False
+
+        breaker.reset("com.example.echo", "main")
+
+        assert breaker.state("com.example.echo", "main") == "closed"
+        assert breaker.allow("com.example.echo", "main") is True
+        # 只清这一个实例，不碰同模块的其它实例。
+        breaker.record_failure("com.example.echo", "other")
+        for _ in range(4):
+            breaker.record_failure("com.example.echo", "other")
+        assert breaker.state("com.example.echo", "other") == "open"
+        assert breaker.state("com.example.echo", "main") == "closed"
+
+    asyncio.run(scenario())
+
+
 def test_oversized_arguments_are_rejected_before_the_frame():
     async def scenario():
         registry = _registry(make_manifest())

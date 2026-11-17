@@ -33,6 +33,15 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
+
+# 模块已迁出主仓（独立私有仓 `vade-module-echo`）。先认主仓里的 modules/echo
+# （旧布局 / CI 的 symlink），再回退到同级目录的独立仓；可用 VADE_ECHO_DIR 覆盖。
+ECHO_DIR = Path(os.environ.get("VADE_ECHO_DIR", REPO / "modules" / "echo"))
+if not ECHO_DIR.is_dir():
+    _sibling = REPO.parent / "Vade-module-echo"
+    if _sibling.is_dir():
+        ECHO_DIR = _sibling
+
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("VADE_E2E_PORT", "18443"))
 URL = f"ws://{HOST}:{PORT}"
@@ -132,7 +141,7 @@ async def main() -> int:
     log_file = log_path.open("w", encoding="utf-8")
     module = subprocess.Popen(
         [sys.executable, "-m", "echo_module", "--core", URL],
-        cwd=REPO / "modules" / "echo",
+        cwd=ECHO_DIR,
         env=env,
         stdout=log_file,
         stderr=subprocess.STDOUT,
@@ -226,7 +235,7 @@ async def main() -> int:
         if module.poll() is not None:
             module = subprocess.Popen(
                 [sys.executable, "-m", "echo_module", "--core", URL],
-                cwd=REPO / "modules" / "echo",
+                cwd=ECHO_DIR,
                 env=env,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
@@ -246,20 +255,23 @@ async def main() -> int:
             if server2.started:
                 break
             await asyncio.sleep(0.05)
+        # 就绪判据必须是「现在真的能调通」，不是「注册表里出现了一个新 connection_id」：
+        # 重启瞬间旧记录/半开的链都能满足后者，于是立刻调用必然 UNAVAILABLE（假红）。
         reconnected_at = None
+        again = None
         started_at = time.monotonic()
         while time.monotonic() - started_at < 15:
-            for item in app.registry.snapshot():
-                if item.module_id == "com.example.echo" and item.connection_id and item.connection_id != record.connection_id:
-                    reconnected_at = time.monotonic() - started_at
-                    break
-            if reconnected_at is not None:
+            again = await app.router.call("com.example.echo/echo", {"text": "again"}, session_id="e2e")
+            if again.ok:
+                reconnected_at = time.monotonic() - started_at
                 break
             await asyncio.sleep(0.1)
         check("re-registered < 5s", reconnected_at is not None and reconnected_at < 5.0, f"{reconnected_at}")
-        if reconnected_at is not None:
-            again = await app.router.call("com.example.echo/echo", {"text": "again"}, session_id="e2e")
-            check("echo works after reconnect", again.ok, repr(again.result))
+        check("echo works after reconnect", bool(again and again.ok),
+              repr({"result": again.result if again else None,
+                    "code": getattr(again, "code", None) if again else None,
+                    "message": getattr(again, "message", "") if again else "",
+                    "records": [(i.module_id, i.connection_id, getattr(i, "online", None)) for i in app.registry.snapshot()]}))
         server2.should_exit = True
         await serve_task2
     finally:

@@ -154,6 +154,11 @@ class AdminContext:
     audit: Any = None
     approvals: Any = None
     pairing: Any = None
+    #: The trust table (`vade.identity.whitelist.Whitelist`). Revoking a node
+    #: must unbind it HERE as well as in the registry, because the registry's
+    #: `_revoked` set is process memory: whitelist.json is what survives a
+    #: restart (otherwise the same key handshakes again).
+    whitelist: Any = None
     stream: EventStream = field(default_factory=EventStream)
     sessions_provider: Callable[[], int] | None = None
     version: str = "1.0.0"
@@ -191,6 +196,7 @@ class AdminContext:
             audit=getattr(app, "audit_writer", None),
             approvals=getattr(app, "approvals", None),
             pairing=getattr(app, "pairing", None),
+            whitelist=getattr(app, "whitelist", None),
             version=config.version,
             e2e_enabled=config.e2e_enabled,
             allow_remote_readonly=config.allow_remote_readonly,
@@ -781,14 +787,25 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         if ctx.registry is None:
             raise VadeError("NOT_FOUND", "registry is not available")
         closed = ctx.registry.revoke_fingerprint(record.fingerprint)
+        # P1-2: the registry's `_revoked` set is process memory only, so on its
+        # own this revoke is forgotten at the next start and the same key
+        # handshakes again with the same (still whitelisted) entry. Unbind the
+        # whitelist record too — that write is what survives the restart. Its
+        # `on_revoke` callback is the App's, which also closes sockets that
+        # never registered and drops the blob tokens minted for them.
+        unbound: tuple[str, ...] = ()
+        whitelist = getattr(ctx, "whitelist", None)
+        if whitelist is not None:
+            unbound = tuple(whitelist.revoke(record.fingerprint))
         event = ctx.write_audit(
             kind="node.revoked", status="ok", code=None, actor=actor_of(session),
             module_id=record.module_id, instance_id=record.instance_id,
             method="POST /admin/api/nodes/{id}/revoke",
-            extra={"connections_closed": len(closed)},
+            extra={"connections_closed": len(closed), "unbound": list(unbound)},
         )
         ctx.stream.publish("node.remove", {"id": record.node_id})
         return JSONResponse({"ok": True, "connections_closed": len(closed),
+                             "unbound": list(unbound),
                              "audit_id": _audit_id(event) if event else None})
 
     async def disconnect_node(request: Request) -> Response:

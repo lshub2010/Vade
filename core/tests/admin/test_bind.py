@@ -625,6 +625,17 @@ def test_an_over_cap_body_is_413_before_the_envelope_is_touched(tmp_path):
         assert response.status_code == 401
         assert response.json()["code"] == "BIND_UNAUTHORIZED"
 
+        # The gate sits before routing: an unknown `/admin` path answers 413
+        # with an oversized body and 404 with a normal one.
+        unknown = "/admin/does-not-exist"
+        big = await client.post(
+            unknown, content=b"x" * (MAX_BODY_BYTES + 1),
+            headers={"content-type": "application/json"},
+        )
+        assert big.status_code == 413
+        small = await client.post(unknown, json={"a": 1})
+        assert small.status_code == 404
+
     run(scenario())
 
 

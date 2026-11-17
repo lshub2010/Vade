@@ -32,7 +32,7 @@
 | `test_devices_add_failure_on_first_run_rolls_back_to_setup_required` | `initialize=False`，`add` 抛 `OSError` → `initialized() is False`、`admin.json` 不存在、`setup.token` 与出错前逐字节相同、票可 peek、设备 0；恢复后同票重试 200，`admin.json` 出现、token 被消费、设备 1。 |
 | `test_devices_add_failure_on_the_step_up_path_changes_nothing` | 已初始化，`add` 失败 → `admin.json` bytes 不变、票可 peek、设备 0，重试 200。 |
 | `test_a_failing_rollback_step_still_releases_the_ticket` | `issue` 与 `discard` 同时失败 → 仍 500 `INTERNAL`、票可 peek；审计里恰好一行 `device.bound`/`INTERNAL`/`steps=["device"]`。 |
-| `test_an_over_cap_body_is_413_before_the_envelope_is_touched` | 1 MiB+ 的合法 JSON → 413 `PAYLOAD_TOO_LARGE`，票未消费、设备 0；1 KiB body 走正常路径（401 `BIND_UNAUTHORIZED`），证明不是一刀切拒绝。 |
+| `test_an_over_cap_body_is_413_before_the_envelope_is_touched` | 1 MiB+ 的合法 JSON → 413 `PAYLOAD_TOO_LARGE`，票未消费、设备 0；1 KiB body 走正常路径（401 `BIND_UNAUTHORIZED`），证明不是一刀切拒绝；未知 `/admin` 路径 + 超大 body 也是 413、同路径小 body 是 404，证明闸门在路由之前。 |
 | `test_the_cap_covers_the_unauthenticated_setup_routes` | `/admin/setup/unlock` 超大 body → 413，`admin.json` 未被创建。 |
 | `test_chunked_body_over_the_cap_is_refused_without_a_content_length` | 直接 ASGI 调用：`Content-Length: 64` 但流式发出 1 MiB+ → 413（第二层生效）。 |
 

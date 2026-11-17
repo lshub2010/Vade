@@ -29,6 +29,7 @@ import secrets
 import shutil
 import socket
 import stat
+import threading
 import time
 import zipfile
 from dataclasses import dataclass, field, replace
@@ -453,6 +454,13 @@ class SkillLoader:
         self._fail_counts: dict[str, int] = {}
         self._warnings: list[str] = []
         self._secret_hits = 0
+        # One lock for every mutation that reads `_states` / `_pending` before
+        # it writes. `approve` and `reject` compare a reviewer-supplied
+        # revision against the pending proposal and then move the directory;
+        # without a lock held across both halves, a concurrent `install` can
+        # swap the proposal between the comparison and the promotion. RLock
+        # because `approve`/`rollback` call `reload()` while holding it.
+        self._lock = threading.RLock()
 
     # ---------------------------------------------------------------- config
     def _cfg(self, key: str, default: Any) -> Any:
@@ -516,6 +524,10 @@ class SkillLoader:
     # ----------------------------------------------------------------- reload
     def reload(self) -> None:
         """Full rescan. Called at startup, on SIGHUP, and after approve/rollback."""
+        with self._lock:
+            self._reload()
+
+    def _reload(self) -> None:
         self._states = {}
         self._invalid = {}
         self._pending = {}
@@ -960,11 +972,12 @@ class SkillLoader:
         token = ""
         if valid:
             token = secrets.token_hex(32)
-            self._previews = {
-                k: v for k, v in self._previews.items() if v.expires_at > self._clock()
-            }
-            self._previews[token] = _Preview(name=name, digest=material.digest,
-                                            expires_at=self._clock() + PREVIEW_TTL_S)
+            with self._lock:
+                self._previews = {
+                    k: v for k, v in self._previews.items() if v.expires_at > self._clock()
+                }
+                self._previews[token] = _Preview(name=name, digest=material.digest,
+                                                 expires_at=self._clock() + PREVIEW_TTL_S)
         body_head = self._body_head(material.text)
         return PreviewResult(
             frontmatter=frontmatter,
@@ -989,108 +1002,156 @@ class SkillLoader:
 
     # ---------------------------------------------------------------- install
     def install(self, source: InstallSource, preview_token: str) -> SkillState:
-        """Land a validated skill in `skills/pending/<name>/`. Never active."""
-        material = materialize(source, self.contract)
-        preview = self._previews.pop(preview_token, None)
-        if preview is None:
-            _reject("preview_token is unknown or already used; call preview() first")
-        if preview.expires_at <= self._clock():
-            _reject("preview_token expired; call preview() again")
-        frontmatter, missing_sections, problems = check_source(material.text, contract=self.contract)
-        name = str(frontmatter.get("name") or "")
-        if problems:
-            _reject("invalid skill: " + "; ".join(problems)[:240])
-        if name != preview.name or material.digest != preview.digest:
-            _reject("preview_token does not match this content")
-        reason = _bad_name(name, self.contract.reserved_names)
-        if reason:
-            # C-11: "Reserved install directories are not legal names."
-            _reject(f"invalid skill name: {reason}")
+        """Land a validated skill in `skills/pending/<name>/`. Never active.
 
-        pending_root = self.skills_dir / "pending"
-        # mkdir's mode is masked by umask and only applies to the leaf, so both
-        # levels are chmod-ed explicitly: skill text is prompt content, not
-        # world-readable data.
-        for directory in (self.skills_dir, pending_root):
-            directory.mkdir(parents=True, exist_ok=True)
-            os.chmod(directory, 0o700)
-        target = pending_root / name
-        if target.exists():
-            self._move_to(self.skills_dir / ".trash", target, reason="pending-replaced")
-        staging = pending_root / f".{name}.tmp-{secrets.token_hex(4)}"
-        staging.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(staging, 0o700)
-        try:
-            _atomic_write(staging / "SKILL.md", material.text.encode("utf-8"))
-            for relative, data in sorted(material.files.items()):
-                destination = staging / relative
-                _atomic_write(destination, data)
-            existing = self._states.get(name)
-            revision = existing.revision if existing is not None else 0
-            state = SkillState(
-                meta=SkillMeta(name=name, description=str(frontmatter["description"]),
-                               when_to_use=str(frontmatter["when_to_use"]),
-                               triggers=tuple(str(t) for t in (frontmatter.get("triggers") or ())),
-                               requires_tools=tuple(str(t) for t in (frontmatter.get("requires_tools") or ())),
-                               body=material.text, path=target / "SKILL.md"),
-                revision=revision,
-                status="pending",
-                origin="install",
-                sha256=hashlib.sha256(material.text.encode("utf-8")).hexdigest(),
-            )
-            _atomic_write(staging / "meta.json",
-                          (json.dumps(state.meta_json(), ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        The pending state is stamped with its **own** revision, strictly above
+        every revision this name has reached (active, previous pending, or a
+        proposal another process left on disk). Stamping the active revision
+        here — which is what this used to do — made the admin review gate a
+        no-op: after two installs both proposals carried revision R, so
+        "approve the revision I was shown" promoted whichever landed last.
+        """
+        material = materialize(source, self.contract)
+        with self._lock:
+            preview = self._previews.pop(preview_token, None)
+            if preview is None:
+                _reject("preview_token is unknown or already used; call preview() first")
+            if preview.expires_at <= self._clock():
+                _reject("preview_token expired; call preview() again")
+            frontmatter, missing_sections, problems = check_source(material.text, contract=self.contract)
+            name = str(frontmatter.get("name") or "")
+            if problems:
+                _reject("invalid skill: " + "; ".join(problems)[:240])
+            if name != preview.name or material.digest != preview.digest:
+                _reject("preview_token does not match this content")
+            reason = _bad_name(name, self.contract.reserved_names)
+            if reason:
+                # C-11: "Reserved install directories are not legal names."
+                _reject(f"invalid skill name: {reason}")
+
+            pending_root = self.skills_dir / "pending"
+            # mkdir's mode is masked by umask and only applies to the leaf, so
+            # both levels are chmod-ed explicitly: skill text is prompt content,
+            # not world-readable data.
+            for directory in (self.skills_dir, pending_root):
+                directory.mkdir(parents=True, exist_ok=True)
+                os.chmod(directory, 0o700)
+            target = pending_root / name
+            revision = self._stamp_pending_revision(name, target)
+            if target.exists():
+                self._move_to(self.skills_dir / ".trash", target, reason="pending-replaced")
+            staging = pending_root / f".{name}.tmp-{secrets.token_hex(4)}"
+            staging.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(staging, 0o700)
-            os.replace(staging, target)
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
-        self._pending[name] = state
-        self._audit("skill.install", name=name, revision=revision, source=material.source)
-        return state
+            try:
+                _atomic_write(staging / "SKILL.md", material.text.encode("utf-8"))
+                for relative, data in sorted(material.files.items()):
+                    destination = staging / relative
+                    _atomic_write(destination, data)
+                state = SkillState(
+                    meta=SkillMeta(name=name, description=str(frontmatter["description"]),
+                                   when_to_use=str(frontmatter["when_to_use"]),
+                                   triggers=tuple(str(t) for t in (frontmatter.get("triggers") or ())),
+                                   requires_tools=tuple(str(t) for t in (frontmatter.get("requires_tools") or ())),
+                                   body=material.text, path=target / "SKILL.md"),
+                    revision=revision,
+                    status="pending",
+                    origin="install",
+                    sha256=hashlib.sha256(material.text.encode("utf-8")).hexdigest(),
+                )
+                _atomic_write(staging / "meta.json",
+                              (json.dumps(state.meta_json(), ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+                os.chmod(staging, 0o700)
+                os.replace(staging, target)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging, ignore_errors=True)
+            self._pending[name] = state
+            self._audit("skill.install", name=name, revision=revision, source=material.source)
+            return state
+
+    def _stamp_pending_revision(self, name: str, target: Path) -> int:
+        """The revision a new pending proposal gets: `max(known) + 1`.
+
+        Known means: the active state, the pending state in memory, and
+        `pending/<name>/meta.json` on disk (a proposal service writes there
+        without this process noticing). Using the maximum rather than just the
+        active revision keeps the stamp monotonic per name across restarts and
+        across proposals that were never approved, which is the whole point:
+        two different sets of pending bytes must never share one revision.
+        """
+        seen = -1
+        active = self._states.get(name)
+        if active is not None:
+            seen = max(seen, active.revision)
+        prior = self._pending.get(name)
+        if prior is not None:
+            seen = max(seen, prior.revision)
+        if (target / "meta.json").is_file():
+            meta = self._read_meta(target, revision=seen, status="pending")
+            try:
+                seen = max(seen, int(meta.get("revision", seen)))
+            except (TypeError, ValueError):
+                pass
+        return seen + 1
 
     # ------------------------------------------------------------ lifecycle
-    def approve(self, name: str) -> SkillState:
+    def approve(self, name: str, *, expect_revision: int | None = None) -> SkillState:
         """Promote `pending/<name>` to `skills/<name>` — if the bytes still match.
 
-        Two gates before anything moves:
+        Three gates before anything moves:
 
         * the name must be one path component (`_require_name`), because the
           directory is renamed with `os.replace`;
+        * when the reviewer supplies `expect_revision`, the pending state's
+          stamped revision must equal it. The comparison and the promotion are
+          one critical section, because a check in the caller is a TOCTOU: an
+          `install` landing between the read and the move would promote bytes
+          the reviewer never saw (`skills.py` used to compare, then call here);
         * `meta.json`'s `sha256` must equal the file's digest. `docs/agents/24
           §T5` forbids approving a pending file that changed after intake: the
           reviewer approved the bytes they were shown, not whatever is on disk
           now. This is the *only* implementation of approve, so the check has to
           be here — `ProposalReview.approve` is a wrapper, not a second gate.
         """
-        self._require_name(name)
-        pending = self._pending.get(name)
-        if pending is None:
-            raise VadeError("NOT_FOUND", f"no pending skill named {name!r}")
-        source_dir = self._contained(self.skills_dir / "pending" / name,
-                                    self.skills_dir / "pending")
-        if not source_dir.is_dir():
-            raise VadeError("NOT_FOUND", f"pending directory for {name!r} is gone")
-        self._verify_pending_digest(name, source_dir)
-        target = self.skills_dir / name
-        previous = self._states.get(name)
-        parked = self._park_superseded(source_dir, name)
-        if target.exists():
-            self._move_to(self.skills_dir / ".trash", target,
-                          reason=f"replaced-rev{previous.revision if previous else 0}")
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.replace(source_dir, target)
-        revision = (previous.revision if previous else pending.revision) + 1
-        approved = replace(pending, revision=revision, status="active")
-        approved = approved.with_meta(replace(approved.meta, path=target / "SKILL.md"))
-        self._write_meta(approved)
-        self._write_history(name, revision, (target / "SKILL.md").read_bytes())
-        self._pending.pop(name, None)
-        self._fail_counts.pop(name, None)
-        self.reload()
-        self._audit("skill.approve", name=name, revision=revision, origin=approved.origin,
-                    superseded_parked=len(parked) or None)
-        return self.get(name) or approved
+        with self._lock:
+            self._require_name(name)
+            pending = self._pending.get(name)
+            if pending is None:
+                raise VadeError("NOT_FOUND", f"no pending skill named {name!r}")
+            if expect_revision is not None and pending.revision != int(expect_revision):
+                raise VadeError(
+                    "TOOL_CONFLICT",
+                    f"revision conflict: pending {name!r} is at revision {pending.revision}")
+            source_dir = self._contained(self.skills_dir / "pending" / name,
+                                         self.skills_dir / "pending")
+            if not source_dir.is_dir():
+                raise VadeError("NOT_FOUND", f"pending directory for {name!r} is gone")
+            self._verify_pending_digest(name, source_dir)
+            target = self.skills_dir / name
+            previous = self._states.get(name)
+            parked = self._park_superseded(source_dir, name)
+            if target.exists():
+                self._move_to(self.skills_dir / ".trash", target,
+                              reason=f"replaced-rev{previous.revision if previous else 0}")
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.replace(source_dir, target)
+            # The stamp is already above the active revision for every install
+            # since the P1-1 fix; the max() keeps a legacy pending (one that
+            # carried the active revision) from collapsing onto it.
+            revision = max(pending.revision,
+                           (previous.revision if previous is not None else 0) + 1)
+            approved = replace(pending, revision=revision, status="active")
+            approved = approved.with_meta(replace(approved.meta, path=target / "SKILL.md"))
+            self._write_meta(approved)
+            self._write_history(name, revision, (target / "SKILL.md").read_bytes())
+            self._pending.pop(name, None)
+            self._fail_counts.pop(name, None)
+            self.reload()
+            self._audit("skill.approve", name=name, revision=revision, origin=approved.origin,
+                        reviewed_revision=pending.revision,
+                        superseded_parked=len(parked) or None)
+            return self.get(name) or approved
 
     def _verify_pending_digest(self, name: str, source_dir: Path) -> None:
         """Refuse to promote bytes that no longer match the intake record."""
@@ -1130,44 +1191,61 @@ class SkillLoader:
             parked.append(str(destination))
         return tuple(parked)
 
-    def reject(self, name: str, reason: str = "") -> None:
-        self._require_name(name)
-        pending_dir = self._contained(self.skills_dir / "pending" / name,
-                                     self.skills_dir / "pending")
-        if not pending_dir.is_dir():
-            raise VadeError("NOT_FOUND", f"no pending skill named {name!r}")
-        self._move_to(self.skills_dir / ".rejected", pending_dir, reason=reason or "rejected")
-        self._pending.pop(name, None)
-        self._audit("skill.reject", name=name)
+    def reject(self, name: str, reason: str = "", *, expect_revision: int | None = None) -> None:
+        """Move `pending/<name>` to `.rejected/`, CAS-ed like `approve`.
+
+        `expect_revision` is checked against the pending state under the same
+        lock that performs the move: a proposal that landed after the reviewer
+        loaded the page must not be rejected in place of the one they saw.
+        """
+        with self._lock:
+            self._require_name(name)
+            if expect_revision is not None:
+                pending = self._pending.get(name)
+                if pending is None:
+                    raise VadeError("NOT_FOUND", f"no pending skill named {name!r}")
+                if pending.revision != int(expect_revision):
+                    raise VadeError(
+                        "TOOL_CONFLICT",
+                        f"revision conflict: pending {name!r} is at revision {pending.revision}")
+            pending_dir = self._contained(self.skills_dir / "pending" / name,
+                                         self.skills_dir / "pending")
+            if not pending_dir.is_dir():
+                raise VadeError("NOT_FOUND", f"no pending skill named {name!r}")
+            self._move_to(self.skills_dir / ".rejected", pending_dir, reason=reason or "rejected")
+            self._pending.pop(name, None)
+            self._audit("skill.reject", name=name)
 
     def uninstall(self, name: str) -> None:
-        self._require_name(name)
-        target = self.skills_dir / name
-        pending_dir = self.skills_dir / "pending" / name
-        moved = False
-        for directory in (target, pending_dir):
-            if directory.is_dir():
-                self._move_to(self.skills_dir / ".trash", directory, reason="uninstall")
-                moved = True
-        if not moved:
-            raise VadeError("NOT_FOUND", f"no skill named {name!r}")
-        self._states.pop(name, None)
-        self._pending.pop(name, None)
-        self._audit("skill.uninstall", name=name)
+        with self._lock:
+            self._require_name(name)
+            target = self.skills_dir / name
+            pending_dir = self.skills_dir / "pending" / name
+            moved = False
+            for directory in (target, pending_dir):
+                if directory.is_dir():
+                    self._move_to(self.skills_dir / ".trash", directory, reason="uninstall")
+                    moved = True
+            if not moved:
+                raise VadeError("NOT_FOUND", f"no skill named {name!r}")
+            self._states.pop(name, None)
+            self._pending.pop(name, None)
+            self._audit("skill.uninstall", name=name)
 
     def set_status(self, name: str, status: str) -> SkillState:
         if status not in ("active", "disabled", "stale"):
             raise VadeError("INVALID_ARGUMENT", f"status must be active|disabled|stale, got {status!r}")
-        state = self._states.get(name)
-        if state is None:
-            raise VadeError("NOT_FOUND", f"no skill named {name!r}")
-        updated = replace(state, status=status, fail_count=0 if status == "active" else state.fail_count)
-        if status == "active":
-            self._fail_counts.pop(name, None)
-        self._states[name] = updated
-        self._write_meta(updated)
-        self._audit("skill.status", name=name, status=status)
-        return updated
+        with self._lock:
+            state = self._states.get(name)
+            if state is None:
+                raise VadeError("NOT_FOUND", f"no skill named {name!r}")
+            updated = replace(state, status=status, fail_count=0 if status == "active" else state.fail_count)
+            if status == "active":
+                self._fail_counts.pop(name, None)
+            self._states[name] = updated
+            self._write_meta(updated)
+            self._audit("skill.status", name=name, status=status)
+            return updated
 
     def rollback(self, name: str, revision: int) -> SkillState:
         """Restore `.history/<name>/<revision>.md` as a **new** revision.
@@ -1176,33 +1254,34 @@ class SkillLoader:
         whose bytes equal revision 1's. Nothing is overwritten, so the mistake
         that prompted the rollback stays auditable.
         """
-        self._require_name(name)
-        current = self._states.get(name)
-        if current is None:
-            raise VadeError("NOT_FOUND", f"no skill named {name!r}")
-        history = self.skills_dir / ".history" / name / f"{int(revision)}.md"
-        if not history.is_file():
-            raise VadeError("NOT_FOUND", f"no history revision {revision} for {name!r}")
-        raw = history.read_bytes()
-        try:
-            text = raw.decode("utf-8")
-            parsed = parse_document(text, required_sections=self.contract.required_sections)
-            validate_frontmatter(parsed.frontmatter)
-        except (UnicodeDecodeError, SkillParseError, SchemaError) as exc:
-            raise VadeError("INVALID_ARGUMENT", f"history revision is not a valid skill: {exc}") from exc
-        if parsed.missing_sections:
-            raise VadeError("INVALID_ARGUMENT",
-                            "history revision is missing sections: " + ", ".join(parsed.missing_sections))
-        target = self.skills_dir / name / "SKILL.md"
-        _atomic_write(target, raw)
-        new_revision = current.revision + 1
-        restored = replace(current, revision=new_revision,
-                           sha256=hashlib.sha256(raw).hexdigest())
-        self._write_meta(restored)
-        self._write_history(name, new_revision, raw)
-        self.reload()
-        self._audit("skill.rollback", name=name, revision=new_revision, from_revision=int(revision))
-        return self.get(name) or restored
+        with self._lock:
+            self._require_name(name)
+            current = self._states.get(name)
+            if current is None:
+                raise VadeError("NOT_FOUND", f"no skill named {name!r}")
+            history = self.skills_dir / ".history" / name / f"{int(revision)}.md"
+            if not history.is_file():
+                raise VadeError("NOT_FOUND", f"no history revision {revision} for {name!r}")
+            raw = history.read_bytes()
+            try:
+                text = raw.decode("utf-8")
+                parsed = parse_document(text, required_sections=self.contract.required_sections)
+                validate_frontmatter(parsed.frontmatter)
+            except (UnicodeDecodeError, SkillParseError, SchemaError) as exc:
+                raise VadeError("INVALID_ARGUMENT", f"history revision is not a valid skill: {exc}") from exc
+            if parsed.missing_sections:
+                raise VadeError("INVALID_ARGUMENT",
+                                "history revision is missing sections: " + ", ".join(parsed.missing_sections))
+            target = self.skills_dir / name / "SKILL.md"
+            _atomic_write(target, raw)
+            new_revision = current.revision + 1
+            restored = replace(current, revision=new_revision,
+                               sha256=hashlib.sha256(raw).hexdigest())
+            self._write_meta(restored)
+            self._write_history(name, new_revision, raw)
+            self.reload()
+            self._audit("skill.rollback", name=name, revision=new_revision, from_revision=int(revision))
+            return self.get(name) or restored
 
     # ---------------------------------------------------------------- history
     def _write_history(self, name: str, revision: int, raw: bytes) -> None:

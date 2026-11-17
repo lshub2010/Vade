@@ -1,0 +1,559 @@
+/* 拓扑画布样式（C5b）。
+   状态编码的唯一真相在这里：`.topo-state-*` 同时给出颜色（--topo-*-color）
+   与线型（--topo-*-dash），节点描边和连线都只消费这两个变量。
+   只改颜色不改线型的改动 = 破坏「颜色 + 线型双通道」约束，别这么改。 */
+
+/* ---------------------------------------------------------------- 页面框架 */
+
+.topo-page {
+  gap: 14px;
+}
+
+.topo-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.topo-hint {
+  font-size: 12.5px;
+}
+
+.topo-canvas {
+  height: clamp(420px, calc(100vh - 320px), 820px);
+  min-height: 380px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background:
+    radial-gradient(620px 320px at 50% 45%, #141d2b80, transparent 70%),
+    #0b1017;
+  overflow: hidden;
+}
+
+.topo-canvas .react-flow {
+  background: transparent;
+}
+
+.topo-canvas .react-flow__attribution {
+  background: transparent;
+  color: #46536b;
+  font-size: 9px;
+  padding: 0 4px;
+}
+
+.topo-canvas .react-flow__attribution a {
+  color: inherit;
+}
+
+/* 缩放按钮：默认样式是白底浅灰，在深色画布上像贴了一张纸。 */
+.topo-canvas .react-flow__controls {
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.topo-canvas .react-flow__controls-button {
+  width: 30px;
+  height: 30px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  fill: var(--text);
+}
+
+.topo-canvas .react-flow__controls-button:hover {
+  background: var(--panel-strong);
+}
+
+/* 加载态 */
+.topo-skeleton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 260px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  font-size: 13px;
+}
+
+.topo-skeleton-ring {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: topo-spin 0.9s linear infinite;
+}
+
+@keyframes topo-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------------------------------------------------------------- 状态编码 */
+
+.topo-state-online {
+  --topo-node-stroke: var(--ok);
+  --topo-node-dash: none;
+  --topo-node-width: 2px;
+  --topo-edge-color: var(--ok);
+  --topo-edge-dash: none;
+  --topo-edge-width: 1.8px;
+  --topo-flow-color: #a9f5cd;
+}
+
+/* degraded 用长虚线而不是实线：design.md §7.7 的表格写「实线」，但同一段又要求
+   「灰度下仍可区分」，online 与 degraded 同为实线时灰度只差明度。双通道优先，
+   这里取长虚线（与 offline 的短虚线一眼可分）。 */
+.topo-state-degraded {
+  --topo-node-stroke: var(--warn);
+  --topo-node-dash: 11 4;
+  --topo-node-width: 2px;
+  --topo-edge-color: var(--warn);
+  --topo-edge-dash: 9 5;
+  --topo-edge-width: 1.8px;
+  --topo-flow-color: #f7dda6;
+}
+
+.topo-state-offline {
+  --topo-node-stroke: var(--muted);
+  --topo-node-dash: 5 4;
+  --topo-node-width: 1.6px;
+  --topo-edge-color: var(--muted);
+  --topo-edge-dash: 5 5;
+  --topo-edge-width: 1.5px;
+  --topo-flow-color: transparent;
+}
+
+.topo-state-rejected {
+  --topo-node-stroke: var(--danger);
+  --topo-node-dash: 1.5 4;
+  --topo-node-width: 2px;
+  --topo-edge-color: var(--danger);
+  --topo-edge-dash: 1.5 4.5;
+  --topo-edge-width: 1.8px;
+  --topo-flow-color: transparent;
+}
+
+.topo-state-pending {
+  --topo-node-stroke: var(--info);
+  --topo-node-dash: 1.5 6;
+  --topo-node-width: 1.6px;
+  --topo-edge-color: var(--info);
+  --topo-edge-dash: 1.5 6;
+  --topo-edge-width: 1.5px;
+  --topo-flow-color: transparent;
+  opacity: 0.78;
+}
+
+/* ---------------------------------------------------------------- 节点 */
+
+.topo-node {
+  --topo-node-fill: #111826;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  color: var(--text);
+  /* 默认光标：这一批不可拖。T3 接上拖拽后改成 grab。 */
+  cursor: default;
+}
+
+.topo-shape-core {
+  --topo-node-fill: #070b11;
+}
+
+.topo-shape-invite {
+  --topo-node-fill: #0c1420;
+}
+
+.topo-node-shape {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.topo-node-outline {
+  fill: var(--topo-node-fill);
+  stroke: var(--topo-node-stroke, var(--border-strong));
+  stroke-width: var(--topo-node-width, 1.6px);
+  stroke-dasharray: var(--topo-node-dash, none);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* 圆柱顶盖弧 / 双框内框：只有描边，不填充。 */
+.topo-node-accent {
+  fill: none;
+  opacity: 0.75;
+}
+
+.topo-shape-core .topo-node-outline {
+  stroke: var(--accent-strong);
+  stroke-dasharray: none;
+  stroke-width: 2px;
+}
+
+.topo-node-content {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+}
+
+.topo-node-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.topo-node-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.topo-kind-glyph {
+  flex: none;
+  color: var(--muted);
+  opacity: 0.9;
+}
+
+.topo-node-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.005em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topo-node-instances {
+  flex: none;
+  font-size: 9.5px;
+  line-height: 1.4;
+  padding: 0 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--muted);
+}
+
+/* 地址：等宽 + 中间省略（JS 里截好，CSS 只负责不换行）。 */
+.topo-node-addr {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.25;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.topo-node-addr-missing {
+  font-style: italic;
+  opacity: 0.65;
+}
+
+.topo-node-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  line-height: 1.3;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* 状态文字是第三通道：颜色 + 线型之外，直接写出来。 */
+.topo-node-state {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.topo-node-state-online {
+  color: var(--ok);
+}
+
+.topo-node-state-degraded {
+  color: var(--warn);
+}
+
+.topo-node-state-offline {
+  color: var(--muted);
+}
+
+.topo-node-state-rejected {
+  color: var(--danger);
+}
+
+.topo-node-state-pending {
+  color: var(--info);
+}
+
+.topo-node-tools {
+  padding: 0 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: #0d1420;
+  color: #c2cde0;
+  font-variant-numeric: tabular-nums;
+}
+
+.topo-node-rtt {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
+.topo-node-kind {
+  opacity: 0.8;
+}
+
+/* 锁标：实心 = 端到端；空心 = 仅 TLS。位置压在右上角，不参与内容排版。 */
+.topo-lock {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 3px;
+  border-radius: 7px;
+  border: 1px solid var(--border-strong);
+  background: #0b1019;
+}
+
+.topo-lock svg {
+  display: block;
+}
+
+.topo-lock-solid {
+  color: #cfe4ff;
+  border-color: #3f5b86;
+}
+
+.topo-lock-hollow {
+  color: #8698b4;
+  border-color: var(--border);
+}
+
+/* Handle 只做连线锚点，不给人看：四向都留，边按方向挑一侧。
+   尺寸必须与 React Flow 的默认可测量值一致（6×6）。曾用 1px 想「更不可见」，
+   但 @xyflow/system 的 getHandleBounds() 用 offsetWidth/offsetHeight 取尺寸，
+   1px 在缩放画布/小数像素下会退化成 0×0 的锚点，表现是「节点都在、一条边也没有」。
+   想隐藏就靠透明背景 + opacity，不要靠改尺寸。 */
+.topo-handle {
+  width: 6px;
+  height: 6px;
+  min-width: 6px;
+  min-height: 6px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* core 卡片 */
+.topo-core-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  height: 100%;
+  text-align: center;
+}
+
+.topo-core-mark {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--accent);
+  letter-spacing: 0.04em;
+}
+
+.topo-core-name {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
+.topo-core-sub {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.topo-core-proto {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: #5f6d87;
+}
+
+/* 邀请位：虚线框 + 低透明度 + 中心「+」 */
+.topo-invite-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  height: 100%;
+  text-align: center;
+  min-width: 0;
+}
+
+.topo-invite-plus {
+  font-size: 26px;
+  font-weight: 300;
+  line-height: 1;
+  color: var(--info);
+}
+
+.topo-invite-caption {
+  max-width: 100%;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topo-invite-hint {
+  font-size: 10px;
+  color: var(--info);
+  letter-spacing: 0.04em;
+  opacity: 0.9;
+}
+
+/* 分组框：同 module_id 的多实例 */
+.topo-group {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border: 1px dashed var(--border-strong);
+  border-radius: 20px;
+  background: rgb(18 25 38 / 55%);
+  pointer-events: none;
+}
+
+.topo-group-title {
+  position: absolute;
+  top: 0;
+  left: 14px;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px;
+  background: #0c121b;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.topo-group-count {
+  color: #5f6d87;
+}
+
+/* ---------------------------------------------------------------- 边 */
+
+.topo-edge {
+  fill: none;
+  stroke: var(--topo-edge-color, var(--border-strong));
+  stroke-width: var(--topo-edge-width, 1.5px);
+  stroke-dasharray: var(--topo-edge-dash, none);
+  stroke-linecap: round;
+}
+
+.topo-edge-flow {
+  fill: none;
+  stroke: var(--topo-flow-color, #a9f5cd);
+  stroke-width: 2.2px;
+  stroke-dasharray: 2 14;
+  stroke-linecap: round;
+  animation: topo-flow 1.15s linear infinite;
+}
+
+@keyframes topo-flow {
+  to {
+    stroke-dashoffset: -32;
+  }
+}
+
+/* T7：节点 > 50 时关掉流动动画（省 GPU），颜色和线型照旧。 */
+.topo-no-flow .topo-edge-flow {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .topo-edge-flow {
+    animation: none;
+  }
+}
+
+/* ---------------------------------------------------------------- 图例 */
+
+.topo-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #0e141d;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.topo-legend-title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.topo-legend-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+}
+
+.topo-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+}
+
+.topo-legend-item svg {
+  display: block;
+}
+
+.topo-legend-note {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: #6f7d95;
+}
+
+/* ---------------------------------------------------------------- 窄屏 */
+
+@media (max-width: 767px) {
+  .topo-canvas {
+    height: 62vh;
+    min-height: 320px;
+  }
+
+  .topo-legend-note {
+    margin-left: 0;
+  }
+}

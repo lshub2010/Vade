@@ -1,3 +1,4 @@
+import { Suspense, lazy } from 'react';
 import { useEffect } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 import { AuthProvider, useAuth } from './auth';
@@ -9,6 +10,12 @@ import { SkillsPage } from '../pages/SkillsPage';
 import { AuditPage } from '../pages/AuditPage';
 import { SetupPage } from '../pages/SetupPage';
 import { SettingsPage } from '../pages/SettingsPage';
+
+/**
+ * 拓扑画布懒加载：`@xyflow/react` 加自研节点约 100KB gzip，
+ * 首屏（节点页）不该为它买单。dist 仍是单份静态资源，hash 路由下不需要额外配置。
+ */
+const TopologyPage = lazy(() => import('../canvas'));
 
 function BootScreen({ label = '正在检查登录状态…' }: { label?: string }): ReactElement {
   return (
@@ -32,6 +39,13 @@ function pageFor(path: string): ReactNode {
   switch (path) {
     case '/nodes':
       return <NodesPage />;
+    case '/topology':
+      // Suspense 放在 pageFor 里而不是 Shell 外面：切走时只卸载画布，页头不动。
+      return (
+        <Suspense fallback={<BootScreen label="拓扑加载中…" />}>
+          <TopologyPage />
+        </Suspense>
+      );
     case '/skills':
       return <SkillsPage />;
     case '/audit':
@@ -45,6 +59,7 @@ function pageFor(path: string): ReactNode {
 
 const TITLES: Record<string, string> = {
   '/nodes': '节点',
+  '/topology': '拓扑',
   '/skills': '技能',
   '/audit': '审计',
   '/settings': '设置',

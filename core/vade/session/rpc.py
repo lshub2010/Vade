@@ -110,8 +110,20 @@ class SessionRPC:
             raise VadeError("INVALID_ARGUMENT", "session_id must be a string or null")
         if last_seq is not None and (not isinstance(last_seq, int) or isinstance(last_seq, bool) or last_seq < 0):
             raise VadeError("INVALID_ARGUMENT", "last_seq must be a non-negative integer or null")
+        connection_key = self._connection_key(connection)
+        if session_id is not None:
+            # A second attach for the same (connection, session) used to leave
+            # the first SinkWorker registered: it kept delivering every event
+            # to the same socket (double delivery — the re-attach's own
+            # `session.attached` was the cheapest witness) and nothing ever
+            # unregistered it (`ui/detach` only knew the newest id), so one
+            # worker leaked per re-attach for the connection's whole lifetime.
+            # Retire BEFORE `log.attach` registers the replacement: the pair
+            # then holds exactly one worker, and the replay/snapshot below is
+            # the only source of any given seq.
+            self._retire_sink(connection_key, session_id)
         result = await self.log.attach(session_id, last_seq, ConnectionSink(connection))
-        self._sinks[(str(getattr(connection, "connection_id", "")), result.session_id)] = result.sink_id
+        self._sinks[(connection_key, result.session_id)] = result.sink_id
         return {"session_id": result.session_id, "from_seq": result.from_seq,
                 "snapshot": result.snapshot}
 
@@ -119,11 +131,31 @@ class SessionRPC:
         session_id = params.get("session_id")
         if not isinstance(session_id, str):
             raise VadeError("INVALID_ARGUMENT", "session_id is required")
-        key = (str(getattr(connection, "connection_id", "")), session_id)
+        key = (self._connection_key(connection), session_id)
         sink_id = self._sinks.pop(key, None)
         if sink_id is None:
             raise VadeError("NOT_FOUND", "this connection is not attached to that session")
         return {"ok": await self.log.detach(session_id, sink_id)}
+
+    def _retire_sink(self, connection_key: str, session_id: str) -> None:
+        """Unregister and discard the sink this connection has for a session.
+
+        `drop()` and not `SessionLog.detach()`: detach writes its stop sentinel
+        BEHIND whatever is still queued, so the worker first flushes frames
+        that the attach about to run is going to replay — the client would see
+        those seqs twice. Dropping cancels the writer and discards that
+        backlog, which the new attach's replay/snapshot then covers exactly
+        once. The id leaves `SessionRPC._sinks` first, so the two maps cannot
+        disagree about who is attached.
+        """
+        sink_id = self._sinks.pop((connection_key, session_id), None)
+        if sink_id is None:
+            return
+        workers = getattr(self.log, "_sinks", None)
+        live = workers.get(session_id) if isinstance(workers, dict) else None
+        worker = live.get(sink_id) if isinstance(live, dict) else None
+        if worker is not None:
+            worker.drop()
 
     async def ui_submit(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
         session_id = params.get("session_id")
@@ -533,6 +565,11 @@ class SessionRPC:
         return bool(getattr(principal, "read_only", False))
 
     # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _connection_key(connection: Any) -> str:
+        """The key `_sinks` is scoped by: one connection, not one device."""
+        return str(getattr(connection, "connection_id", ""))
+
     @staticmethod
     def _ids(params: Mapping[str, Any]) -> tuple[str, str]:
         session_id, turn_id = params.get("session_id"), params.get("turn_id")

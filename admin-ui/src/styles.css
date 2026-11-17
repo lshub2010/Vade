@@ -1222,6 +1222,135 @@ a:hover {
   flex-direction: column;
   gap: 14px;
   padding: clamp(14px, 2.4vw, 20px);
+
+/* ------------------------------------------------------------------ 技能安装 */
+
+.page-tabs {
+  display: flex;
+  align-self: flex-start;
+  gap: 4px;
+  max-width: 100%;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #0e1420;
+  overflow-x: auto;
+}
+
+.tab-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 650;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.tab-button:hover {
+  background: #161e2c;
+  color: var(--text);
+}
+
+.tab-button-active {
+  background: var(--panel-strong);
+  color: var(--text);
+  box-shadow: 0 1px 0 rgb(255 255 255 / 4%) inset;
+}
+
+.tab-count {
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #1d3a55;
+  color: #9ed3f5;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* 关键：.tab-panel 的 display 会盖过 UA 对 [hidden] 的处理，必须显式关掉。 */
+.tab-panel[hidden] {
+  display: none;
+}
+
+.install-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.install-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.install-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #101623;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.install-step-no {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #1a2333;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.install-step-current {
+  border-color: #33517a;
+  background: #132033;
+  color: var(--text);
+}
+
+.install-step-current .install-step-no {
+  background: var(--accent);
+  color: #08111f;
+}
+
+.install-step-done {
+  border-color: #1f5140;
+  background: #10251d;
+  color: #bfe9d7;
+}
+
+.install-step-done .install-step-no {
+  background: var(--ok);
+  color: #06130d;
+}
+
+.install-section,
+.install-result {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: linear-gradient(180deg, #161d2a, #131924);
@@ -1269,6 +1398,26 @@ a:hover {
 /* 设备 */
 
 .device-list {
+
+.install-result {
+  border-color: #31527a;
+}
+
+.install-result-ok {
+  border-color: #1f5140;
+}
+
+.install-h2 {
+  font-size: 17px;
+  line-height: 1.3;
+}
+
+.install-result-name {
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+.source-grid {
   display: grid;
   gap: 10px;
 }
@@ -1620,6 +1769,278 @@ a:hover {
 
 .estimate-line {
   font-size: 12.5px;
+
+.source-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #0f1521;
+  cursor: pointer;
+}
+
+.source-card:hover {
+  border-color: var(--border-strong);
+}
+
+.source-card-active {
+  border-color: #3d6ba8;
+  background: #121c2d;
+  box-shadow: 0 0 0 1px #3d6ba8 inset;
+}
+
+.source-card-disabled {
+  border-style: dashed;
+  opacity: 0.62;
+  cursor: not-allowed;
+}
+
+.source-card-disabled:hover {
+  border-color: var(--border);
+}
+
+.source-radio {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.source-radio-static {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  margin-top: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+}
+
+.source-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.source-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.source-desc {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.install-inputs {
+  display: grid;
+  gap: 12px;
+}
+
+.input-file {
+  min-height: 42px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.input-file::file-selector-button {
+  margin-right: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.install-textarea {
+  min-height: 180px;
+}
+
+.install-limits {
+  padding: 10px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.install-limits-title {
+  margin-bottom: 4px;
+  color: #b9c6dc;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.install-limits ul {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-left: 16px;
+  list-style: disc;
+}
+
+.install-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.install-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 14px;
+}
+
+.install-meta dt {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+}
+
+.install-meta dd {
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.install-fm {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.install-fm > div {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid #1c2636;
+}
+
+.install-fm dt {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.install-fm dd {
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.install-subsection {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.install-subtitle {
+  font-size: 14px;
+}
+
+.install-details summary {
+  color: var(--accent);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.install-json {
+  max-height: 220px;
+  margin-top: 8px;
+}
+
+.install-tool-chips {
+  padding: 0;
+  list-style: none;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #0d1320;
+  font-size: 12px;
+}
+
+.chip-missing {
+  border-color: #6b2f2f;
+  background: #241416;
+  color: #ffc7c7;
+}
+
+.chip-flag {
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #5d2a2a;
+  color: #ffd6d6;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.install-excerpt {
+  max-height: 300px;
+}
+
+.install-token-meta {
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.install-token {
+  font-size: 11.5px;
+  word-break: break-all;
+}
+
+.install-ack {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #0f1521;
+  color: #d3ddec;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.install-ack input {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.install-ack:has(input:disabled) {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.install-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
 }
 
 /* ------------------------------------------------------------------ 断点 */
@@ -1641,8 +2062,43 @@ a:hover {
   }
 }
 
+@media (min-width: 768px) {
+  .source-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 /* 窄屏（主场景）：操作按钮占满一行，方便拇指点；不允许 hover 才出现的控件。 */
 @media (max-width: 767px) {
+  .page-tabs {
+    width: 100%;
+    align-self: stretch;
+  }
+
+  .tab-button {
+    flex: 1 1 0;
+    min-height: 42px;
+  }
+
+  .install-steps {
+    grid-template-columns: 1fr;
+  }
+
+  .install-meta {
+    grid-template-columns: 1fr;
+  }
+
+  .install-fm > div {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .install-actions .Button,
+  .install-result-actions .Button {
+    flex: 1 1 auto;
+    min-height: 42px;
+  }
+
   .shell-header {
     flex-wrap: wrap;
     gap: 8px 12px;

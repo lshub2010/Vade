@@ -209,6 +209,30 @@ export interface SkillHistoryEntry {
   bytes: number;
 }
 
+/**
+ * `POST /admin/api/skills/install/preview` 的响应。
+ *
+ * schema 只冻结了 `preview_token/name/frontmatter/excerpt/missing_tools/conflict`；
+ * core 还下发 `valid`、`missing_sections`、`files`、`conflict_with`。后者按可选字段读，
+ * 缺了也不影响预检展示（旧构建只是少几行提示）。
+ */
+export interface InstallPreview {
+  /** 60 秒一次性；`valid=false` 时为空串。安装时必须原样带回。 */
+  preview_token: string;
+  name: string;
+  frontmatter: Record<string, unknown>;
+  /** 服务端截取的正文头部（当前实现 ≤400 字符），页面不再解析 YAML。 */
+  excerpt: string;
+  missing_tools: string[];
+  conflict: boolean;
+  /** `active` / `pending`，说明和哪种版本重名。 */
+  conflict_with?: string | null;
+  valid?: boolean;
+  missing_sections?: string[];
+  /** zip/dir 来源里的资源文件名；文本来源为空。 */
+  files?: string[];
+}
+
 /** `GET /admin/api/skills/{name}`。diff 由后端算，页面不解析 YAML。 */
 export interface SkillDetail extends SkillSummary {
   when_to_use?: string;

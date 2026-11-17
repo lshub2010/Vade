@@ -360,11 +360,19 @@ class LoopEngine:
                     self._raise_if_interrupted(turn)
                     message = f"Tool call denied: {decision.reason or 'denied by policy'}. Continue without it."
                     if decision.request_id:
+                        # Same payload shape as the allow path
+                        # (`ApprovalManager.decide`): a device that missed the
+                        # prompt matches the card by `session_id` + the §7.1
+                        # attribution, and a deny used to publish only
+                        # `turn_id`, so it could not close the right card in a
+                        # subagent's parent session.
                         await self._turn_emit(
                             turn, "turn.approval_resolved",
                             {"turn_id": turn.id, "request_id": decision.request_id,
                              "decision": "deny", "by": decision.by or "policy",
-                             "scope": decision.scope, "state": "running"},
+                             "scope": decision.scope, "state": "running",
+                             "session_id": turn.session_id,
+                             **_approval_attribution(turn)},
                         )
                     messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": message})
                     tool_message = Message(id=new_id(), session_id=turn.session_id,
@@ -766,6 +774,7 @@ class LoopEngine:
             session_id=turn.session_id, turn_id=turn.id, tool_id=entry.tool_id, args=args,
             risk=entry.risk, expires_at=now_ms() + self.config.approval_timeout_s * 1000,
             emit=lambda event_type, payload: self._turn_emit(turn, event_type, payload),
+            **_approval_attribution(turn),
         )
         try:
             return await self.approval.check(request)
@@ -855,6 +864,27 @@ class LoopEngine:
             self.audit.record(event)
         except Exception:
             pass
+
+
+def _approval_attribution(turn: Turn) -> dict[str, Any]:
+    """RFC-0007 §7.1 attribution for an approval this turn raises.
+
+    `depth == 0` / `task_id is None` is a main turn, which is the only kind
+    `LoopEngine` runs today (subagents are not wired through this module), but
+    the fields are read off the turn rather than hard-coded so a spawned turn
+    carrying the triple reaches both the prompt and the resolution.
+
+    One helper for both directions on purpose: `_check_approval` puts the
+    triple on the request and the deny path publishes the same triple on
+    `turn.approval_resolved`, which is what lets a device that missed the
+    prompt close the right card. Keeping two copies is how the deny payload
+    ended up with only the six required fields.
+    """
+    return {
+        "task_id": getattr(turn, "task_id", None),
+        "task_name": getattr(turn, "task_name", None),
+        "depth": int(getattr(turn, "depth", 0) or 0),
+    }
 
 
 def _runtime_facts(model_id: str | None) -> str:

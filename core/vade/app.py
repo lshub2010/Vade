@@ -109,6 +109,21 @@ class App:
     async def shutdown(self) -> None:
         if self.pairing is not None:
             self.pairing.close()
+        # C3 first: ending the sessions is the step everything else depends on.
+        # `SessionLog.close()` fires `app.on_session_end` (C3d's `session.closed`
+        # beat reads the transcript through `sessions.db`, C5a's grant cleanup),
+        # closes the RFC-0008 dialogs on the still-attached sockets, awaits the
+        # turn workers and only then closes the store. Closing `app.blob` before
+        # this would pull the attachment service out from under a turn that is
+        # still finalizing (`_LazyBlobs` resolves it at call time), and the beat
+        # must reach devices before their sinks are detached inside `close()`.
+        session = getattr(self, "session", None)
+        if session is not None:
+            close_session = getattr(session, "close", None)
+            if callable(close_session):
+                result = close_session()
+                if inspect.isawaitable(result):
+                    await result
         # RFC-0004: the blob store holds a sqlite handle *and* a GC task; close
         # both with the app so a restart does not depend on process exit. The
         # async closer is preferred because it awaits the cancelled sweeper

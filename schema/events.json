@@ -868,6 +868,20 @@
           "skills stays on turn.completed only: turn.skill_catalog keeps its own digest/entries/empty payload and gains nothing — one truth for 'which skills ran this turn' (RFC-0002 §5)"
         ],
         "rewrites": "none. The top-level `version` stays 2.0.0 (no state, no enum widening — RFC-0002 appends one optional payload key to one event); every pre-existing entry, `required` list and rule is untouched. This block continues the append-level non-blocking lineage (RFC-0006 1.1.0 → RFC-0013 1.2.0) at 1.3.0."
+      },
+      {
+        "contract": "C-06",
+        "version": "1.1.0",
+        "owner": "C3",
+        "doc": "docs/rfc/RFC-0007-subagents-and-tasks.md",
+        "adds": ["task.started", "task.status", "task.progress", "task.finished"],
+        "overrides": [
+          "top-level `task_states` appended — a NEW top-level enum, not a `task.state` entry under `events`: only `turn.state` is exempt from the 'declared events nobody emits' gate, so `task.state` would be red on day one (RFC-0007 §9.2); `turn_states` itself was not widened (still 8 states)",
+          "task.started / task.status / task.finished are state-change events (they declare AND require `state`); task.progress is payload-only and must never carry it (C-06 rule 4)",
+          "task.progress carries `x-vade.coalesce: true` (RFC-0007 §5.5 R5): it may be dropped from replay coverage, and a seq gap made only of such events is not a hole. §9.2 proposed a matching C-06 rule, but `rules[]` is frozen text and the rule was not appended — the marker plus this block are the authority",
+          "turn.approval_required / turn.approval_resolved gained four OPTIONAL payload keys (session_id / task_id / task_name / depth); both `required` lists are unchanged (RFC-0007 §7.1)"
+        ],
+        "rewrites": "none. Every pre-existing C-06 entry, rule and enum is unchanged. Block version 1.1.0 matches the C-05 1.1.0 that rpc.json carried when RFC-0007 landed and the 1.1.0 its rpc append block still records. This is a RETROSPECTIVE registration: at 404c3f3 events.json was still 1.0.0 with no `appends` array at all (it was a plain string), so the four events and `task_states` were declared without a block; the original sibling registration under `x-vade.append_rfc0007` is kept verbatim as audit history. Top-level `version` stays 2.0.0 (RFC-0008's enum widening owns that bump; this block adds no state)."
       }
 
     ]

@@ -167,11 +167,32 @@ export interface PasswordChangeResponse {
   refresh_token?: string;
 }
 
-/** 审计行（只在这里用到 `llm.call` 的 `ts` / `extra`，用于估算复盘成本）。 */
+/**
+ * `GET /admin/api/audit` 的一行（schema#AuditRow）。
+ *
+ * 服务端已经脱敏：`args_redacted` / `extra` 里命中 `password|token|secret|key|
+ * credential` 的字段值是 `"[redacted]"`。页面不再请求原文，也不猜。
+ */
 export interface AuditRow {
+  /** 天表内的自增主键；跨天可重复，游标里与 `ts` 一起用。 */
   id?: number;
+  /** epoch 秒（不是毫秒）。 */
   ts: number;
   kind: string;
+  session_id?: string | null;
+  turn_id?: string | null;
+  module_id?: string | null;
+  instance_id?: string | null;
+  method?: string | null;
+  tool?: string | null;
+  duration_ms?: number | null;
+  status?: string | null;
+  code?: string | null;
+  request_id?: string | null;
+  /** 确认人：设备 id / `loopback_admin` / `system`。 */
+  actor?: string | null;
+  args_digest?: string | null;
+  args_redacted?: Record<string, unknown> | null;
   extra?: Record<string, unknown> | null;
 }
 

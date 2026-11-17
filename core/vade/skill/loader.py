@@ -728,6 +728,15 @@ class SkillLoader:
             state = self._pending.get(name)
         return state
 
+    def pending(self, name: str) -> SkillState | None:
+        """The pending proposal for `name`, or None.
+
+        `get(include_pending=True)` returns the ACTIVE state when both exist, so
+        a reviewer has no way to see the proposal's body through `get`. The
+        admin detail view needs it for the diff; nothing is parsed here.
+        """
+        return self._pending.get(name)
+
     def list_all(self, include_pending: bool = False) -> list[SkillSummary]:
         states = list(self._visible())
         if include_pending:

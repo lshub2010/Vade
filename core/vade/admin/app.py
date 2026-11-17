@@ -190,6 +190,9 @@ class AdminContext:
     _invites: dict[str, str] = field(default_factory=dict)
     _config_overrides: dict[str, Any] = field(default_factory=dict)
     _layout: dict[str, Any] = field(default_factory=lambda: {"rev": 0, "nodes": []})
+    #: The registry listener that turns health flips into `node.upsert`; kept so
+    #: the attachment is idempotent when `create_admin_app` runs twice in tests.
+    _registry_listener: Any = None
     _limits: dict[str, list[float]] = field(default_factory=dict)
     _global_failures: list[float] = field(default_factory=list)
     _locked_until: float = 0.0
@@ -742,20 +745,61 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         })
 
     # -------------------------------------------------------------------- nodes
+    def _view_for(record: Any) -> dict[str, Any]:
+        names = sorted(
+            b.spec.name for b in (ctx.registry.tools().values() if ctx.registry is not None else ())
+            if b.module_id == record.module_id and b.instance_id == record.instance_id
+        )
+        layout = next((n for n in ctx._layout.get("nodes", [])
+                       if isinstance(n, dict) and n.get("id") == record.node_id), None)
+        return to_public_view(record, tool_names=names, layout=layout,
+                              revoked=record.health.value == "rejected")
+
     def _views() -> list[dict[str, Any]]:
         if ctx.registry is None:
             return []
-        bindings = list(ctx.registry.tools().values())
-        layout_nodes = {n["id"]: n for n in ctx._layout.get("nodes", []) if isinstance(n, dict) and "id" in n}
-        views = []
-        for record in ctx.registry.snapshot():
-            names = sorted(
-                b.spec.name for b in bindings
-                if b.module_id == record.module_id and b.instance_id == record.instance_id
-            )
-            views.append(to_public_view(record, tool_names=names, layout=layout_nodes.get(record.node_id),
-                                        revoked=record.health.value == "rejected"))
-        return views
+        _ensure_status_listener()
+        return [_view_for(record) for record in ctx.registry.snapshot()]
+
+    def _publish_node(record: Any, *, changes: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Publish ONE full public view; `changes` is kept for older consumers.
+
+        The canvas cannot patch a node from `{id, changes}`: enabled/concurrency/
+        risk are not in the Node whitelist. `node` therefore carries the whole
+        whitelisted view, and `changes` stays additive for audit-style clients.
+        """
+        view = _view_for(record)
+        payload: dict[str, Any] = {"id": view["id"], "node": view}
+        if changes is not None:
+            payload["changes"] = dict(changes)
+        return ctx.stream.publish("node.upsert", payload)
+
+    def _ensure_status_listener() -> None:
+        """Bind registry health flips to `node.upsert` once.
+
+        `touch()` (heartbeat restored), `mark_disconnected()`, `refresh_health()`
+        and `register()` all notify listeners. Without this bridge the canvas
+        only hears about L2 edits, never about a node going offline or coming
+        back, which is the one thing the topology exists to show.
+        """
+        registry = ctx.registry
+        if registry is None or ctx._registry_listener is not None:
+            return
+        add = getattr(registry, "add_listener", None)
+        if not callable(add):
+            return
+
+        def on_status(payload: Mapping[str, Any]) -> None:
+            try:
+                record = registry.get(str(payload.get("module_id") or ""),
+                                      str(payload.get("instance_id") or ""))
+                if record is not None:
+                    _publish_node(record)
+            except Exception:  # a status event must never break the registry
+                return
+
+        add(on_status)
+        ctx._registry_listener = on_status
 
     def _find(node_id: str) -> Any:
         module_id, instance_id = _node_ids(node_id)
@@ -781,12 +825,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
     async def get_node(request: Request) -> Response:
         guard(request)
         record = _find(request.path_params["id"])
-        names = sorted(b.spec.name for b in ctx.registry.tools().values()
-                       if b.module_id == record.module_id and b.instance_id == record.instance_id)
-        layout = next((n for n in ctx._layout.get("nodes", [])
-                       if isinstance(n, dict) and n.get("id") == record.node_id), None)
-        return JSONResponse(to_public_view(record, tool_names=names, layout=layout,
-                                           revoked=record.health.value == "rejected"))
+        return JSONResponse(_view_for(record))
 
     async def patch_node(request: Request) -> Response:
         session = guard(request)
@@ -820,16 +859,28 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
                 # only if the caller sends several tools, so fail on the first.
                 await ctx.registry_api.set_risk_override(record.module_id, str(tool), str(risk))
         if "label" in changes:
-            ctx._layout["nodes"] = [
-                n for n in ctx._layout.get("nodes", []) if isinstance(n, dict) and n.get("id") != record.node_id
-            ] + [{"id": record.node_id, "label": changes["label"]}]
+            # L1 alias. Merge into the existing layout row instead of replacing
+            # it: the old one-line replacement dropped x/y and group_id, so
+            # renaming a node teleported it back to the origin.
+            existing = next((n for n in ctx._layout.get("nodes", [])
+                             if isinstance(n, dict) and n.get("id") == record.node_id), None)
+            entry = dict(existing) if existing else {"id": record.node_id}
+            entry["label"] = changes["label"]
+            ctx._layout = {
+                "rev": int(ctx._layout.get("rev", 0)) + 1,
+                "nodes": [n for n in ctx._layout.get("nodes", [])
+                          if isinstance(n, dict) and n.get("id") != record.node_id] + [entry],
+            }
         event = ctx.write_audit(
             kind="node.updated", status="ok", code=None, actor=actor_of(session),
             module_id=record.module_id, instance_id=record.instance_id,
             method="PATCH /admin/api/nodes/{id}",
             extra={"changes": changes, "impact": impact},
         )
-        ctx.stream.publish("node.upsert", {"id": record.node_id, "changes": changes})
+        # Re-read: `set_enabled` replaces the record, so the local one is stale
+        # and a full view built from it would still say "online".
+        current = ctx.registry.get(record.module_id, record.instance_id) if ctx.registry else record
+        _publish_node(current or record, changes=changes)
         return JSONResponse({"ok": True, "impact": impact, "audit_id": _audit_id(event) if event else None,
                              "id": record.node_id})
 
@@ -1014,10 +1065,20 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         session = guard(request)
         body = await _json(request)
         rev = body.get("rev")
-        if rev is not None and int(rev) != int(ctx._layout.get("rev", 0)):
-            # Layout edits are cheap and non-security; still, a lost update
-            # should be visible rather than silently overwriting a teammate.
-            raise VadeError("INVALID_ARGUMENT", "layout revision conflict")
+        current_rev = int(ctx._layout.get("rev", 0))
+        if rev is not None:
+            try:
+                provided_rev = int(rev)
+            except (TypeError, ValueError):
+                raise VadeError("INVALID_ARGUMENT", "rev must be an integer") from None
+            if provided_rev != current_rev:
+                # design §7.6: rev mismatch is a CONFLICT (409), and the caller
+                # is told the server's current rev so it can refresh instead of
+                # silently overwriting the other device's layout.
+                raise VadeError(
+                    "TOOL_CONFLICT",
+                    f"layout revision conflict: current rev is {current_rev}",
+                )
         nodes = body.get("nodes")
         if not isinstance(nodes, list):
             raise VadeError("INVALID_ARGUMENT", "nodes must be a list")
@@ -1062,6 +1123,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
     async def stream(request: Request) -> Response:
         guard(request)
         last = request.headers.get("last-event-id")
+        _ensure_status_listener()
 
         async def generator():
             async for chunk in ctx.stream.events(last):
@@ -1151,6 +1213,10 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         routes.append(Route(path, unsupported, methods=["GET", "POST", "PATCH", "DELETE", "PUT"]))
 
     starlette_app = Starlette(routes=routes)
+    # Health flips (heartbeat restored / disconnected / stale) have no HTTP
+    # request behind them; bind the registry listener at app construction too,
+    # so an SSE client that was already connected gets them.
+    _ensure_status_listener()
 
     def on_vade_error(request: Request, exc: Exception) -> Response:
         assert isinstance(exc, VadeError)

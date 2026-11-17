@@ -1132,6 +1132,10 @@ paths:
       summary: "SSE（`Last-Event-ID` 续传；15s `: ping`）"
       description: |
         事件格式 `id: <seq>\ndata: <json>\n\n`；增量事件 `node.upsert` / `edge.state` / `node.remove`。
+        `node.upsert` 的 data 是 `{id, node}`，`node` 为**完整** `Node` 视图（同 `/admin/api/nodes`
+        的字段白名单）；L2 编辑额外带 `changes`（enabled/concurrency/risk），它只是给审计型消费方
+        的附注，**不足以**更新画布。`state`/`rtt_ms`/`last_seen`/`tool_count` 变化（心跳恢复、
+        断连、租约超时）同样发布 `node.upsert`。
         **序号复用 C3 的 replay seq**，不另造一套。记忆内容不进 SSE。
       parameters:
         - name: Last-Event-ID
@@ -1324,7 +1328,14 @@ components:
         label: {type: [string, "null"]}
         capabilities:
           type: array
-          items: {type: string}
+          description: >-
+            能力**种类**，决定画布形状与分组（design §7.2/§7.7）。这里**不放工具名**——
+            工具名/数量在 `tool_names` / `tool_count`。取值：`tools`（有工具）、
+            `prompts` / `events`（声明了对应能力段）、`model`（`capabilities.models` 非空）、
+            `memory` / `bridge`（模块类型约定）。客户端不要再按 `module_id` 子串猜形状。
+          items:
+            type: string
+            enum: [tools, prompts, events, model, memory, bridge]
         state: {type: string, enum: [online, offline, pending, degraded, rejected]}
         endpoint:
           type: [string, "null"]

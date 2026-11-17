@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,10 @@ class SetupService:
     wall: Callable[[], float] = time.time
     unlock_ttl_s: int = 600
     _tickets: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Ticket state is read-modify-write (`peek` → `consume`); without the lock
+    #: two concurrent `POST /admin/bind` calls can both observe an unconsumed
+    #: ticket. See `admin/bind.py` for the enclosing bind transaction.
+    _lock: Any = field(default_factory=threading.RLock)
 
     # ------------------------------------------------------------------ state
     @property
@@ -122,24 +127,40 @@ class SetupService:
     def create_ticket(self, ttl: int = TICKET_TTL_S) -> dict[str, Any]:
         ticket = "".join(secrets.choice(TICKET_ALPHABET) for _ in range(TICKET_LEN))
         expires = self.wall() + ttl
-        self._tickets[ticket] = {"expires_at": expires, "consumed": False}
+        with self._lock:
+            self._tickets[ticket] = {"expires_at": expires, "consumed": False}
         return {
             "ticket": ticket, "expires_at": int(expires),
             "bind_url": f"vade://bind?h={self.admin_host}&fp={self.fp8}&t={ticket}&v=1",
         }
 
     def peek_ticket(self, ticket: str) -> dict[str, Any] | None:
-        entry = self._tickets.get(ticket)
-        if entry is None or entry["consumed"] or entry["expires_at"] <= self.wall():
-            return None
-        return entry
+        """Read-only lookup for `GET /admin/bind/info` and step ④a."""
+        with self._lock:
+            entry = self._tickets.get(ticket)
+            if entry is None or entry["consumed"] or entry["expires_at"] <= self.wall():
+                return None
+            return entry
 
     def consume_ticket(self, ticket: str) -> bool:
-        entry = self.peek_ticket(ticket)
-        if entry is None:
-            return False
-        entry["consumed"] = True
-        return True
+        """Atomic single-use claim: exactly one caller per ticket gets `True`."""
+        with self._lock:
+            entry = self.peek_ticket(ticket)
+            if entry is None:
+                return False
+            entry["consumed"] = True
+            return True
+
+    def release_ticket(self, ticket: str) -> None:
+        """Roll back a reservation after a later step of the same transaction failed.
+
+        Only `admin/bind.py` calls this, while it holds its own lock, so no
+        other request can observe the ticket as consumable in between.
+        """
+        with self._lock:
+            entry = self._tickets.get(ticket)
+            if entry is not None:
+                entry["consumed"] = False
 
     # ----------------------------------------------------------------- unlock
     def unlock(self, provided: str) -> dict[str, Any]:
@@ -176,13 +197,7 @@ class SetupService:
             validate_password(password)
         except PasswordPolicyError as exc:
             raise VadeError("INVALID_ARGUMENT", str(exc)) from None
-        doc = {
-            "version": 1,
-            "password": hash_password(password),
-            "created_at": self.wall(),
-            "password_changed_at": self.wall(),
-            "created_from_ip": ip,
-        }
+        doc = self._initial_doc(password, ip)
         self._write_admin(doc)
         # Only now: a crash between the two leaves a token that is ignored
         # because admin.json exists, which is recoverable without `reset`.
@@ -199,6 +214,35 @@ class SetupService:
                 label=label, ip=ip,
             )
         return {"initialized": True, "device": device.public() if device else None}
+
+    def _initial_doc(self, password: str, ip: str | None) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "password": hash_password(password),
+            "created_at": self.wall(),
+            "password_changed_at": self.wall(),
+            "created_from_ip": ip,
+        }
+
+    def initialize_bound(self, *, password: str, ip: str | None) -> None:
+        """First-run setup completed by a verified bind ticket (§7.12.3 ③).
+
+        The bind ticket **is** the credential here: the envelope was decrypted,
+        the challenge signature was verified and the ticket was reserved under
+        the bind lock before this is called. Re-checking `setup.token` would
+        demand a secret a phone scanning a QR never has — and the caller is
+        never loopback, so `initialize()` would refuse it by design.
+
+        Same crash ordering as `initialize()`: `admin.json` first, token second.
+        """
+        if self.initialized():
+            raise VadeError("BIND_UNAUTHORIZED", "admin plane is already initialised")
+        try:
+            validate_password(password)
+        except PasswordPolicyError as exc:
+            raise VadeError("INVALID_ARGUMENT", str(exc)) from None
+        self._write_admin(self._initial_doc(password, ip))
+        setup_token.consume(self.data_dir)
 
     def change_password(self, old: str, new: str) -> None:
         from .auth import verify_password

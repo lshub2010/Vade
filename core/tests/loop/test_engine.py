@@ -10,9 +10,11 @@ import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from vade.loop.context import BlobStore, CompactionConfig, ContextBuilder
 from vade.loop.engine import LoopConfig, LoopEngine
+from vade.loop.ports import ApprovalDecision
 from vade.loop.prompt import PromptParts, assemble
 from vade.llm.base import Delta, ToolCallDelta
 from vade.llm.mock import MockLLMProvider
@@ -173,6 +175,67 @@ def test_no_concrete_tool_names_in_loop_source():
     for literal in ("fs__", "shell__", "com.example", "read_file",
                     "skill_load", "tools_search", "tools/search"):
         assert literal not in source, f"agent-loop must not know {literal!r}"
+
+
+class _DenyingApproval:
+    """C5a's port when a human answered `deny`: a decision with a request id."""
+
+    def __init__(self) -> None:
+        self.requests: list[Any] = []
+
+    async def check(self, request):
+        self.requests.append(request)
+        return ApprovalDecision(False, reason="denied by approver", request_id="rid-1",
+                                scope="once", by="dev-1")
+
+
+class _TaskTurn:
+    """A turn spawned by a subagent task, so it carries RFC-0007 §7.1 attribution."""
+
+    id = "t9"
+    session_id = "s9"
+    model_id = None
+    user_text = "do it"
+    task_id = "task-1"
+    task_name = "writer"
+    depth = 2
+
+
+def test_a_denied_call_publishes_the_same_attribution_as_its_prompt():
+    """P3-1: the deny path published only the six required fields, while the
+    allow path published `session_id` + the §7.1 triple.
+
+    A device that missed `turn.approval_required` closes the card by matching
+    exactly those, so a deny that omits them leaves the dialog up — and the
+    prompt/resolution pair must carry the SAME task, or it closes the wrong one.
+    """
+
+    async def scenario():
+        llm = MockLLMProvider([
+            [Delta(tool_calls=(ToolCallDelta(index=0, id="c1", name="fs__read_file",
+                                             arguments='{"path":"a"}'),))],
+            [Delta(text="denied")],
+        ])
+        entries = [_entry("fs__read_file", "com.example.fs/read_file", risk="high")]
+        snapshot = FakeSnapshot(entries)
+        recorder = Recorder()
+        approval = _DenyingApproval()
+        engine = LoopEngine(FakeRouter(), llm, lambda: snapshot, recorder, approval=approval)
+        await engine.run_turn(_TaskTurn(), ())
+
+        [payload] = [p for t, p in recorder.events if t == "turn.approval_resolved"]
+        assert payload["decision"] == "deny" and payload["request_id"] == "rid-1"
+        assert payload["session_id"] == "s9"
+        assert payload["task_id"] == "task-1" and payload["task_name"] == "writer"
+        assert payload["depth"] == 2
+        request = approval.requests[0]
+        assert (request.task_id, request.task_name, request.depth) == (
+            payload["task_id"], payload["task_name"], payload["depth"]
+        )
+        # The call never ran: the denial is a tool result, not a tool call.
+        assert [t for t, _ in recorder.events].count("turn.tool_call") == 1
+
+    asyncio.run(scenario())
 
 
 def test_high_risk_is_denied_when_no_approver_is_installed():

@@ -255,3 +255,93 @@ def test_session_end_drops_grants_and_unblocks_waiters(tmp_path):
         writer.close()
 
     asyncio.run(scenario())
+
+
+async def _suspend(manager, request_id, within=10.0):
+    """Wait until the waiter is parked on the approval future.
+
+    `pending_count` alone is not enough: the coroutine must already be
+    *awaiting* for `close_turn` / `cancel()` to reproduce the interleavings the
+    two tests below are about.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + within
+    while True:
+        pending = manager._pending.get(request_id)
+        if pending is not None and pending.awaited:
+            return
+        if loop.time() > deadline:
+            raise AssertionError("the waiter never reached the approval suspend point")
+        await asyncio.sleep(0)
+
+
+def test_a_sweep_that_won_the_race_keeps_its_deny_against_the_late_cancel(tmp_path):
+    """`close_turn` resolves the row `denied` and drains `_cancelled`; the
+    CancelledError that surfaces afterwards in the waiter used to write
+    `cancelled` over that verdict and push the already-drained row back into
+    `_cancelled`.
+
+    Two consequences, both asserted here: `decision_of()` contradicted the
+    `deny`/interrupted event already on the wire, and the re-queued row had no
+    sweep left to run — its dialog stayed open on every other device.
+    """
+
+    async def scenario():
+        manager, writer = _manager(tmp_path)
+        task = asyncio.create_task(manager.request(_request()))
+        [pending] = await _pending(manager)
+        rid = pending["request_id"]
+        await _suspend(manager, rid)
+
+        closed = await manager.close_turn("s1", "t1")
+        assert [row["request_id"] for row in closed] == [rid]
+        assert manager.decision_of(rid) == "denied"
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert manager.decision_of(rid) == "denied", "the late cancel must not rewrite the verdict"
+        assert manager._cancelled == {}, "a resolved id must not be queued for a sweep that already ran"
+        assert manager.pending_count == 0
+        writer.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_cancelled_waiter_is_handed_off_unresolved_and_closed_denied(tmp_path):
+    """The other interleaving: the cancel arrives first, so the verdict is the
+    sweep's.
+
+    The hand-off row therefore stays *unresolved* (`decision_of()` → None, never
+    `cancelled`), and `close_turn` writes the same `denied` it announces, so the
+    table and the event agree whichever order the two land in.
+    """
+
+    async def scenario():
+        manager, writer = _manager(tmp_path)
+        task = asyncio.create_task(manager.request(_request()))
+        [pending] = await _pending(manager)
+        rid = pending["request_id"]
+        await _suspend(manager, rid)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert manager.decision_of(rid) is None, "the verdict belongs to the turn-end sweep"
+        assert rid in manager._cancelled, "handed off, not dropped"
+        assert manager.pending_count == 0
+
+        closed = await manager.close_turn("s1", "t1")
+        assert [row["request_id"] for row in closed] == [rid]
+        assert manager.decision_of(rid) == "denied"
+        assert manager._cancelled == {}
+
+        # Dead but announced: a retry must be told "already resolved", not
+        # "unknown request" (which reads like the id was wrong).
+        with pytest.raises(VadeError) as caught:
+            await manager.decide(rid, "approve", by="dev-1", actor_kind="device_key")
+        assert caught.value.code == "INVALID_ARGUMENT"
+        writer.close()
+
+    asyncio.run(scenario())

@@ -115,6 +115,12 @@ class ApprovalManager:
         #: its `emit` is the loop's turn guard, which raises CancelledError for
         #: every write once the turn is stopping — so without this hand-off the
         #: dialog stayed open forever on every other device.
+        #:
+        #: A hand-off of *unresolved* rows only: the verdict of a cancelled
+        #: waiter belongs to `close_turn` (it publishes `deny`/interrupted), so
+        #: nothing here may be pre-resolved in `_resolved` and nothing already
+        #: resolved may be queued here again. `decision_of()` must never answer
+        #: `cancelled` while the wire says `deny`.
         self._cancelled: dict[str, PendingApproval] = {}
         self._grants: dict[tuple[str, str, str], float] = {}
         self._lock = asyncio.Lock()
@@ -307,12 +313,24 @@ class ApprovalManager:
             # closes the dialog on every device. Emitting from here is not an
             # option: this `emit` is the loop's turn guard, and it raises
             # CancelledError for every write once the turn is stopping.
+            #
+            # The sweep may already have won: `close_turn` resolves every row of
+            # the turn `denied` and drains `_cancelled` under this same lock, and
+            # the cancellation then surfaces here *after* it. Re-writing
+            # `cancelled` over that verdict made `decision_of()` contradict the
+            # `deny`/interrupted event already on the wire, and re-queueing the
+            # row handed the sweep a request it had just drained — no sweep is
+            # left to close that dialog. So: a resolved id stays resolved and is
+            # never queued; otherwise the row waits *unresolved* for the sweep
+            # that owns its verdict.
             async with self._lock:
-                if not pending.future.done():
-                    pending.future.cancel()
-                self._resolved[rid] = "cancelled"
-                self._pending.pop(rid, None)
-                self._note_cancelled(pending)
+                if rid in self._resolved:
+                    self._pending.pop(rid, None)
+                else:
+                    if not pending.future.done():
+                        pending.future.cancel()
+                    self._pending.pop(rid, None)
+                    self._note_cancelled(pending)
             # Deliberately no `running` write here: the turn is being torn down
             # and the queue is about to publish its terminal state. Resurrecting
             # `running` first would emit a transition the user never caused.
@@ -357,7 +375,12 @@ class ApprovalManager:
         return len(expired)
 
     def decision_of(self, request_id: str) -> str | None:
-        """`allowed` / `denied` / `timeout` / `cancelled`, or None while pending.
+        """`allowed` / `denied` / `timeout` / `session_ended`, or None while pending.
+
+        Never `cancelled`: a waiter cancelled by an interrupt leaves the row
+        unresolved for the turn-end sweep, which publishes `deny` and writes
+        `denied` here in the same breath (`close_turn`). Answering `cancelled`
+        while the wire said `deny` is exactly the drift this avoids.
 
         Read-only on purpose: stage two of a page call must never be able to
         *change* a decision, only observe the one `approval/decide` wrote.
@@ -413,7 +436,11 @@ class ApprovalManager:
         async with self._lock:
             pending = self._pending.get(request_id)
             if pending is None:
-                if request_id in self._resolved:
+                if request_id in self._resolved or request_id in self._cancelled:
+                    # `_cancelled` rows are requests whose turn is being torn
+                    # down: the verdict is the sweep's to publish, but the row
+                    # is already dead, and "unknown request" would suggest a
+                    # retry could still land.
                     raise VadeError("INVALID_ARGUMENT", "approval request already resolved")
                 raise VadeError("NOT_FOUND", "unknown approval request")
             if pending.future.done():
@@ -507,7 +534,10 @@ class ApprovalManager:
 
         `_cancelled` entries are drained here too: a request whose waiter was
         cancelled by the interrupt has no other place that can write its close
-        event (see `_await_decision`).
+        event (see `_await_decision`). Those rows arrive unresolved, so this is
+        where their verdict is written — the same `denied` the event below
+        announces — and `decision_of()` therefore agrees with the wire instead
+        of saying `cancelled`.
         """
         async with self._lock:
             rows = [
@@ -528,10 +558,20 @@ class ApprovalManager:
             ]
             for pending in cancelled:
                 self._cancelled.pop(pending.request_id, None)
+                # The waiter is already gone, so nothing else will ever write
+                # this row's state. Announce and record the SAME verdict: the
+                # sweep emits `deny`, so `decision_of()` must not keep saying
+                # `cancelled` (nor keep answering "still pending").
+                self._resolved[pending.request_id] = "denied"
         return [self._row(p) for p in (*rows, *cancelled)]
 
     def _note_cancelled(self, pending: PendingApproval) -> None:
-        """Hand a cancelled request to the turn-end sweep (bounded FIFO)."""
+        """Hand a cancelled, still-*unresolved* request to the turn-end sweep.
+
+        Bounded FIFO: a row that no sweep ever drains must not keep its args
+        alive. Nothing enters here with a verdict in `_resolved` — see
+        `_await_decision`.
+        """
         self._cancelled[pending.request_id] = pending
         while len(self._cancelled) > CANCELLED_KEEP:
             self._cancelled.pop(next(iter(self._cancelled)), None)

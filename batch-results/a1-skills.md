@@ -36,8 +36,8 @@
 
 ## 验证
 
-- `python -m pytest core/tests/admin/test_skills.py -q` → **10 passed**
-- `python -m pytest core/tests/admin -q` → **42 passed**
+- `python -m pytest core/tests/admin/test_skills.py -q` → **10 passed**（新增）
+- `python -m pytest core/tests/admin -q` → **43 passed**
 - `python -m pytest core/tests/test_skill -q` → **162 passed**
 - `python tools/check_contracts.py` → **contracts: OK**（C-03/C-04/C-05/C-06/C-18、event gate 全绿；未新增事件/错误码）
 - 路由表核对：`/admin/api/skills` 9 个操作全部注册，`/install*` 在 `/{name}` 之前（Starlette 顺序匹配）。

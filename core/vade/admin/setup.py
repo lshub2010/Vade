@@ -25,11 +25,26 @@ from ..errors import VadeError
 from . import setup_token
 from .auth import PasswordPolicyError, hash_password, validate_password
 
-__all__ = ["SetupService", "TICKET_ALPHABET", "TICKET_LEN", "TICKET_TTL_S"]
+__all__ = ["SetupService", "InitializeSnapshot", "TICKET_ALPHABET", "TICKET_LEN", "TICKET_TTL_S"]
 
 TICKET_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 TICKET_LEN = 26
 TICKET_TTL_S = 600
+
+
+@dataclass(frozen=True, slots=True)
+class InitializeSnapshot:
+    """The pre-bind state of `admin.json` and `setup.token`, for rollback.
+
+    `setup_required=true` means `admin.json` did not exist; the token file did
+    (generated at start, or pinned through `VADE_SETUP_TOKEN`). Both are captured
+    so `rollback_initialize()` can return the plane to exactly what the bind
+    request found — otherwise a failed enrolment leaves "initialised, no device,
+    token gone", which only `vade admin reset` can repair.
+    """
+
+    admin_doc: bytes | None
+    setup_token: str | None
 
 
 @dataclass(slots=True)
@@ -65,17 +80,31 @@ class SetupService:
 
     def _write_admin(self, doc: Mapping[str, Any]) -> None:
         """tmp + `os.replace`, mode 0600. The only writer of `admin.json`."""
-        path = self.admin_doc_path
+        self._atomic_write(
+            self.admin_doc_path,
+            json.dumps(dict(doc), ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+
+    @staticmethod
+    def _atomic_write(path: Path, raw: bytes) -> None:
+        """tmp + `os.replace`, mode 0600 — for the state files this service owns."""
         path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(path.parent, 0o700)
         tmp = path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(fd, json.dumps(dict(doc), ensure_ascii=False, indent=2).encode("utf-8"))
+            os.write(fd, raw)
         finally:
             os.close(fd)
         os.replace(tmp, path)
         os.chmod(path, 0o600)
+
+    def _read_admin_bytes(self) -> bytes | None:
+        """Raw `admin.json` bytes, or `None` when the plane is uninitialised."""
+        try:
+            return self.admin_doc_path.read_bytes()
+        except (FileNotFoundError, OSError):
+            return None
 
     def rehash_password(self, password: str, stored: str | None = None) -> bool:
         """Upgrade a verified credential in place (scrypt → Argon2id, or weak params).
@@ -278,6 +307,43 @@ class SetupService:
             raise VadeError("INVALID_ARGUMENT", str(exc)) from None
         self._write_admin(self._initial_doc(password, ip))
         setup_token.consume(self.data_dir)
+
+    def begin_initialize_bound(self, *, password: str, ip: str | None) -> InitializeSnapshot:
+        """`initialize_bound` plus the snapshot that can undo it.
+
+        Called by `admin/bind.py` inside its bind transaction: if the device
+        cannot be enrolled afterwards, `rollback_initialize()` puts the plane
+        back to "setup required" and the caller keeps the ticket, so the same QR
+        can be retried instead of needing `vade admin reset`.
+        """
+        snapshot = InitializeSnapshot(
+            admin_doc=self._read_admin_bytes(),
+            setup_token=setup_token.read_token(self.data_dir),
+        )
+        self.initialize_bound(password=password, ip=ip)
+        return snapshot
+
+    def rollback_initialize(self, snapshot: InitializeSnapshot) -> None:
+        """Undo `begin_initialize_bound`, in the crash-safe order.
+
+        The token is restored *first*: a crash between the two steps then leaves
+        "initialised + token present" (the token is ignored while `admin.json`
+        exists, and `ensure_setup_token()` unlinks it on the next start). The
+        reverse order would leave "no password, no token", which is the state
+        `initialize()` exists to avoid.
+        """
+        if snapshot.setup_token:
+            self._atomic_write(
+                setup_token.token_path(self.data_dir), snapshot.setup_token.encode("ascii"),
+            )
+        path = self.admin_doc_path
+        if snapshot.admin_doc is None:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            self._atomic_write(path, snapshot.admin_doc)
 
     def change_password(self, old: str, new: str) -> None:
         from .auth import verify_password

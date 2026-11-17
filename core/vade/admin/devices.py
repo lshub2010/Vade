@@ -163,6 +163,22 @@ class DeviceStore:
             self._save()
             return device
 
+    def discard(self, device_id: str) -> bool:
+        """Undo `add()` — for a bind transaction that failed after enrolling.
+
+        Deliberately **not** `revoke()`: the key was never usable, so it must not
+        land on the revoked list (that would refuse the retry the released ticket
+        is meant to allow). The device list and the revoked set are written
+        together by `_save()`, so nothing else can observe the half-step.
+        """
+        with self._lock:
+            devices = self._load()
+            if device_id not in devices:
+                return False
+            devices.pop(device_id)
+            self._save()
+            return True
+
     def revoke(self, device_id: str) -> bool:
         with self._lock:
             devices = self._load()

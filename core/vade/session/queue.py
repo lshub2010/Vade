@@ -332,7 +332,7 @@ class TurnQueue:
                 error_code=code,
                 error_message=message,
                 task=task,
-                usage=_unmeasured_usage(turn.model_id),
+                usage=_failed_usage(exc, turn),
             )
             return
 
@@ -402,6 +402,19 @@ class TurnQueue:
                                  exc_info=True)
             if state is not TurnState.COMPLETED or turn.state is not TurnState.COMPLETED:
                 turn = turn.with_state(state, ended_at=turn.ended_at or self._clock())
+            if error_code is not None or error_message is not None:
+                # RFC-0005 §6.1/C-04: the failure has to survive on the ROW, not
+                # only in the `turn.failed` payload. `turns.error_code` /
+                # `error_message` are what a client reads back after the event
+                # is gone — from `ui/attach`'s snapshot and from `session/get`
+                # on a restarted core — and they used to stay NULL because the
+                # parameters were accepted and never applied.
+                turn = replace(
+                    turn,
+                    error_code=error_code if error_code is not None else turn.error_code,
+                    error_message=(error_message if error_message is not None
+                                   else turn.error_message),
+                )
             if usage is not None:
                 # RFC-0005 §6.1: a failed/interrupted turn has burned tokens too.
                 # When the provider never reported them the honest value is
@@ -699,6 +712,27 @@ class TurnQueue:
         task.add_done_callback(self._orphans.discard)
         if not task.cancelled():
             task.exception()
+
+
+def _failed_usage(exc: BaseException, turn: Turn) -> dict[str, Any]:
+    """Usage for a turn that ended in an exception (RFC-0005 §6.1).
+
+    A turn that fails has usually been billed for the calls it did make, and
+    the audit `llm.call` rows keep them (§6.2). Writing the `source="none"`
+    placeholder over that made `session/usage.get` disagree with the audit
+    trail by exactly the tokens a failure had burned. The loop attaches what it
+    measured to the exception it raised (`loop.engine.failure_usage`); an
+    executor that measures nothing attaches nothing and keeps the honest
+    placeholder — core never estimates (N4/D102).
+    """
+    # Imported here, not at module scope: the session queue must not drag the
+    # agent loop in with it (the loop imports this package's models).
+    from ..loop.engine import failure_usage
+
+    measured = failure_usage(exc)
+    if measured is not None:
+        return measured
+    return _unmeasured_usage(turn.model_id)
 
 
 def _unmeasured_usage(model_id: str | None) -> dict[str, Any]:

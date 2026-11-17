@@ -28,7 +28,8 @@ from .prompt import PromptParts, apply_hooks, assemble
 from .toolcard import build_args_preview
 from .tools import ToolEntry, ToolSnapshot, resolve_hot
 
-__all__ = ["LoopEngine", "LoopConfig", "TurnOutcome", "DEFAULT_PERSONA"]
+__all__ = ["LoopEngine", "LoopConfig", "TurnOutcome", "DEFAULT_PERSONA",
+           "USAGE_ATTR", "attach_usage", "failure_usage"]
 
 
 DEFAULT_PERSONA = (
@@ -64,6 +65,38 @@ class TurnOutcome:
     #: dedups or truncates). `()` when no hook activated anything. The queue
     #: emits it as `turn.completed.skills` (always present, `[]` when empty).
     activated_skills: tuple[str, ...] = ()
+
+
+class _UsageMeter:
+    """Tokens this turn was billed for, kept where a `raise` cannot lose them.
+
+    `run_turn` returns a `TurnOutcome` only when the turn completes, so the
+    counters used to die with the stack frame: a turn that failed after three
+    paid calls reported `source="none"` and the queue wrote that placeholder
+    over usage the audit trail (`llm.call`) still held — `session/usage.get`
+    and the audit then disagreed by exactly the tokens a failure had burned
+    (RFC-0005 §6.1/§6.2, D102). The meter is created before the first provider
+    call and owned by `run_turn`'s frame, so the exception path can still read
+    it instead of guessing.
+    """
+
+    __slots__ = ("model_id", "usage", "reported", "steps")
+
+    def __init__(self, model_id: str | None) -> None:
+        self.model_id = model_id
+        self.usage: dict[str, int] = {}
+        self.reported = False
+        self.steps = 0
+
+    def absorb(self, call_usage: Mapping[str, int]) -> None:
+        """Fold one call's counts into the turn total (ok AND aborted calls)."""
+        for key, value in call_usage.items():
+            self.usage[key] = self.usage.get(key, 0) + int(value)
+
+    def record(self) -> dict[str, Any]:
+        """The §6.1 record: zeros with `source="none"` when nothing was reported."""
+        return _usage_record(self.model_id, self.usage, reported=self.reported,
+                             steps=self.steps)
 
 
 class _PartCursors:
@@ -138,6 +171,27 @@ class LoopEngine:
         self.builtins = builtins
 
     async def run_turn(self, turn: Turn, content: Sequence[Mapping[str, Any]]) -> TurnOutcome:
+        """Run one turn, carrying what it was billed onto a failure.
+
+        A `TurnOutcome` only exists when the turn completes, so the tokens a
+        FAILING turn spent had nowhere to go: the queue saw an exception and
+        wrote `source="none"`, while the audit `llm.call` rows kept the real
+        counts. The meter rides the exception instead (`failure_usage`) — the
+        exception is the only object that crosses this boundary — and the queue
+        persists it as the failed turn's usage.
+        """
+        meter = _UsageMeter(turn.model_id)
+        try:
+            return await self._run_turn(turn, content, meter)
+        except BaseException as exc:
+            # BaseException, not Exception: the meter is attached regardless of
+            # the exception class, so nothing about the accounting depends on
+            # what kind of failure ended the turn.
+            attach_usage(exc, meter.record())
+            raise
+
+    async def _run_turn(self, turn: Turn, content: Sequence[Mapping[str, Any]],
+                        meter: _UsageMeter) -> TurnOutcome:
         if self.llm is None:
             raise VadeError("UNAVAILABLE", "no LLM provider is configured")
         # A turn can be interrupted before its executor even starts (the queue
@@ -212,12 +266,9 @@ class LoopEngine:
         if self.builtins:
             tools.extend(self.builtins.schemas())
 
-        usage: dict[str, int] = {}
         recorded: list[dict[str, Any]] = []
         final_text = ""
         stopped_reason = "stop"
-        reported = False
-        llm_calls = 0
         parts = _PartCursors()
         start_visible = frozenset(visible)
 
@@ -227,7 +278,7 @@ class LoopEngine:
             calls: dict[int, dict[str, str]] = {}
             call_usage: dict[str, int] = {}
             attribution: dict[str, Any] = {}
-            llm_calls += 1
+            meter.steps += 1
             started = time.perf_counter()
             tools = list(snapshot.schemas())
             if layered:
@@ -264,17 +315,19 @@ class LoopEngine:
                         if fragment.arguments:
                             slot["arguments"] += fragment.arguments
                     if delta.usage:
-                        reported = True
+                        meter.reported = True
                         for key, value in delta.usage.items():
                             if isinstance(value, int):
                                 call_usage[key] = call_usage.get(key, 0) + value
-                                usage[key] = usage.get(key, 0) + value
             except BaseException as exc:
                 # The audit is the only place an operator can see that tokens
-                # were spent on a call that then failed (§6.2).
+                # were spent on a call that then failed (§6.2) — and the meter
+                # is what lets the turn row agree with it (see `run_turn`).
+                meter.absorb(call_usage)
                 self._audit_llm_call(turn, attribution, call_usage, started,
                                      status="error", code=_error_code(exc))
                 raise
+            meter.absorb(call_usage)
             self._audit_llm_call(turn, attribution, call_usage, started, status="ok", code=None)
 
             text = "".join(text_parts)
@@ -474,7 +527,7 @@ class LoopEngine:
         self._audit({"kind": "turn_completed", "session_id": turn.session_id, "turn_id": turn.id,
                      "stopped_reason": stopped_reason, "tool_calls": len(recorded)})
         return TurnOutcome(
-            usage=_usage_record(turn.model_id, usage, reported=reported, steps=llm_calls),
+            usage=meter.record(),
             assistant_text=final_text, tool_calls=tuple(recorded),
             stopped_reason=stopped_reason,
             activated_skills=activated_skills,
@@ -944,6 +997,38 @@ def _usage_record(
         "cached_tokens": count("cached_tokens"),
         "reasoning_tokens": count("reasoning_tokens"),
     }
+
+
+#: Attribute `run_turn` attaches a failed turn's measured usage to.
+#:
+#: The exception is the only object that crosses the engine -> queue boundary
+#: when a turn fails, and `TurnOutcome` never exists in that case: without this
+#: carrier a turn that had already been billed lost its counts and the queue
+#: wrote `source="none"` over real usage the audit `llm.call` rows still held.
+USAGE_ATTR = "vade_usage"
+
+
+def attach_usage(exc: BaseException, usage: Mapping[str, Any]) -> None:
+    """Carry `usage` on the exception that ended the turn (see `USAGE_ATTR`)."""
+    try:
+        setattr(exc, USAGE_ATTR, dict(usage))
+    except Exception:  # pragma: no cover - an exotic exception must not mask the turn's
+        pass
+
+
+def failure_usage(exc: BaseException) -> dict[str, Any] | None:
+    """The usage the loop measured for a turn that failed, or `None`.
+
+    `None` means "this executor measured nothing" (a test double, a core wired
+    without the loop) — the caller then writes the honest `source="none"`
+    placeholder rather than an estimate. A loop-raised exception always carries
+    a record, which is `source="none"` with zero counts when the provider never
+    reported before the failure.
+    """
+    value = getattr(exc, USAGE_ATTR, None)
+    if isinstance(value, Mapping):
+        return dict(value)
+    return None
 
 
 def _error_code(exc: BaseException) -> str:

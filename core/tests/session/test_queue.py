@@ -11,6 +11,7 @@ import pytest
 from vade.errors import VadeError
 from vade.llm.base import Delta, ToolCallDelta
 from vade.llm.mock import MockLLMProvider
+from vade.llm.usage import UsageAccounting
 from vade.loop.engine import LoopEngine, TurnOutcome
 from vade.loop.tools import build_snapshot
 from vade.registry.manifest import validate_manifest
@@ -948,6 +949,223 @@ def test_shutdown_terminates_running_and_queued_turns_before_cancelling(tmp_path
         # And a stopped queue never starts another worker.
         queue.ensure_worker()
         assert queue._worker is None
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+# ------------------------------------------------- failure accounting (C1)
+
+
+class _Cfg:
+    """Minimal `[usage]` view: every key falls back to its documented default."""
+
+    def get(self, key: str, default=None):
+        return default
+
+
+class _AuditReader:
+    """`audit/reader.py`'s query shape over a recording port's rows."""
+
+    def __init__(self, rows: list) -> None:
+        self.rows = rows
+
+    def query(self, *, kind=None, from_ts=None, limit=500, cursor=None):
+        rows = [row for row in self.rows if kind is None or row.get("kind") == kind]
+        return {"items": rows[:limit], "next_cursor": None}
+
+
+class _RecordingAudit:
+    """`AuditPort`: keeps every row so a test can reconcile against it."""
+
+    def __init__(self) -> None:
+        self.events: list = []
+
+    def record(self, event) -> None:
+        self.events.append(dict(event))
+
+    def llm_calls(self) -> list:
+        return [event for event in self.events if event.get("kind") == "llm.call"]
+
+
+class _IdleRouter:
+    """No module, never cancelled: the engine only needs the probe."""
+
+    def was_cancelled(self, turn_id: str) -> bool:
+        return False
+
+
+def _engine_log(tmp_path, llm, audit):
+    """A SessionLog + LoopEngine wired the way the session component wires them."""
+    registry = Registry()
+    registry.register(
+        validate_manifest(make_manifest()), fingerprint="fp-fs", connection_id="c-fs"
+    )
+    log = SessionLog(SQLiteStore(tmp_path / "sessions.db"), replay=ReplayBuffer(maxlen=500))
+    engine = LoopEngine(_IdleRouter(), llm, lambda: build_snapshot(registry), log.emit, audit=audit)
+    log.set_executor(engine.run_turn)
+    return log
+
+
+def test_failed_turn_persists_error_code_and_attach_snapshot_shows_it(tmp_path):
+    """C-04 on the ROW, not only in `turn.failed`.
+
+    A client that reconnects gets `ui/attach`'s snapshot instead of the event
+    stream, so the answer to "why did this turn fail" has to survive in
+    `turns.error_code`/`error_message`. The queue accepted both parameters and
+    never applied them, so the row said `failed` and nothing else.
+    """
+
+    async def scenario():
+        async def boom(turn, content):
+            raise VadeError("UNAVAILABLE", "provider is offline")
+
+        log = _log(tmp_path, boom)
+        session = log.create_session()
+        turn, position = await log.submit(session.id, [{"type": "text", "text": "go"}], "c1")
+        assert position == 1
+        await log.wait_idle(session.id)
+        await asyncio.sleep(0.02)
+
+        row = log.store.find_turn(session.id, turn.id)
+        assert row.state is TurnState.FAILED
+        assert row.error_code == "UNAVAILABLE"
+        assert row.error_message == "provider is offline"
+
+        # The same pair rides the terminal event (the frozen payload shape).
+        failed = [e for e in log.store.read_since(session.id, 0) if e.type == "turn.failed"]
+        assert len(failed) == 1
+        assert (failed[0].payload["code"], failed[0].payload["message"]) == (
+            "UNAVAILABLE", "provider is offline",
+        )
+
+        # `ui/attach` with no last_seq answers with the snapshot, not a replay.
+        attached = await log.attach(session.id, None, CollectSink())
+        assert attached.snapshot is not None
+        [wire] = [t for t in attached.snapshot["turns"] if t["id"] == turn.id]
+        assert wire["state"] == "failed"
+        assert wire["error_code"] == "UNAVAILABLE"
+        assert wire["error_message"] == "provider is offline"
+
+        # A retry of the same submit returns the ORIGINAL turn: no second row,
+        # no second failure, and the error survives the replay untouched.
+        again, position = await log.submit(session.id, [{"type": "text", "text": "go"}], "c1")
+        assert again.id == turn.id and position == 0
+        assert [t.id for t in log.store.load(session.id).turns] == [turn.id]
+        same = log.store.find_turn(session.id, turn.id)
+        assert (same.error_code, same.error_message) == ("UNAVAILABLE", "provider is offline")
+        assert [e.type for e in log.store.read_since(session.id, 0)].count("turn.failed") == 1
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_failed_turn_keeps_provider_reported_usage_and_agrees_with_the_audit(tmp_path):
+    """Tokens billed before the break are not overwritten by the placeholder.
+
+    The provider reported 15 tokens and then the stream died. `_unmeasured_usage`
+    used to replace that with `source="none"`/zeros, so `session/usage.get`
+    under-reported by exactly the 15 the audit `llm.call` row still carried
+    (D102).
+    """
+
+    async def scenario():
+        class PaidThenFailLLM:
+            """One stream that reports usage, then breaks: the tokens WERE billed."""
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def chat(self, messages, tools=None, stream=True, model=None,
+                           attribution=None):
+                self.calls += 1
+                yield Delta(text="partial",
+                            usage={"prompt_tokens": 12, "completion_tokens": 3,
+                                   "total_tokens": 15})
+                raise VadeError("UNAVAILABLE", "upstream closed the stream")
+
+        audit = _RecordingAudit()
+        llm = PaidThenFailLLM()
+        log = _engine_log(tmp_path, llm, audit)
+        usage = UsageAccounting(config=_Cfg(), store=log.store,
+                                audit_reader=_AuditReader(audit.events))
+        log.set_usage_accounting(usage)
+        session = log.create_session()
+        turn, _ = await log.submit(session.id, [{"type": "text", "text": "go"}], "u1")
+        await log.wait_idle(session.id)
+        await asyncio.sleep(0.02)
+
+        row = log.store.find_turn(session.id, turn.id)
+        assert row.state is TurnState.FAILED          # still a failure …
+        assert row.error_code == "UNAVAILABLE"
+        assert row.usage["source"] == "provider"      # … with the real measurement
+        assert (row.usage["prompt_tokens"], row.usage["completion_tokens"],
+                row.usage["total_tokens"]) == (12, 3, 15)
+        assert row.usage["steps"] == 1
+
+        # The wire says the same thing as the row.
+        [failed] = [e for e in log.store.read_since(session.id, 0) if e.type == "turn.failed"]
+        assert failed.payload["usage"]["source"] == "provider"
+        assert failed.payload["usage"]["total_tokens"] == 15
+
+        # §6.2: the call that broke is audited with what it had billed so far.
+        rows = audit.llm_calls()
+        assert len(rows) == 1 and rows[0]["status"] == "error"
+        assert rows[0]["extra"]["total_tokens"] == 15
+
+        # §6.3/D102: `session/usage.get` (turn rows) and the audit agree, and
+        # the turn is NOT counted as unmeasured.
+        report = usage.report(log.store.load(session.id))
+        assert report["chat"]["total_tokens"] == 15
+        assert report["chat"]["total_tokens"] == sum(r["extra"]["total_tokens"] for r in rows)
+        assert report["chat"]["partial_turns"] == 0
+        assert report["by_model"][0]["total_tokens"] == 15
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_failed_turn_with_no_report_is_unmeasured_and_never_estimated(tmp_path):
+    """Nothing was ever reported -> `source="none"`, zero counts, no estimate.
+
+    The other half of the rule: a provider that dies before its first usage
+    delta must not be turned into a number. `session/usage.get` counts it in
+    `partial_turns` instead (N4/D102).
+    """
+
+    async def scenario():
+        class FailsBeforeUsageLLM:
+            async def chat(self, messages, tools=None, stream=True, model=None,
+                           attribution=None):
+                raise RuntimeError("socket closed")
+                yield  # pragma: no cover - makes this an async generator
+
+        audit = _RecordingAudit()
+        log = _engine_log(tmp_path, FailsBeforeUsageLLM(), audit)
+        usage = UsageAccounting(config=_Cfg(), store=log.store,
+                                audit_reader=_AuditReader(audit.events))
+        log.set_usage_accounting(usage)
+        session = log.create_session()
+        turn, _ = await log.submit(session.id, [{"type": "text", "text": "go"}], "n1")
+        await log.wait_idle(session.id)
+        await asyncio.sleep(0.02)
+
+        row = log.store.find_turn(session.id, turn.id)
+        assert row.state is TurnState.FAILED
+        # A non-Vade exception is still a C-04 surface, never a traceback.
+        assert row.error_code == "INTERNAL"
+        assert row.error_message and "internal error" in row.error_message
+        assert row.usage["source"] == "none"
+        assert (row.usage["prompt_tokens"], row.usage["completion_tokens"],
+                row.usage["total_tokens"]) == (0, 0, 0)
+
+        [llm_call] = audit.llm_calls()
+        assert llm_call["extra"]["total_tokens"] == 0
+        assert llm_call["extra"]["source"] == "none"
+
+        report = usage.report(log.store.load(session.id))
+        assert report["chat"]["total_tokens"] == 0
+        assert report["chat"]["partial_turns"] == 1
         await log.close()
 
     asyncio.run(scenario())

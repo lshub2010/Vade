@@ -98,6 +98,41 @@ class SetupService:
         self._write_admin(doc)
         return True
 
+    def replace_password_hash(
+        self,
+        new_hash: str,
+        *,
+        expected_current: str | None,
+        params: Mapping[str, Any] | None = None,
+        rehashed_from: str | None = None,
+    ) -> bool:
+        """Offline swap of a stored credential (tools/migrate_password_hashes.py).
+
+        Compare-and-swap on the hash read a moment earlier: a login that
+        re-hashed in between makes this return False instead of clobbering the
+        newer value. `new_hash` must already be at today's parameters — the
+        guard below keeps a caller from writing back a weaker or foreign
+        string (an empty value would otherwise silently lock the admin out).
+
+        `params` is written verbatim as `password_params` so the cost settings
+        are queryable without parsing the PHC string.
+        """
+        from .auth import password_needs_rehash
+
+        if password_needs_rehash(new_hash):
+            raise ValueError("refusing to store a hash that is not current Argon2id")
+        doc = self.load_admin()
+        if doc is None or doc.get("password") != expected_current:
+            return False
+        doc["password"] = new_hash
+        doc["password_rehashed_at"] = self.wall()
+        if params is not None:
+            doc["password_params"] = dict(params)
+        if rehashed_from is not None:
+            doc["password_rehashed_from"] = rehashed_from
+        self._write_admin(doc)
+        return True
+
     def state(self, *, loopback: bool, unlocked: bool) -> dict[str, Any]:
         """The payload of `GET /admin/setup`. Gate first, QR second."""
         if not self.initialized():

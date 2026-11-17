@@ -315,6 +315,23 @@ def test_disable_and_uninstall_go_through_the_loader(env, tmp_path):
 
 
 # ------------------------------------------------------------------- read-only
+def test_without_a_loader_the_routes_still_answer_501(tmp_path):
+    """A build without C3b keeps the label the schema's 501 documents."""
+    context = make_context(tmp_path)
+    app = create_admin_app(context)
+    assert context.skills is None
+
+    async def scenario():
+        client, token = await _client_with_token(app, context)
+        response = await client.get("/admin/api/skills", headers=bearer(token))
+        assert response.status_code == 501, response.text
+        assert response.json()["code"] == "UNSUPPORTED"
+
+    asyncio.run(scenario())
+    if context.audit is not None:
+        context.audit.close()
+
+
 def test_a_browser_cookie_cannot_write_skills(env):
     _ctx, _loader, app = env
 

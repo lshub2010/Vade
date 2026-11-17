@@ -8,7 +8,8 @@
 | fs | https://github.com/lshub2010/vade-module-fs | 白名单根目录的 list/stat/read/write/delete（65 tests） |
 | shell | https://github.com/lshub2010/vade-module-shell | cwd 白名单/超时/输出截断（77 tests） |
 | web | https://github.com/lshub2010/vade-module-web | SSRF 防护的 fetch/head（120 tests） |
-| memory / mcp-bridge / model | `vade-module-<name>` | W5 待建 |
+| model | https://github.com/lshub2010/vade-module-model | OpenAI 兼容 M6（94 tests） |
+| memory / mcp-bridge | `vade-module-<name>` | 暂缓 / 待建 |
 
 约定：
 - 每个模块仓遵循 `docs/design.md` §15.1 的目录结构（`manifest.json` 由装饰器生成、`tools.py` 不 import SDK、`server.py` 只转发）

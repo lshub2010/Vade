@@ -5,6 +5,7 @@ import { isRoute, navigate, useRoute } from './router';
 import { Shell } from './Shell';
 import { LoginPage } from '../pages/LoginPage';
 import { NodesPage } from '../pages/NodesPage';
+import { SkillsPage } from '../pages/SkillsPage';
 import { AuditPage, SettingsPage, SetupPage } from '../pages/PlaceholderPages';
 
 function BootScreen({ label = '正在检查登录状态…' }: { label?: string }): ReactElement {
@@ -29,6 +30,8 @@ function pageFor(path: string): ReactNode {
   switch (path) {
     case '/nodes':
       return <NodesPage />;
+    case '/skills':
+      return <SkillsPage />;
     case '/audit':
       return <AuditPage />;
     case '/settings':
@@ -40,6 +43,7 @@ function pageFor(path: string): ReactNode {
 
 const TITLES: Record<string, string> = {
   '/nodes': '节点',
+  '/skills': '技能',
   '/audit': '审计',
   '/settings': '设置',
   '/setup': '首次配置',

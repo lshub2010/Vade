@@ -2,8 +2,9 @@
 
 import { useEffect, useState } from 'react';
 
-// 第一批只注册这五条；`/skills`、`/memory`、`/topology` 归后续批次（canvas 由 C5b 提供）。
-export const ROUTES = ['/nodes', '/audit', '/settings', '/setup', '/login'] as const;
+// 已注册：`/nodes`、`/skills`、`/audit`、`/settings`、`/setup`、`/login`；
+// `/memory`、`/topology` 归后续批次（canvas 由 C5b 提供）。
+export const ROUTES = ['/nodes', '/skills', '/audit', '/settings', '/setup', '/login'] as const;
 
 export type RoutePath = (typeof ROUTES)[number];
 

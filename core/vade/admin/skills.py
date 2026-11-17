@@ -31,7 +31,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from ..errors import VadeError
-from ..skill import InstallSource
+from ..skill.loader import InstallSource
 
 __all__ = ["build_routes", "PREVIEW_TTL_S"]
 

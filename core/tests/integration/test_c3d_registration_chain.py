@@ -25,12 +25,21 @@ import pytest_asyncio
 from vade.app import App, install_components, make_rpc_handler
 from vade.config import load_config
 from vade.errors import VadeError
+from vade.identity.whitelist import fp8_hex
 from vade.registry.manifest import ManifestError, validate_manifest
 from vade.session.models import Session, now_ms
-from tests.events.helpers import ALLOWED_FP, FakeConnection, add_turn
+from tests.events.helpers import FakeConnection, add_turn
 
 MODULE = "com.example.evolve"
 OTHER = "com.example.other"
+#: Real static keys, paired into the real whitelist below. `App.register_module`
+#: now decides membership from the pairing table (P1-3: one key may be paired
+#: to several instances), so a fake that merely asserts a `device_id` is not
+#: enough — the key itself has to be paired, exactly as a handshake requires.
+KEY = bytes(range(32))
+OTHER_KEY = bytes(range(32, 64))
+FP = fp8_hex(KEY)
+OTHER_FP = fp8_hex(OTHER_KEY)
 
 
 def manifest_dict(**overrides: Any) -> dict[str, Any]:
@@ -56,19 +65,28 @@ async def app(tmp_path):
         "core.data_dir": str(tmp_path),
         "evolve.enabled": True,
         "evolve.allow_transcript": True,
-        "evolve.allowlist": [f"{MODULE}:{ALLOWED_FP}"],
+        "evolve.allowlist": [f"{MODULE}:{FP}"],
         "evolve.redact": ["user_text"],
     })
     instance = App(config)
     await instance.startup()
+    assert instance.whitelist is not None
+    instance.whitelist.add(MODULE, "evo-1", FP, public_key=KEY)
+    instance.whitelist.add(OTHER, "other-1", OTHER_FP, public_key=OTHER_KEY)
     install_components(instance, strict=False)
     yield instance
     await instance.shutdown()
 
 
 def _connection(app: App, connection_id: str = "c-evo", *,
-                module_id: str = MODULE, instance_id: str = "evo-1") -> FakeConnection:
-    connection = FakeConnection(connection_id, module_id=module_id, instance_id=instance_id)
+                module_id: str = MODULE, instance_id: str = "evo-1",
+                fingerprint: str | None = None) -> FakeConnection:
+    connection = FakeConnection(
+        connection_id,
+        module_id=module_id,
+        instance_id=instance_id,
+        fingerprint=fingerprint or (FP if module_id == MODULE else OTHER_FP),
+    )
     # `App._connections()` prefers a transport dict; a dict here is the same
     # shape `_serve` publishes, minus the socket.
     app.transport = {"connections": {connection_id: connection}}
@@ -191,8 +209,10 @@ async def test_registration_refuses_a_connection_paired_as_another_node(app: App
 @pytest.mark.asyncio
 async def test_registration_fails_closed_without_a_paired_identity(app: App) -> None:
     """No pairing ⇒ no registration, even with a perfectly valid manifest."""
-    connection = _connection(app, "c-anon")
-    connection.device_id = None
+    # A key nobody paired: the connection may still look like it has a
+    # `device_id`, which is exactly why the pairing table — not that hint —
+    # decides. `fp8_hex(bytes(range(64, 96)))` appears in no whitelist entry.
+    connection = _connection(app, "c-anon", fingerprint=fp8_hex(bytes(range(64, 96))))
     handler = make_rpc_handler(app)
     with pytest.raises(VadeError) as excinfo:
         await handler(connection, {"method": "module/register", "params": manifest_dict()})

@@ -406,14 +406,25 @@ async def test_an_unpaired_fingerprint_stays_anonymous_and_fail_closed(tmp_path)
 
 
 # -------------------------------------------------------------------- resolver
-def test_one_key_paired_twice_resolves_to_one_canonical_name(tmp_path):
-    """A stable answer across restarts; `None` for a key nobody paired."""
+def test_one_key_paired_twice_is_ambiguous_not_a_guessed_name(tmp_path):
+    """`None`, not the lexicographic minimum; `None` for a key nobody paired.
+
+    A single name would claim the socket belongs to that pairing and lock the
+    other instance out of `module/register` (P1-3). Ambiguity is answered by
+    `devices_for_fingerprint()`, which `App.register_module` checks for
+    membership of the claimed slot.
+    """
     key = bytes(range(32))
     fingerprint = fingerprint_of(key)
     whitelist = Whitelist(tmp_path / "identity" / "whitelist.json")
     whitelist.add("com.example.zeta", "z-1", fingerprint, public_key=key)
     assert whitelist.device_for_fingerprint(fingerprint) == "com.example.zeta#z-1"
+    assert whitelist.devices_for_fingerprint(fingerprint) == {"com.example.zeta#z-1"}
 
     whitelist.add("com.example.alpha", "a-9", fingerprint, public_key=key)
-    assert whitelist.device_for_fingerprint(fingerprint) == "com.example.alpha#a-9"
+    assert whitelist.device_for_fingerprint(fingerprint) is None
+    assert whitelist.devices_for_fingerprint(fingerprint) == {
+        "com.example.zeta#z-1",
+        "com.example.alpha#a-9",
+    }
     assert whitelist.device_for_fingerprint(fingerprint_of(bytes(range(32, 64)))) is None

@@ -154,27 +154,36 @@ class Whitelist:
     def allows(self, fingerprint: str) -> bool:
         return any(e.fingerprint == fingerprint for e in self._entries.values())
 
-    def device_for_fingerprint(self, fingerprint: str) -> str | None:
-        """The paired device that proved this key, as `module_id#instance_id`.
+    def devices_for_fingerprint(self, fingerprint: str) -> frozenset[str]:
+        """Every `module#instance` this key is paired to (possibly empty).
 
-        This is the only identity a Noise peer can offer: the handshake proves
-        possession of a static key, and the whitelist says which pairing that
-        key belongs to. There is no separate "UI device" record, so the node id
-        the rest of core already uses (`Registration.session_id`,
-        `NodeRecord`) is the canonical name.
-
-        One key may be paired under several instances (same device, several
-        node slots); the lowest `(module_id, instance_id)` is returned so the
-        answer is stable across restarts. `None` means "no pairing" — callers
-        must fail closed rather than invent an identity.
+        One static key may be paired to several instances — a pooled module
+        runs N workers that share one key. Whoever decides *whether* a claimed
+        slot belongs to this key must ask this set: any single-name answer is
+        a guess that rejects the other instances.
         """
-        matches = sorted(
-            (e.module_id, e.instance_id) for e in self._entries.values()
+        return frozenset(
+            f"{e.module_id}#{e.instance_id}"
+            for e in self._entries.values()
             if e.fingerprint == fingerprint
         )
-        if not matches:
-            return None
-        return f"{matches[0][0]}#{matches[0][1]}"
+
+    def device_for_fingerprint(self, fingerprint: str) -> str | None:
+        """A single paired device name, or `None` when unpaired OR ambiguous.
+
+        Kept for `CoreApp._bind_device_identity`, which can only store one
+        name on `connection.device_id`. A key paired to several instances
+        returns `None` instead of the lexicographically smallest name: that
+        name is a claim that the socket belongs to *that* pairing, and it
+        locked the connection out of every other instance (P1-3, a pooled
+        worker whose `module/register` was refused as `PERMISSION_DENIED`).
+        Registration re-derives the exact name from
+        `devices_for_fingerprint()` once the manifest says which slot it
+        claims. `None` means "no pairing or no single answer" — callers must
+        fail closed rather than invent an identity.
+        """
+        names = self.devices_for_fingerprint(fingerprint)
+        return next(iter(names)) if len(names) == 1 else None
 
     def fingerprint_for(self, module_id: str, instance_id: str | None = None) -> str | None:
         """`instance_id=None` -> the module's fingerprint when all instances agree."""

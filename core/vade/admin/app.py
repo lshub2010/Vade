@@ -71,6 +71,16 @@ READONLY_EXEMPT = frozenset({
 #: escapes the read-only rule lives in one place.
 PREAUTH_PREFIXES = ("/admin/setup", "/admin/bind")
 
+#: Every `/admin` request body is capped at 1 MiB. The largest legitimate body is
+#: a bind envelope (a 65-byte key, a signature and a password: a few hundred
+#: bytes); everything else is a handful of config keys. The cap exists because
+#: the pre-auth routes (`/admin/setup`, `/admin/setup/unlock`, `/admin/bind`) are
+#: reachable without a session, so an unbounded JSON parse there is free memory
+#: for anyone who can reach the port. Enforced twice: `Content-Length` is refused
+#: before a byte is read (`GuardedApp`), and `_json` stops a chunked/lying body
+#: while streaming it.
+MAX_BODY_BYTES = 1024 * 1024
+
 
 def readonly_exempt(path: str) -> bool:
     """True iff a browser session may issue a non-GET request to `path`."""
@@ -285,7 +295,22 @@ def _error(exc: VadeError, status: int | None = None) -> JSONResponse:
 
 
 async def _json(request: Request, *, required: bool = True) -> dict[str, Any]:
-    raw = await request.body()
+    """Parse a JSON object body, refusing anything over `MAX_BODY_BYTES`.
+
+    The `Content-Length` check happens before reading, and the streaming cap
+    covers a chunked upload or a header that lies — a pre-auth route must not be
+    able to make the core buffer an arbitrary amount of memory.
+    """
+    if _declared_too_large(request.headers.get("content-length")):
+        raise _too_large()
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_BODY_BYTES:
+            raise _too_large()
+        chunks.append(chunk)
+    raw = b"".join(chunks)
     if not raw:
         if required:
             raise VadeError("INVALID_ARGUMENT", "request body must be a JSON object")
@@ -297,6 +322,22 @@ async def _json(request: Request, *, required: bool = True) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise VadeError("INVALID_ARGUMENT", "request body must be a JSON object")
     return data
+
+
+def _too_large() -> VadeError:
+    return VadeError("PAYLOAD_TOO_LARGE", "request body exceeds 1 MiB")
+
+
+def _declared_too_large(value: str | None) -> bool:
+    """`Content-Length` above the cap — refuse before the body is read."""
+    if value is None:
+        return False
+    try:
+        return int(value) > MAX_BODY_BYTES
+    except ValueError:
+        # A malformed length never reaches here in practice (the server rejects
+        # it); the streaming cap in `_json` is the real boundary either way.
+        return False
 
 
 def _node_ids(node_id: str) -> tuple[str, str]:
@@ -1190,19 +1231,6 @@ class GuardedApp:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        if scope["path"].startswith("/admin"):
-            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
-            host = headers.get("host")
-            if host not in self.ctx.config.allowed_hosts:
-                # DNS rebinding: a page on evil.example resolving to 127.0.0.1
-                # still sends its own Host header.
-                response = JSONResponse(
-                    {"code": "ORIGIN_MISMATCH", "message": "Host is not the configured admin host"},
-                    status_code=403,
-                    headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
-                )
-                await response(scope, receive, send)
-                return
 
         async def send_with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
@@ -1221,5 +1249,29 @@ class GuardedApp:
                         headers["content-type"] = "application/json"
                 message = {**message, "headers": headers.raw}
             await send(message)
+
+        if scope["path"].startswith("/admin"):
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+            host = headers.get("host")
+            if host not in self.ctx.config.allowed_hosts:
+                # DNS rebinding: a page on evil.example resolving to 127.0.0.1
+                # still sends its own Host header.
+                response = JSONResponse(
+                    {"code": "ORIGIN_MISMATCH", "message": "Host is not the configured admin host"},
+                    status_code=403,
+                    headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
+                )
+                await response(scope, receive, send)
+                return
+            if _declared_too_large(headers.get("content-length")):
+                # Before routing and before any handler: the pre-auth routes
+                # (`/admin/bind`, `/admin/setup*`) have no session to rate-limit
+                # them, so the size gate cannot wait for `_json`.
+                response = JSONResponse(
+                    {"code": "PAYLOAD_TOO_LARGE", "message": "request body exceeds 1 MiB"},
+                    status_code=413,
+                )
+                await response(scope, receive, send_with_headers)
+                return
 
         await self.app(scope, receive, send_with_headers)

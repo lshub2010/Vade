@@ -22,11 +22,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from vade.admin.app import create_admin_app
+from vade.admin.app import MAX_BODY_BYTES, create_admin_app
 from vade.admin.bind import bind_aad, envelope_key
 from vade.admin import setup_token
 
-from .conftest import PASSWORD, client_for, make_context
+from .conftest import ORIGIN, PASSWORD, client_for, make_context
 
 #: Built by concatenation so this file does not read like a leaked credential.
 NEW_PASSWORD = "fresh" + "-battery-" + "staple-9"
@@ -465,3 +465,262 @@ def test_consume_ticket_has_exactly_one_winner(tmp_path):
         results = list(pool.map(lambda _: ctx.setup.consume_ticket(ticket), range(8)))
     assert results.count(True) == 1
     assert ctx.setup.peek_ticket(ticket) is None
+
+
+# ------------------------------------------------------- transaction rollback
+def internal_error_client(app) -> httpx.AsyncClient:
+    """`raise_app_exceptions=False`: assert the wire response of a 500."""
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, client=("127.0.0.1", 40000),
+                                      raise_app_exceptions=False),
+        base_url=ORIGIN,
+    )
+
+
+def test_session_issue_failure_releases_the_ticket_and_leaves_no_device(tmp_path):
+    """`sessions.issue` is part of the bind transaction (review P1-2).
+
+    A token that cannot be minted must not leave a consumed ticket plus an
+    enrolled device: the App would retry into a permanent 401 and the device
+    slot would be lost for nothing.
+    """
+    ctx = make_context(tmp_path)
+    app = create_admin_app(ctx)
+
+    async def scenario():
+        client = internal_error_client(app)
+        ticket = ctx.setup.create_ticket()["ticket"]
+        key, pub = p256_device()
+        body = seal(await hello(client, ticket), ticket, device_key=key, device_pub=pub)
+
+        def boom(**_: object) -> dict:
+            raise RuntimeError("session store unavailable")
+
+        original = ctx.sessions.issue
+        ctx.sessions.issue = boom
+        try:
+            response = await post(client, body)
+        finally:
+            ctx.sessions.issue = original
+
+        assert response.status_code == 500
+        assert response.json()["code"] == "INTERNAL"
+        assert len(ctx.devices) == 0
+        # Discarded, not revoked: a revoked key would refuse the retry below.
+        on_disk = json.loads((tmp_path / "admin" / "devices.json").read_text(encoding="utf-8"))
+        assert on_disk["devices"] == []
+        assert on_disk["revoked"] == []
+        assert ctx.setup.peek_ticket(ticket) is not None
+
+        body = seal(await hello(client, ticket), ticket, device_key=key, device_pub=pub)
+        resp = await post(client, body)
+        assert resp.status_code == 200, resp.text
+        assert len(ctx.devices) == 1
+
+    run(scenario())
+
+
+def test_devices_add_failure_on_first_run_rolls_back_to_setup_required(tmp_path):
+    """`setup_required=true`: `admin.json` must not survive a failed enrolment.
+
+    The chosen contract is rollback, not "initialised but unbound": `admin.json`
+    is removed, `setup.token` is restored and the ticket is kept, so the same QR
+    completes on retry. Leaving the plane initialised with no device and no token
+    would be recoverable only through `vade admin reset`.
+    """
+    ctx = make_context(tmp_path, initialize=False)
+    app = create_admin_app(ctx)
+
+    async def scenario():
+        client = internal_error_client(app)
+        token_before = setup_token.read_token(tmp_path)
+        assert token_before
+        ticket = ctx.setup.create_ticket()["ticket"]
+        key, pub = p256_device()
+        body = seal(await hello(client, ticket), ticket, password=NEW_PASSWORD,
+                    device_key=key, device_pub=pub)
+
+        def boom(**_: object):
+            raise OSError("disk full while writing devices.json")
+
+        original = ctx.devices.add
+        ctx.devices.add = boom
+        try:
+            response = await post(client, body)
+        finally:
+            ctx.devices.add = original
+
+        assert response.status_code == 500
+        assert response.json()["code"] == "INTERNAL"
+        assert ctx.setup.initialized() is False
+        assert not (tmp_path / "admin" / "admin.json").exists()
+        assert setup_token.read_token(tmp_path) == token_before
+        assert ctx.setup.peek_ticket(ticket) is not None
+        assert len(ctx.devices) == 0
+        # The password the client chose did not become the plane's password.
+        assert ctx.setup.load_admin() is None
+
+        body = seal(await hello(client, ticket), ticket, password=NEW_PASSWORD,
+                    device_key=key, device_pub=pub)
+        resp = await post(client, body)
+        assert resp.status_code == 200, resp.text
+        assert ctx.setup.initialized() is True
+        assert setup_token.read_token(tmp_path) is None
+        assert len(ctx.devices) == 1
+
+    run(scenario())
+
+
+def test_devices_add_failure_on_the_step_up_path_changes_nothing(tmp_path):
+    """Already initialised: the rollback must not touch the password or the token."""
+    ctx = make_context(tmp_path)
+    app = create_admin_app(ctx)
+
+    async def scenario():
+        client = internal_error_client(app)
+        doc_before = (tmp_path / "admin" / "admin.json").read_bytes()
+        ticket = ctx.setup.create_ticket()["ticket"]
+        key, pub = p256_device()
+        body = seal(await hello(client, ticket), ticket, device_key=key, device_pub=pub)
+
+        def boom(**_: object):
+            raise OSError("devices.json is not writable")
+
+        original = ctx.devices.add
+        ctx.devices.add = boom
+        try:
+            response = await post(client, body)
+        finally:
+            ctx.devices.add = original
+
+        assert response.status_code == 500
+        assert (tmp_path / "admin" / "admin.json").read_bytes() == doc_before
+        assert ctx.setup.peek_ticket(ticket) is not None
+        assert len(ctx.devices) == 0
+
+        body = seal(await hello(client, ticket), ticket, device_key=key, device_pub=pub)
+        assert (await post(client, body)).status_code == 200
+
+    run(scenario())
+
+
+# ------------------------------------------------------------------ body limit
+def test_an_over_cap_body_is_413_before_the_envelope_is_touched(tmp_path):
+    ctx = make_context(tmp_path)
+    app = create_admin_app(ctx)
+
+    async def scenario():
+        client = client_for(app)
+        ticket = ctx.setup.create_ticket()["ticket"]
+        response = await post(client, {"ticket": ticket, "pad": "x" * MAX_BODY_BYTES})
+        assert response.status_code == 413
+        assert response.json()["code"] == "PAYLOAD_TOO_LARGE"
+        # Refused before parsing: the ticket was never read, let alone consumed.
+        assert ctx.setup.peek_ticket(ticket) is not None
+        assert len(ctx.devices) == 0
+
+        # A body under the cap still runs the normal path (401: no hello was
+        # minted), so the limit is a size gate, not a refusal of bind requests.
+        response = await post(client, {"ticket": ticket, "pad": "x" * 1024})
+        assert response.status_code == 401
+        assert response.json()["code"] == "BIND_UNAUTHORIZED"
+
+    run(scenario())
+
+
+def test_the_cap_covers_the_unauthenticated_setup_routes(tmp_path):
+    """preauth: `/admin/setup/unlock` has no session, so it needs the same gate."""
+    ctx = make_context(tmp_path, initialize=False)
+    app = create_admin_app(ctx)
+
+    async def scenario():
+        client = client_for(app)
+        response = await client.post(
+            "/admin/setup/unlock", json={"setup_token": "acs_" + "A" * MAX_BODY_BYTES}
+        )
+        assert response.status_code == 413
+        assert response.json()["code"] == "PAYLOAD_TOO_LARGE"
+        assert ctx.setup.initialized() is False
+
+    run(scenario())
+
+
+def test_chunked_body_over_the_cap_is_refused_without_a_content_length(tmp_path):
+    """Second layer: the body streams past 1 MiB while claiming 64 bytes."""
+    ctx = make_context(tmp_path)
+    app = create_admin_app(ctx)
+
+    async def scenario():
+        scope = {
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1", "method": "POST", "scheme": "https",
+            "path": "/admin/bind", "raw_path": b"/admin/bind", "root_path": "",
+            "query_string": b"", "server": ("127.0.0.1", 8444),
+            "client": ("127.0.0.1", 40000),
+            "headers": [
+                (b"host", b"127.0.0.1:8444"),
+                (b"content-type", b"application/json"),
+                # A lie: the middleware sees 64 bytes and lets the request through.
+                (b"content-length", b"64"),
+            ],
+        }
+        chunks = [b'{"ticket":"', b"x" * MAX_BODY_BYTES, b'"}']
+        messages: list[dict] = []
+
+        async def receive() -> dict:
+            if chunks:
+                body = chunks.pop(0)
+                return {"type": "http.request", "body": body, "more_body": bool(chunks)}
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message: dict) -> None:
+            messages.append(message)
+
+        await app(scope, receive, send)
+        start = next(m for m in messages if m["type"] == "http.response.start")
+        body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+        assert start["status"] == 413
+        assert json.loads(body)["code"] == "PAYLOAD_TOO_LARGE"
+
+    run(scenario())
+
+
+def test_a_failing_rollback_step_still_releases_the_ticket(tmp_path):
+    """`release_ticket` runs last and unconditionally (the QR stays retryable)."""
+    ctx = make_context(tmp_path)
+    app = create_admin_app(ctx)
+
+    async def scenario():
+        client = internal_error_client(app)
+        ticket = ctx.setup.create_ticket()["ticket"]
+        key, pub = p256_device()
+        body = seal(await hello(client, ticket), ticket, device_key=key, device_pub=pub)
+
+        def boom_session(**_: object):
+            raise RuntimeError("session store unavailable")
+
+        def boom_discard(device_id: str) -> bool:
+            raise OSError("devices.json is not writable")
+
+        original_issue, original_discard = ctx.sessions.issue, ctx.devices.discard
+        ctx.sessions.issue = boom_session
+        ctx.devices.discard = boom_discard
+        try:
+            response = await post(client, body)
+        finally:
+            ctx.sessions.issue = original_issue
+            ctx.devices.discard = original_discard
+
+        # The undo failure is audited, not re-raised: the client still gets the
+        # original 500 and the ticket is back in the pool.
+        assert response.status_code == 500
+        assert response.json()["code"] == "INTERNAL"
+        assert ctx.setup.peek_ticket(ticket) is not None
+        # The incomplete undo is recorded rather than silently dropped.
+        from vade.audit.reader import AuditReader
+
+        rows = AuditReader(ctx.audit.path).query(kind="device.bound")["items"]
+        assert [row["code"] for row in rows] == ["INTERNAL"]
+        assert rows[0]["extra"]["steps"] == ["device"]
+
+    run(scenario())

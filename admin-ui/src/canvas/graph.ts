@@ -77,6 +77,13 @@ export interface Graph {
   count: number;
 }
 
+export interface BuildGraphOptions {
+  /** `GET /admin/api/layout` 的位置：已落库的拖拽结果，优先于节点自带的 x/y。 */
+  positions?: Readonly<Record<string, { x: number; y: number }>>;
+  /** SSE `edge.state` 的叠加层：只改边的状态，不改节点自身。 */
+  edgeStates?: Readonly<Record<string, { state: string; reason: string | null }>>;
+}
+
 /** 形状判定优先级：桥 > 模型 > 记忆 > 工具 > 默认方框。 */
 export function shapeFor(node: NodeView): NodeShape {
   if (node.state === 'pending') return 'invite';
@@ -105,17 +112,21 @@ interface Placement {
 /**
  * 布局：core 在原点（虚拟坐标，fitView 会处理）。
  *
- * 后端给了 `x`/`y`（L1 布局表）就用它——那是用户拖过的位置，不能被前端重排覆盖；
- * 没给过的按环带均匀摆开，保证首次进入不是一坨。
+ * 优先级：L1 布局表（用户拖过的位置）> 节点自带的 x/y（同源，但布局表带 rev）
+ * > 环带均匀摆开（首次进入不是一坨）。
  * 环带容量 12/20/28：第 13 个节点开始第二环，半径跳 320，避免与第一环的节点标签重叠。
  */
-function place(items: NodeView[]): Map<string, Placement> {
+function place(items: NodeView[], positions: BuildGraphOptions['positions']): Map<string, Placement> {
   const placed = new Map<string, Placement>();
-  let cursor = 0;
   let ring = 0;
   let indexInRing = 0;
 
   for (const item of items) {
+    const saved = positions?.[item.id];
+    if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+      placed.set(item.id, { x: saved.x, y: saved.y });
+      continue;
+    }
     if (typeof item.x === 'number' && typeof item.y === 'number') {
       placed.set(item.id, { x: item.x, y: item.y });
       continue;
@@ -137,7 +148,6 @@ function place(items: NodeView[]): Map<string, Placement> {
       y: Math.round(Math.sin(angle) * radius - size.height / 2),
     });
     indexInRing += 1;
-    cursor += 1;
   }
 
   return placed;
@@ -158,7 +168,8 @@ function moduleNode(item: NodeView, placement: Placement, instanceCount: number)
     id: item.id,
     type: item.state === 'pending' ? NODE_TYPE.invite : NODE_TYPE.module,
     position: placement,
-    draggable: false,
+    // 拖拽在 onNodeDragStop 一次性提交（T3）：拖动过程中不写后端。
+    draggable: true,
     connectable: false,
     // 尺寸写进 style：好处是首帧不用等 DOM 测量，fitView 不会跳两次。
     style: { width: size.width, height: size.height },
@@ -258,9 +269,9 @@ function center(node: { position: Placement; data: { size: Size } }): { x: numbe
   };
 }
 
-export function buildGraph(items: NodeView[]): Graph {
+export function buildGraph(items: NodeView[], options: BuildGraphOptions = {}): Graph {
   const ordered = [...items].sort(compareNodes);
-  const placements = place(ordered);
+  const placements = place(ordered, options.positions);
 
   const byModule = new Map<string, number>();
   for (const item of ordered) {
@@ -285,6 +296,9 @@ export function buildGraph(items: NodeView[]): Graph {
       dy: nodeCenter.y - coreCenter.y,
     });
     const isPending = node.data.kind === 'pending';
+    // SSE 的 edge.state 只覆盖边：节点描边仍由 NodeView.state 决定（T4）。
+    const overlay = options.edgeStates?.[node.id];
+    const edgeState = overlay?.state ?? node.data.state;
 
     return {
       id: `edge:${node.id}`,
@@ -296,10 +310,10 @@ export function buildGraph(items: NodeView[]): Graph {
       selectable: false,
       focusable: false,
       data: {
-        state: node.data.state,
-        reason: null,
+        state: edgeState,
+        reason: overlay?.reason ?? null,
         // pending 的线是「等接入」的占位，不该有流动感——它还没通。
-        flow: flowAllowed && (node.data.state === 'online' || node.data.state === 'degraded'),
+        flow: flowAllowed && (edgeState === 'online' || edgeState === 'degraded'),
       },
       // pending 的箭头指向 core（「待接入」而不是「已连上」），所以用 markerStart。
       markerStart: isPending

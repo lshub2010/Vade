@@ -1,8 +1,10 @@
 /**
- * 画布容器：把注册表快照渲染成 core 为中心的辐射图。
+ * 画布容器：core 为中心的辐射图 + 拖拽 / 双击。
  *
- * 这一批（T1/T2）只做「画对」：读一次 `GET /admin/api/nodes` 后静态渲染。
- * 拖拽 / SSE / 属性面板在 T3、T4、T5，见各处的 TODO —— 这里没有假实现。
+ * 这一层只管交互接线：
+ * - 拖动结束（`onNodeDragStop`）才回调一次，由 useLayout 去 PATCH；拖动过程中不写后端。
+ * - 双击节点打开右侧属性面板；工具不进画布（D35）。
+ * - 可视化编码、边的状态全部来自 graph.ts，不在这里二次判断。
  */
 
 import { useMemo } from 'react';
@@ -15,12 +17,13 @@ import {
   ReactFlow,
   ReactFlowProvider,
 } from '@xyflow/react';
-import type { EdgeTypes, NodeTypes } from '@xyflow/react';
+import type { EdgeTypes, Node as FlowNode, NodeTypes } from '@xyflow/react';
 import type { NodeView } from '../app/types';
 import '@xyflow/react/dist/style.css';
 import './styles/topology.css';
 import { SessionEdge } from './edges/SessionEdge';
-import { buildGraph, NODE_TYPE } from './graph';
+import { buildGraph, CORE_NODE_ID, NODE_TYPE } from './graph';
+import type { BuildGraphOptions } from './graph';
 import { CoreNode } from './nodes/CoreNode';
 import { GroupFrame } from './nodes/GroupFrame';
 import { InviteNode } from './nodes/InviteNode';
@@ -56,9 +59,31 @@ function reportFlowError(code: string, message: string): void {
   console.error(`[topo] react-flow ${code}: ${message}`);
 }
 
-function Canvas({ items }: { items: NodeView[] }): ReactElement {
-  const graph = useMemo(() => buildGraph(items), [items]);
+export interface FlowCanvasProps {
+  items: NodeView[];
+  positions?: BuildGraphOptions['positions'];
+  edgeStates?: BuildGraphOptions['edgeStates'];
+  /** 布局未加载完时不允许拖：否则第一次拖动会把未知的整表布局覆盖掉。 */
+  layoutReady: boolean;
+  onMoveNode: (id: string, x: number, y: number) => void;
+  onOpenNode: (id: string) => void;
+}
+
+function Canvas({
+  items,
+  positions,
+  edgeStates,
+  layoutReady,
+  onMoveNode,
+  onOpenNode,
+}: FlowCanvasProps): ReactElement {
+  const graph = useMemo(
+    () => buildGraph(items, { positions, edgeStates }),
+    [items, positions, edgeStates],
+  );
   const nodes = useMemo(() => [...graph.groups, ...graph.nodes], [graph]);
+
+  const isSelectableTarget = (id: string): boolean => id !== CORE_NODE_ID && !id.startsWith('group:');
 
   return (
     <ReactFlow
@@ -67,12 +92,18 @@ function Canvas({ items }: { items: NodeView[] }): ReactElement {
       nodeTypes={NODE_TYPES}
       edgeTypes={EDGE_TYPES}
       defaultEdgeOptions={DEFAULT_EDGE_OPTIONS}
-      // 这一批不接拖拽：位置只读，PATCH /layout 在 T3 上线。
-      nodesDraggable={false}
+      nodesDraggable={layoutReady}
       nodesConnectable={false}
       edgesReconnectable={false}
       onError={reportFlowError}
-      // 缩放（滚轮/按钮）与平移（空白拖）是 T3 之前就该有的基础操作。
+      onNodeDragStop={(_event, node: FlowNode) => {
+        if (!isSelectableTarget(node.id)) return;
+        onMoveNode(node.id, Math.round(node.position.x), Math.round(node.position.y));
+      }}
+      onNodeDoubleClick={(_event, node: FlowNode) => {
+        if (!isSelectableTarget(node.id)) return;
+        onOpenNode(node.id);
+      }}
       zoomOnScroll
       zoomOnPinch
       panOnDrag
@@ -81,8 +112,6 @@ function Canvas({ items }: { items: NodeView[] }): ReactElement {
       fitView
       fitViewOptions={{ padding: 0.22, maxZoom: 1.1 }}
       proOptions={{ hideAttribution: false }}
-      // TODO(T5)：双击打开右侧属性面板（工具列表分页），不是子节点（D35）。
-      // TODO(T4)：接入 EventSource('/admin/api/stream')，按 seq 去重合并。
       aria-label="拓扑画布"
     >
       <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#232c3d" />
@@ -91,12 +120,12 @@ function Canvas({ items }: { items: NodeView[] }): ReactElement {
   );
 }
 
-export function FlowCanvas({ items }: { items: NodeView[] }): ReactElement {
-  const count = items.length;
+export function FlowCanvas(props: FlowCanvasProps): ReactElement {
+  const count = props.items.length;
   return (
     <div className={count > 50 ? 'topo-canvas topo-no-flow' : 'topo-canvas'}>
       <ReactFlowProvider>
-        <Canvas items={items} />
+        <Canvas {...props} />
       </ReactFlowProvider>
     </div>
   );

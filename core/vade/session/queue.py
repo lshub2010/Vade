@@ -15,12 +15,15 @@ Guarantees:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import OrderedDict, deque
 from dataclasses import replace
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError
 from .models import Message, QueueItem, Turn, TurnState, message_ref, new_id, now_ms
+
+_log = logging.getLogger(__name__)
 
 __all__ = ["TurnQueue"]
 
@@ -49,7 +52,7 @@ class TurnQueue:
         max_pending: int = 100,
         clock: Callable[[], int] = now_ms,
         resolve_model: Callable[[Turn], tuple[str | None, str | None]] | None = None,
-        pre_terminal_hook: Callable[[str, TurnState], Awaitable[Any]] | None = None,
+        pre_terminal_hook: Callable[[str, TurnState, "str | None"], Awaitable[Any]] | None = None,
         partial_provider: Callable[[str], str] | None = None,
     ) -> None:
         self.session_id = session_id
@@ -71,6 +74,11 @@ class TurnQueue:
         #: engine, keeps the queue free of loop-level state.
         self._partial_provider = partial_provider
         self._pending: deque[QueueItem] = deque()
+        #: Slots reserved by `claim()` for a turn that is still being written
+        #: (the announcement emit). Counted against `max_pending` so a claim is
+        #: a real capacity decision, not a hint.
+        self._claims: dict[int, bool] = {}
+        self._claim_seq = 0
         self._running: QueueItem | None = None
         self._worker: asyncio.Task[None] | None = None
         #: Kept for `shutdown()`/introspection only: decisions are turn-scoped
@@ -105,7 +113,38 @@ class TurnQueue:
 
     def has_capacity(self) -> bool:
         """True when one more turn can be enqueued without `OVERLOADED`."""
-        return len(self._pending) < self._max_pending
+        return len(self._pending) + len(self._claims) < self._max_pending
+
+    def claim(self) -> int | None:
+        """Reserve one pending slot for a turn that does not exist yet, or `None`.
+
+        A caller checks capacity and then does async work (an `emit` that
+        announces the turn) before it can build the `QueueItem`; a bare
+        `has_capacity()` sample would be stale by the time `enqueue` runs if
+        that work ever yielded. The claim closes that gap by taking the slot at
+        decision time: `enqueue(..., claim=...)` consumes it without re-checking
+        capacity, so an announced turn can never be refused afterwards (a
+        `queued` row that is never dequeued is invisible to every client and
+        blocks the version chain with `turn_active`).
+
+        Returns an opaque token for `release()`/`enqueue()`. The caller OWNS it
+        until one of those two calls: dropping it without either loses the slot
+        for the life of the queue.
+        """
+        if not self.has_capacity():
+            return None
+        self._claim_seq += 1
+        self._claims[self._claim_seq] = True
+        return self._claim_seq
+
+    def release(self, claim: int) -> bool:
+        """Give back a claim whose turn never reached `enqueue`.
+
+        Returns whether the claim was still outstanding, so a release on a
+        consumed (or foreign) token is a no-op instead of silently freeing
+        another caller's slot.
+        """
+        return self._claims.pop(claim, None) is not None
 
     def is_finalized(self, turn_id: str) -> bool:
         return turn_id in self._finalized or turn_id in self._finalizing
@@ -116,8 +155,22 @@ class TurnQueue:
         while len(self._finalized) > FINALIZED_LIMIT:
             self._finalized.popitem(last=False)
 
-    def enqueue(self, turn: Turn, content: Sequence[Mapping[str, Any]]) -> int:
-        if len(self._pending) >= self._max_pending:
+    def enqueue(self, turn: Turn, content: Sequence[Mapping[str, Any]], *,
+                claim: int | None = None) -> int:
+        """Insert `turn`; `claim` is the slot `claim()` already reserved for it.
+
+        With a claim the capacity decision was already made (and taken), so this
+        must NOT check it again — a second check is the check-then-insert race
+        the claim exists to remove. Without one the queue defends itself, which
+        is the path direct callers (tests, future wiring) use.
+        """
+        if claim is not None:
+            if not self.release(claim):
+                raise VadeError(
+                    "INTERNAL",
+                    "enqueue() with a claim that was already consumed or never taken",
+                )
+        elif len(self._pending) + len(self._claims) >= self._max_pending:
             raise VadeError("OVERLOADED", f"queue is full ({self._max_pending} pending turns)")
         item = QueueItem(turn=turn, content=tuple(dict(b) for b in content), enqueued_at=self._clock())
         self._pending.append(item)
@@ -167,7 +220,13 @@ class TurnQueue:
         return None
 
     def is_idle(self) -> bool:
-        return self._running is None and not self._pending and self._worker is None
+        """Nothing running, nothing waiting, and no un-consumed slot claim."""
+        return (
+            self._running is None
+            and not self._pending
+            and self._worker is None
+            and not self._claims
+        )
 
     # ------------------------------------------------------------------ worker
     def ensure_worker(self) -> None:
@@ -182,7 +241,10 @@ class TurnQueue:
 
     async def _run_loop(self) -> None:
         try:
-            while self._pending:
+            # `_stopped` in the condition: `shutdown()` empties `_pending` and
+            # finalizes each turn, but a worker resumed in between must never
+            # dequeue one and announce `turn.started` after its terminal event.
+            while self._pending and not self._stopped:
                 item = self._pending.popleft()
                 await self._run_one(item)
         finally:
@@ -314,6 +376,7 @@ class TurnQueue:
         task: asyncio.Task[Any] | None = None,
         usage: Mapping[str, Any] | None = None,
         data: Mapping[str, Any] | None = None,
+        reason: str | None = None,
     ) -> None:
         if self.is_finalized(turn.id):
             return
@@ -326,12 +389,17 @@ class TurnQueue:
             # RFC-0008 S5: a pending `turn.input_resolved` must be written BEFORE the
             # turn's terminal event, or the dialog is left open forever (C-06 forbids
             # any `turn.*` after `turn.interrupted`). This is the only place a turn
-            # ends, so the hook lives here rather than at each caller.
+            # ends, so the hook lives here rather than at each caller. `reason`
+            # tells the hook *why* the turn is ending (`shutdown` closes dialogs
+            # as `session_closed`, per RFC-0008's close-order table).
             if self._pre_terminal_hook is not None:
                 try:
-                    await self._pre_terminal_hook(turn.id, state)
-                except Exception:  # pragma: no cover - a hook must not block finalization
-                    pass
+                    await self._pre_terminal_hook(turn.id, state, reason)
+                except Exception:  # a hook must not block finalization…
+                    # …but never silently: a signature drift here once disabled
+                    # every approval close on interrupt (caught only by tests).
+                    _log.warning("pre-terminal hook failed for turn %s", turn.id,
+                                 exc_info=True)
             if state is not TurnState.COMPLETED or turn.state is not TurnState.COMPLETED:
                 turn = turn.with_state(state, ended_at=turn.ended_at or self._clock())
             if usage is not None:
@@ -387,7 +455,8 @@ class TurnQueue:
         )
 
     async def _finalize_interrupted(self, turn: Turn, *, by: str,
-                                    task: asyncio.Task[Any] | None = None) -> None:
+                                    task: asyncio.Task[Any] | None = None,
+                                    reason: str | None = None) -> None:
         text, message = self._partial_message(turn.id)
         # RFC-0006 §4.3 + schema/events.json: `partial_message_id` is a
         # `msg:<hex>` pointer, the same scheme as `result_ref` — a bare hex id
@@ -399,11 +468,18 @@ class TurnQueue:
             "partial_message_id": pointer,
             "partial_chars": len(text),
         }
+        if reason is not None:
+            # `data.reason` is the machine answer to "who stopped this turn":
+            # `reconcile_unfinished_turns` already writes `restart` this way, so
+            # a shutdown writes `shutdown` and a client can tell the two apart.
+            payload["data"] = {"reason": reason}
+            turn = replace(turn, stopped_reason=reason)
         if message is not None:
             turn = turn.with_state(TurnState.INTERRUPTED, partial_message_id=pointer)
         await self._finalize(
             turn, TurnState.INTERRUPTED, payload,
             messages=[message] if message is not None else (), task=task,
+            reason=reason,
         )
 
     # ------------------------------------------------------------------ cancel flag
@@ -524,19 +600,36 @@ class TurnQueue:
             await asyncio.shield(worker)
 
     async def shutdown(self) -> None:
-        """Stop every task this queue owns; terminal and idempotent.
+        """Terminate every turn this queue owns, THEN stop every task.
 
-        The worker is awaited (as a cancelled task) so the caller — `close()` —
-        returns with the queue actually stopped. Without the join the worker
-        was free to wake up after `store.close()` and write one more terminal
-        event into a closed database. The turn tasks are cancelled but NOT
-        awaited: a module that ignores `tools/cancel` would otherwise hold up
-        process shutdown, and `_consume_orphan` already swallows whatever it
-        returns (`interrupt` arms that callback for exactly this reason).
+        Order is contractual. A turn is given its terminal `turn.interrupted`
+        while the store, the sinks and the seq bus are still up — `close()`
+        calls this before `session.closed`, before `detach()` and before the
+        store closes — and only then is its task cancelled. Cancelling first
+        (the old order) killed the turn before `_execute_one` could resume, so
+        a client that had already received `session.closed` waited forever for
+        a terminal `turn.*` that never came. `_finalize` is the only terminal
+        writer, so "exactly one" holds even when an `interrupt` — or the
+        worker waking up on the cancelled task — races this method.
+
+        The worker is awaited (as a cancelled task) so the caller returns with
+        the queue actually stopped: without the join the worker was free to
+        wake up after `store.close()` and write one more terminal event into a
+        closed database. The turn tasks are cancelled but NOT awaited: a module
+        that ignores `tools/cancel` would hold up process shutdown, and
+        `_consume_orphan` already swallows whatever it returns.
+
+        Idempotent: `_stopped` makes the second call a no-op, and every
+        `_finalize` is refused by the `_finalized` marker, so a double shutdown
+        writes no second event.
         """
         if self._stopped:
             return
         self._stopped = True
+        # 1. Terminal states first — the event must exist before the socket
+        #    learns the session is over.
+        await self._terminate_turns()
+        # 2. Then the tasks behind them.
         for task in list(self._turn_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -554,6 +647,51 @@ class TurnQueue:
             # report a worker, not even a dead one.
             if self._worker is worker:
                 self._worker = None
+
+    async def _terminate_turns(self) -> None:
+        """Write `turn.interrupted{by: system, data.reason: shutdown}` per turn.
+
+        The running turn first (it owns the head of the queue and any
+        streamed text), then every queued one in arrival order. Queued turns
+        never reached the router, so they get no `tools/cancel` and no partial
+        message: their row moves `queued -> interrupted` in the same
+        transaction as the event.
+
+        `_pending` is emptied BEFORE the writes: a worker waking up mid-way
+        must not dequeue a turn that is already terminal and announce
+        `turn.started` after its `turn.interrupted` (C-06 forbids any `turn.*`
+        after the terminal one).
+        """
+        running = self._running
+        if running is not None and not self.is_finalized(running.turn_id):
+            task = self._turn_tasks.get(running.turn_id)
+            if task is not None and not task.done():
+                # Same courtesy `interrupt` pays: tell the module to stop
+                # before the turn is closed under it. Sync + non-blocking.
+                if self._cancel_hook is not None:
+                    try:
+                        self._cancel_hook(running.turn_id)
+                    except Exception:  # pragma: no cover - cancel must never raise
+                        pass
+            await self._finalize_interrupted(
+                running.turn, by="system", task=task, reason="shutdown",
+            )
+        queued = list(self._pending)
+        self._pending.clear()
+        for item in queued:
+            if self.is_finalized(item.turn_id):
+                continue
+            turn = replace(item.turn, stopped_reason="shutdown")
+            await self._finalize(
+                turn, TurnState.INTERRUPTED,
+                {"turn_id": item.turn_id, "by": "system",
+                 "state": TurnState.INTERRUPTED.value,
+                 "partial_message_id": None, "partial_chars": 0},
+                data={"reason": "shutdown"}, reason="shutdown",
+            )
+            # A queued turn has no executor task: `_finalize` saw `task=None`
+            # and armed `_release_pending` for a task that will never exist.
+            self._forget_turn(item.turn_id)
 
     def _consume_orphan(self, task: asyncio.Task[Any]) -> None:
         """A module that ignores tools/cancel leaves a orphan task: swallow it."""

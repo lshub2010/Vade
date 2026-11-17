@@ -168,6 +168,20 @@ def test_an_awaited_approval_is_closed_once_after_the_interrupt(tmp_path):
         assert payload["request_id"] == request_id
         assert manager.pending_count == 0
         assert log.snapshot(session.id)["pending_approvals"] == []
+        # P2-1: the waiter lost its row to CancelledError, so the sweep writes
+        # the verdict. `decision_of()` must report the SAME `denied` the event
+        # announced (it used to answer `cancelled` whenever the interrupt won
+        # the race), and nothing may be left in the hand-off table for a sweep
+        # that has already run.
+        assert manager.decision_of(request_id) == "denied"
+        assert manager._cancelled == {}
+        # P3-1: a resolution a device acts on carries the same attribution as
+        # the prompt, or a card that never saw the prompt cannot be matched.
+        assert payload["session_id"] == session.id
+        for key in ("task_id", "task_name", "depth"):
+            assert key in payload, f"deny payload is missing {key!r}"
+        assert payload["task_id"] is None and payload["task_name"] is None
+        assert payload["depth"] == 0
         # The waiter itself was cancelled mid-`check` — that is exactly why the
         # manager has to hand the row to the sweep instead of finishing it —
         # so the turn ends `interrupted`, never `failed`.

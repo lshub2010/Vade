@@ -107,6 +107,13 @@ class App:
         self.started = True
 
     async def shutdown(self) -> None:
+        # C5a retention first: it is the one thread that touches the audit
+        # store without a caller asking. Left running, a sweep could DROP a day
+        # table while the next process holds the same file — and a joined stop
+        # keeps `shutdown()` deterministic for tests and restarts.
+        retention = getattr(self, "audit_retention", None)
+        if retention is not None:
+            retention.stop()
         if self.pairing is not None:
             self.pairing.close()
         # C3 first: ending the sessions is the step everything else depends on.

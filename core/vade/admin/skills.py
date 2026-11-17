@@ -294,17 +294,13 @@ def build_routes(ctx: Any, guard: Callable[..., Any],
         name = request.path_params["name"]
         body = await read_json(request)
         revision = _integer(body, "revision")
-        pending = _pending_state(loader, name)
-        if pending is None:
-            raise VadeError("NOT_FOUND", f"no pending skill named {name!r}")
-        if revision != int(getattr(pending, "revision", 0) or 0):
-            # The reviewer approved a revision they were shown; if the queue
-            # moved, the UI must re-read instead of promoting unknown bytes.
-            raise VadeError("TOOL_CONFLICT",
-                            f"revision conflict: pending {name!r} is at revision "
-                            f"{getattr(pending, 'revision', 0)}")
-        state = loader.approve(name)
-        _audit(ctx, session, "skill.approve", name=name, revision=state.revision)
+        # The revision the reviewer saw is a CAS token, and the loader checks it
+        # inside the lock that also moves the proposal. Comparing
+        # `pending.revision` here and calling `approve` after would be a TOCTOU:
+        # an install landing in between promotes bytes nobody read.
+        state = loader.approve(name, expect_revision=revision)
+        _audit(ctx, session, "skill.approve", name=name, revision=state.revision,
+               reviewed_revision=revision)
         return JSONResponse(_summary(state))
 
     async def reject_skill(request: Request) -> Response:
@@ -316,14 +312,7 @@ def build_routes(ctx: Any, guard: Callable[..., Any],
         reason = body.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             raise VadeError("INVALID_ARGUMENT", "reason is required to reject a proposal")
-        pending = _pending_state(loader, name)
-        if pending is None:
-            raise VadeError("NOT_FOUND", f"no pending skill named {name!r}")
-        if revision != int(getattr(pending, "revision", 0) or 0):
-            raise VadeError("TOOL_CONFLICT",
-                            f"revision conflict: pending {name!r} is at revision "
-                            f"{getattr(pending, 'revision', 0)}")
-        loader.reject(name, reason.strip()[:300])
+        loader.reject(name, reason.strip()[:300], expect_revision=revision)
         _audit(ctx, session, "skill.reject", name=name, revision=revision)
         return JSONResponse({"ok": True})
 

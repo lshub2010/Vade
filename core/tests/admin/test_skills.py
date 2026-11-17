@@ -199,6 +199,82 @@ def test_approve_with_a_stale_revision_is_a_conflict(env):
     asyncio.run(scenario())
 
 
+def test_a_superseded_proposal_cannot_be_approved_with_the_old_revision(env, tmp_path):
+    """P1-1: the pending revision identifies bytes, not the active revision.
+
+    Two installs of one name both carried the active revision, so after the
+    queue moved `revision` still matched and approve promoted whichever
+    proposal landed last — bytes no reviewer had read.
+    """
+    _ctx, loader, app = env
+
+    async def scenario():
+        client, token = await _client_with_token(app, _ctx)
+
+        base = await _preview(client, token, "sup-one", "first")
+        await _install(client, token, base["preview_token"])
+        activated = await client.post("/admin/api/skills/sup-one/approve",
+                                      json={"revision": 0}, headers=bearer(token))
+        assert activated.status_code == 200, activated.text
+        assert activated.json()["revision"] == 1
+
+        for marker in ("second", "third"):
+            preview = await _preview(client, token, "sup-one", marker)
+            await _install(client, token, preview["preview_token"])
+
+        detail = (await client.get("/admin/api/skills/sup-one", headers=bearer(token))).json()
+        assert detail["pending_revision"] == 3          # 2 for B, 3 for C
+
+        for stale_revision in (1, 2):
+            stale = await client.post("/admin/api/skills/sup-one/approve",
+                                      json={"revision": stale_revision}, headers=bearer(token))
+            assert stale.status_code == 409, stale.text
+            assert stale.json()["code"] == "TOOL_CONFLICT"
+        # The conflicts moved nothing: the live skill is still the first body.
+        assert "body marker first" in loader.get("sup-one").body
+
+        approved = await client.post("/admin/api/skills/sup-one/approve",
+                                     json={"revision": 3}, headers=bearer(token))
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["revision"] == 3
+        assert "body marker third" in loader.get("sup-one").body
+        assert loader.pending("sup-one") is None
+
+    asyncio.run(scenario())
+
+
+def test_reject_with_a_superseded_revision_is_a_conflict(env, tmp_path):
+    _ctx, loader, app = env
+
+    async def scenario():
+        client, token = await _client_with_token(app, _ctx)
+
+        base = await _preview(client, token, "sup-two", "first")
+        await _install(client, token, base["preview_token"])
+        await client.post("/admin/api/skills/sup-two/approve",
+                          json={"revision": 0}, headers=bearer(token))
+        for marker in ("second", "third"):
+            preview = await _preview(client, token, "sup-two", marker)
+            await _install(client, token, preview["preview_token"])
+
+        stale = await client.post("/admin/api/skills/sup-two/reject",
+                                  json={"revision": 2, "reason": "stale page"},
+                                  headers=bearer(token))
+        assert stale.status_code == 409, stale.text
+        assert loader.pending("sup-two") is not None
+
+        rejected = await client.post("/admin/api/skills/sup-two/reject",
+                                     json={"revision": 3, "reason": "not useful"},
+                                     headers=bearer(token))
+        assert rejected.status_code == 200, rejected.text
+        parked = list((tmp_path / "skills" / ".rejected").iterdir())
+        assert len(parked) == 1
+        assert "body marker third" in (parked[0] / "SKILL.md").read_text(encoding="utf-8")
+        assert loader.get("sup-two").revision == 1
+
+    asyncio.run(scenario())
+
+
 # --------------------------------------------------------------------- detail
 def test_detail_serves_a_backend_diff_for_a_pending_proposal(env, tmp_path):
     _ctx, loader, app = env
@@ -213,7 +289,9 @@ def test_detail_serves_a_backend_diff_for_a_pending_proposal(env, tmp_path):
 
         detail = (await client.get("/admin/api/skills/manual-two", headers=bearer(token))).json()
         assert detail["status"] == "active"          # the live one
-        assert detail["pending_revision"] == 0
+        # The proposal is stamped ABOVE the active revision (rev 0 -> rev 1):
+        # the stamp identifies the bytes, it is not the active revision copied.
+        assert detail["pending_revision"] == 1
         assert detail["pending_diff"] and "+1. body marker second" in detail["pending_diff"]
         assert "-1. body marker first" in detail["pending_diff"]
 
@@ -264,7 +342,7 @@ def test_rollback_appends_a_new_revision(env, tmp_path):
         second = await _preview(client, token, "roll-one", "second")
         await _install(client, token, second["preview_token"])
         approved = await client.post("/admin/api/skills/roll-one/approve",
-                                     json={"revision": 1}, headers=bearer(token))
+                                     json={"revision": 2}, headers=bearer(token))
         assert approved.json()["revision"] == 2
 
         rolled = await client.post("/admin/api/skills/roll-one/rollback",

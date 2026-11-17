@@ -5,7 +5,8 @@
 | 模块 | 仓库 | 状态 |
 |---|---|---|
 | echo | https://github.com/lshub2010/vade-module-echo | 参考实现（已迁出） |
-| fs / shell / web / memory / mcp-bridge / model | `vade-module-<name>` | W5 建仓 |
+| fs | https://github.com/lshub2010/vade-module-fs | 白名单根目录的 list/stat/read/write/delete（65 tests） |
+| shell / web / memory / mcp-bridge / model | `vade-module-<name>` | W5 待建 |
 
 约定：
 - 每个模块仓遵循 `docs/design.md` §15.1 的目录结构（`manifest.json` 由装饰器生成、`tools.py` 不 import SDK、`server.py` 只转发）

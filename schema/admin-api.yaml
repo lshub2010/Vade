@@ -797,7 +797,7 @@ paths:
     get:
       tags: [governance]
       summary: skill 列表
-      x-vade-implemented: false
+      x-vade-implemented: true
       description: |
         `status ∈ {active, pending, disabled, stale, unavailable}`；`rejected` 是目录不是状态。
         数据必须来自 C3b 的 `SkillLoader.list_all`——禁止自己解析 SKILL.md frontmatter。
@@ -817,7 +817,7 @@ paths:
     post:
       tags: [governance]
       summary: 安装预检（不落盘）
-      x-vade-implemented: false
+      x-vade-implemented: true
       requestBody:
         required: true
         content:
@@ -851,7 +851,7 @@ paths:
     post:
       tags: [governance]
       summary: 安装到 `skills/pending/`（无 preview_token 一律拒绝；装完不生效）
-      x-vade-implemented: false
+      x-vade-implemented: true
       requestBody:
         required: true
         content:
@@ -873,7 +873,7 @@ paths:
     get:
       tags: [governance]
       summary: skill 详情（含后端算好的 diff）
-      x-vade-implemented: false
+      x-vade-implemented: true
       parameters:
         - $ref: "#/components/parameters/Name"
       responses:
@@ -897,7 +897,7 @@ paths:
     patch:
       tags: [governance]
       summary: 启停（只改 meta.json，不改 frontmatter；与 approve 是两件事）
-      x-vade-implemented: false
+      x-vade-implemented: true
       parameters:
         - $ref: "#/components/parameters/Name"
       requestBody:
@@ -919,7 +919,7 @@ paths:
     delete:
       tags: [governance]
       summary: 卸载（移到 `.trash/<name>-<ts>/`，可恢复）
-      x-vade-implemented: false
+      x-vade-implemented: true
       parameters:
         - $ref: "#/components/parameters/Name"
       responses:
@@ -933,7 +933,7 @@ paths:
     post:
       tags: [governance]
       summary: 提案转正（install 与 proposal 共用；rev+1 + .history/ + 热加载）
-      x-vade-implemented: false
+      x-vade-implemented: true
       parameters:
         - $ref: "#/components/parameters/Name"
       requestBody:
@@ -957,7 +957,7 @@ paths:
     post:
       tags: [governance]
       summary: 驳回（移到 `.rejected/`，7 天清理）
-      x-vade-implemented: false
+      x-vade-implemented: true
       parameters:
         - $ref: "#/components/parameters/Name"
       requestBody:
@@ -981,7 +981,7 @@ paths:
     post:
       tags: [governance]
       summary: 回滚（复制旧版 + rev+1，不删历史）
-      x-vade-implemented: false
+      x-vade-implemented: true
       parameters:
         - $ref: "#/components/parameters/Name"
       requestBody:

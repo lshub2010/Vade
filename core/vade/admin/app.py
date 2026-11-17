@@ -38,7 +38,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..errors import VadeError, http_status
 from ..identity.pairing import Purpose
-from . import setup_token
+from . import bind as bind_service, setup_token
 from .auth import (
     ChallengeStore, PasswordPolicyError, SessionStore, hash_password, is_loopback,
     normalize_pubkey, origin_allowed, validate_password, verify_password,
@@ -486,12 +486,9 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         entry = ctx.setup.peek_ticket(ticket)
         if entry is None:
             raise VadeError("BIND_UNAUTHORIZED", "bind ticket is unknown, expired or already used")
-        kex_private, kex_public = _x25519_keypair()
-        challenge = secrets.token_bytes(32)
-        session = ctx._bind_sessions.setdefault(ticket, {})
-        session.update({"kex_public": kex_public, "challenge": challenge, "private": kex_private})
-        kex_b64 = base64.b64encode(kex_public).decode()
-        challenge_b64 = base64.b64encode(challenge).decode()
+        session = bind_service.begin_hello(ctx, ticket, entry, ip=_client(request))
+        kex_b64 = base64.b64encode(session["kex_public"]).decode()
+        challenge_b64 = base64.b64encode(session["challenge"]).decode()
         hello_sig = ctx.identity.hello_signature(
             kex_pub=kex_b64, challenge=challenge_b64, ticket=ticket, admin_host=ctx.config.admin_host,
         )
@@ -503,10 +500,15 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         })
 
     async def bind(request: Request) -> Response:
-        # The encrypted envelope (X25519 + AES-GCM, AAD over fp8/ticket hash) is
-        # C-17 T4 work. Refusing loudly beats accepting a half-verified device
-        # registration: there is no fallback that is safe.
-        raise VadeError("UNSUPPORTED", "POST /admin/bind is not enabled in this build; use step-up device registration")
+        """§7.12.3 ③–⑤: verify the envelope, then consume the ticket.
+
+        Everything that can reject the request happens in `bind.complete()`
+        before the ticket is touched, so a failed attempt leaves the QR usable.
+        The plaintext password only exists inside that call.
+        """
+        body = await _json(request)
+        payload = bind_service.complete(ctx, body, ip=_client(request))
+        return JSONResponse(payload)
 
     # --------------------------------------------------------------------- auth
     async def login_challenge(request: Request) -> Response:
@@ -1221,19 +1223,3 @@ class GuardedApp:
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
-
-
-def _x25519_keypair() -> tuple[bytes, bytes]:
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-
-    key = X25519PrivateKey.generate()
-    private = key.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    public = key.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
-    )
-    return private, public

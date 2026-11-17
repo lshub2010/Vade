@@ -171,7 +171,7 @@ paths:
       tags: [setup]
       summary: 绑定设备（信封加密；先验后删）
       security: []
-      x-vade-implemented: false
+      x-vade-implemented: true
       description: |
         `{ticket, eph_pub, nonce, ct}`，ticket 明文，其余在密文里。
         AAD = `"vade-bind-v1" ‖ fp8 ‖ SHA256(ticket) ‖ challenge ‖ kex_pub`。

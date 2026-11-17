@@ -91,6 +91,67 @@ def test_missing_cryptography_is_unsupported_not_a_der_fallback(tmp_path: Path, 
     assert "DER" in excinfo.value.message
 
 
+def test_cli_print_tls_fingerprint_prints_the_spki_pin_not_the_der(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """`core --print-tls-fingerprint` must emit the same `tls=` value as the setup page.
+
+    It used to hash the certificate DER, so a user comparing the CLI output
+    with the QR pin (`SHA-256(SPKI)[:16]`) always saw two different strings
+    under two same-looking commands (P0).
+    """
+    from vade.__main__ import main
+
+    cert, key = ensure_certificates(None, None, tmp_path)
+    config = tmp_path / "core.toml"
+    config.write_text(
+        "[core]\n"
+        f"data_dir = {json.dumps(tmp_path.as_posix())}\n"
+        "[tls]\n"
+        f"cert = {json.dumps(str(cert))}\n"
+        f"key = {json.dumps(str(key))}\n",
+        encoding="utf-8",
+    )
+
+    assert main(["--config", str(config), "--print-tls-fingerprint"]) == 0
+    printed = capsys.readouterr().out.strip()
+    assert printed == spki_fingerprint_hex(cert)
+    assert len(printed) == 16
+    assert printed != cert_fingerprint_hex(cert)[:16]
+
+
+def test_cli_print_tls_fingerprint_without_cryptography_exits_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No silent DER fallback: UNSUPPORTED on stderr, exit 2, nothing on stdout."""
+    import builtins
+
+    from vade.__main__ import main
+
+    cert, key = ensure_certificates(None, None, tmp_path)
+    config = tmp_path / "core.toml"
+    config.write_text(
+        "[core]\n"
+        f"data_dir = {json.dumps(tmp_path.as_posix())}\n"
+        "[tls]\n"
+        f"cert = {json.dumps(str(cert))}\n"
+        f"key = {json.dumps(str(key))}\n",
+        encoding="utf-8",
+    )
+    der_value = cert_fingerprint_hex(cert)[:16]
+    real_import = builtins.__import__
+
+    def blocked(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "cryptography" or name.startswith("cryptography."):
+            raise ImportError("cryptography is not installed (simulated)")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    assert main(["--config", str(config), "--print-tls-fingerprint"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out.strip() == ""
+    assert "UNSUPPORTED" in captured.err
+    assert der_value not in captured.err
+
+
 # ---------------------------------------------------------------- whitelist
 
 

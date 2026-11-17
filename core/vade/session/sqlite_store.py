@@ -26,7 +26,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from ..errors import VadeError
 from .models import (
-    Event, Message, Session, SessionGroup, SubagentRun, SubagentState,
+    TERMINAL_STATES, Event, Message, Session, SessionGroup, SubagentRun, SubagentState,
     Turn, TurnState, now_ms,
 )
 from .search import LIMIT_DEFAULT, SearchHit, escape_like, find_ascii_ci, make_snippet
@@ -326,6 +326,89 @@ class SQLiteStore(SessionStore):
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # --------------------------------------------------------------- reconcile
+    def reconcile_unfinished_turns(self, *, reason: str = "restart") -> int:
+        """Startup: turn rows a dead process left non-terminal become interrupted.
+
+        The turn queue lives in memory only, so `queued`/`running`/
+        `waiting_*` rows from a previous process can never finish: every
+        snapshot would advertise a turn that runs forever, and `regenerate`/
+        `edit` would refuse the version chain with `turn_active` forever.
+
+        One transaction for the whole repair: the turn row and the terminal
+        `turn.interrupted` event must land together, or a crash in between
+        leaves a state no client can explain (the same rule `append()` follows
+        for every other terminal write). The seq comes from `seq_counter`
+        under `BEGIN IMMEDIATE`, so it can never collide with an event a
+        replaying client already has.
+
+        `ended_at` is stamped only when the dead process did not stamp one,
+        and `updated_at` is deliberately NOT touched: a crash is not activity,
+        so a repaired session must not jump to the top of `session/list`.
+
+        Idempotent: a second call (dev hot reload installing twice) finds no
+        non-terminal rows and writes nothing.
+        """
+        terminal = tuple(sorted(state.value for state in TERMINAL_STATES))
+        placeholders = ",".join("?" for _ in terminal)
+        now = now_ms()
+        reconciled = 0
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT id, session_id FROM turns"
+                f" WHERE state NOT IN ({placeholders}) ORDER BY session_id, rowid",
+                terminal,
+            ).fetchall()
+            if not rows:
+                return 0
+            by_session: dict[str, list[str]] = {}
+            for row in rows:
+                by_session.setdefault(str(row["session_id"]), []).append(str(row["id"]))
+
+            for session_id, turn_ids in by_session.items():
+                counter = conn.execute(
+                    "SELECT seq_counter FROM sessions WHERE id=?", (session_id,)
+                ).fetchone()
+                seq = int(counter["seq_counter"]) if counter is not None else 0
+                for turn_id in turn_ids:
+                    cursor = conn.execute(
+                        "UPDATE turns SET state=?, ended_at=COALESCE(ended_at, ?),"
+                        f" stopped_reason=? WHERE id=? AND state NOT IN ({placeholders})",
+                        (TurnState.INTERRUPTED.value, now, reason, turn_id, *terminal),
+                    )
+                    # Another process reconciled it between our SELECT and this
+                    # UPDATE (or it finished for real): count only our writes.
+                    if cursor.rowcount == 0:
+                        continue
+                    reconciled += 1
+                    if counter is None:
+                        # Orphan turn row (no `sessions` row): repair the state,
+                        # but there is no seq space to write an event into.
+                        continue
+                    seq += 1
+                    payload = {
+                        "turn_id": turn_id,
+                        "state": TurnState.INTERRUPTED.value,
+                        "by": "system",
+                        # A dead process streamed nothing we could persist; the
+                        # fields stay present so clients that read them see the
+                        # documented "no partial text" value, not a missing key.
+                        "partial_message_id": None,
+                        "partial_chars": 0,
+                        "data": {"reason": reason},
+                    }
+                    conn.execute(
+                        "INSERT INTO events(session_id, seq, type, payload, ts, coalesce)"
+                        " VALUES(?,?,?,?,?,0)",
+                        (session_id, seq, "turn.interrupted",
+                         json.dumps(payload, ensure_ascii=False), now),
+                    )
+                if counter is not None and seq > int(counter["seq_counter"]):
+                    conn.execute(
+                        "UPDATE sessions SET seq_counter=? WHERE id=?", (seq, session_id)
+                    )
+        return reconciled
 
     # ------------------------------------------------------------------ writes
     def create_session(self, session: Session) -> None:

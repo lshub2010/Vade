@@ -72,7 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--admin-allow-cidr", default=None, help="optional narrowing of admin sources")
     parser.add_argument("--san", action="append", default=None, help="extra TLS SAN (repeatable)")
     parser.add_argument("--print-fingerprint", action="store_true", help="print core identity fp8 and exit")
-    parser.add_argument("--print-tls-fingerprint", action="store_true", help="print TLS certificate fingerprint and exit")
+    parser.add_argument(
+        "--print-tls-fingerprint",
+        action="store_true",
+        help="print the TLS SPKI fingerprint SHA-256(SPKI)[:16] (the `tls=` pin) and exit",
+    )
     parser.add_argument(
         "--no-pair-banner",
         action="store_true",
@@ -293,7 +297,16 @@ def main(argv: list[str] | None = None) -> int:
         if not cert:
             print("vade: [tls].cert is not configured (self-signed material is generated on first start)", file=sys.stderr)
             return 2
-        print(tls_module.cert_fingerprint_hex(cert)[:16])
+        # The `tls=` pin is SHA-256(SPKI)[:16] (D78), the SAME value `/admin/setup`
+        # shows and the App stores. Hashing the certificate DER instead produced
+        # a different 16-hex string under the same-looking command, so the pin
+        # comparison could never match. `spki_fingerprint_hex` already truncates;
+        # it raises UNSUPPORTED (never a DER fallback) without `cryptography`.
+        try:
+            print(tls_module.spki_fingerprint_hex(cert))
+        except VadeError as exc:
+            print(f"vade: {exc.code}: {exc}", file=sys.stderr)
+            return 2
         return 0
 
     # Starting a live listener needs an ASGI server (uvicorn). Keep the import

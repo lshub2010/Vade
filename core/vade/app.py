@@ -109,6 +109,21 @@ class App:
     async def shutdown(self) -> None:
         if self.pairing is not None:
             self.pairing.close()
+        # C3 first: ending the sessions is the step everything else depends on.
+        # `SessionLog.close()` fires `app.on_session_end` (C3d's `session.closed`
+        # beat reads the transcript through `sessions.db`, C5a's grant cleanup),
+        # closes the RFC-0008 dialogs on the still-attached sockets, awaits the
+        # turn workers and only then closes the store. Closing `app.blob` before
+        # this would pull the attachment service out from under a turn that is
+        # still finalizing (`_LazyBlobs` resolves it at call time), and the beat
+        # must reach devices before their sinks are detached inside `close()`.
+        session = getattr(self, "session", None)
+        if session is not None:
+            close_session = getattr(session, "close", None)
+            if callable(close_session):
+                result = close_session()
+                if inspect.isawaitable(result):
+                    await result
         # RFC-0004: the blob store holds a sqlite handle *and* a GC task; close
         # both with the app so a restart does not depend on process exit. The
         # async closer is preferred because it awaits the cancelled sweeper
@@ -277,32 +292,42 @@ class App:
 
         # Three identities must agree: the key that finished the handshake, the
         # pairing record that key belongs to, and the manifest claiming a slot.
-        # `device_id` is set by the transport from the verified key, never from
-        # anything the peer sent (`transport/server.py::_bind_device_identity`).
-        # None therefore means "no pairing" and this must fail closed — a
-        # paired module A declaring itself as B would otherwise inherit B's
-        # tools and approval surface (review D1).
-        device_id = getattr(connection, "device_id", None)
-        if not device_id:
+        # The question is set membership — is this key paired to
+        # `module#instance`? — never "does it equal the first name in sorted
+        # order": a pooled module shares one key across instances, and taking
+        # the lexicographic minimum rejected every worker but one (P1-3).
+        # `device_id` from the transport is only a hint; it is `None` when the
+        # key is ambiguous. None allowed therefore means "no pairing" and this
+        # must fail closed — a paired module A declaring itself as B would
+        # otherwise inherit B's tools and approval surface (review D1).
+        fingerprint = self._peer_fingerprint(connection)
+        claimed = f"{manifest.module_id}#{manifest.instance_id}"
+        allowed = self._paired_devices(fingerprint)
+        if not allowed:
             raise VadeError(
                 "PERMISSION_DENIED",
                 "module/register requires a paired module identity on this connection",
                 fatal=True,
             )
-        claimed = f"{manifest.module_id}#{manifest.instance_id}"
-        if str(device_id) != claimed:
+        if claimed not in allowed:
             raise VadeError(
                 "PERMISSION_DENIED",
-                f"connection is paired as {device_id!r}, manifest claims {claimed!r}",
+                f"key {fingerprint[:16]} is not paired to {claimed!r} "
+                f"(paired to {sorted(allowed)!r})",
                 fatal=True,
             )
+        # The claim is now proven by the pairing record, so bind it: blob
+        # tokens and `ui/*` page authorisation read `connection.device_id`, and
+        # a pooled worker must carry its own name, not a sibling's.
+        if getattr(connection, "device_id", None) != claimed:
+            connection.device_id = claimed
 
         kind = "device" if manifest.role == "ui" else "module"
         auth_mode = "module_key"
         try:
             registration = self.registry.register(
                 manifest,
-                fingerprint=self._peer_fingerprint(connection),
+                fingerprint=fingerprint,
                 connection_id=connection.connection_id,
                 kind=kind,
                 auth_mode=auth_mode,
@@ -314,6 +339,23 @@ class App:
             "session_id": registration.session_id,
             "tool_names": list(registration.tool_names),
         }
+
+    def _paired_devices(self, fingerprint: str) -> frozenset[str]:
+        """`module#instance` names the whitelist pairs this key to.
+
+        Prefers the plural query. A whitelist from an older revision (or a
+        test double) only answers with one name; that is still a valid
+        membership check for the single-instance case.
+        """
+        whitelist = self.whitelist
+        if whitelist is None:
+            return frozenset()
+        plural = getattr(whitelist, "devices_for_fingerprint", None)
+        if callable(plural):
+            return frozenset(str(name) for name in plural(fingerprint))
+        single = getattr(whitelist, "device_for_fingerprint", None)
+        name = single(fingerprint) if callable(single) else None
+        return frozenset({str(name)}) if name else frozenset()
 
     def update_module_capabilities(self, connection: Any, params: Any) -> Any:
         if self.registry is None:

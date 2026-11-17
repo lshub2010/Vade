@@ -1,0 +1,26 @@
+{
+  "name": "vade-admin-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Vade 管理面（浏览器只读 / App 内 WebView 全功能）",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@xyflow/react": "13.0.1",
+    "qrcode-generator": "^2.0.4",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "typescript": "5.9.3",
+    "vite": "8.3.8"
+  }
+}

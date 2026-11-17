@@ -398,14 +398,23 @@ class Registry:
 
     # ------------------------------------------------------------------ health
     def touch(self, module_id: str, instance_id: str, *, rtt_ms: float | None = None) -> None:
+        restored = False
+        updated: NodeRecord | None = None
         with self._lock:
             key = (module_id, instance_id)
             record = self._records.get(key)
             if record is None:
                 return
-            if record.health is not HealthState.ONLINE:
+            restored = record.health is not HealthState.ONLINE
+            if restored:
                 self._bump()  # availability flips back on: the list changed
-            self._records[key] = replace(record, last_frame_at=self._clock(), rtt_ms=rtt_ms or record.rtt_ms, health=HealthState.ONLINE)
+            updated = replace(record, last_frame_at=self._clock(),
+                              rtt_ms=rtt_ms or record.rtt_ms, health=HealthState.ONLINE)
+            self._records[key] = updated
+        if restored and updated is not None:
+            # design §7.3: a heartbeat that brings a node back is a state
+            # change and must reach the topology, not only the model catalog.
+            self._publish_status(updated)
 
     def mark_disconnected(self, module_id: str, instance_id: str) -> None:
         with self._lock:

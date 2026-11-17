@@ -11,13 +11,48 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
-__all__ = ["sanitize_endpoint", "to_public_view", "NODE_FIELDS"]
+__all__ = ["sanitize_endpoint", "to_public_view", "capability_kinds", "NODE_FIELDS", "CAPABILITY_KINDS"]
 
 NODE_FIELDS = (
     "id", "kind", "module_id", "instance_id", "label", "capabilities", "state",
     "endpoint", "protocol", "version", "auth_mode", "rtt_ms", "last_seen",
     "x", "y", "revoked", "tool_count", "tool_names",
 )
+
+#: Canonical capability kinds (design §7.2/§7.7, 32-C5b T2). This is the set the
+#: canvas reads to pick a shape; tool names are NOT capabilities and live in
+#: `tool_names` only. Order is stable so a diff is meaningful.
+CAPABILITY_KINDS = ("tools", "prompts", "events", "model", "memory", "bridge")
+
+
+def capability_kinds(record: Any) -> list[str]:
+    """Capability *kinds* for a node, never tool names (design §7.2).
+
+    `manifest.capabilities` declares four sections (tools/prompts/events/models);
+    `models` is published as the singular `model` because that is the node-type
+    vocabulary in §7.7 / 32-C5b T2. `memory` and `bridge` have no manifest flag,
+    so they follow the module-id convention the canvas already used: core owns
+    that derivation now, so a client does not have to string-match `module_id`
+    twice and get a different answer.
+    """
+    manifest = getattr(record, "manifest", None)
+    kinds: set[str] = set()
+    if manifest is not None:
+        if getattr(manifest, "tools", ()):
+            kinds.add("tools")
+        if getattr(manifest, "prompts", ()):
+            kinds.add("prompts")
+        if getattr(manifest, "events", ()):
+            kinds.add("events")
+        if getattr(manifest, "models", ()):
+            kinds.add("model")
+    module_id = str(getattr(record, "module_id", "") or "").lower()
+    if "memory" in module_id:
+        kinds.add("memory")
+    if "mcp" in module_id or "bridge" in module_id:
+        kinds.add("bridge")
+    return [kind for kind in CAPABILITY_KINDS if kind in kinds]
+
 
 
 def sanitize_endpoint(value: str | None) -> str | None:
@@ -51,7 +86,7 @@ def to_public_view(
         "module_id": getattr(record, "module_id", None),
         "instance_id": getattr(record, "instance_id", None),
         "label": position.get("label") or getattr(record, "module_id", None),
-        "capabilities": names,
+        "capabilities": capability_kinds(record),
         "state": state,
         "endpoint": sanitize_endpoint(getattr(record, "endpoint", None)),
         "protocol": "vade/v1",

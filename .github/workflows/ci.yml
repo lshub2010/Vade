@@ -47,3 +47,30 @@ jobs:
           python tools/check_contracts.py
           python docs/check_docs.py
           python tools/check_ledger.py
+
+  admin-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: admin-ui/package-lock.json
+
+      - name: Install
+        working-directory: admin-ui
+        run: npm ci
+
+      - name: Build
+        working-directory: admin-ui
+        run: npm run build
+
+      - name: dist matches source
+        run: |
+          # 构建必须可复现：dist 与源码不同步（含未跟踪文件）就失败。
+          git diff --exit-code -- admin-ui/dist
+          test -z "$(git status --porcelain -- admin-ui/dist)"
+

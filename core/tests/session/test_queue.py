@@ -652,6 +652,56 @@ def test_an_interrupted_turn_is_never_audited_as_completed(tmp_path):
     asyncio.run(scenario())
 
 
+def test_capacity_claim_reserves_one_slot_and_enqueue_consumes_it():
+    """`claim()` is the capacity decision, `enqueue(claim=...)` its consumption.
+
+    This is the mechanism that keeps a capacity refusal BEFORE the first write
+    of `submit`/`regenerate`/`edit_resubmit`: the slot is taken when capacity is
+    judged, so no intervening `emit` can lose it. The bookkeeping is
+    single-use by design — a double release or a stale claim must not free (or
+    consume) another caller's slot.
+    """
+
+    async def scenario():
+        async def emit(session_id, event_type, payload=None, **kwargs):
+            return None
+
+        async def executor(turn, content):  # pragma: no cover - worker never runs
+            raise AssertionError("no turn should run in this test")
+
+        queue = TurnQueue("claim-session", executor=executor, emit=emit,
+                          save_turn=lambda session_id, turn: None, max_pending=1)
+        first = Turn(id="turn-1", session_id="claim-session", user_text="one")
+
+        claim = queue.claim()
+        assert claim is not None
+        assert not queue.has_capacity()      # the claim counts against max_pending
+        assert queue.claim() is None         # a second caller is refused
+        assert queue.release(claim) is True  # ... and the slot comes back
+        assert queue.release(claim) is False  # double release frees nothing
+        assert queue.has_capacity()
+
+        claim = queue.claim()
+        assert claim is not None
+        assert queue.enqueue(first, (), claim=claim) == 1
+        assert queue.release(claim) is False  # consumed: no second free
+        assert not queue.has_capacity()
+
+        # A stale/foreign token is a programming error, never a silent slot.
+        second = Turn(id="turn-2", session_id="claim-session", user_text="two")
+        with pytest.raises(VadeError) as stale:
+            queue.enqueue(second, (), claim=claim)
+        assert stale.value.code == "INTERNAL"
+
+        # A direct caller without a claim still meets the queue's own guard.
+        with pytest.raises(VadeError) as full:
+            queue.enqueue(second, ())
+        assert full.value.code == "OVERLOADED"
+        assert queue.state()["pending"][0]["turn_id"] == first.id
+
+    asyncio.run(scenario())
+
+
 def test_cancel_clear_is_bound_to_its_own_turn_when_the_previous_task_is_an_orphan():
     """The clear follows THIS turn's task, not `self._turn_task`.
 

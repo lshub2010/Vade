@@ -9,14 +9,11 @@ Four defects, one file each so a regression names its own bug:
 * a stopped turn left its `turn.approval_required` card open on every device;
 * `mark_state` swallowed the queue's verdict and refused the wire string.
 
-The OVERLOADED section also pins the two follow-ups the enqueue-race repair
-left behind:
-
-* roll-forward, not roll-back: `superseded_by`/`message.edited` keep pointing
-  at the announced v2 even when that v2 never entered the queue (events are
-  append-only; the failed v2 is a real chain head);
-* an idempotent retry that hits that `failed{OVERLOADED}` row is answered with
-  `OVERLOADED`, never a 200 that silently drops the message.
+The OVERLOADED section pins the shape that replaced the old roll-forward
+repair: capacity is CLAIMED before the first write, so a turn is never
+announced and then refused. The roll-forward path (`_fail_unstarted`,
+`_prior_overloaded`) is gone because the window it patched is unreachable —
+see `batch-results/g3-overload.md` for the measurement.
 """
 
 from __future__ import annotations
@@ -61,16 +58,24 @@ def _turn_row(log: SessionLog, session_id: str, turn_id: str):
     raise AssertionError(f"turn {turn_id} was never persisted")
 
 
-def _refuse_enqueue(queue) -> None:
-    """Simulate the race: the slot filled between the pre-check and the enqueue."""
-
-    def enqueue(turn, content):  # noqa: ANN001 - mirrors TurnQueue.enqueue
-        raise VadeError("OVERLOADED", f"queue is full ({queue.max_pending} pending turns)")
-
-    queue.enqueue = enqueue  # type: ignore[method-assign]
-
-
 # ------------------------------------------------------------------ OVERLOADED
+#
+# Capacity is decided ONCE, before the first write: `_queue_for_new_turn` CLAIMS
+# a slot and `enqueue(..., claim=...)` consumes it. It used to be a bare
+# `has_capacity()` sample separated from `enqueue` by an `emit` (and, for
+# regenerate/edit, by `turn.superseded`/`message.edited`), and the repair for
+# losing that race was roll-forward: announce the turn, get refused by the full
+# queue, then terminate the announced turn `failed{OVERLOADED}` and refuse a
+# replay of its `client_msg_id`.
+#
+# That window is unreachable in this code — `submit` performs no suspension at
+# all (`emit` takes an uncontended `asyncio.Lock`, writes through a sync store
+# and broadcasts to sync sinks) — so the repair is deleted rather than kept
+# alive by a stubbed `enqueue`. The claim is what keeps the invariant honest if
+# an `emit` ever does yield: the slot is already taken, so no announcement can
+# be followed by a capacity refusal. The tests below drive real objects only.
+
+
 def test_submit_overloaded_refuses_before_anything_is_written(tmp_path):
     """A queue that is already full must not leave a `queued` turn behind."""
 
@@ -90,16 +95,20 @@ def test_submit_overloaded_refuses_before_anything_is_written(tmp_path):
         assert caught.value.data == {"reason": "queue_full"}
 
         # Nothing of the refused turn reached the log: no event announced it and
-        # no row exists, so the idempotent retry cannot hand back a corpse.
+        # no row exists, so a retry cannot find a corpse to hand back.
         assert "s3" not in [e.payload.get("client_msg_id") for e in _events(log, session.id)]
         assert log.store.find_turn_by_client_msg(session.id, "s3") is None
         assert log.queue_state(session.id)["running"] == first.id
+        # A refused submit must not leave its slot claim behind either.
+        queue = log._queues[session.id]
+        assert queue._claims == {}
+        assert [e.type for e in _events(log, session.id)].count("turn.failed") == 0
 
         executor.gate.set()
         await log.wait_idle(session.id)
 
-        # Nothing was written, so the same key is NOT a refused corpse: once
-        # there is room again the retry is a plain submit and lands.
+        # Nothing was written, so once there is room the same key is a plain
+        # submit and lands for real.
         again, _ = await log.submit(session.id, [{"type": "text", "text": "three"}], "s3")
         assert again.user_text == "three"
         await log.wait_idle(session.id)
@@ -108,105 +117,253 @@ def test_submit_overloaded_refuses_before_anything_is_written(tmp_path):
     asyncio.run(scenario())
 
 
-def test_submit_terminates_a_turn_announced_but_not_enqueued(tmp_path):
-    """The emit-then-enqueue window: the announced turn must fail, not hang."""
+def test_concurrent_submits_for_one_slot_admit_exactly_one(tmp_path):
+    """Real concurrency, one free slot, six submits: one winner, five refusals.
 
-    async def scenario():
-        executor = GateExecutor()
-        log = _log(tmp_path, executor, max_pending=1)
-        session = log.create_session()
-        first, _ = await log.submit(session.id, [{"type": "text", "text": "one"}], "s1")
-        assert await wait_until(lambda: log.queue_state(session.id)["running"] == first.id)
-
-        _refuse_enqueue(log._queues[session.id])
-        with pytest.raises(VadeError) as caught:
-            await log.submit(session.id, [{"type": "text", "text": "two"}], "s2")
-        assert caught.value.code == "OVERLOADED"
-
-        events = _events(log, session.id)
-        queued = next(e for e in events if e.type == "turn.queued"
-                      and e.payload.get("client_msg_id") == "s2")
-        failed = next(e for e in events if e.type == "turn.failed"
-                      and e.payload.get("turn_id") == queued.payload["turn_id"])
-        assert _types(events).index("turn.queued") < _types(events).index("turn.failed")
-        assert failed.payload["state"] == "failed"
-        assert failed.payload["code"] == "OVERLOADED"
-        assert failed.payload["data"] == {"reason": "queue_full"}
-        assert failed.payload["usage"]["source"] == "none"
-
-        row = _turn_row(log, session.id, queued.payload["turn_id"])
-        assert row.state is TurnState.FAILED
-        assert row.ended_at is not None
-        # The failed turn is terminal, so the version chain is not blocked.
-        assert row.state.value in {"failed"}
-
-        executor.gate.set()
-        await log.wait_idle(session.id)
-
-    asyncio.run(scenario())
-
-
-def test_submit_retry_after_an_enqueue_race_is_overloaded_not_200(tmp_path):
-    """P1-2: a refused `client_msg_id` must not replay a never-queued turn.
-
-    `find_turn_by_client_msg` finds the `failed{OVERLOADED}` corpse the race
-    left behind; answering 200 with it told the client the text was accepted
-    when no engine ever saw it. The retry is refused with the retriable
-    `OVERLOADED` instead, and a fresh key really queues the message.
+    Nothing is stubbed — this is the case the deleted roll-forward path
+    claimed to handle. Every loser must be refused by the capacity claim, so it
+    announces nothing (`turn.queued`), fails nothing (`turn.failed`) and leaves
+    no turn row: the `queued`-forever zombie the old code patched up afterwards
+    cannot exist. If the pre-check ever stops being authoritative (an `emit`
+    that yields before the slot is taken), one of these assertions breaks.
     """
 
     async def scenario():
         executor = GateExecutor()
         log = _log(tmp_path, executor, max_pending=1)
         session = log.create_session()
-        first, _ = await log.submit(session.id, [{"type": "text", "text": "one"}], "s1")
+
+        first, _ = await log.submit(session.id, [{"type": "text", "text": "base"}], "base")
         assert await wait_until(lambda: log.queue_state(session.id)["running"] == first.id)
+        assert log.queue_state(session.id)["pending"] == []  # the slot is free
 
-        queue = log._queues[session.id]
-        original_enqueue = queue.enqueue
-        _refuse_enqueue(queue)
-        with pytest.raises(VadeError) as caught:
-            await log.submit(session.id, [{"type": "text", "text": "two"}], "s2")
-        assert caught.value.code == "OVERLOADED"
+        racers = await asyncio.gather(*[
+            log.submit(session.id, [{"type": "text", "text": f"race-{i}"}], f"r{i}")
+            for i in range(6)
+        ], return_exceptions=True)
+        winners = [result for result in racers if not isinstance(result, BaseException)]
+        refusals = [result for result in racers if isinstance(result, BaseException)]
+        assert len(winners) == 1, f"one slot admitted {len(winners)} turns"
+        assert len(refusals) == 5
+        for refusal in refusals:
+            assert isinstance(refusal, VadeError)
+            assert refusal.code == "OVERLOADED"
+            assert refusal.data == {"reason": "queue_full"}
 
-        corpse = log.store.find_turn_by_client_msg(session.id, "s2")
-        assert corpse is not None
-        assert corpse.state is TurnState.FAILED
-        assert corpse.error_code == "OVERLOADED"
-        assert corpse.started_at is None
-
-        with pytest.raises(VadeError) as retried:
-            await log.submit(session.id, [{"type": "text", "text": "two"}], "s2")
-        assert retried.value.code == "OVERLOADED"
-        assert retried.value.data == {
-            "reason": "prior_attempt_failed", "turn_id": corpse.id,
-            "client_msg_id": "s2",
+        winner, _pos = winners[0]
+        events = _events(log, session.id)
+        announced = {
+            e.payload.get("client_msg_id") for e in events if e.type == "turn.queued"
         }
-        # No duplicate row and no duplicate announcement for the refused key.
-        assert len([
-            e for e in _events(log, session.id)
-            if e.type == "turn.queued" and e.payload.get("client_msg_id") == "s2"
-        ]) == 1
+        assert announced == {"base", winner.client_msg_id}
+        assert [e.type for e in events].count("turn.failed") == 0
+        for index in range(6):
+            key = f"r{index}"
+            if key == winner.client_msg_id:
+                assert log.store.find_turn_by_client_msg(session.id, key) is not None
+            else:
+                assert log.store.find_turn_by_client_msg(session.id, key) is None
 
-        # A fresh key (the documented retry) lands the same text for real.
-        queue.enqueue = original_enqueue
-        second, _ = await log.submit(session.id, [{"type": "text", "text": "two"}], "s2b")
-        assert second.id != corpse.id
-        assert _turn_row(log, session.id, second.id).user_text == "two"
+        # Capacity is exactly full: one pending turn, and no claim was leaked
+        # (a lost claim would silently shrink `max_pending` for good).
+        queue = log._queues[session.id]
+        assert queue._claims == {}
+        assert not queue.has_capacity()
+        assert len(log.queue_state(session.id)["pending"]) == 1
 
         executor.gate.set()
         await log.wait_idle(session.id)
-        assert _turn_row(log, session.id, second.id).state is TurnState.COMPLETED
+
+    asyncio.run(scenario())
+
+
+def test_a_yielding_announcement_cannot_lose_the_claimed_slot(tmp_path):
+    """The old race, reproduced on purpose: `emit` suspends mid-announcement.
+
+    This is the window the deleted roll-forward path patched up. A hook makes
+    the announcement wait (no `enqueue` stub, no monkeypatched capacity), so a
+    concurrent submit runs exactly where the race used to be — and must be
+    refused, because the slot was already claimed. Without the claim it takes
+    the slot, and the resumed submit hits a full queue *after* `turn.queued`:
+    the `queued`-forever zombie.
+    """
+
+    async def scenario():
+        executor = GateExecutor()
+        log = _log(tmp_path, executor, max_pending=1)
+        session = log.create_session()
+        real_emit = log.emit
+        paused = asyncio.Event()   # the announcement reached its suspension
+        release = asyncio.Event()  # ... and may finish
+
+        async def slow_emit(session_id, event_type, payload=None, **kwargs):
+            if event_type == "turn.queued":
+                paused.set()
+                await release.wait()
+            return await real_emit(session_id, event_type, payload, **kwargs)
+
+        log.emit = slow_emit
+        slow = asyncio.create_task(
+            log.submit(session.id, [{"type": "text", "text": "slow"}], "slow")
+        )
+        assert await wait_until(paused.is_set)  # it has claimed and announced
+
+        with pytest.raises(VadeError) as caught:
+            await log.submit(session.id, [{"type": "text", "text": "fast"}], "fast")
+        assert caught.value.code == "OVERLOADED"
+        assert caught.value.data == {"reason": "queue_full"}
+
+        release.set()
+        turn, pos = await slow
+        assert pos == 1
+        events = _events(log, session.id)
+        assert [e.type for e in events].count("turn.failed") == 0
+        assert log.store.find_turn_by_client_msg(session.id, "fast") is None
+        assert log.store.find_turn_by_client_msg(session.id, "slow").id == turn.id
+
+        executor.gate.set()
+        await log.wait_idle(session.id)
+        assert _turn_row(log, session.id, turn.id).state is TurnState.COMPLETED
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_announcement_returns_the_claimed_slot(tmp_path):
+    """The claim is released when `turn.queued` never lands.
+
+    Losing the claim on an exception would shrink `max_pending` for the life of
+    the queue — the same class of permanent damage as the `queued`-forever turn,
+    just harder to see.
+    """
+
+    async def scenario():
+        executor = GateExecutor()
+        log = _log(tmp_path, executor, max_pending=1)
+        session = log.create_session()
+        real_emit = log.emit
+        state = {"failures": 1}
+
+        async def flaky_emit(session_id, event_type, payload=None, **kwargs):
+            if event_type == "turn.queued" and state["failures"]:
+                state["failures"] -= 1
+                raise VadeError("INTERNAL", "store is down")
+            return await real_emit(session_id, event_type, payload, **kwargs)
+
+        log.emit = flaky_emit
+        with pytest.raises(VadeError):
+            await log.submit(session.id, [{"type": "text", "text": "lost"}], "f1")
+
+        queue = log._queues[session.id]
+        assert queue._claims == {}
+        assert queue.has_capacity()  # the slot came back
+        assert log.store.find_turn_by_client_msg(session.id, "f1") is None
+
+        log.emit = real_emit
+        turn, _ = await log.submit(session.id, [{"type": "text", "text": "kept"}], "f2")
+        executor.gate.set()
+        await log.wait_idle(session.id)
+        assert _turn_row(log, session.id, turn.id).state is TurnState.COMPLETED
+
+    asyncio.run(scenario())
+
+
+def test_regenerate_overloaded_writes_nothing(tmp_path):
+    """Capacity is claimed before `turn.superseded`: a refusal supersedes nothing.
+
+    The slot is taken here by an outstanding claim (a submit mid-announcement),
+    not by a stubbed `enqueue` — that is the only way a full queue can coexist
+    with a terminal tail turn, which `regenerate` requires.
+    """
+
+    async def scenario():
+        executor = GateExecutor()
+        log = _log(tmp_path, executor, max_pending=1)
+        session = log.create_session()
+        first, _ = await log.submit(session.id, [{"type": "text", "text": "hi"}], "s1")
+        executor.gate.set()
+        await log.wait_idle(session.id)
+
+        queue = log._queues[session.id]
+        claim = queue.claim()
+        assert claim is not None
+        with pytest.raises(VadeError) as caught:
+            await log.regenerate(session.id, first.id, "r1")
+        assert caught.value.code == "OVERLOADED"
+        assert caught.value.data == {"reason": "queue_full"}
+
+        # Roll-back in the only sense that matters: nothing was written, so the
+        # old turn still points at nothing and no v2 exists.
+        events = _events(log, session.id)
+        assert "turn.superseded" not in [e.type for e in events]
+        assert "r1" not in [e.payload.get("client_msg_id") for e in events]
+        assert _turn_row(log, session.id, first.id).superseded_by is None
+        assert log.store.find_turn_by_client_msg(session.id, "r1") is None
+
+        # Same key, once the slot is free: a plain regenerate, no corpse to
+        # refuse and no special retry contract.
+        assert queue.release(claim) is True
+        result = await log.regenerate(session.id, first.id, "r1")
+        assert result["version"] == 2
+        assert result["supersedes_turn_id"] == first.id
+        assert _turn_row(log, session.id, first.id).superseded_by == result["turn_id"]
+
+        executor.gate.set()
+        await log.wait_idle(session.id)
+
+    asyncio.run(scenario())
+
+
+def test_edit_resubmit_overloaded_writes_nothing(tmp_path):
+    """Capacity is claimed before `message.edited`: a refusal edits nothing."""
+
+    async def scenario():
+        executor = GateExecutor()
+        log = _log(tmp_path, executor, max_pending=1)
+        session = log.create_session()
+        first, _ = await log.submit(session.id, [{"type": "text", "text": "hi"}], "s1")
+        executor.gate.set()
+        await log.wait_idle(session.id)
+        assert first.user_message_id is not None
+
+        queue = log._queues[session.id]
+        claim = queue.claim()
+        assert claim is not None
+        with pytest.raises(VadeError) as caught:
+            await log.edit_resubmit(
+                session.id, first.user_message_id, [{"type": "text", "text": "edited"}], "e1",
+            )
+        assert caught.value.code == "OVERLOADED"
+        assert caught.value.data == {"reason": "queue_full"}
+
+        events = _events(log, session.id)
+        assert "message.edited" not in [e.type for e in events]
+        assert "e1" not in [e.payload.get("client_msg_id") for e in events]
+        reloaded = log.store.load(session.id)
+        assert reloaded is not None
+        message = next(m for m in reloaded.messages if m.id == first.user_message_id)
+        assert message.superseded_by is None
+        assert _turn_row(log, session.id, first.id).superseded_by is None
+
+        assert queue.release(claim) is True
+        result = await log.edit_resubmit(
+            session.id, first.user_message_id, [{"type": "text", "text": "edited"}], "e1",
+        )
+        assert result["supersedes_turn_id"] == first.id
+        assert _turn_row(log, session.id, first.id).superseded_by == result["turn_id"]
+
+        executor.gate.set()
+        await log.wait_idle(session.id)
 
     asyncio.run(scenario())
 
 
 def test_overloaded_after_a_started_turn_is_still_an_idempotent_result(tmp_path):
-    """Only the never-started corpse is special; a turn that started is returned.
+    """`OVERLOADED` from a turn that ran is an outcome, not a refusal.
 
-    A model-resolution failure carries `error_code="OVERLOADED"` too, but its
-    `started_at` is set: the request was dequeued and the failure is the real
-    outcome of that attempt, so the idempotent replay must return it.
+    Model-resolution failure carries `error_code="OVERLOADED"` too: the request
+    was dequeued (`started_at` set), so the idempotent replay returns that turn
+    instead of retrying. Only a capacity refusal — which now happens before any
+    row exists — is a different answer.
     """
 
     async def scenario():
@@ -226,167 +383,13 @@ def test_overloaded_after_a_started_turn_is_still_an_idempotent_result(tmp_path)
         row = _turn_row(log, session.id, turn.id)
         assert row.state is TurnState.FAILED
         assert row.error_code == "OVERLOADED"
-        assert row.started_at is not None  # dequeued; not the enqueue corpse
+        assert row.started_at is not None  # dequeued; not a capacity refusal
 
         # Replay of the same request returns the original failed turn: the
         # failure is that attempt's outcome, not a silently dropped message.
         replay, pos = await log.submit(session.id, [{"type": "text", "text": "hi"}], "s1")
         assert replay.id == turn.id
         assert pos == 0
-
-    asyncio.run(scenario())
-
-
-def test_regenerate_rolls_forward_to_a_failed_version_when_enqueue_fails(tmp_path):
-    """`turn.superseded` is already persisted; the new version must end `failed`.
-
-    Roll-forward is the chosen contract (events are append-only, so the old turn
-    cannot be un-pointed): v2 stays in the chain as a terminal head. A retry
-    with the SAME `client_msg_id` is refused with `OVERLOADED` instead of being
-    answered 200 with the never-queued turn; a fresh key regenerates the failed
-    head into v3, reusing the same user message.
-    """
-
-    async def scenario():
-        executor = GateExecutor()
-        log = _log(tmp_path, executor)
-        session = log.create_session()
-        first, _ = await log.submit(session.id, [{"type": "text", "text": "hi"}], "s1")
-        executor.gate.set()
-        await log.wait_idle(session.id)
-
-        queue = log._queues[session.id]
-        original_enqueue = queue.enqueue
-        _refuse_enqueue(queue)
-        with pytest.raises(VadeError) as caught:
-            await log.regenerate(session.id, first.id, "r1")
-        assert caught.value.code == "OVERLOADED"
-
-        events = _events(log, session.id)
-        types = _types(events)
-        queued_index = next(
-            i for i, e in enumerate(events)
-            if e.type == "turn.queued" and e.payload.get("client_msg_id") == "r1"
-        )
-        assert types.index("turn.superseded") < queued_index
-        assert queued_index < types.index("turn.failed")
-        new_id = next(e.payload["turn_id"] for e in events
-                      if e.type == "turn.queued" and e.payload.get("client_msg_id") == "r1")
-        assert _turn_row(log, session.id, first.id).superseded_by == new_id
-        # Roll-forward, not roll-back: the chain now ends in a failed v2, which
-        # is a terminal row the client can show and the user can work from.
-        failed = _turn_row(log, session.id, new_id)
-        assert failed.state is TurnState.FAILED
-        assert failed.error_code == "OVERLOADED"
-        assert failed.started_at is None
-        assert failed.parent_turn_id == first.id
-        assert failed.version == 2
-
-        # Same key: OVERLOADED with a pointer to the corpse, never a 200 replay.
-        with pytest.raises(VadeError) as retried:
-            await log.regenerate(session.id, first.id, "r1")
-        assert retried.value.code == "OVERLOADED"
-        assert retried.value.data == {
-            "reason": "prior_attempt_failed", "turn_id": new_id,
-            "client_msg_id": "r1",
-        }
-        assert len([
-            e for e in _events(log, session.id)
-            if e.type == "turn.queued" and e.payload.get("client_msg_id") == "r1"
-        ]) == 1
-
-        # A fresh key on the failed head produces v3 with the same user message:
-        # the text is never lost to the refused version.
-        queue.enqueue = original_enqueue
-        result = await log.regenerate(session.id, new_id, "r2")
-        assert result["version"] == 3
-        assert result["supersedes_turn_id"] == new_id
-        assert _turn_row(log, session.id, new_id).superseded_by == result["turn_id"]
-        v3 = _turn_row(log, session.id, result["turn_id"])
-        assert v3.user_message_id == first.user_message_id
-
-        executor.gate.set()
-        await log.wait_idle(session.id)
-
-    asyncio.run(scenario())
-
-
-def test_edit_resubmit_rolls_forward_to_a_failed_version_when_enqueue_fails(tmp_path):
-    """The edit already pointed the old message at the new one — no silence.
-
-    `message.edited` and `turn.superseded` stay durable and must agree with the
-    announced v2 (`new_turn_id`, `superseded_by_message_id`), even though v2
-    never entered the queue. The same-key retry is `OVERLOADED`; editing the
-    failed edition's message with a fresh key continues the chain as v3.
-    """
-
-    async def scenario():
-        executor = GateExecutor()
-        log = _log(tmp_path, executor)
-        session = log.create_session()
-        first, _ = await log.submit(session.id, [{"type": "text", "text": "hi"}], "s1")
-        executor.gate.set()
-        await log.wait_idle(session.id)
-        assert first.user_message_id is not None
-
-        queue = log._queues[session.id]
-        original_enqueue = queue.enqueue
-        _refuse_enqueue(queue)
-        with pytest.raises(VadeError) as caught:
-            await log.edit_resubmit(
-                session.id, first.user_message_id, [{"type": "text", "text": "edited"}], "e1",
-            )
-        assert caught.value.code == "OVERLOADED"
-
-        events = _events(log, session.id)
-        types = _types(events)
-        edited = next(e for e in events if e.type == "message.edited")
-        queued = next(e for e in events
-                      if e.type == "turn.queued" and e.payload.get("client_msg_id") == "e1")
-        assert queued.payload["reason"] == "edit_resubmit"
-        new_id = queued.payload["turn_id"]
-        new_message_id = queued.payload["user_message_id"]
-        assert types.index("message.edited") < types.index("turn.superseded")
-        assert types.index("turn.superseded") < next(
-            i for i, e in enumerate(events) if e is queued
-        )
-        assert next(i for i, e in enumerate(events) if e is queued) < types.index("turn.failed")
-        # The edited bubble and the superseded turn point at the announced v2,
-        # never at a turn that was not persisted.
-        assert edited.payload["new_turn_id"] == new_id
-        assert edited.payload["superseded_by_message_id"] == new_message_id
-        reloaded = log.store.load(session.id)
-        assert reloaded is not None
-        old_message = next(m for m in reloaded.messages if m.id == first.user_message_id)
-        assert old_message.superseded_by == new_message_id
-        assert _turn_row(log, session.id, first.id).superseded_by == new_id
-        failed = _turn_row(log, session.id, new_id)
-        assert failed.state is TurnState.FAILED
-        assert failed.error_code == "OVERLOADED"
-        assert failed.started_at is None
-        assert failed.user_message_id == new_message_id
-
-        # Same key: OVERLOADED, not a 200 with the failed edition.
-        with pytest.raises(VadeError) as retried:
-            await log.edit_resubmit(
-                session.id, first.user_message_id, [{"type": "text", "text": "edited"}], "e1",
-            )
-        assert retried.value.code == "OVERLOADED"
-        assert retried.value.data == {
-            "reason": "prior_attempt_failed", "turn_id": new_id,
-            "client_msg_id": "e1",
-        }
-
-        # A fresh key edits the failed edition's message; v3 supersedes v2.
-        queue.enqueue = original_enqueue
-        result = await log.edit_resubmit(
-            session.id, new_message_id, [{"type": "text", "text": "edited again"}], "e2",
-        )
-        assert result["supersedes_turn_id"] == new_id
-        assert _turn_row(log, session.id, new_id).superseded_by == result["turn_id"]
-
-        executor.gate.set()
-        await log.wait_idle(session.id)
 
     asyncio.run(scenario())
 

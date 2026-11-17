@@ -7,6 +7,8 @@ venv/
 .mypy_cache/
 node_modules/
 dist/
+!admin-ui/dist/
+!admin-ui/dist/**
 build/
 target/
 *.log

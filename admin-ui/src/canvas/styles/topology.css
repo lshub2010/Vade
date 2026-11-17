@@ -157,8 +157,8 @@
   width: 100%;
   height: 100%;
   color: var(--text);
-  /* 默认光标：这一批不可拖。T3 接上拖拽后改成 grab。 */
-  cursor: default;
+  /* 拖拽光标由 .react-flow__node.draggable 提供（见文件末尾），这里不写死 default。 */
+  cursor: inherit;
 }
 
 .topo-shape-core {
@@ -543,6 +543,364 @@
   margin-left: auto;
   font-size: 11.5px;
   color: #6f7d95;
+}
+
+/* ------------------------------------------------------- 实时状态 / 横幅 */
+
+.topo-live-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--muted);
+  vertical-align: 1px;
+}
+
+.topo-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.topo-live-live {
+  color: var(--ok);
+  border-color: #27503f;
+}
+
+.topo-live-live .topo-live-dot {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px #2ea26a22;
+}
+
+.topo-live-connecting .topo-live-dot,
+.topo-live-reconnecting .topo-live-dot {
+  background: var(--warn);
+  animation: topo-blink 1s steps(2, end) infinite;
+}
+
+.topo-live-reconnecting {
+  color: var(--warn);
+  border-color: #5a4a23;
+}
+
+.topo-live-polling {
+  color: var(--info);
+  border-color: #2c4a6b;
+}
+
+.topo-live-polling .topo-live-dot {
+  background: var(--info);
+}
+
+@keyframes topo-blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.topo-live-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid #5a4a23;
+  border-radius: var(--radius-sm);
+  background: #241d10;
+  color: #f2d9a4;
+  font-size: 12.5px;
+}
+
+.topo-live-banner-info {
+  border-color: #2c4a6b;
+  background: #101c2a;
+  color: #bcd8f5;
+}
+
+.topo-live-banner-warn {
+  border-color: #5a4a23;
+  background: #241d10;
+  color: #f2d9a4;
+}
+
+.topo-save-state {
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------ 面板 */
+
+.topo-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.topo-body-panel {
+  grid-template-columns: minmax(0, 1fr) 360px;
+}
+
+.topo-body .topo-canvas {
+  height: clamp(420px, calc(100vh - 340px), 780px);
+}
+
+.topo-panel {
+  position: sticky;
+  top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: clamp(420px, calc(100vh - 200px), 780px);
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #0e141d;
+  box-shadow: var(--shadow);
+}
+
+.topo-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.topo-panel-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.topo-panel-title {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.topo-panel-module {
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.topo-panel-close {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.topo-panel-close:hover {
+  color: var(--text);
+  background: var(--panel-strong);
+}
+
+.topo-panel-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.topo-panel-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.topo-panel-section h3 {
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.topo-panel-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.topo-panel-dl {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.topo-panel-dl > div {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.topo-panel-dl dt {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.topo-panel-dl dd {
+  margin: 0;
+  min-width: 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.topo-panel-endpoint {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.topo-panel-caps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.topo-panel-caps code {
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 10.5px;
+}
+
+.topo-panel-crypto {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 12.5px;
+}
+
+/* 面板里的锁标参与排版，不再绝对定位到角落。 */
+.topo-panel-crypto .topo-lock {
+  position: static;
+  flex: none;
+}
+
+.topo-panel-crypto-detail {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.topo-tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.topo-tool-list li {
+  min-width: 0;
+}
+
+.topo-tool-name {
+  display: block;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0a0f17;
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.topo-tool-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.topo-tool-total {
+  margin: 0;
+  font-size: 11px;
+}
+
+.topo-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.topo-panel-notice {
+  margin: 0;
+  font-size: 11.5px;
+}
+
+.topo-impact-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 180px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 11.5px;
+}
+
+.topo-toast {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.topo-toast-warn {
+  border-color: #5a4a23;
+  background: #241d10;
+  color: #f2d9a4;
+}
+
+.topo-toast-error {
+  border-color: #5b2a2a;
+  background: #251212;
+  color: #f5c2c2;
+}
+
+/* 可拖节点给抓取光标；core 与分组框没有 draggable 类。 */
+.topo-canvas .react-flow__node.draggable {
+  cursor: grab;
+}
+
+.topo-canvas .react-flow__node.draggable:active {
+  cursor: grabbing;
+}
+
+@media (max-width: 1100px) {
+  .topo-body-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .topo-panel {
+    position: static;
+    max-height: none;
+  }
 }
 
 /* ---------------------------------------------------------------- 窄屏 */

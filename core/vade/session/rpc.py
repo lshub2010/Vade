@@ -237,35 +237,15 @@ class SessionRPC:
             resolved = await resolved
         ok = True
         if isinstance(resolved, tuple) and len(resolved) == 2:
-            ok, resolved = resolved
-        # `ApprovalManager.decide` answers `(ok, dict)`; reading it with
-        # `getattr` returned None on every field, so the close event below was
-        # dead code and other devices' dialogs never closed.
-        winner: Mapping[str, Any] = resolved if isinstance(resolved, Mapping) else {}
-        session_id = winner.get("session_id")
-        turn_id = winner.get("turn_id")
-        attribution: dict[str, Any] = {}
-        # RFC-0007 §7.1: `decide()` returns the attribution it resolved, so
-        # the event that closes the dialog names the same task the prompt did.
-        for key in ("task_id", "task_name", "depth"):
-            if key in winner:
-                attribution[key] = winner[key]
-        if session_id and turn_id:
-            # Always close the dialog on every attached UI, even on a failed
-            # first-wins race — otherwise the other devices spin forever.
-            # `decision`/`by` are the WINNER's: the manager normalizes them
-            # (`by or actor_kind`, `allow|deny`), and the wire vocabulary for
-            # this event is `approve|deny` (schema/events.json), not `allow`.
-            verdict = str(winner.get("decision") or "").lower()
-            await self.log.emit(session_id, "turn.approval_resolved", {
-                "turn_id": turn_id, "request_id": request_id,
-                "session_id": session_id,
-                "decision": "approve" if verdict in ("allow", "approve", "approved") else "deny",
-                "by": winner.get("by") or getattr(connection, "device_id", None) or "admin",
-                "scope": winner.get("scope") or scope,
-                "state": winner.get("state") or "running",
-                **attribution,
-            })
+            ok = bool(resolved[0])
+        # No `turn.approval_resolved` here. `ApprovalManager.decide` is the
+        # single emitter for an allowed request — it writes through the loop's
+        # turn guard, so a decision can never land after the terminal event.
+        # Emitting on this side too closed every dialog twice, with two
+        # different decision strings (`allow` here, `approve` there: only
+        # `approve|deny` is in schema/events.json), and it also published a
+        # page approval's resolution as a `turn.*` event the RFC-0009 §9.4
+        # synchronous RPC deliberately does not have.
         return {"ok": bool(ok)}
 
     # ------------------------------------------------------------------ models

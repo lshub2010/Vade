@@ -93,7 +93,7 @@ def test_browser_session_cannot_approve_a_high_risk_call(tmp_path):
                                             actor_kind="device_key")
         decision = await asyncio.wait_for(task, 10)
         assert ok and decision.allowed and decision.by == "dev-1"
-        assert resolved["decision"] == "allow"
+        assert resolved["decision"] == "approve", "wire vocabulary is approve|deny"
         rows = AuditReader(writer.path).query(kind="approval")["items"]
         # Newest first in the audit page, so read the two rows oldest-first.
         assert [r["status"] for r in reversed(rows)] == ["denied", "allowed"]

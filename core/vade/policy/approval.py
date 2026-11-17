@@ -29,6 +29,11 @@ __all__ = [
     "ALLOWED_APPROVER_KINDS", "GENERIC_EXECUTORS",
 ]
 
+#: Requests whose waiter was cancelled but whose close event was never
+#: written (see `_cancelled`). Bounded: an entry that no turn-end sweep
+#: drains must not keep a `PendingApproval` (and its args) alive forever.
+CANCELLED_KEEP = 256
+
 #: Anything else — `browser_session`, `ui`, `browser`, a module — is refused
 #: with `APPROVER_INVALID`, which is exactly the C-04 code for this.
 ALLOWED_APPROVER_KINDS = frozenset({"device_key", "loopback_admin"})
@@ -104,6 +109,13 @@ class ApprovalManager:
         self._approver_probe = approver_probe
         self._pending: dict[str, PendingApproval] = {}
         self._resolved: dict[str, str] = {}
+        #: RFC-0009 §6.2 + C-06: a request whose waiter was cancelled by an
+        #: interrupt, kept just long enough for the turn-end sweep to write its
+        #: `turn.approval_resolved`. `_await_decision` cannot write it itself —
+        #: its `emit` is the loop's turn guard, which raises CancelledError for
+        #: every write once the turn is stopping — so without this hand-off the
+        #: dialog stayed open forever on every other device.
+        self._cancelled: dict[str, PendingApproval] = {}
         self._grants: dict[tuple[str, str, str], float] = {}
         self._lock = asyncio.Lock()
         self._ui_count = 0
@@ -289,12 +301,18 @@ class ApprovalManager:
                 )
         except asyncio.CancelledError:
             # A cancelled turn must not strand the entry: `pending_requests()`
-            # would keep advertising a request nobody can resolve.
+            # would keep advertising a request nobody can resolve. It is not
+            # dropped on the floor either — `close_turn` drains `_cancelled` in
+            # the turn-end sweep and writes the `turn.approval_resolved` that
+            # closes the dialog on every device. Emitting from here is not an
+            # option: this `emit` is the loop's turn guard, and it raises
+            # CancelledError for every write once the turn is stopping.
             async with self._lock:
                 if not pending.future.done():
                     pending.future.cancel()
                 self._resolved[rid] = "cancelled"
                 self._pending.pop(rid, None)
+                self._note_cancelled(pending)
             # Deliberately no `running` write here: the turn is being torn down
             # and the queue is about to publish its terminal state. Resurrecting
             # `running` first would emit a transition the user never caused.
@@ -435,7 +453,7 @@ class ApprovalManager:
                 scope="session",
             )
         resolved = {
-            "request_id": request_id, "decision": "allow" if allow else "deny",
+            "request_id": request_id, "decision": "approve" if allow else "deny",
             "by": by or actor_kind, "scope": scope, "state": "running",
             # The turn this request belonged to. `approval/decide` needs both
             # ids to write the `turn.approval_resolved` that closes every other
@@ -449,14 +467,75 @@ class ApprovalManager:
         if allow and pending.emit is not None:
             # On denial C3's engine emits `turn.approval_resolved` itself; on
             # allow nobody else does, so other attached UIs would keep their
-            # dialog open (31 §T2 "两端同时收到").
+            # dialog open (31 §T2 "两端同时收到"). This is the ONLY emitter on
+            # the allow path: `approval/decide` used to publish a second one in
+            # `allow` vocabulary right next to this `approve`, so every allowed
+            # call closed two dialogs with two different decision strings.
             try:
-                await pending.emit("turn.approval_resolved", {"turn_id": pending.turn_id, **resolved})
+                await pending.emit("turn.approval_resolved",
+                                   {"turn_id": pending.turn_id, **resolved})
+            except asyncio.CancelledError:
+                # `_turn_emit`'s interrupt guard raises this to stop the TURN;
+                # it is not a cancellation of *this* caller. A real cancel of
+                # the RPC/admin task still has to propagate.
+                task = asyncio.current_task()
+                if task is not None and getattr(task, "cancelling", lambda: 0)():
+                    raise
             except Exception:
                 pass
         return True, resolved
 
     # ------------------------------------------------------------- session ends
+    async def close_turn(
+        self, session_id: str, turn_id: str, *,
+        reason: str = "turn_interrupted", by: str = "system",
+    ) -> list[dict[str, Any]]:
+        """Retire every approval of a turn that is ending; return the rows.
+
+        C3's pre-terminal hook calls this *before* the terminal event, because
+        two things must happen together and only this method can do both
+        atomically:
+
+        * every attached device must be told to close its dialog — only
+          `turn.approval_resolved` does that — and
+        * the entries must leave the table, or `pending_requests()` and the
+          session snapshot keep advertising a request nobody can answer.
+
+        The pop happens under the same lock `decide()` takes, so a decision
+        landing concurrently either wins outright (and this returns nothing for
+        it) or is refused as already resolved; it can never be announced twice.
+
+        `_cancelled` entries are drained here too: a request whose waiter was
+        cancelled by the interrupt has no other place that can write its close
+        event (see `_await_decision`).
+        """
+        async with self._lock:
+            rows = [
+                p for p in self._pending.values()
+                if p.turn_id == turn_id and p.session_id == session_id
+            ]
+            for pending in rows:
+                self._pending.pop(pending.request_id, None)
+                if not pending.future.done():
+                    # Wake a still-waiting `request()` with a real denial: a
+                    # dangling future would make the engine wait out the full
+                    # deadline for a decision that can no longer arrive.
+                    pending.future.set_result((False, by, "once", reason))
+                self._resolved[pending.request_id] = "denied"
+            cancelled = [
+                p for p in self._cancelled.values()
+                if p.turn_id == turn_id and p.session_id == session_id
+            ]
+            for pending in cancelled:
+                self._cancelled.pop(pending.request_id, None)
+        return [self._row(p) for p in (*rows, *cancelled)]
+
+    def _note_cancelled(self, pending: PendingApproval) -> None:
+        """Hand a cancelled request to the turn-end sweep (bounded FIFO)."""
+        self._cancelled[pending.request_id] = pending
+        while len(self._cancelled) > CANCELLED_KEEP:
+            self._cancelled.pop(next(iter(self._cancelled)), None)
+
     async def on_session_end(self, session_id: str) -> None:
         async with self._lock:
             for key in [k for k in self._grants if k[0] == session_id]:
@@ -467,23 +546,31 @@ class ApprovalManager:
                     pending.future.set_result((False, "system", "once", "session_ended"))
                 self._resolved[pending.request_id] = "session_ended"
                 self._pending.pop(pending.request_id, None)
+            # A cancelled row for this session can never be announced now: the
+            # turn-end sweep only runs for a live turn, and the session is gone.
+            for request_id in [
+                p.request_id for p in self._cancelled.values()
+                if p.session_id == session_id
+            ]:
+                self._cancelled.pop(request_id, None)
 
     def grants(self) -> dict[tuple[str, str, str], float]:
         return dict(self._grants)
+
+    @staticmethod
+    def _row(p: PendingApproval) -> dict[str, Any]:
+        return {
+            "request_id": p.request_id, "session_id": p.session_id, "turn_id": p.turn_id,
+            "tool": p.tool_id, "args": dict(p.args), "risk": p.risk,
+            "created_at": p.created_at, "deadline": p.deadline,
+            "task_id": p.task_id, "task_name": p.task_name, "depth": p.depth,
+        }
 
     def pending_requests(self) -> list[dict[str, Any]]:
         """Snapshot for the admin UI; args are included because the approver must
         see exactly what will run (`31 §T2`). Nothing here is persisted."""
         self.reap_expired()
-        return [
-            {
-                "request_id": p.request_id, "session_id": p.session_id, "turn_id": p.turn_id,
-                "tool": p.tool_id, "args": dict(p.args), "risk": p.risk,
-                "created_at": p.created_at, "deadline": p.deadline,
-                "task_id": p.task_id, "task_name": p.task_name, "depth": p.depth,
-            }
-            for p in self._pending.values()
-        ]
+        return [self._row(p) for p in self._pending.values()]
 
     # ------------------------------------------------------------------ auditing
     def _write_audit(

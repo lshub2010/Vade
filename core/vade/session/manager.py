@@ -1512,23 +1512,51 @@ class SessionLog:
         approved, so the call did not run. `by: "system"` says the channel
         decided, not a person (a device answering after this event is refused
         by the tombstone instead of reopening a closed turn).
+
+        Announcing and dequeuing are ONE step: `close_turn` pops the rows (and
+        wakes any waiter with a denial) under the approval manager's lock,
+        then hands them back for the event. Emitting without dequeuing — the
+        old behaviour — closed the dialogs while `pending_requests()` and the
+        session snapshot kept advertising a request nobody could answer, so a
+        reconnecting client re-opened a card for a dead turn.
         """
         port: Any = self.approval_port
-        lister: Any = getattr(port, "pending", None)
-        if not callable(lister):
-            return
-        try:
-            rows = list(lister(session_id))
-        except Exception:  # pragma: no cover - approval port is C5a's
-            return
         target = (
             "interrupted"
             if state in (TurnState.INTERRUPTED, TurnState.CANCELLED)
             else state.value
         )
+        if state is TurnState.INTERRUPTED:
+            reason = "turn_interrupted"
+        elif state is TurnState.CANCELLED:
+            reason = "session_closed"
+        else:
+            reason = "turn_ended"
+
+        rows: list[Mapping[str, Any]] | None = None
+        closer: Any = getattr(port, "close_turn", None)
+        if callable(closer):
+            try:
+                closed = closer(session_id, turn_id, reason=reason)
+                if inspect.isawaitable(closed):
+                    closed = await closed
+                if closed is not None:
+                    rows = [row for row in closed if isinstance(row, Mapping)]
+            except Exception:  # pragma: no cover - approval port is C5a's
+                rows = None
+        if rows is None:
+            # A port without a turn-end closer (an older/fake implementation):
+            # announce-only, exactly as before. It cannot be dequeued here —
+            # the session layer must not reach into the manager's table.
+            lister: Any = getattr(port, "pending", None)
+            if not callable(lister):
+                return
+            try:
+                rows = [row for row in lister(session_id) if isinstance(row, Mapping)]
+            except Exception:  # pragma: no cover - approval port is C5a's
+                return
+
         for row in rows:
-            if not isinstance(row, Mapping):
-                continue
             if row.get("turn_id") != turn_id:
                 continue
             request_id = row.get("request_id")

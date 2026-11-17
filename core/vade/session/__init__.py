@@ -7,6 +7,7 @@ readable "no capability" turn instead of crashing (FR-1.4).
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,29 @@ class _LazyApproval:
             return [row for row in getter() if row.get("session_id") == session_id]
         except Exception:  # pragma: no cover - approval port is C5a's
             return []
+
+    async def close_turn(
+        self, session_id: str, turn_id: str, *, reason: str = "turn_interrupted",
+    ) -> list[dict[str, Any]] | None:
+        """Close + dequeue every approval left open on a turn that is ending.
+
+        Returns the rows to announce, `[]` when there was nothing left, and
+        `None` when the installed port has no turn-end closer at all — the
+        caller then falls back to `pending()` (a fake/older port in tests).
+        Closing the row and announcing it must be one step: `pending()` alone
+        left the table advertising a request nobody could answer.
+        """
+        port = getattr(self._app, "approval_port", None)
+        closer = getattr(port, "close_turn", None)
+        if not callable(closer):
+            return None
+        try:
+            result: Any = closer(session_id, turn_id, reason=reason)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception:  # pragma: no cover - approval port is C5a's
+            return None
+        return [dict(row) for row in (result or ()) if isinstance(row, dict)]
 
     async def on_session_end(self, session_id: str) -> None:
         port = getattr(self._app, "approval_port", None)

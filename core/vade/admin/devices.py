@@ -35,6 +35,12 @@ class Device:
     added_at: float
     added_from_ip: str | None
     last_used_at: float | None = None
+    #: §7.12.3 ③ stores `{hardware_backed, attested:false}`. `hardware_backed`
+    #: is the device's own claim and core cannot check it, so `attested` is
+    #: persisted as an explicit False rather than inferred from its absence —
+    #: the UI reads this pair to label the row "device's own claim" instead of
+    #: "verified", and a future attestation has a slot to fill.
+    attested: bool = False
 
     def public(self) -> dict[str, Any]:
         return {
@@ -43,6 +49,7 @@ class Device:
             "alg": self.alg,
             "fp8": self.fp8,
             "hardware_backed": bool(self.hardware_backed),
+            "attested": bool(self.attested),
             "added_at": self.added_at,
             "added_from_ip": self.added_from_ip,
             "last_used_at": self.last_used_at,
@@ -162,6 +169,22 @@ class DeviceStore:
             devices[device_id] = device
             self._save()
             return device
+
+    def discard(self, device_id: str) -> bool:
+        """Undo `add()` — for a bind transaction that failed after enrolling.
+
+        Deliberately **not** `revoke()`: the key was never usable, so it must not
+        land on the revoked list (that would refuse the retry the released ticket
+        is meant to allow). The device list and the revoked set are written
+        together by `_save()`, so nothing else can observe the half-step.
+        """
+        with self._lock:
+            devices = self._load()
+            if device_id not in devices:
+                return False
+            devices.pop(device_id)
+            self._save()
+            return True
 
     def revoke(self, device_id: str) -> bool:
         with self._lock:

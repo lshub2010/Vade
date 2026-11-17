@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import threading
 import zipfile
 from pathlib import Path
 
@@ -115,6 +116,102 @@ def test_update_never_touches_the_active_copy(tmp_path: Path) -> None:
     assert state.revision == 2 and state.description == "version two"
 
 
+def test_each_install_stamps_its_own_pending_revision(tmp_path: Path) -> None:
+    """P1-1: the pending revision identifies bytes, it is not the active one.
+
+    Two installs of one name used to carry the same revision (the active one),
+    so `approve(revision=N)` stopped naming a proposal and the admin gate let
+    the later, unreviewed bytes through.
+    """
+    loader = make_loader(tmp_path)
+    for description, expected in (("one", 0), ("two", 1)):
+        text = _text(description=description)
+        state = loader.install(InstallSource("text", text=text),
+                               loader.preview(InstallSource("text", text=text)).preview_token)
+        assert state.status == "pending"
+        assert state.revision == expected
+
+    # The stamp is in meta.json, so a restart reports the same identity.
+    restarted = make_loader(tmp_path)
+    assert restarted.pending("kb-guide").revision == 1
+    approved = restarted.approve("kb-guide")
+    assert approved.revision == 1 and approved.description == "two"
+
+
+def test_approve_and_reject_require_the_revision_they_were_shown(tmp_path: Path) -> None:
+    loader = make_loader(tmp_path)
+    first = _text(description="first")
+    loader.install(InstallSource("text", text=first),
+                   loader.preview(InstallSource("text", text=first)).preview_token)
+    assert loader.approve("kb-guide").revision == 1
+
+    for description in ("second", "third"):
+        text = _text(description=description)
+        loader.install(InstallSource("text", text=text),
+                       loader.preview(InstallSource("text", text=text)).preview_token)
+    assert loader.pending("kb-guide").revision == 3
+
+    with pytest.raises(VadeError) as excinfo:
+        loader.approve("kb-guide", expect_revision=1)      # the active revision
+    assert excinfo.value.code == "TOOL_CONFLICT"
+    with pytest.raises(VadeError) as excinfo:
+        loader.reject("kb-guide", "stale", expect_revision=2)   # superseded proposal
+    assert excinfo.value.code == "TOOL_CONFLICT"
+    assert loader.pending("kb-guide") is not None, "a refused CAS must not move anything"
+    assert loader.get("kb-guide").description == "first"
+
+    promoted = loader.approve("kb-guide", expect_revision=3)
+    assert promoted.revision == 3 and promoted.description == "third"
+
+    with pytest.raises(VadeError) as excinfo:
+        loader.reject("kb-guide", "again", expect_revision=3)   # already approved
+    assert excinfo.value.code == "NOT_FOUND"
+
+
+def test_reject_with_the_shown_revision_moves_that_proposal(tmp_path: Path) -> None:
+    loader = make_loader(tmp_path)
+    for description in ("second", "third"):
+        text = _text(description=description)
+        loader.install(InstallSource("text", text=text),
+                       loader.preview(InstallSource("text", text=text)).preview_token)
+
+    loader.reject("kb-guide", "not useful", expect_revision=1)
+    assert loader.pending("kb-guide") is None
+    rejected = list((tmp_path / ".rejected").iterdir())
+    assert len(rejected) == 1
+    assert "description: third" in (rejected[0] / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_concurrent_approvals_with_one_revision_promote_exactly_once(tmp_path: Path) -> None:
+    """The CAS and the move are one critical section: whoever loses the race
+    either sees a conflict or no pending proposal — never a second promotion."""
+    loader = make_loader(tmp_path)
+    text = _text()
+    loader.install(InstallSource("text", text=text),
+                   loader.preview(InstallSource("text", text=text)).preview_token)
+    barrier = threading.Barrier(6)
+    won: list[int] = []
+    lost: list[str] = []
+
+    def attempt() -> None:
+        barrier.wait()
+        try:
+            won.append(loader.approve("kb-guide", expect_revision=0).revision)
+        except VadeError as exc:
+            lost.append(exc.code)
+
+    threads = [threading.Thread(target=attempt) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert won == [1]
+    assert lost == ["NOT_FOUND"] * 5
+    assert loader.get("kb-guide").revision == 1
+    assert sorted(p.name for p in (tmp_path / ".history" / "kb-guide").iterdir()) == ["1.md"]
+
+
 def test_rollback_restores_an_older_revision_as_a_new_one(tmp_path: Path) -> None:
     loader = make_loader(tmp_path)
     for description in ("one", "two"):
@@ -148,6 +245,36 @@ def test_reject_moves_pending_to_rejected(tmp_path: Path) -> None:
     loader.reject("kb-guide", "not wanted")
     assert not (tmp_path / "pending" / "kb-guide").exists()
     assert list((tmp_path / ".rejected").iterdir())
+
+
+def test_rejected_ttl_purges_stale_entries_on_reload(tmp_path: Path) -> None:
+    """C-11 / design §16.5: `.rejected/<name>-<ts>/` is cleaned after 7 days.
+
+    The clock starts at **rejection**, not at intake: a proposal can sit in
+    `pending/` for weeks, so `reject()` stamps the moved directory's mtime
+    (a bare rename would carry the old pending mtime over). A fresh rejection
+    must survive the same pass.
+    """
+    loader = make_loader(tmp_path)
+    for name in ("kb-guide", "other-guide"):
+        source = InstallSource("text", text=_text(name))
+        loader.install(source, loader.preview(source).preview_token)
+    old = 1_700_000_000
+    for name in ("kb-guide", "other-guide"):
+        os.utime(tmp_path / "pending" / name, (old, old))
+
+    loader.reject("kb-guide", "not wanted")
+    loader.reject("other-guide", "not wanted either")
+
+    stale = next(p for p in (tmp_path / ".rejected").iterdir() if p.name.startswith("kb-guide-"))
+    assert stale.stat().st_mtime > old + 86_400, "reject() must stamp the rejection time"
+
+    os.utime(stale, (old, old))
+    loader.reload()
+
+    assert not stale.exists()
+    survivors = [p.name for p in (tmp_path / ".rejected").iterdir()]
+    assert len(survivors) == 1 and survivors[0].startswith("other-guide-")
 
 
 def test_install_refuses_a_reserved_name(tmp_path: Path) -> None:

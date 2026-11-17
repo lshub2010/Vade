@@ -956,7 +956,7 @@ paths:
   /admin/api/skills/{name}/reject:
     post:
       tags: [governance]
-      summary: 驳回（移到 `.rejected/`，7 天清理）
+      summary: 驳回（移到 `.rejected/`，7 天后按目录 mtime 清理；拒绝是终态，删除不进 `.trash`）
       x-vade-implemented: true
       parameters:
         - $ref: "#/components/parameters/Name"
@@ -1302,10 +1302,16 @@ components:
         alg: {type: string, enum: [p256, ed25519]}
         fp8: {type: string}
         hardware_backed: {type: boolean}
+        attested:
+          type: boolean
+          description: >-
+            恒 `false`：`hardware_backed` 是设备自述，core 无法验证（design §7.12.3 ③）。
+            与 `hardware_backed` 成对出现，UI 据此标「设备自述」而不是「已验证」。
+            **不要拿它做授权判断。**
         added_at: {type: number}
         added_from_ip: {type: [string, "null"]}
         last_used_at: {type: [number, "null"]}
-      required: [device_id, label, alg, fp8, hardware_backed, added_at]
+      required: [device_id, label, alg, fp8, hardware_backed, attested, added_at]
       additionalProperties: false
     Node:
       type: object

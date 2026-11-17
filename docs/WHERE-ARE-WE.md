@@ -1,43 +1,45 @@
 # 现在到哪一步了（WHERE-ARE-WE）
 
-> 可直接贴给人的口径页。基线：`tmp/w-ledger` @ `320384a`，2026-11-14。
+> 可直接贴给人的口径页。基线：`tmp/d2-docs`（基于 `dev_gingshan` @ `be16ebe`），2026-11-17；契约数字按 `schema/*.json` 重算，`tools/check_ledger.py` 复算通过。
 > 纪律：每一行带证据来源；核不出的写「未核实」；**不以「代码里存在 X」推断「X 生效」，不以计划充当现状**。
 > 完整对应关系见 `docs/rfc/LEDGER.md`（每条 RFC 一行，`tools/check_ledger.py` 可重跑自检）。
 
 ## 已完成（本仓可核实）
 
-- 契约：C-05 `rpc.json` **1.5.0**，方法 **48**（ui_to_core 35 / core_to_module 7 / module_to_core 6）；C-06 `events.json` **2.0.0**，事件 **34**；C-04 **34** 错误码；append 登记 **10+8+3=21** 块（另有 `x-vade.rfc0015_pending` **1** 块，**不是** append；出处：三份 schema 文件重算，`tools/check_ledger.py` 比对通过）。
-- 服务端测试：**1089 passed**（`pytest core/tests -q`；本 worktree 复跑 `1089 passed`，基线见 `docs/rfc/LEDGER.md` §1）。
-- 契约门禁：`tools/check_contracts.py` → exit 0（`contracts: OK … RFC-0014 session search green …`）。
-- docs 门禁：`docs/check_docs.py` → exit 0（12 项，失败 0 项）。
-- RFC-0001～0009：已批准（frontmatter `approved`）且已实现合并（`docs/status.md` 各「已合并」行 + 契约 appends 登记在案 + 实现文件在仓）。
-- RFC-0010 / 0012 / 0013 / 0014：core 侧已实现（各自 `core/vade/*/RESULT-rfc*.md` + C-05 1.3.0/1.4.0/1.5.0 与 C-06 登记块）。
-- RFC-0015（`ui/modules` 模块清单通道）：**core 已实现，契约登记仍 pending**——`ModulePageService.list_modules()`（`core/vade/modulepage/service.py`）+ `ui/modules` handler（`core/vade/modulepage/rpc.py`，经 `app.session_handlers` 分发），32 条新测试含真 WS 端到端；C-05 顶部仍 **1.5.0**（升 1.6.0 实测仍红 `check_contracts` 三处版本钉，本棒不许改门禁），登记块留在 `x-vade.rfc0015_pending`，故 LEDGER 行 `impl_state=未实施` 是**契约登记口径**，不是「没写 core」；**客户端未接线 → A3（模块页入口）仍缺数据源**（§8 三处未做）。
+- 契约：C-05 `rpc.json` **1.7.0**，方法 **49**（ui_to_core 36 / core_to_module 7 / module_to_core 6）；C-06 `events.json` **2.0.0**，事件 **34**（含 `turn.state` 枚举条目，不含则 33）；C-04 **34** 错误码；append 登记 **12+9+3=24** 块，**无** `x-vade.rfc0015_pending` 之类占位块（出处：四份 schema 重算；`tools/check_ledger.py` → `ledger: OK (16 RFC rows; rpc 1.7.0 49 methods …, appends 12+9+3)`）。
+- 服务端测试：**1203 passed**（出处 `shots/s-blob-impl/RESULT.md`：`1203 passed, 9 warnings in 526.67s`，基线 `7941b93` = 1165 + 本批 38）。**当前 HEAD `be16ebe` 只做了收集计数：`pytest core/tests -q --collect-only` → 1383 tests collected（2026-11-17 复跑），全量未复跑，故本页不给 HEAD 的 passed 数**。历史口径：1165（`s-rfc0015-register`）、1089（2026-11-14）。
+- 契约门禁：`tools/check_contracts.py` → exit 0（含 `RFC-0016 blob token green`；出处 `docs/rfc/LEDGER.md` §1、`shots/s-blob-impl/RESULT.md`）。
+- docs 门禁：`docs/check_docs.py` → exit 0（12 项，失败 0 项；本 worktree 2026-11-17 复跑）。
+- 契约登记全部在案：RFC-0001～0009 各有 `x-vade.appends` 块；RFC-0015 第 **11** 块（C-05 1.6.0）、RFC-0016 第 **12** 块（C-05 1.7.0）；RFC-0007 的 4 个 `task.*` 事件补登记为 events.json 第 **9** 块（C-06 1.1.0，追溯登记，随块保留原 `x-vade.append_rfc0007` 作史料）。
+- RFC-0001～0009：已批准（frontmatter `status: approved`；0001/0002 为正文状态表）且已实现合并；frontmatter `stage` 已由 `s-hygiene`（`a9c7dcc`）回填为「已实现并合并」，`docs/rfc/README.md` 状态列同批同步（见 `docs/rfc/HYGIENE-RESULT.md` §1-4）。
+- RFC-0010 / 0012 / 0013 / 0014 / 0015 / 0016：core 侧已实现（各自 `core/vade/*/RESULT-rfc*.md`；契约块 1.3.0 / 1.4.0 / 1.2.0 / 1.5.0 / 1.6.0 / 1.7.0 均在案）。
 - RFC-0004 数据面 `/ui/blob` 六路由 + content parts 定型（`core/vade/blob/http.py`、`core/vade/session/parts.py`；RESULT-parts.md 539 passed）。
+- RFC-0016 `ui/blob.token`：`BlobTokenRPC`（`core/vade/blob/rpc.py`，严格参数 / 拒 cookie / 绑 `connection.device_id`）经 `handler_providers` 双路发布；解绑设备即清 token（`Whitelist.revoke` → `BlobService.revoke_device`）；新增 32 + 5 + 1 条测试（含真 socket 的 铸 token → HTTP 上传 → `ui/submit` → 新连接 `ui/attach` 取回）。
 
 ## 在飞 / 有保留的「完成」
 
-- **「已实现但未批准」**：RFC-0010/0012/0013/0014 frontmatter `status: proposed` —— 代码与契约已落地，批准流程未走（出处：各 RFC frontmatter；`docs/rfc/README.md`）。
-- **文档债**：RFC-0003～0009 frontmatter `stage` 仍写「草稿，未实现」，与 status.md「已合并」矛盾——字段过时未回填（本仓不许改 RFC 正文，只能记录）。
+- **「已实现但未批准」**：RFC-0010 / 0012 / 0013 / 0014 / 0015 / 0016 frontmatter `status: proposed` —— 代码与契约已落地，批准流程未走（出处：各 RFC frontmatter；`docs/rfc/README.md`）。
+- **RFC-0002（`turn.completed.skills`）**：正文状态「草案」，但**已实现**——`turn.completed` 追加可选字段（`core/vade/loop/engine.py`、`core/vade/session/queue.py`），events.json 第 8 块（C-06 1.3.0，`adds=[]`、`rewrites: none`）。缺的是批准追认，不是实现（旧口径「未实施 / 无契约登记」已过期）。
 - **RFC-0011（InputBar 拆分）**：README 记客户端仓 vade-client `d667442` 已实现——**本仓无证据，未核实**。
-- 客户端三端（U1/U2/U3）：`ui/` 已迁出为独立仓 **`vade-client`**（本仓不可达，故本页原先只能写「status.md 均未开工」——**那个口径已过期**）。该仓 `main` @ `31f8f9a` 的真实数字：**368 tests / 0 failures**、三目标绿（`desktopTest` + `assembleDebug` + `compileKotlinWasmJs`）、APK 21,878,888 B、Wasm 链接产物 13,681,513 B、MSI 93,312,713 B。**但 UI 数据仍是 fixtures**（`App()` 默认 `FakeSessionSource()`），真连接/真聊天/模块页/ask_user 卡片均未接线——「零件齐 ≠ 能用」，口径见该仓 `docs/QUICKSTART.md` 状态表。
+- **客户端三端**：`ui/` 已迁出为独立仓 `vade-client`，**本仓不可达**。本仓两处口径互相矛盾，引用前先裁定：`docs/status.md` U1 行记 **1122 tests / 0 failures / 1 skipped**、APK **22,915,908 B**、MSI 93,312,713 B（2026-11-15 复核，`shots/g-module-page/RESULT.md`），且仍写「聊天写侧不出网」；`docs/ALPHA.md` §三 A6 记 **1467 tests（154 files）/ 0 failures / 1 skipped**、APK **22,845,270 B**（`tmp/s-alpha-truth2`），§七 B1 记「聊天写侧已解除」。**哪一行是新口径需编排者裁定**，本页不替客户端仓下结论。
 - `ask_user` 内置工具（RFC-0008 §14）：已注册（`core/vade/loop/builtins.py`；RESULT-askuser-tool.md 944 passed）。
 
 ## 未开始 / 未达成
 
-- RFC-0002（`turn.completed.skills`）：**未实施**（正文状态「草案」，无契约登记、无实现落点）。
 - 里程碑 G1～G5：全部「未达成」；G4（iOS）用户已裁定暂缓（出处：status.md 里程碑表与主表 U4 行）。
-- status.md 主表 23 批次中 C0a/C0b/C1/C2/C3/C3b/C3d/C4/C5a/C5b/M1–M6/U1–U3/F1 均「未开工」（出处：status.md 主表）。
+- status.md 主表 23 批次中 C0a/C0b/C1/C2/C3/C3b/C3d/C4/C5a/C5b/M1–M6/F1 仍标「未开工」——该主表**未随实施回填**，与同文件附录里大量「已合并」行矛盾；引用「未开工」前先看附录行，本页不再据此断言「全部未开工」（出处：status.md 主表 vs 附录行）。
 
-## 口径陷阱（已说错过的两件事 + 本次新发现）
+## 口径陷阱（已说错过的几件事）
 
 - 「代码里有 GlassSurface」≠「glass 皮肤生效」；「字符图标存在」≠「已清零」——一切以 LEDGER + 测试输出为准。
-- 「35 方法」是 ui_to_core 一个方向的数；三方向合计 **48**（说全表 35 就是错的）。其中 `ui/modules` 是**提案声明**：在 `directions` 里、不在 `appends` 里、core 未实现——「schema 里有」≠「core 在服务」。
-- 「events.json 10 条 appends」错：events.json 是 **8** 块；10 是 rpc.json 的块数。
-- RFC-0007 的 4 个 `task.*` 事件在 events.json **无 append 登记块**（rpc.json 侧有）——纪律缺口，详见 `docs/rfc/LEDGER-RESULT.md`。
+- 「36 方法」是 ui_to_core 一个方向的数；三方向合计 **49**（把 36 当全表就是错的）。`ui/modules`（第 11 块）与 `ui/blob.token`（第 12 块）现在**既在** `directions` 里、**也在** `x-vade.appends` 里、**且有 core 实现**——旧说法「`ui/modules` 只是提案声明、core 未实现」已过期。
+- 「events.json 10 条 appends」错：events.json 是 **9** 块、rpc.json 是 **12** 块，三文件合计 **24** 块（引用时务必写清是哪个文件；「10」「8」都是旧快照）。
+- RFC-0007 的 4 个 `task.*` 事件**已有** events.json 第 9 块（C-06 1.1.0，追溯登记）——旧说法「无 append 登记块、纪律缺口」已过期，缺口在 `a2-ledger` 补完。
+- append **块级**版本 ≠ 契约**顶部**版本（例：RFC-0013 块级 1.2.0，顶部 C-06 2.0.0）；引用版本号必须说明是哪一层。
 
 ## 未核实清单
 
 - RFC-0011 的客户端实现与测试（vade-client 仓，本仓不可达）。
-- status.md rfc0007 行 607 passed vs RESULT-rfc0007.md 601 passed 的 6 条差异来源。
-- Android/Wasm/浏览器端运行时行为（本仓无对应测试证据）。
+- 客户端测试数 / 产物体积 / 聊天写侧是否出网：`docs/status.md` U1 行与 `docs/ALPHA.md` §三 A6、§七 B1 互相矛盾（见上「客户端三端」条），本仓无法裁决。
+- 当前 HEAD `be16ebe` 的服务端全量 passed 数（只做了 `--collect-only` = 1383；1203 是 `s-blob-impl` 基线 `7941b93` 的记录值）。
+- Android / Wasm / 浏览器端运行时行为（本仓无对应测试证据）。

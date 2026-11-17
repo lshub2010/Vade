@@ -22,6 +22,11 @@ Ordering rules — the reasons this lives in its own module:
   concurrent POSTs with the same ticket enrol exactly one device.
 * `setup_required=true` writes `admin.json` *before* the setup token is
   unlinked (a crash leaves a recoverable state, never "no password, no token").
+* the commit is all-or-nothing: ticket, `admin.json`, device row and session.
+  Any failure after the reservation rolls the finished steps back — the device
+  row is discarded (not revoked), `admin.json` is restored from a snapshot and
+  the ticket is released last — because an "initialised, no device, no ticket"
+  plane can only be repaired with `vade admin reset`.
 * the plaintext password never leaves this function: it is hashed by
   `hash_password`, never audited and never logged.
 """
@@ -219,20 +224,33 @@ def complete(ctx: Any, body: dict[str, Any], *, ip: str | None) -> dict[str, Any
         if not ctx.setup.consume_ticket(ticket):
             # rowcount=0 equivalent: another request won the race.
             raise _unauthorized()
+        # From here the bind is a commit: the reservation, `admin.json` on first
+        # run, the device row and the session. Every failure must undo all of it
+        # (④) — a session that cannot be minted would otherwise burn the QR and
+        # leave a registered device that no client knows about.
+        device: Any = None
+        init_snapshot: Any = None
         try:
             if setup_required:
-                ctx.setup.initialize_bound(password=password, ip=ip)
+                # Snapshot before writing: `devices.add` can fail right after
+                # `admin.json` exists, and then the plane must return to "setup
+                # required" rather than "initialised, no device, token gone"
+                # (which only `vade admin reset` repairs).
+                init_snapshot = ctx.setup.begin_initialize_bound(password=password, ip=ip)
             device = ctx.devices.add(
                 pubkey_b64=base64.b64encode(raw_pubkey).decode("ascii"), alg=alg,
                 label=label, ip=ip, hardware_backed=hardware_backed,
             )
+            # §7.12.3 ⑤: the token is minted inside the transaction. `issue` only
+            # touches in-memory dicts, but the client cannot use a device it has
+            # no session for, so a failure here is a failure of the whole bind.
+            tokens = ctx.sessions.issue(mode="device", device_id=device.device_id, ip=ip)
         except BaseException:
-            # Failure must not burn the ticket (§7.12.3 ④). The rollback runs
-            # under the same lock, so no other request can observe it.
-            ctx.setup.release_ticket(ticket)
+            # Runs under `_BIND_LOCK`: no other request can observe the
+            # half-applied state, and the ticket is released last.
+            _rollback(ctx, ticket, device=device, init_snapshot=init_snapshot)
             raise
 
-    tokens = ctx.sessions.issue(mode="device", device_id=device.device_id, ip=ip)
     ctx.write_audit(
         kind="device.bound", status="ok", code=None, actor=device.device_id,
         extra={"device_id": device.device_id, "alg": alg, "label": device.label,
@@ -305,6 +323,34 @@ def _validate_new_password(password: str) -> None:
 
 
 # --------------------------------------------------------------------- helpers
+def _rollback(ctx: Any, ticket: str, *, device: Any, init_snapshot: Any) -> None:
+    """Undo, newest first, everything the bind transaction already committed.
+
+    The ticket is released **last and unconditionally**: it is the only step
+    that makes the QR retryable, so a failing rollback step must not skip it.
+    Each step is best-effort — the caller is about to re-raise the original
+    exception, and replacing it with a bookkeeping error would hide the cause.
+    A failed step is recorded in the audit log instead of being swallowed.
+    """
+    failed: list[str] = []
+    if device is not None:
+        try:
+            ctx.devices.discard(device.device_id)
+        except Exception:
+            failed.append("device")
+    if init_snapshot is not None:
+        try:
+            ctx.setup.rollback_initialize(init_snapshot)
+        except Exception:
+            failed.append("admin")
+    ctx.setup.release_ticket(ticket)
+    if failed:
+        ctx.write_audit(
+            kind="device.bound", status="denied", code="INTERNAL", actor=None,
+            extra={"reason": "bind rollback incomplete", "steps": failed},
+        )
+
+
 def _unauthorized() -> VadeError:
     """§7.12.3 ④: every verification failure is one indistinguishable 401."""
     return VadeError("BIND_UNAUTHORIZED", "bind ticket is unknown, expired or already used")

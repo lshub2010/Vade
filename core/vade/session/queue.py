@@ -71,6 +71,11 @@ class TurnQueue:
         #: engine, keeps the queue free of loop-level state.
         self._partial_provider = partial_provider
         self._pending: deque[QueueItem] = deque()
+        #: Slots reserved by `claim()` for a turn that is still being written
+        #: (the announcement emit). Counted against `max_pending` so a claim is
+        #: a real capacity decision, not a hint.
+        self._claims: dict[int, bool] = {}
+        self._claim_seq = 0
         self._running: QueueItem | None = None
         self._worker: asyncio.Task[None] | None = None
         #: Kept for `shutdown()`/introspection only: decisions are turn-scoped
@@ -105,7 +110,38 @@ class TurnQueue:
 
     def has_capacity(self) -> bool:
         """True when one more turn can be enqueued without `OVERLOADED`."""
-        return len(self._pending) < self._max_pending
+        return len(self._pending) + len(self._claims) < self._max_pending
+
+    def claim(self) -> int | None:
+        """Reserve one pending slot for a turn that does not exist yet, or `None`.
+
+        A caller checks capacity and then does async work (an `emit` that
+        announces the turn) before it can build the `QueueItem`; a bare
+        `has_capacity()` sample would be stale by the time `enqueue` runs if
+        that work ever yielded. The claim closes that gap by taking the slot at
+        decision time: `enqueue(..., claim=...)` consumes it without re-checking
+        capacity, so an announced turn can never be refused afterwards (a
+        `queued` row that is never dequeued is invisible to every client and
+        blocks the version chain with `turn_active`).
+
+        Returns an opaque token for `release()`/`enqueue()`. The caller OWNS it
+        until one of those two calls: dropping it without either loses the slot
+        for the life of the queue.
+        """
+        if not self.has_capacity():
+            return None
+        self._claim_seq += 1
+        self._claims[self._claim_seq] = True
+        return self._claim_seq
+
+    def release(self, claim: int) -> bool:
+        """Give back a claim whose turn never reached `enqueue`.
+
+        Returns whether the claim was still outstanding, so a release on a
+        consumed (or foreign) token is a no-op instead of silently freeing
+        another caller's slot.
+        """
+        return self._claims.pop(claim, None) is not None
 
     def is_finalized(self, turn_id: str) -> bool:
         return turn_id in self._finalized or turn_id in self._finalizing
@@ -116,8 +152,22 @@ class TurnQueue:
         while len(self._finalized) > FINALIZED_LIMIT:
             self._finalized.popitem(last=False)
 
-    def enqueue(self, turn: Turn, content: Sequence[Mapping[str, Any]]) -> int:
-        if len(self._pending) >= self._max_pending:
+    def enqueue(self, turn: Turn, content: Sequence[Mapping[str, Any]], *,
+                claim: int | None = None) -> int:
+        """Insert `turn`; `claim` is the slot `claim()` already reserved for it.
+
+        With a claim the capacity decision was already made (and taken), so this
+        must NOT check it again — a second check is the check-then-insert race
+        the claim exists to remove. Without one the queue defends itself, which
+        is the path direct callers (tests, future wiring) use.
+        """
+        if claim is not None:
+            if not self.release(claim):
+                raise VadeError(
+                    "INTERNAL",
+                    "enqueue() with a claim that was already consumed or never taken",
+                )
+        elif len(self._pending) + len(self._claims) >= self._max_pending:
             raise VadeError("OVERLOADED", f"queue is full ({self._max_pending} pending turns)")
         item = QueueItem(turn=turn, content=tuple(dict(b) for b in content), enqueued_at=self._clock())
         self._pending.append(item)
@@ -167,7 +217,13 @@ class TurnQueue:
         return None
 
     def is_idle(self) -> bool:
-        return self._running is None and not self._pending and self._worker is None
+        """Nothing running, nothing waiting, and no un-consumed slot claim."""
+        return (
+            self._running is None
+            and not self._pending
+            and self._worker is None
+            and not self._claims
+        )
 
     # ------------------------------------------------------------------ worker
     def ensure_worker(self) -> None:

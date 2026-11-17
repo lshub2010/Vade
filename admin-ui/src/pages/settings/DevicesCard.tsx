@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { ReactElement } from 'react';
 import { api, describeError } from '../../app/api';
 import { ConfirmDialog } from '../../app/ConfirmDialog';
-import { formatFingerprint, relativeTime, absoluteTime } from '../../app/format';
+import { formatCountdown, formatFingerprint, relativeTime, absoluteTime } from '../../app/format';
 import type { AdminDevice, BindTicket, DeviceListResponse } from '../../app/types';
 import { StepUpDialog } from './StepUpDialog';
 
@@ -481,12 +481,6 @@ export function DevicesCard({ readOnly }: { readOnly: boolean }): ReactElement {
       ) : null}
     </section>
   );
-}
-
-function formatCountdown(totalSeconds: number): string {
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
 function stepUpMessage(cause: unknown): string {

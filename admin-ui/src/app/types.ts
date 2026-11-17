@@ -93,6 +93,36 @@ export interface HealthResponse {
   fp8?: string;
 }
 
+// ------------------------------------------------------------------- setup
+
+/**
+ * `GET /admin/setup`（schema#SetupState）。非回环且未解锁时**只有**
+ * `setup_required` 与 `requires_token` —— 页面不能指望在这里拿到 `bind_url`。
+ */
+export interface SetupState {
+  setup_required: boolean;
+  requires_token?: boolean;
+  bind_url?: string;
+  fp8?: string;
+  /** epoch 秒；绑定票有效期 10 分钟。 */
+  expires_at?: number;
+}
+
+/** `POST /admin/setup/unlock`：解锁成功后才有二维码，cookie 由 core 下发。 */
+export interface SetupUnlockResponse {
+  bind_url: string;
+  fp8: string;
+  expires_at: number;
+}
+
+/** `POST /admin/setup`（浏览器直配）的响应。 */
+export interface SetupInitializeResponse {
+  ok: boolean;
+  initialized?: boolean;
+  device?: AdminDevice | null;
+}
+
+
 // ---------------------------------------------------------------- settings
 
 /** `GET /admin/api/devices` 的一行（schema#Device）。**不含公钥原文**。 */

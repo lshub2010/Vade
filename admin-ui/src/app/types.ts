@@ -93,6 +93,93 @@ export interface HealthResponse {
   fp8?: string;
 }
 
+// ---------------------------------------------------------------- settings
+
+/** `GET /admin/api/devices` 的一行（schema#Device）。**不含公钥原文**。 */
+export interface AdminDevice {
+  device_id: string;
+  label: string;
+  alg: 'p256' | 'ed25519' | string;
+  fp8: string;
+  hardware_backed: boolean;
+  /** 恒 `false`：`hardware_backed` 是设备自述，core 无法验证（design §7.12.3 ③）。 */
+  attested?: boolean;
+  /** epoch 秒。 */
+  added_at: number;
+  added_from_ip: string | null;
+  last_used_at: number | null;
+}
+
+export interface DeviceListResponse {
+  items: AdminDevice[];
+  /** 设备上限，当前是 5；到顶时页面把「添加设备」置灰。 */
+  max: number;
+}
+
+/** `POST /admin/api/devices/ticket`：10 分钟一次性绑定票。 */
+export interface BindTicket {
+  bind_ticket: string;
+  bind_url: string;
+  /** epoch 秒。 */
+  expires_at: number;
+}
+
+export type ConfigSource = 'default' | 'core.toml' | 'overrides' | 'env' | 'cli';
+
+/** `GET /admin/api/config` 的一项（schema#ConfigItem）。 */
+export interface ConfigItem {
+  key: string;
+  value: unknown;
+  default: unknown;
+  source: ConfigSource | string;
+  mode: 'hot' | 'restart';
+  min?: number;
+  max?: number;
+  values?: string[];
+}
+
+export interface ConfigListResponse {
+  items: ConfigItem[];
+}
+
+/** `PUT /admin/api/config`。`applied` 与 `needs_restart` 互斥；失败也可能回 `error`。 */
+export interface ConfigPutResponse {
+  applied?: boolean;
+  needs_restart?: boolean;
+  audit_id?: string | null;
+  error?: string;
+}
+
+export interface ConfigUsage {
+  day: string;
+  tokens_used: number;
+  tokens_budget: number;
+  reviews_today: number;
+  proposals_today: number;
+}
+
+/** `POST /admin/api/password`：成功后会发一套新 token，当前设备不掉线。 */
+export interface PasswordChangeResponse {
+  ok: boolean;
+  mode?: string;
+  expires_in?: number;
+  access_token?: string;
+  refresh_token?: string;
+}
+
+/** 审计行（只在这里用到 `llm.call` 的 `ts` / `extra`，用于估算复盘成本）。 */
+export interface AuditRow {
+  id?: number;
+  ts: number;
+  kind: string;
+  extra?: Record<string, unknown> | null;
+}
+
+export interface AuditListResponse {
+  items: AuditRow[];
+  next_cursor: string | null;
+}
+
 // ---------------------------------------------------------------- skills
 
 /** `SkillSummary.status`；`rejected` 是目录不是状态，不会出现。 */

@@ -23,6 +23,8 @@ export interface HostInjection {
   /** core 身份指纹，16 位小写 hex。 */
   fp8?: string;
   deviceLabel?: string;
+  /** core 的 admin_host（`host:port`）；只有宿主知道时才有，页面拿不到就不编一个。 */
+  adminHost?: string;
   /** 冷启动时原生已经完成登录的情况下可直接注入；页面仍然只放内存。 */
   session?: HostSession;
 }

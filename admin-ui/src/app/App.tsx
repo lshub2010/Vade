@@ -6,7 +6,8 @@ import { Shell } from './Shell';
 import { LoginPage } from '../pages/LoginPage';
 import { NodesPage } from '../pages/NodesPage';
 import { SkillsPage } from '../pages/SkillsPage';
-import { AuditPage, SettingsPage, SetupPage } from '../pages/PlaceholderPages';
+import { AuditPage, SetupPage } from '../pages/PlaceholderPages';
+import { SettingsPage } from '../pages/SettingsPage';
 
 function BootScreen({ label = '正在检查登录状态…' }: { label?: string }): ReactElement {
   return (

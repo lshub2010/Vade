@@ -18,5 +18,5 @@
 | RFC-0011 | InputBar 拆分为「输入区」与 `SendOrb`（C-09 组件 11 → 12，破坏性）：三个皮肤槽位独立撞到「框内发送」与 v2 框外 48dp 球冲突 | proposed（客户端仓已实现：`d667442`，三皮肤同步 + ChatThread 改回用 Skin；见 `vade-client/docs/rfc/RFC-0011-inputbar-split.md`） |
 | RFC-0013 | 中断留痕落库（R9）：partial 消息进 snapshot、C-06「only from turn.delta」旧注记改写、C-05 `ui/attach` 声明 `partial` | proposed（落库复用 RFC-0006 §4 既有实现；契约修订 + 验收测试见 `core/vade/session/RESULT-rfc0013.md`） |
 | RFC-0014 | 会话搜索：`session/search`（标题 + 正文参数化 LIKE 扫描、两档排序、片段硬截断，C-05 1.4.0 → 1.5.0） | proposed（core 侧已实现：`session/search` 方法 + `search.py` 语义模块，见 `core/vade/session/RESULT-rfc0014.md`） |
-| RFC-0015 | 模块清单通道：`ui/modules`（一次拉全量模块与页面入口、`revision` 单调、`module.status` 作失效边，C-05 1.5.0 → 1.6.0） | proposed（core 侧已实现 + 契约已登记为 `x-vade.appends` 第 11 块；客户端未接线，见 `docs/rfc/LEDGER.md`） |
-| RFC-0016 | 附件上传的设备凭据铸造：`ui/blob.token`（补上 RFC-0004 §4.5 漏登记的方法，让原生配对设备能上传并提交附件，C-05 1.6.0 → 1.7.0） | proposed（**未实施**：本棒只交付设计，`schema/**` 与 `core/**` 一行未动） |
+| RFC-0015 | 模块清单通道：`ui/modules`（一次拉全量模块与页面入口、`revision` 单调、`module.status` 作失效边，C-05 1.5.0 → 1.6.0） | proposed（core 侧已实现 + 契约已登记为 `x-vade.appends` 第 11 块 / C-05 1.6.0；客户端接线状态本仓不可核实，见 `docs/ALPHA.md` §七 B1 与 `docs/rfc/LEDGER.md`） |
+| RFC-0016 | 附件上传的设备凭据铸造：`ui/blob.token`（补上 RFC-0004 §4.5 漏登记的方法，让原生配对设备能上传并提交附件，C-05 1.6.0 → 1.7.0） | proposed（core 侧已实现 + 契约已登记为 `x-vade.appends` 第 12 块 / C-05 1.7.0，`adds=["ui/blob.token"]`；32 + 5 + 1 条新测试，见 `shots/s-blob-impl/RESULT.md`。客户端三态（A11）在 vade-client，本仓不核实） |

@@ -52,22 +52,6 @@ export function AuditPage(): ReactElement {
   );
 }
 
-export function SettingsPage(): ReactElement {
-  return (
-    <PlaceholderPage
-      title="设置"
-      summary="改密码、已绑定设备、登出全部、记忆与进化策略，以及只读的生效配置。"
-      spec="docs/agents/31-C5a-governance-admin.md · /settings"
-      planned={[
-        '改密码（旧密码 + 新密码 + 确认，成功后其它设备的登录失效）',
-        '已绑定设备列表（label / fp8 / alg / hardware_backed / 时间 / 来源 IP）与 step-up 添加设备',
-        '记忆与进化策略 10 项（热生效，三项二次确认，用量条）',
-        '只读配置：监听地址、fp8、审批超时、审计保留、e2e 开关及「需重启」组',
-      ]}
-    />
-  );
-}
-
 export function SetupPage(): ReactElement {
   return (
     <section className="page" aria-labelledby="setup-title">

@@ -92,3 +92,45 @@ export interface HealthResponse {
   /** 契约目前没有这个字段；core 若下发了身份指纹就顺手用。 */
   fp8?: string;
 }
+
+// ---------------------------------------------------------------- skills
+
+/** `SkillSummary.status`；`rejected` 是目录不是状态，不会出现。 */
+export type SkillStatus = 'active' | 'pending' | 'disabled' | 'stale' | 'unavailable';
+
+/** `GET /admin/api/skills` 的一行（schema#SkillSummary + core 实际下发的字段）。 */
+export interface SkillSummary {
+  name: string;
+  description?: string;
+  revision: number;
+  status: SkillStatus | string;
+  origin?: string;
+  available?: boolean;
+  unavailable_reason?: string;
+  last_used_at?: number | null;
+  fail_count?: number;
+  derived_from?: string | null;
+}
+
+export interface SkillListResponse {
+  items: SkillSummary[];
+}
+
+/** `.history/<name>/<rev>.md` 的索引项。只有名字与大小，没有内容。 */
+export interface SkillHistoryEntry {
+  revision: number;
+  bytes: number;
+}
+
+/** `GET /admin/api/skills/{name}`。diff 由后端算，页面不解析 YAML。 */
+export interface SkillDetail extends SkillSummary {
+  when_to_use?: string;
+  triggers?: string[];
+  requires_tools?: string[];
+  body: string;
+  /** 没有提案、或提案正文与当前版本没有差异时为 null。 */
+  pending_diff: string | null;
+  /** 有提案时是提案的 revision（approve/reject 的 CAS token）。 */
+  pending_revision: number | null;
+  history: SkillHistoryEntry[];
+}

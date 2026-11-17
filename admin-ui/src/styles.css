@@ -802,6 +802,419 @@ a:hover {
   font-weight: 800;
 }
 
+/* ------------------------------------------------------------------ 技能审核 */
+
+.skill-list {
+  display: grid;
+  gap: 12px;
+}
+
+.skill-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 15px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, #161d2a, #131924);
+  box-shadow: 0 1px 0 rgb(255 255 255 / 3%) inset;
+}
+
+/* 有待审提案的卡片：左侧一道信息色，配合顶部的「有提案待审」徽标。 */
+.skill-card-pending {
+  border-left: 3px solid var(--info);
+}
+
+.skill-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.skill-title {
+  min-width: 0;
+}
+
+.skill-name {
+  font-size: 17px;
+  font-weight: 650;
+  line-height: 1.3;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.skill-desc-line {
+  margin-top: 3px;
+  font-size: 13px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.skill-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.skill-meta {
+  display: grid;
+  gap: 8px 14px;
+}
+
+.skill-meta-card {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.skill-meta dt {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+}
+
+.skill-meta dd {
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.skill-stale {
+  margin: 0;
+  padding: 7px 10px;
+  border: 1px solid #5d2a2a;
+  border-radius: var(--radius-sm);
+  background: #251416;
+  color: #ffc7c7;
+  font-size: 13px;
+}
+
+.skill-card-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+/* ------------------------------------------------------------------ 抽屉 */
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes slide-in {
+  from {
+    transform: translateX(16px);
+    opacity: 0.7;
+  }
+}
+
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  justify-content: flex-end;
+  background: rgb(4 7 12 / 62%);
+  animation: fade-in 120ms ease-out;
+}
+
+.drawer {
+  display: flex;
+  flex-direction: column;
+  width: min(780px, 100%);
+  height: 100dvh;
+  border-left: 1px solid var(--border-strong);
+  background: #10151f;
+  box-shadow: var(--shadow);
+  animation: slide-in 160ms ease-out;
+}
+
+.drawer:focus {
+  outline: none;
+}
+
+.drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: #131a26;
+}
+
+.drawer-title {
+  min-width: 0;
+}
+
+.drawer-title h2 {
+  font-size: 19px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.drawer-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.drawer-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overscroll-behavior: contain;
+}
+
+.skill-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.skill-section h3 {
+  font-size: 15px;
+  letter-spacing: 0.01em;
+}
+
+.skill-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.skill-meta {
+  margin: 0;
+}
+
+.skill-meta-detail {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.skill-desc {
+  margin: 0;
+  font-size: 14px;
+  color: #d5deee;
+}
+
+.skill-when {
+  font-size: 13px;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip-row code {
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #0d1320;
+  font-size: 12px;
+}
+
+.skill-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.history-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #0f1521;
+  font-size: 13px;
+}
+
+.history-list li .muted {
+  font-size: 12px;
+}
+
+.rollback-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.skill-body {
+  margin: 0;
+  max-height: 340px;
+  overflow: auto;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #0a0f18;
+  color: #c9d4e6;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.textarea {
+  min-height: 84px;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.alert-warn {
+  border-color: #6b5122;
+  background: #261d0e;
+  color: #f2d79c;
+}
+
+.alert-warn strong {
+  display: block;
+  margin-bottom: 4px;
+  color: #ffdf9f;
+}
+
+.alert-warn p {
+  margin: 4px 0 0;
+  font-size: 13px;
+}
+
+/* ------------------------------------------------------------------ diff */
+
+.diff {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: #0a0f18;
+}
+
+.diff-head {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-bottom: 1px solid var(--border-strong);
+  background: #141c2a;
+  font-size: 12px;
+}
+
+.diff-head-cell {
+  padding: 7px 10px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.diff-head-cell + .diff-head-cell {
+  border-left: 1px solid var(--border-strong);
+}
+
+.diff-head-cell code {
+  color: var(--accent);
+}
+
+.diff-body {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.diff-hunk {
+  min-width: 40rem;
+}
+
+.diff-hunk + .diff-hunk {
+  border-top: 1px solid var(--border-strong);
+}
+
+.diff-hunk-head {
+  padding: 4px 10px;
+  background: #16202f;
+  color: #8fb4e8;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.diff-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.diff-cell {
+  display: flex;
+  gap: 8px;
+  padding: 1px 8px;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.diff-cell-left {
+  border-right: 1px solid var(--border);
+}
+
+.diff-no {
+  flex: none;
+  width: 3ch;
+  text-align: right;
+  color: #5c6b85;
+  user-select: none;
+}
+
+.diff-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.diff-del {
+  background: rgb(255 123 123 / 12%);
+  color: #ffd3d3;
+}
+
+.diff-add {
+  background: rgb(62 207 142 / 12%);
+  color: #c8f6e0;
+}
+
+.diff-empty {
+  background: rgb(255 255 255 / 2%);
+}
+
+.diff-row-equal .diff-cell {
+  color: #b9c5d8;
+}
+
 /* ------------------------------------------------------------------ 断点 */
 
 /* 中等宽度：元信息三列，节点卡片两列（卡片 380px 起才够读地址）。 */
@@ -858,6 +1271,34 @@ a:hover {
 
   .node-actions .Button {
     flex: 1 1 0;
+    min-height: 40px;
+  }
+
+  /* 技能审核：卡片与抽屉在主场景（手机宽度）下按钮占满一行。 */
+  .skill-meta-card {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .skill-card-actions .Button,
+  .skill-actions .Button {
+    flex: 1 1 0;
+    min-height: 40px;
+  }
+
+  .drawer-head {
+    padding: 12px 13px;
+  }
+
+  .drawer-body {
+    padding: 12px;
+    gap: 12px;
+  }
+
+  .skill-section {
+    padding: 12px;
+  }
+
+  .rollback-row .Button {
     min-height: 40px;
   }
 

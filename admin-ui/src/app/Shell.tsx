@@ -5,6 +5,7 @@ import { navigate } from './router';
 
 const NAV = [
   { path: '/nodes', label: '节点' },
+  { path: '/skills', label: '技能' },
   { path: '/audit', label: '审计' },
   { path: '/settings', label: '设置' },
 ] as const;

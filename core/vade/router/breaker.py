@@ -88,6 +88,17 @@ class CircuitBreaker:
         state.probe_in_flight = True
         return True
 
+    def reset(self, module_id: str, instance_id: str) -> None:
+        """Forget every outcome for one instance.
+
+        A module that re-registers after a restart (or a reconnect) starts a
+        NEW link: the old window is about a connection that no longer exists.
+        Without this, a brief outage fills the window with five failures, the
+        breaker opens for 30s, and every call is refused even though the module
+        is back — the classic "circuit-open after reconnect" false outage.
+        """
+        self._states.pop((module_id, instance_id), None)
+
     def record_success(self, module_id: str, instance_id: str) -> None:
         state = self._state(module_id, instance_id)
         state.phase = CLOSED

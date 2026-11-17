@@ -877,7 +877,7 @@ class SessionLog:
 
     @staticmethod
     def _overloaded(queue: TurnQueue) -> VadeError:
-        """The one `OVERLOADED` refusal (pre-check and rollback say the same).
+        """The one `OVERLOADED` refusal (pre-check and enqueue race say the same).
 
         One message source matters: `data.reason` is what the client keys its
         "wait for a turn to finish" hint off, and a queue-full raised from two
@@ -887,6 +887,46 @@ class SessionLog:
             "OVERLOADED",
             f"queue is full ({queue.max_pending} pending turns); wait for a turn to finish",
             data={"reason": "queue_full"},
+        )
+
+    @staticmethod
+    def _refused_before_start(turn: Turn) -> bool:
+        """True for the corpse `_fail_unstarted` leaves behind.
+
+        `started_at is None` is the discriminator between "the queue refused
+        this turn before any engine saw it" and a turn that really ran and
+        failed with `OVERLOADED` (provider pressure) — the latter has
+        `started_at` set and is a normal idempotent result.
+        """
+        return (
+            turn.state is TurnState.FAILED
+            and turn.error_code == "OVERLOADED"
+            and turn.started_at is None
+        )
+
+    @staticmethod
+    def _prior_overloaded(turn: Turn, client_msg_id: str) -> VadeError:
+        """Answer an idempotent retry of a refusal: never a 200 with the corpse.
+
+        `submit`/`regenerate`/`edit_resubmit` return the stored turn when a
+        `client_msg_id` repeats. For a turn that was announced and then refused
+        by a full queue, that "idempotent replay" was the last place a message
+        could be silently dropped: the client got 200 with a `failed` turn and
+        never learned its text was never queued. The row cannot be revived in
+        place (terminal states are never left, and no `turn.*` event may follow
+        the terminal one), so the honest answer is the retriable `OVERLOADED`
+        with a pointer to the dead turn — the client resends with a fresh key,
+        which is exactly what the original refusal asked for.
+        """
+        return VadeError(
+            "OVERLOADED",
+            "the previous attempt was refused before it entered the queue; "
+            "resend with a new client_msg_id",
+            data={
+                "reason": "prior_attempt_failed",
+                "turn_id": turn.id,
+                "client_msg_id": client_msg_id,
+            },
         )
 
     def _queue_for_new_turn(self, session_id: str) -> TurnQueue:
@@ -899,14 +939,15 @@ class SessionLog:
         and the idempotent retry handed the same corpse back. The pre-check is
         not enough on its own — the emit above it yields to the loop, so a
         concurrent submit can still fill the queue — which is why the callers
-        also roll the turn back to a terminal state (`_enqueue_or_rollback`).
+        also drive the announced turn to a terminal `failed` state
+        (`_enqueue_or_fail`); it is never moved back to `queued`.
         """
         queue = self._queue(session_id)
         if not queue.has_capacity():
             raise self._overloaded(queue)
         return queue
 
-    async def _enqueue_or_rollback(
+    async def _enqueue_or_fail(
         self,
         session_id: str,
         queue: TurnQueue,
@@ -919,9 +960,16 @@ class SessionLog:
         here yields to the loop, so a concurrent submit can take the last slot.
         `enqueue` then refuses, and the turn row is already `queued` — the
         zombie this path exists to kill (a `queued` turn is never dequeued, so
-        it shows forever and blocks the version chain with `turn_active`). Roll
-        it to `failed{OVERLOADED}` — a terminal event the client can render and
-        retry with a new `client_msg_id` — before re-raising the refusal.
+        it shows forever and blocks the version chain with `turn_active`).
+
+        The repair is ROLL-FORWARD, not roll-back: `turn.queued` (and, for
+        regenerate/edit, `turn.superseded`/`message.edited`) is already durable
+        and cannot be retracted — events are append-only, and any client that
+        saw them would be left pointing at a turn that no longer exists. So the
+        announced turn is terminated `failed{OVERLOADED}` and stays in the
+        version chain as a real (failed) head. The retry contract is a new
+        `client_msg_id`; a replay of the same one is answered with `OVERLOADED`
+        by `_prior_overloaded`, never with the failed row as a 200 success.
         """
         try:
             return queue.enqueue(turn, content)
@@ -929,13 +977,13 @@ class SessionLog:
             if exc.code != "OVERLOADED":
                 raise
             refusal = self._overloaded(queue)
-            await self._rollback_unstarted(
+            await self._fail_unstarted(
                 session_id, turn, code=refusal.code, message=refusal.message,
                 reason="queue_full",
             )
             raise refusal from exc
 
-    async def _rollback_unstarted(
+    async def _fail_unstarted(
         self, session_id: str, turn: Turn, *, code: str, message: str, reason: str,
     ) -> None:
         """End a turn that was announced but never entered the queue.
@@ -943,7 +991,12 @@ class SessionLog:
         `turn.queued` is already on the wire (and the row is persisted), so the
         only honest repair is a terminal event: a `failed` turn the UI can show
         and the user can retry with a new `client_msg_id`. Silence here is what
-        made the turn a zombie.
+        made the turn a zombie; un-persisting the row would leave the event
+        stream describing a turn that does not exist.
+
+        `started_at` stays `None` on purpose: it is what tells later readers
+        (see `_prior_overloaded`) that no engine ever ran this turn, as opposed
+        to a turn that ran and failed with `OVERLOADED` from the provider.
         """
         failed = replace(
             turn, state=TurnState.FAILED, ended_at=now_ms(),
@@ -1019,9 +1072,14 @@ class SessionLog:
         # 2. Idempotency BEFORE validation. A retry of the same submit must
         #    return the original turn even if a TTL expired or the effective
         #    model changed in between — otherwise the retry "fixes" itself into
-        #    a different error and the UI shows a phantom failure.
+        #    a different error and the UI shows a phantom failure. The one
+        #    exception is a turn the queue refused before it started: it is not
+        #    an outcome, so `_prior_overloaded` refuses the replay instead of
+        #    telling the client the message was accepted.
         existing = self.store.find_turn_by_client_msg(session_id, client_msg_id)
         if existing is not None:
+            if self._refused_before_start(existing):
+                raise self._prior_overloaded(existing, client_msg_id)
             # Idempotent replay of the same submit: same turn, no new queue entry.
             return existing, self._queue(session_id).position(existing.id)
 
@@ -1108,7 +1166,7 @@ class SessionLog:
             # storage that no future session can free.
             self._unpin(pinned)
             raise
-        pos = await self._enqueue_or_rollback(session_id, queue, turn, parts)
+        pos = await self._enqueue_or_fail(session_id, queue, turn, parts)
         await self.emit(session_id, "queue.updated", queue.state_payload())
         queue.ensure_worker()
         return turn, pos
@@ -1176,6 +1234,8 @@ class SessionLog:
                     "client_msg_id is already used by another turn",
                     data={"reason": "client_msg_id_conflict"},
                 )
+            if self._refused_before_start(existing):
+                raise self._prior_overloaded(existing, client_msg_id)
             return self._version_result(session_id, existing)
 
         if old.state not in TERMINAL_STATES:
@@ -1206,9 +1266,14 @@ class SessionLog:
                       "parts": list(old.user_parts)},
             )
 
-        # Capacity before `turn.superseded` is persisted: a refusal must not
-        # leave the old turn pointing at a version that never entered the queue.
-        # The emit below yields, so `_enqueue_or_rollback` still covers a race.
+        # Capacity before `turn.superseded` is persisted: a queue that is
+        # ALREADY full is refused here, so the old turn never points at a
+        # version that was not even announced. The pre-check is not a
+        # transaction: the emit below yields, so a concurrent submit can still
+        # take the last slot. That race is roll-forward (see `_enqueue_or_fail`):
+        # the supersede is already on the wire, so the new version is terminated
+        # `failed{OVERLOADED}` and stays in the chain as a real head; the retry
+        # contract is a new `client_msg_id` (`_prior_overloaded`).
         queue = self._queue_for_new_turn(session_id)
         new_turn_id = new_id()
         new_turn = Turn(
@@ -1231,7 +1296,7 @@ class SessionLog:
             ],
             turns=[superseded, new_turn],
         )
-        pos = await self._enqueue_or_rollback(
+        pos = await self._enqueue_or_fail(
             session_id, queue, new_turn,
             [{"type": "text", "text": user_message.content}],
         )
@@ -1291,6 +1356,8 @@ class SessionLog:
                     "client_msg_id is already used by another turn",
                     data={"reason": "client_msg_id_conflict"},
                 )
+            if self._refused_before_start(existing):
+                raise self._prior_overloaded(existing, client_msg_id)
             return self._version_result(session_id, existing)
 
         if message.superseded_by is not None:
@@ -1310,8 +1377,12 @@ class SessionLog:
                             data={"reason": "not_head", "head_turn_id": old_turn.superseded_by})
 
         # Capacity before `message.edited`/`turn.superseded` are persisted: a
-        # refusal here must not tombstone the old message for a version that
-        # never entered the queue.
+        # queue that is ALREADY full is refused here, so the old message and
+        # turn are never tombstoned for a version that was not even announced.
+        # The emit below yields, so a concurrent submit can still take the last
+        # slot; that race is roll-forward (see `_enqueue_or_fail`) — the edition
+        # and the supersede stay, the new turn ends `failed{OVERLOADED}` as the
+        # chain head, and the retry needs a new `client_msg_id`.
         queue = self._queue_for_new_turn(session_id)
         new_message_id = new_id()
         new_turn_id = new_id()
@@ -1348,7 +1419,7 @@ class SessionLog:
             turns=[superseded, new_turn],
             message_updates=[(message_id, new_message_id)],
         )
-        pos = await self._enqueue_or_rollback(session_id, queue, new_turn, blocks)
+        pos = await self._enqueue_or_fail(session_id, queue, new_turn, blocks)
         await self.emit(session_id, "queue.updated", queue.state_payload())
         queue.ensure_worker()
         return {

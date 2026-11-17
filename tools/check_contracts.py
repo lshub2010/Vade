@@ -1002,6 +1002,27 @@ def check_task_events(events: dict, declared_events: dict, schema_events: set[st
         actual = set((declared_events.get(name) or {}).get("required") or [])
         check(actual == wanted, f"events.json {name}.required drift: {sorted(actual)} != {sorted(wanted)}")
 
+    # C-06 append block (§9.1/§9.2 asked for one; it landed retroactively —
+    # events.json was still 1.0.0 with a string-shaped `appends` at 404c3f3).
+    # Without a block the four events and `task_states` are declared but never
+    # registered, which is the gap this pin exists to keep shut.
+    appends = (events.get("x-vade") or {}).get("appends") or []
+    eblock = next((b for b in appends if isinstance(b, dict)
+                   and "RFC-0007" in str(b.get("doc") or "")), None)
+    check(eblock is not None, "events.json: missing the x-vade.appends block for RFC-0007")
+    if eblock is not None:
+        check(eblock.get("contract") == "C-06",
+              "events.json: the RFC-0007 append block must target C-06")
+        check(eblock.get("version") == "1.1.0",
+              "events.json: the RFC-0007 append block must carry version 1.1.0 "
+              "(the version rpc.json's RFC-0007 block records)")
+        check(
+            set(eblock.get("adds") or []) == {"task.started", "task.status", "task.progress", "task.finished"},
+            "events.json: the RFC-0007 append block must add exactly the four task.* events",
+        )
+        check(str(eblock.get("rewrites") or "").startswith("none"),
+              "events.json: the RFC-0007 append block must declare rewrites 'none' (append-only)")
+
 
 def check_approval_attribution(declared_events: dict) -> None:
     """RFC-0007 §7.1: four OPTIONAL keys, and `required` must not have moved."""
@@ -1802,8 +1823,9 @@ def main() -> int:
             print(f"  - {failure}")
         return 1
     print("contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 34 error codes, config metadata complete, "
-          "RFC-0005 append green, RFC-0010 session metadata green, RFC-0012 subagent family green, "
-          "RFC-0014 session search green, RFC-0016 blob token green, RFC-0003 layers green, event gate green)")
+          "RFC-0005 append green, RFC-0007 task family green, RFC-0010 session metadata green, "
+          "RFC-0012 subagent family green, RFC-0014 session search green, RFC-0016 blob token green, "
+          "RFC-0003 layers green, event gate green)")
     return 0
 
 

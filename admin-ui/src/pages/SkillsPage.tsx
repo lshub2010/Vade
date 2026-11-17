@@ -6,6 +6,7 @@ import { describeSkillError } from '../app/skillError';
 import { originLabel, statusMeta } from '../app/skillMeta';
 import type { SkillListResponse, SkillSummary } from '../app/types';
 import { SkillDrawer } from './SkillDrawer';
+import { SkillInstallPanel } from './SkillInstallPanel';
 
 interface SkillRow {
   name: string;
@@ -71,6 +72,15 @@ function SkillCard({
   const meta = statusMeta(row.display.status);
   const proposal = row.proposal;
   const stale = row.display.status === 'stale';
+  /**
+   * pending 有两种来源：自动提案（origin=proposal）与手动安装（origin=install）。
+   * 只有后者且没有生效版本时，才在卡片上写「待安装确认」——把人装的东西说成
+   * 「提案」会让人找不到自己刚装的那一份。
+   */
+  const pendingInstall =
+    proposal !== null &&
+    row.current === null &&
+    (row.display.origin === 'install' || row.display.origin === 'manual');
   const open = (): void => onOpen(row.name);
 
   return (
@@ -90,7 +100,11 @@ function SkillCard({
           <span className={meta.className} title={meta.hint}>
             {meta.label}
           </span>
-          {proposal && row.current ? (
+          {pendingInstall ? (
+            <span className="badge badge-info" title="已落到 pending/，尚未生效；批准后才进工具表与 prompt">
+              待安装确认
+            </span>
+          ) : proposal && row.current ? (
             <span className="badge badge-info">有提案待审</span>
           ) : null}
         </div>
@@ -135,7 +149,7 @@ function SkillCard({
 
       <div className="skill-card-actions">
         <button type="button" className="Button Button-sm" onClick={open}>
-          {proposal ? (readOnly ? '查看 diff' : '审核') : '查看'}
+          {proposal ? (readOnly ? '查看 diff' : pendingInstall ? '启用' : '审核') : '查看'}
         </button>
       </div>
     </li>
@@ -150,6 +164,8 @@ export function SkillsPage(): ReactElement {
   const [unsupported, setUnsupported] = useState(false);
   const [flash, setFlash] = useState('');
   const [openName, setOpenName] = useState<string | null>(null);
+  /** 审核与安装是两个 tab；安装面板保持挂载，切走再回来预检结果还在。 */
+  const [tab, setTab] = useState<'review' | 'install'>('review');
 
   const load = useCallback(async (signal?: AbortSignal, silent = false): Promise<void> => {
     if (!silent) setLoading(true);
@@ -200,7 +216,7 @@ export function SkillsPage(): ReactElement {
         <div>
           <h1 id="skills-title">技能</h1>
           <p className="muted">
-            共 {rows.length} 个 · {pendingCount} 个待审提案 · 审核只影响下一轮对话
+            共 {rows.length} 个 · {pendingCount} 个待确认（提案 / 安装） · 生效变更从下一轮对话开始
             {readOnly ? ' · 只读' : ''}
           </p>
         </div>
@@ -214,55 +230,107 @@ export function SkillsPage(): ReactElement {
         </button>
       </header>
 
-      {readOnly ? (
-        <div className="notice notice-readonly" role="status">
-          浏览器会话只能查看：列表、diff、正文都能读，通过 / 驳回 / 回滚按钮不渲染。要审核请用 Vade App
-          打开管理面。
-        </div>
-      ) : null}
+      <div className="page-tabs" role="tablist" aria-label="技能">
+        <button
+          type="button"
+          role="tab"
+          id="skills-tab-review"
+          aria-selected={tab === 'review'}
+          aria-controls="skills-panel-review"
+          className={tab === 'review' ? 'tab-button tab-button-active' : 'tab-button'}
+          onClick={() => setTab('review')}
+        >
+          审核
+          {pendingCount > 0 ? <span className="tab-count">{pendingCount}</span> : null}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id="skills-tab-install"
+          aria-selected={tab === 'install'}
+          aria-controls="skills-panel-install"
+          className={tab === 'install' ? 'tab-button tab-button-active' : 'tab-button'}
+          onClick={() => setTab('install')}
+        >
+          安装
+        </button>
+      </div>
 
-      {loadError ? (
-        <div className="alert" role="alert">
-          <span>读取技能列表失败：{loadError}</span>
-          <button type="button" className="Button Button-sm" onClick={() => void load()}>
-            重试
-          </button>
-        </div>
-      ) : null}
+      <div
+        role="tabpanel"
+        id="skills-panel-review"
+        aria-labelledby="skills-tab-review"
+        className="tab-panel"
+        hidden={tab !== 'review'}
+      >
+        {readOnly ? (
+          <div className="notice notice-readonly" role="status">
+            浏览器会话只能查看：列表、diff、正文都能读，通过 / 驳回 / 回滚按钮不渲染。要审核请用 Vade App
+            打开管理面。
+          </div>
+        ) : null}
 
-      {unsupported ? (
-        <div className="empty empty-left">
-          <h2>本构建不含技能管理</h2>
-          <p>
-            core 返回 <code>501 UNSUPPORTED</code>：这个构建没有装配 <code>SkillLoader</code>。
-            换一个带技能加载器的构建后这里会显示列表，不渲染假控件。
-          </p>
-        </div>
-      ) : null}
+        {loadError ? (
+          <div className="alert" role="alert">
+            <span>读取技能列表失败：{loadError}</span>
+            <button type="button" className="Button Button-sm" onClick={() => void load()}>
+              重试
+            </button>
+          </div>
+        ) : null}
 
-      {loading && rows.length === 0 && !loadError && !unsupported ? (
-        <p className="muted">正在读取技能列表…</p>
-      ) : null}
+        {unsupported ? (
+          <div className="empty empty-left">
+            <h2>本构建不含技能管理</h2>
+            <p>
+              core 返回 <code>501 UNSUPPORTED</code>：这个构建没有装配 <code>SkillLoader</code>。
+              换一个带技能加载器的构建后这里会显示列表，不渲染假控件。
+            </p>
+          </div>
+        ) : null}
 
-      {!loading && rows.length === 0 && !loadError && !unsupported ? (
-        <div className="empty">
-          <h2>还没有技能</h2>
-          <p className="muted">
-            安装与自动提案都会先落到 <code>skills/pending/</code>，待审的会出现在这里。
-          </p>
-        </div>
-      ) : null}
+        {loading && rows.length === 0 && !loadError && !unsupported ? (
+          <p className="muted">正在读取技能列表…</p>
+        ) : null}
 
-      <ul className="skill-list">
-        {rows.map((row) => (
-          <SkillCard
-            key={row.name}
-            row={row}
-            readOnly={readOnly}
-            onOpen={(name) => setOpenName(name)}
-          />
-        ))}
-      </ul>
+        {!loading && rows.length === 0 && !loadError && !unsupported ? (
+          <div className="empty">
+            <h2>还没有技能</h2>
+            <p className="muted">
+              安装与自动提案都会先落到 <code>skills/pending/</code>，待审的会出现在这里。
+            </p>
+          </div>
+        ) : null}
+
+        <ul className="skill-list">
+          {rows.map((row) => (
+            <SkillCard
+              key={row.name}
+              row={row}
+              readOnly={readOnly}
+              onOpen={(name) => setOpenName(name)}
+            />
+          ))}
+        </ul>
+      </div>
+
+      <div
+        role="tabpanel"
+        id="skills-panel-install"
+        aria-labelledby="skills-tab-install"
+        className="tab-panel"
+        hidden={tab !== 'install'}
+      >
+        <SkillInstallPanel
+          readOnly={readOnly}
+          unsupported={unsupported}
+          onChanged={handleChanged}
+          onReview={(name) => {
+            setTab('review');
+            setOpenName(name);
+          }}
+        />
+      </div>
 
       {openName ? (
         <SkillDrawer

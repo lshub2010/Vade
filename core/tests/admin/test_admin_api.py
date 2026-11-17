@@ -431,16 +431,15 @@ def test_config_rejects_unknown_keys_and_dangerous_changes_need_confirm(ctx, app
 
 
 def test_unimplemented_feature_endpoints_answer_501_not_404(ctx, app):
-    """C5b's skills/memory routes are in the schema but not built in this batch.
+    """C5b's memory routes are in the schema but not built in this batch.
 
     Every shape the schema declares — including nested actions — must answer 501
     `UNSUPPORTED`. A 404 reads as a broken build or a typo'd URL and leaves the
-    UI unable to say "not in this build"; a 501 can be labelled.
+    UI unable to say "not in this build"; a 501 can be labelled. Skills were in
+    this list until `admin/skills.py` landed; their coverage lives in
+    `test_skills.py`.
     """
     paths = (
-        "/admin/api/skills", "/admin/api/skills/install", "/admin/api/skills/install/preview",
-        "/admin/api/skills/foo", "/admin/api/skills/foo/approve",
-        "/admin/api/skills/foo/reject", "/admin/api/skills/foo/rollback",
         "/admin/api/memory", "/admin/api/memory/stats", "/admin/api/memory/m1",
         "/admin/api/memory/m1/promote", "/admin/api/memory/m1/archive",
         "/admin/api/memory/m1/restore",

@@ -46,6 +46,7 @@ from .auth import (
 from .devices import DeviceStore
 from .identity import CoreIdentity, load_or_create
 from .setup import SetupService
+from .skills import build_routes as skill_routes
 from .stream import EventStream
 from .views import to_public_view
 
@@ -155,6 +156,10 @@ class AdminContext:
     audit: Any = None
     approvals: Any = None
     pairing: Any = None
+    #: C3b's `SkillLoader` (`app.skill_loader`). Resolved again in `bind_ports`
+    #: because `admin` installs BEFORE `skill` (alphabetical), so it does not
+    #: exist yet when this context is built.
+    skills: Any = None
     #: The trust table (`vade.identity.whitelist.Whitelist`). Revoking a node
     #: must unbind it HERE as well as in the registry, because the registry's
     #: `_revoked` set is process memory: whitelist.json is what survives a
@@ -198,6 +203,7 @@ class AdminContext:
             approvals=getattr(app, "approvals", None),
             pairing=getattr(app, "pairing", None),
             whitelist=getattr(app, "whitelist", None),
+            skills=getattr(app, "skill_loader", None),
             version=config.version,
             e2e_enabled=config.e2e_enabled,
             allow_remote_readonly=config.allow_remote_readonly,
@@ -226,6 +232,8 @@ class AdminContext:
             self.approvals = getattr(source, "approvals", None)
         if self.pairing is None:
             self.pairing = getattr(source, "pairing", None)
+        if self.skills is None:
+            self.skills = getattr(source, "skill_loader", None)
 
     def __post_init__(self) -> None:
         self.sessions.set_device_checker(self.devices.is_active)
@@ -1079,18 +1087,20 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         Route("/admin/api/layout", get_layout, methods=["GET"]),
         Route("/admin/api/layout", patch_layout, methods=["PATCH"]),
         Route("/admin/api/layout/auto", layout_auto, methods=["POST"]),
+    ])
+    # Skills are C5b, implemented in `admin/skills.py`; they sit here rather
+    # than in the 501 block below so every schema shape resolves to a handler.
+    routes.extend(skill_routes(ctx, guard, _json))
+    routes.extend([
         Route("/admin/api/stream", stream, methods=["GET"]),
         Route("/login", login_page, methods=["GET"]),
         Route("/", login_page, methods=["GET"]),
     ])
-    # Skills and memory are C5b. They are declared in `schema/admin-api.yaml`
-    # already, so answer `UNSUPPORTED` (501) — not `NOT_FOUND` — for every shape
-    # the schema defines, including nested actions that would otherwise miss the
-    # `{name}`/`{id}` routes. A UI can then label the feature "not in this build".
+    # Memory is C5b. It is declared in `schema/admin-api.yaml` already, so
+    # answer `UNSUPPORTED` (501) — not `NOT_FOUND` — for every shape the schema
+    # defines, including nested actions that would otherwise miss the `{id}`
+    # routes. A UI can then label the feature "not in this build".
     for path in (
-        "/admin/api/skills", "/admin/api/skills/install", "/admin/api/skills/install/preview",
-        "/admin/api/skills/{name}", "/admin/api/skills/{name}/approve",
-        "/admin/api/skills/{name}/reject", "/admin/api/skills/{name}/rollback",
         "/admin/api/memory", "/admin/api/memory/stats", "/admin/api/memory/{id}",
         "/admin/api/memory/{id}/promote", "/admin/api/memory/{id}/archive",
         "/admin/api/memory/{id}/restore",

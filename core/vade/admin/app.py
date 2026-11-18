@@ -41,7 +41,8 @@ from ..identity.pairing import Purpose
 from . import bind as bind_service, setup_token
 from .auth import (
     ChallengeStore, PasswordPolicyError, SessionStore, hash_password, is_loopback,
-    normalize_pubkey, origin_allowed, validate_password, verify_password,
+    normalize_pubkey, origin_allowed, run_argon2, validate_password,
+    verify_password_async,
 )
 from .devices import DeviceStore
 from .identity import CoreIdentity, load_or_create
@@ -406,6 +407,11 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
 
     # ---------------------------------------------------------------- auth core
     def guard(request: Request, *, readonly_check: bool = True) -> Any:
+        # Expired access/refresh rows are otherwise only dropped when their own
+        # token is presented, so the table grows for the life of the process.
+        # This rides on a request that already pays for a dict lookup; a sweep
+        # of a handful of rows is cheaper than a background task.
+        ctx.sessions.sweep_if_due()
         host = request.headers.get("host")
         if host not in ctx.config.allowed_hosts:
             ctx.write_audit(kind="admin.rejected", status="denied", code="ORIGIN_MISMATCH",
@@ -509,7 +515,10 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
             else:
                 limiter.hit(f"setup:{_client(request)}", 300)
         try:
-            result = ctx.setup.initialize(
+            # First-run setup hashes the new password (64 MiB) and writes
+            # `admin.json`: both belong off the event loop.
+            result = await run_argon2(
+                ctx.setup.initialize,
                 password=str(body.get("password") or ""),
                 setup_token_value=body.get("setup_token"),
                 loopback=loopback, ip=_client(request),
@@ -546,12 +555,28 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
     async def bind(request: Request) -> Response:
         """§7.12.3 ③–⑤: verify the envelope, then consume the ticket.
 
-        Everything that can reject the request happens in `bind.complete()`
-        before the ticket is touched, so a failed attempt leaves the QR usable.
-        The plaintext password only exists inside that call.
+        Everything that can reject the request happens in `bind.complete()` —
+        including the Argon2 digest, which runs in a worker thread outside both
+        the bind lock and the event loop — before the ticket is touched, so a
+        failed attempt leaves the QR usable.
+
+        The budget is login's: it is the same password from the same address.
+        The 5-per-300 s check runs *before* the envelope is opened, so a
+        locked-out caller cannot spend CPU (or 64 MiB) on a digest at all; only
+        a `BIND_UNAUTHORIZED` (the one code that means "a credential did not
+        check out", not "your clock is wrong" or "your key is at the limit")
+        counts against it, both per IP and in the 20-in-5-minutes global ledger.
         """
+        ip = _client(request)
+        limiter.check_ip(ip)
         body = await _json(request)
-        payload = bind_service.complete(ctx, body, ip=_client(request))
+        try:
+            payload = await bind_service.complete(ctx, body, ip=ip)
+        except VadeError as exc:
+            if exc.code == "BIND_UNAUTHORIZED":
+                limiter.hit(f"pw:{ip}", 300)
+                limiter.password_failure(ip)
+            raise
         return JSONResponse(payload)
 
     # --------------------------------------------------------------------- auth
@@ -575,7 +600,9 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         challenge_b64 = base64.b64encode(challenge_raw).decode()
         password = str(body.get("password") or "")
         stored = ctx.setup.password_hash()
-        if not verify_password(password, stored):
+        # Off the loop: an Argon2id digest is 64 MiB of CPU, and four logins in
+        # parallel used to freeze every other request for the duration.
+        if not await verify_password_async(password, stored):
             limiter.hit(f"pw:{ip}", 300)
             limiter.password_failure(ip)
             ctx.write_audit(kind="admin.login", status="denied", code="AUTH_FAILED", actor=None,
@@ -583,7 +610,9 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
             raise VadeError("AUTH_FAILED", "password or device is incorrect")
         # The password is proven, so legacy scrypt material (or Argon2id with
         # weaker parameters) can be replaced in place. No offline migration.
-        if ctx.setup.rehash_password(password, stored):
+        # A re-hash is another 64 MiB digest, so it goes through the same
+        # worker-thread channel (and shares its two slots).
+        if await run_argon2(ctx.setup.rehash_password, password, stored):
             ctx.write_audit(kind="admin.password_rehashed", status="ok", actor=None,
                             extra={"ip": ip, "to": "argon2id"})
 
@@ -675,7 +704,9 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         body = await _json(request)
         old = str(body.get("old_password") or "")
         new = str(body.get("new_password") or "")
-        ctx.setup.change_password(old, new)
+        # Verify (64 MiB) + hash (64 MiB): both on the worker channel, so the
+        # loop keeps serving while a password changes.
+        await run_argon2(ctx.setup.change_password, old, new)
         # Keep the caller signed in, invalidate everyone else by version.
         mode, device_id = session.mode, session.device_id
         ctx.sessions.bump_password_version()
@@ -706,7 +737,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         password = str(body.get("password") or "")
         # step-up: the only load-bearing check on this path. A logged-in
         # attacker with a stolen cookie must not be able to enrol a new key.
-        if not verify_password(password, ctx.setup.password_hash()):
+        if not await verify_password_async(password, ctx.setup.password_hash()):
             raise VadeError("AUTH_FAILED", "password or device is incorrect")
         alg, raw = normalize_pubkey(str(body.get("pubkey") or ""), body.get("alg"))
         device = ctx.devices.add(
@@ -722,8 +753,16 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         session = guard(request)
         device_id = request.path_params["id"]
         body = await _json(request, required=False)
-        if body.get("password") and not verify_password(str(body["password"]), ctx.setup.password_hash()):
-            raise VadeError("AUTH_FAILED", "password or device is incorrect")
+        if body.get("password"):
+            # A wrong password here guesses the same secret as `login`, so it
+            # spends the same budget: without this, a session holder could
+            # brute-force the password offline of every login-side limit.
+            ip = _client(request)
+            limiter.check_ip(ip)
+            if not await verify_password_async(str(body["password"]), ctx.setup.password_hash()):
+                limiter.hit(f"pw:{ip}", 300)
+                limiter.password_failure(ip)
+                raise VadeError("AUTH_FAILED", "password or device is incorrect")
         if not ctx.devices.revoke(device_id):
             raise VadeError("NOT_FOUND", "unknown device")
         ctx.sessions.revoke_device(device_id)
@@ -734,7 +773,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
     async def device_ticket(request: Request) -> Response:
         session = guard(request)
         body = await _json(request)
-        if not verify_password(str(body.get("password") or ""), ctx.setup.password_hash()):
+        if not await verify_password_async(str(body.get("password") or ""), ctx.setup.password_hash()):
             raise VadeError("AUTH_FAILED", "password or device is incorrect")
         ticket = ctx.setup.create_ticket()
         ctx.write_audit(kind="device.ticket", status="ok", actor=actor_of(session),

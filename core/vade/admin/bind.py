@@ -17,9 +17,15 @@ Ordering rules — the reasons this lives in its own module:
 * verify everything first, consume the ticket last. A bad ciphertext, a bad
   signature or a full device list must not burn a ticket: that would be a
   zero-cost onboarding DoS (§7.12.3 ④).
-* ticket reservation and device enrolment happen together under one lock;
-  `SetupService.consume_ticket` is the single point that can succeed once, so
-  concurrent POSTs with the same ticket enrol exactly one device.
+* the expensive half (the Argon2 digest) runs *outside* the process lock, in a
+  worker thread. Locking across it serialised every bind on ~100 ms of CPU, and
+  doing it on the loop stalled every other admin request; `_BIND_LOCK` now
+  covers only the in-memory reservation (re-check + `consume_ticket`).
+* the disk writes (`admin.json` on first run, `devices.json`) run outside that
+  lock too. Two commits for *different* tickets cannot corrupt each other:
+  `devices.add` re-checks the limit under its own lock, and the only mutation
+  overlapping between two first-run binds — creating `admin.json` — is refused
+  with `BIND_SETUP_LOCKED` while another first-run commit is in flight.
 * `setup_required=true` writes `admin.json` *before* the setup token is
   unlinked (a crash leaves a recoverable state, never "no password, no token").
 * the commit is all-or-nothing: ticket, `admin.json`, device row and session.
@@ -50,7 +56,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from ..errors import VadeError
-from .auth import verify_password, verify_signature
+from .auth import run_argon2, verify_password_async, verify_signature
 
 __all__ = [
     "BIND_PREFIX", "HELLO_TTL_S", "MAX_SKEW_S", "begin_hello", "complete",
@@ -67,10 +73,17 @@ HELLO_TTL_S = 60
 #: §7.12.3 ④b / §7.12.5 `BIND_CLOCK_SKEW`.
 MAX_SKEW_S = 120
 
-#: One lock for every bind attempt in this process. It spans "reserve the
-#: ticket → write admin.json → add the device", so a rollback never exposes a
-#: half-applied state to a second request.
+#: Guards the in-memory reservation only: the hello table, the re-check and
+#: `consume_ticket`. Never held across a digest or a file write — that was the
+#: whole point of the split (P0-3).
 _BIND_LOCK = threading.RLock()
+
+#: How many first-run commits are creating `admin.json` right now. Guarded by
+#: `_BIND_LOCK`; only non-zero on an uninitialised plane. Two of them would
+#: interleave `os.replace` on `admin.json` and one rollback could unlink the
+#: other's finished document, so the second is refused with the spec'd
+#: `BIND_SETUP_LOCKED` (423, retriable) instead.
+_SETUP_COMMITS = 0
 
 _TICKET_ALPHABET = frozenset("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
 
@@ -144,10 +157,13 @@ def _take_hello(ctx: Any, ticket: str, ip: str | None) -> dict[str, Any]:
 
 
 # -------------------------------------------------------------------- complete
-def complete(ctx: Any, body: dict[str, Any], *, ip: str | None) -> dict[str, Any]:
+async def complete(ctx: Any, body: dict[str, Any], *, ip: str | None) -> dict[str, Any]:
     """Verify the envelope, then reserve the ticket and enrol the device.
 
-    Raises `VadeError`; every pre-consumption failure leaves the ticket usable.
+    `async` because the Argon2 digest runs in a worker thread: a bind must not
+    stop the loop for 100 ms, and it must not hold `_BIND_LOCK` while waiting
+    for CPU either. Raises `VadeError`; every pre-consumption failure leaves
+    the ticket usable.
     """
     ticket = body.get("ticket")
     if not isinstance(ticket, str) or len(ticket) != TICKET_LEN or not set(ticket) <= _TICKET_ALPHABET:
@@ -202,54 +218,76 @@ def complete(ctx: Any, body: dict[str, Any], *, ip: str | None) -> dict[str, Any
     if ctx.devices.is_revoked(raw_pubkey):
         raise _unauthorized()
 
-    # ④e + ④f. From here on the ticket is the scarce resource: everything is
-    # re-checked under the lock, and the ticket is only consumed when the
-    # device can actually be enrolled.
+    # ④e. The password is the only expensive step, and it no longer runs under
+    # `_BIND_LOCK` nor on the event loop: one digest is 64 MiB / tens of ms, and
+    # holding the process lock across it queued every other bind behind it.
+    setup_required = not ctx.setup.initialized()
+    if setup_required:
+        _validate_new_password(password)
+    elif not await verify_password_async(password, ctx.setup.password_hash()):
+        raise _unauthorized()
+
+    # ④f. Reservation — in-memory only, no `await`, no I/O beyond the cached
+    # `stat` in `initialized()`. Everything that can change while the digest ran
+    # is re-checked here, and the ticket is only consumed when the device can
+    # actually be enrolled.
+    global _SETUP_COMMITS
     with _BIND_LOCK:
         entry = ctx.setup.peek_ticket(ticket)
         if entry is None:
             raise _unauthorized()
-        # The state may have flipped since the hello: the browser can finish
-        # `POST /admin/setup` while a phone is scanning. Re-read it here.
-        setup_required = not ctx.setup.initialized()
-        if setup_required:
-            _validate_new_password(password)
-        elif not verify_password(password, ctx.setup.password_hash()):
+        # The state may have flipped since the digest: the browser can finish
+        # `POST /admin/setup` while a phone is scanning. That flips which
+        # password had to be proven (a *new* one vs the stored one), so refuse
+        # and let the App retry — the ticket is untouched.
+        now_setup_required = not ctx.setup.initialized()
+        if now_setup_required != setup_required:
             raise _unauthorized()
         if len(ctx.devices) >= ctx.devices.max_devices:
             raise VadeError("BIND_DEVICE_LIMIT", "at most 5 devices per account")
         if ctx.devices.is_revoked(raw_pubkey):
             raise _unauthorized()
-
+        if setup_required:
+            if _SETUP_COMMITS:
+                # Two first-run commits would race on `admin.json`: the loser's
+                # rollback would unlink the winner's finished document.
+                raise VadeError("BIND_SETUP_LOCKED", "setup is in progress in another session")
+            _SETUP_COMMITS += 1
         if not ctx.setup.consume_ticket(ticket):
             # rowcount=0 equivalent: another request won the race.
-            raise _unauthorized()
-        # From here the bind is a commit: the reservation, `admin.json` on first
-        # run, the device row and the session. Every failure must undo all of it
-        # (④) — a session that cannot be minted would otherwise burn the QR and
-        # leave a registered device that no client knows about.
-        device: Any = None
-        init_snapshot: Any = None
-        try:
             if setup_required:
-                # Snapshot before writing: `devices.add` can fail right after
-                # `admin.json` exists, and then the plane must return to "setup
-                # required" rather than "initialised, no device, token gone"
-                # (which only `vade admin reset` repairs).
-                init_snapshot = ctx.setup.begin_initialize_bound(password=password, ip=ip)
-            device = ctx.devices.add(
-                pubkey_b64=base64.b64encode(raw_pubkey).decode("ascii"), alg=alg,
-                label=label, ip=ip, hardware_backed=hardware_backed,
+                _SETUP_COMMITS -= 1
+            raise _unauthorized()
+
+    # ④g. Commit, outside the lock: both remaining steps are file writes.
+    # `devices.add` re-checks the limit under its own lock, so the reservation
+    # above is an optimisation rather than the invariant; a bind that loses that
+    # race rolls back and releases the ticket like any other commit failure.
+    device: Any = None
+    init_snapshot: Any = None
+    try:
+        if setup_required:
+            # The first-run digest is 64 MiB too: keep it off the loop.
+            init_snapshot = await run_argon2(
+                ctx.setup.begin_initialize_bound, password=password, ip=ip,
             )
-            # §7.12.3 ⑤: the token is minted inside the transaction. `issue` only
-            # touches in-memory dicts, but the client cannot use a device it has
-            # no session for, so a failure here is a failure of the whole bind.
-            tokens = ctx.sessions.issue(mode="device", device_id=device.device_id, ip=ip)
-        except BaseException:
-            # Runs under `_BIND_LOCK`: no other request can observe the
-            # half-applied state, and the ticket is released last.
-            _rollback(ctx, ticket, device=device, init_snapshot=init_snapshot)
-            raise
+        device = ctx.devices.add(
+            pubkey_b64=base64.b64encode(raw_pubkey).decode("ascii"), alg=alg,
+            label=label, ip=ip, hardware_backed=hardware_backed,
+        )
+        # §7.12.3 ⑤: the token is minted inside the transaction. `issue` only
+        # touches in-memory dicts, but the client cannot use a device it has
+        # no session for, so a failure here is a failure of the whole bind.
+        tokens = ctx.sessions.issue(mode="device", device_id=device.device_id, ip=ip)
+    except BaseException:
+        # The ticket is released last, unconditionally: it is the only step that
+        # makes the QR retryable.
+        _rollback(ctx, ticket, device=device, init_snapshot=init_snapshot)
+        raise
+    finally:
+        if setup_required:
+            with _BIND_LOCK:
+                _SETUP_COMMITS -= 1
 
     ctx.write_audit(
         kind="device.bound", status="ok", code=None, actor=device.device_id,
@@ -325,6 +363,12 @@ def _validate_new_password(password: str) -> None:
 # --------------------------------------------------------------------- helpers
 def _rollback(ctx: Any, ticket: str, *, device: Any, init_snapshot: Any) -> None:
     """Undo, newest first, everything the bind transaction already committed.
+
+    Runs *outside* `_BIND_LOCK` (nothing else can observe this ticket as
+    consumable: `consume_ticket` already returned True for exactly one caller),
+    so the cost here is one `devices.json` rewrite plus one `admin.json`
+    restore — the failure path of a request that would otherwise have written
+    both anyway.
 
     The ticket is released **last and unconditionally**: it is the only step
     that makes the QR retryable, so a failing rollback step must not skip it.

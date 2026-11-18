@@ -59,6 +59,8 @@ class SetupService:
     #: two concurrent `POST /admin/bind` calls can both observe an unconsumed
     #: ticket. See `admin/bind.py` for the enclosing bind transaction.
     _lock: Any = field(default_factory=threading.RLock)
+    #: `(stat key, stored hash)` — see `password_hash()`.
+    _hash_cache: tuple[tuple[int, int, int], str | None] | None = None
 
     # ------------------------------------------------------------------ state
     @property
@@ -75,8 +77,28 @@ class SetupService:
             return None
 
     def password_hash(self) -> str | None:
+        """The stored credential, cached until `admin.json` itself changes.
+
+        Every login, step-up and bind reads this, and each read used to parse
+        the whole document; the parse is pure overhead next to the digest. The
+        cache key is the file's identity (`st_mtime_ns`, `st_size`, `st_ino`) —
+        every writer in this module replaces the file via `os.replace`, so a new
+        inode (or a new mtime) is exactly "the credential may have changed".
+        A missing file is not cached: `admin.json` appearing is what makes the
+        plane initialised, and that transition must be visible immediately.
+        """
+        try:
+            stat = self.admin_doc_path.stat()
+        except OSError:
+            self._hash_cache = None
+            return None
+        key = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        if self._hash_cache is not None and self._hash_cache[0] == key:
+            return self._hash_cache[1]
         doc = self.load_admin()
-        return doc.get("password") if doc else None
+        value = doc.get("password") if doc else None
+        self._hash_cache = (key, value)
+        return value
 
     def _write_admin(self, doc: Mapping[str, Any]) -> None:
         """tmp + `os.replace`, mode 0600. The only writer of `admin.json`."""
@@ -84,6 +106,10 @@ class SetupService:
             self.admin_doc_path,
             json.dumps(dict(doc), ensure_ascii=False, indent=2).encode("utf-8"),
         )
+        # Belt and braces: the new inode already misses the cache key, but a
+        # credential change must never be served from a stale read even if a
+        # filesystem reports a coarse `st_mtime_ns`.
+        self._hash_cache = None
 
     @staticmethod
     def _atomic_write(path: Path, raw: bytes) -> None:
@@ -218,8 +244,9 @@ class SetupService:
     def release_ticket(self, ticket: str) -> None:
         """Roll back a reservation after a later step of the same transaction failed.
 
-        Only `admin/bind.py` calls this, while it holds its own lock, so no
-        other request can observe the ticket as consumable in between.
+        Only `admin/bind.py` calls this, after its commit failed. It is atomic
+        on its own lock, so no other request can observe a ticket that is half
+        released: from `consume_ticket` to here the ticket simply reads as used.
         """
         with self._lock:
             entry = self._tickets.get(ticket)

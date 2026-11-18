@@ -81,6 +81,12 @@ class TurnQueue:
         self._claim_seq = 0
         self._running: QueueItem | None = None
         self._worker: asyncio.Task[None] | None = None
+        #: True from the first line of a `_run_loop` body to its `finally`.
+        #: `_worker` alone cannot carry "one worker" (`shutdown()` clears the
+        #: reference while the body can still be unwinding) and a second body
+        #: would dequeue from the same `_pending`, running two turns of one
+        #: session at once — the single guarantee this class exists to make.
+        self._worker_live = False
         #: Kept for `shutdown()`/introspection only: decisions are turn-scoped
         #: (`_turn_tasks`), never made off this mutable attribute.
         self._turn_task: asyncio.Task[Any] | None = None
@@ -236,21 +242,92 @@ class TurnQueue:
         # created a new one that ran turns into a closed store.
         if self._stopped:
             return
+        if self._worker_live:
+            # A loop body is already serving this queue, whatever `_worker`
+            # says. Creating another one here is the only way two workers can
+            # ever exist for one session, and it would run two turns at once.
+            return
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._run_loop(), name=f"queue-{self.session_id[:8]}")
 
     async def _run_loop(self) -> None:
+        if self._worker_live:  # pragma: no cover - guarded by `ensure_worker`
+            _log.error("session %s: refused a second queue worker", self.session_id)
+            return
+        self._worker_live = True
         try:
             # `_stopped` in the condition: `shutdown()` empties `_pending` and
             # finalizes each turn, but a worker resumed in between must never
             # dequeue one and announce `turn.started` after its terminal event.
             while self._pending and not self._stopped:
                 item = self._pending.popleft()
-                await self._run_one(item)
+                try:
+                    await self._run_one(item)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A turn must never take the worker with it. The exception
+                    # used to escape `_run_loop`: the worker task died with
+                    # nobody holding it ("Task exception was never retrieved"),
+                    # `_running` stayed set (so the session reported a live turn
+                    # forever and `session/delete` refused with `turn_active`),
+                    # and the `finally` below started a second worker for the
+                    # same session. The terminal state is still owed, so write
+                    # the fallback here and keep serving the queue.
+                    _log.exception(
+                        "session %s: turn %s crashed while finishing",
+                        self.session_id, item.turn_id,
+                    )
+                    await self._fail_crashed_turn(item)
         finally:
+            self._worker_live = False
             self._worker = None
             if self._pending and not self._stopped:  # a submit raced the loop exit
                 self.ensure_worker()
+
+    async def _fail_crashed_turn(self, item: QueueItem) -> None:
+        """Last-ditch `turn.failed{INTERNAL}` for a turn whose finalize raised.
+
+        A retry, not a second write: `_finalize` is the only terminal writer and
+        it refuses a turn that already finalized, so a turn whose terminal row
+        and event did land is left untouched. What is left here is a turn that
+        has no durable terminal state — it must get one, or the row stays
+        `running` for the life of the process (a client sees a turn that never
+        ends and `session/delete` answers `turn_active` forever).
+
+        If even this write fails the queue stops pretending: `_running` and the
+        in-flight markers are cleared so the session is not permanently active,
+        and the row is left for `reconcile_unfinished_turns` on the next start.
+        Nothing is raised — this runs inside the worker, and a raise here would
+        recreate the dead-worker bug it exists to prevent.
+        """
+        running = self._running
+        turn = (running.turn
+                if running is not None and running.turn_id == item.turn_id
+                else item.turn)
+        message = "internal error while executing the turn"
+        try:
+            await self._finalize(
+                turn,
+                TurnState.FAILED,
+                {"turn_id": turn.id, "code": "INTERNAL", "message": message,
+                 "state": TurnState.FAILED.value},
+                error_code="INTERNAL",
+                error_message=message,
+                usage=_unmeasured_usage(turn.model_id),
+                data={"reason": "internal"},
+            )
+        except Exception:
+            _log.exception(
+                "session %s: could not persist the terminal state of turn %s",
+                self.session_id, turn.id,
+            )
+            self._finalizing.discard(turn.id)
+            if self._running is not None and self._running.turn_id == turn.id:
+                self._running = None
+            if self._finish is not None and not self._finish.is_set():
+                self._finish.set()
+            self._release_cancel(turn.id, self._turn_tasks.get(turn.id))
 
     async def _run_one(self, item: QueueItem) -> None:
         """Run one turn to completion.
@@ -385,6 +462,16 @@ class TurnQueue:
         # this write is suspended. Ownership of the released marker lives here,
         # not in `_run_one`: this method is the only writer of a terminal state.
         self._finalizing.add(turn.id)
+        #: `persisted` is the honest answer to "did the terminal state land?".
+        #: It gates the `_finalized` tombstone AND the local completion marks:
+        #: `store.append` commits the row, the messages and the event in ONE
+        #: transaction, so a write that raised wrote nothing and the turn is
+        #: still unfinished. The old `finally` recorded the tombstone
+        #: unconditionally, which turned a failed write into "already done" —
+        #: the worker woke up, saw the marker and returned, `_running` stayed
+        #: set (a session that is `turn_active` forever) and the client watched
+        #: a turn run until the next process start.
+        persisted = False
         try:
             # RFC-0008 S5: a pending `turn.input_resolved` must be written BEFORE the
             # turn's terminal event, or the dialog is left open forever (C-06 forbids
@@ -437,15 +524,33 @@ class TurnQueue:
             # `update_turn` followed by the event's own upsert.
             await self._emit(self.session_id, event_type, payload, messages=messages,
                              turns=(turn,))
+            # Durable. Only now may the turn be remembered as finalized — see
+            # the `persisted` note above — and only now is it safe to forget it.
+            persisted = True
             if self._running is not None and self._running.turn_id == turn.id:
                 self._running = None
-            await self._emit(self.session_id, "queue.updated", self.state_payload())
+            try:
+                await self._emit(self.session_id, "queue.updated", self.state_payload())
+            except Exception:
+                # The terminal row and event are already committed; this is a
+                # derived snapshot the next event supersedes. Its failure must
+                # not roll the turn back, re-finalize it, or tell the caller the
+                # turn did not end.
+                _log.warning("session %s: queue.updated after terminal write failed",
+                             self.session_id, exc_info=True)
         finally:
+            # Rollback: whatever happened, no terminal write is in flight any
+            # more, so a retry must be allowed. `_running` is only cleared on the
+            # success path above — on failure the turn is still live (the worker
+            # or `_fail_crashed_turn` writes the fallback terminal state), and a
+            # failure that cleared it would report the turn as finished while
+            # the row still says `running`.
             self._finalizing.discard(turn.id)
-            self._remember_finalized(turn.id)
-        if self._finish is not None and not self._finish.is_set():
-            self._finish.set()
-        self._release_cancel(turn.id, task)
+            if persisted:
+                self._remember_finalized(turn.id)
+                if self._finish is not None and not self._finish.is_set():
+                    self._finish.set()
+                self._release_cancel(turn.id, task)
 
     def _partial_message(self, turn_id: str) -> tuple[str, Message | None]:
         """The already-streamed text for `turn_id` and its `partial=true` row.

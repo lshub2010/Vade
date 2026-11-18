@@ -62,7 +62,7 @@ class EventStream:
                 self._seq += 1
                 seq = self._seq
             event = {"id": seq, "type": event_type, "data": dict(payload)}
-            if self._events.maxlen is not None and len(self._events) >= self._events.maxlen:
+            if self._events and self._events.maxlen is not None and len(self._events) >= self._events.maxlen:
                 # About to drop the oldest event: remember how far the hole
                 # reaches so a lagging subscriber gets a resync, not a gap.
                 self._evicted_through = max(self._evicted_through, _as_id(self._events[0]["id"]))

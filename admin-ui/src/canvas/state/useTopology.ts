@@ -309,6 +309,15 @@ export function useTopology(): TopologyApi {
     function handleEvent(raw: string, lastEventId: string): void {
       const event = parseStreamEvent(raw, lastEventId);
       if (!event) return;
+      // 服务端明确说"你的游标已滑出缓冲"（stream.py 的 resync 帧）。这一帧刻意不带
+      // `id:`，所以 lastEventId 还是旧值，会被下面的 seq 去重挡掉——必须先处理：
+      // 丢掉本地水位，重新拉一次全量快照，否则后续重放的事件全被当重复丢弃，
+      // 画布会一直停在缺口前的状态（幽灵节点就是这么留下的）。
+      if (event.type === 'resync') {
+        appliedSeq = 0;
+        void snapshot();
+        return;
+      }
       if (event.seq !== null) {
         if (event.seq <= appliedSeq) return; // 重连重放：丢弃
         appliedSeq = event.seq;

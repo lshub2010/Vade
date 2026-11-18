@@ -88,14 +88,34 @@ class AuditWriter:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._degraded = False
+        #: Batches that hit a sqlite error and were dropped. Never silent: the
+        #: flusher survives the error, logs it, and resets the handle so the
+        #: next batch can succeed (review P0-4).
+        self.write_failures = 0
 
     # ------------------------------------------------------------------ public
     def record(self, event: Mapping[str, Any]) -> str:
         row = self._normalise(event)
         audit_id = row["extra"]["audit_id"]
-        if self._sync or self._degraded:
+        if self._sync:
             self._write_many([row])
             return audit_id
+        if self._degraded:
+            # Degraded means "the queue could not take it, so this write went
+            # synchronous". It must end when the backlog does: the old flag was
+            # never cleared, so one `queue.Full` pinned every later write onto
+            # the caller's thread — the event loop — until process restart
+            # (review P1-2).
+            if self._queue.qsize() <= self._max_queue // 2:
+                self._degraded = False
+                log.info(
+                    "audit queue drained (<=%s rows); leaving degraded mode",
+                    self._max_queue // 2,
+                    extra={"code": None, "msg": "audit_recovered"},
+                )
+            else:
+                self._write_many([row])
+                return audit_id
         try:
             self._ensure_worker()
             self._queue.put_nowait(row)
@@ -112,9 +132,7 @@ class AuditWriter:
 
     def flush(self) -> None:
         self._drain()
-        with self._lock:
-            if self._db is not None:
-                self._db.commit()
+        self._commit()
 
     def close(self) -> None:
         self._stop.set()
@@ -124,8 +142,11 @@ class AuditWriter:
         self._drain()
         with self._lock:
             if self._db is not None:
-                self._db.commit()
-                self._db.close()
+                self._commit_locked()
+                try:
+                    self._db.close()
+                except sqlite3.Error:
+                    pass
                 self._db = None
                 self._tables.clear()
         self._thread = None
@@ -227,10 +248,25 @@ class AuditWriter:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            batch = self._collect()
-            if batch:
-                self._write_many(batch)
-            else:
+            try:
+                batch = self._collect()
+                if batch:
+                    self._write_many(batch)
+                else:
+                    self._stop.wait(self._batch_ms / 1000.0)
+                    continue
+            except Exception as exc:  # noqa: BLE001 - one bad batch must not kill the flusher
+                # The old loop had no guard: a single `sqlite3.OperationalError`
+                # killed the thread (and its batch, up to 500 rows) with only a
+                # default traceback, and nothing restarted it until the next
+                # `record()` — which also blocked on the poisoned handle.
+                self.write_failures += 1
+                log.error(
+                    "audit flush failed (batch dropped, total=%s): %s",
+                    self.write_failures, exc,
+                    extra={"code": None, "msg": "audit_write_failed"},
+                )
+                self._reset_db()
                 self._stop.wait(self._batch_ms / 1000.0)
                 continue
             time.sleep(self._batch_ms / 1000.0)
@@ -251,8 +287,51 @@ class AuditWriter:
             try:
                 row = self._queue.get_nowait()
             except queue.Empty:
-                break
-            self._write_many([row])
+                return
+            try:
+                self._write_many([row])
+            except Exception as exc:  # noqa: BLE001 - keep draining, keep logging
+                self.write_failures += 1
+                log.error(
+                    "audit drain failed (row dropped, total=%s): %s",
+                    self.write_failures, exc,
+                    extra={"code": None, "msg": "audit_write_failed"},
+                )
+                self._reset_db()
+
+    def _commit(self) -> None:
+        with self._lock:
+            self._commit_locked()
+
+    def _commit_locked(self) -> None:
+        if self._db is None:
+            return
+        try:
+            self._db.commit()
+        except sqlite3.Error as exc:
+            self.write_failures += 1
+            log.error(
+                "audit commit failed (total=%s): %s", self.write_failures, exc,
+                extra={"code": None, "msg": "audit_write_failed"},
+            )
+            self._reset_db()
+
+    def _reset_db(self) -> None:
+        """Drop the handle after an error so the next batch reconnects.
+
+        A `sqlite3` connection that failed mid-transaction stays unusable for
+        some errors ("database is locked" from a racing prune, a full disk);
+        keeping it would turn one transient failure into a permanent outage.
+        """
+        with self._lock:
+            if self._db is None:
+                return
+            try:
+                self._db.close()
+            except sqlite3.Error:
+                pass
+            self._db = None
+            self._tables.clear()
 
     def _connect(self) -> sqlite3.Connection:
         if self._db is None:

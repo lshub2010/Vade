@@ -19,6 +19,7 @@ no raw signing API, so it cannot supply the second factor, so it cannot write.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -38,6 +39,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..errors import VadeError, http_status
 from ..identity.pairing import Purpose
+from ..logging import get_logger
 from . import bind as bind_service, setup_token
 from .auth import (
     ChallengeStore, PasswordPolicyError, SessionStore, hash_password, is_loopback,
@@ -58,6 +60,8 @@ __all__ = [
 COOKIE_NAME = "__Host-ac_admin"
 SETUP_COOKIE = "__Host-ac_setup"
 CSRF_HEADER = "x-csrf-token"
+
+log = get_logger("vade.admin")
 #: 31-C5a §T4 ⑤ exemption list, exactly: the only paths a browser cookie may
 #: reach with a write method. `logout-all` and `password` are deliberately NOT
 #: here — both are destructive and device-only. Adding a path to this set is
@@ -197,6 +201,15 @@ class AdminContext:
     _global_failures: list[float] = field(default_factory=list)
     _locked_until: float = 0.0
     _rate_lock: Any = field(default_factory=lambda: __import__("threading").RLock())
+    #: Count of audit writes that raised. Monotonic, per process: the counter is
+    #: the only trace an operator gets when `audit.db` is unwritable and the
+    #: API keeps answering 200 (review P0-4).
+    audit_failures: int = 0
+    #: `config_usage` is polled by the UI but only changes when an `llm.call`
+    #: lands, so one aggregate query per minute per day is plenty. Shape:
+    #: `(day, monotonic_ts, tokens)`.
+    _usage_cache: tuple[str, float, int] | None = None
+    usage_cache_s: float = 60.0
 
     # ------------------------------------------------------------- construction
     @classmethod
@@ -273,12 +286,55 @@ class AdminContext:
 
     # ------------------------------------------------------------------- audit
     def write_audit(self, **event: Any) -> str | None:
+        """Queue an audit row. Returns the audit id, or None when it was lost.
+
+        `None` has two very different meanings and the API must not conflate
+        them: no writer installed at all (a test/dev core) versus a writer that
+        raised. The second one used to be swallowed with no log and no counter,
+        so a full disk broke the audit chain while every route kept answering
+        200 with `audit_id: null` (review P0-4).
+        """
         if self.audit is None:
             return None
         try:
             return self.audit.record(event)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - a bad audit row must not 500 the write
+            self.audit_failures += 1
+            log.error(
+                "audit write failed (kind=%s failures=%s): %s",
+                event.get("kind"), self.audit_failures, exc,
+                extra={"code": None, "msg": "audit_unavailable"},
+            )
             return None
+
+    def _count_usage_tokens(self, day: str) -> int:
+        """EVOLVE tokens spent on `day`; one aggregate SELECT over one table."""
+        if self.audit is None:
+            return 0
+        from ..audit.reader import AuditReader
+
+        return AuditReader(self.audit.path).sum_extra_int(
+            day=day, kind="llm.call", field="tokens",
+            # RFC-0005 §6.5 / A12: this budget gates SELF-EVOLUTION only. Chat
+            # turns write `llm.call` rows too, so the exclusion belongs in the
+            # SQL — filtering in Python forced every chat row through the loop.
+            exclude={"purpose": "chat"},
+        )
+
+    async def usage_tokens_today(self, day: str) -> int:
+        """Cached (60 s) token total, computed off the event loop.
+
+        The scan is pure sqlite: running it inline froze heartbeat, SSE and
+        module RPC for as long as the table took (26.9 s on 200k rows), which
+        is enough to time out every module connection (review P0-2).
+        """
+        cached = self._usage_cache
+        now = time.monotonic()
+        if cached is not None and cached[0] == day and now - cached[1] < self.usage_cache_s:
+            return cached[2]
+        tokens = await asyncio.to_thread(self._count_usage_tokens, day)
+        self._usage_cache = (day, now, tokens)
+        return tokens
 
 
 # ----------------------------------------------------------------------- helpers
@@ -356,6 +412,20 @@ def _audit_id(event: Any) -> str | None:
         return event or None
     extra = event.get("extra") if isinstance(event, Mapping) else None
     return extra.get("audit_id") if isinstance(extra, Mapping) else None
+
+
+def _audit_payload(ctx: "AdminContext", event: Any) -> dict[str, Any]:
+    """`audit_id` for the toast, plus an explicit marker when the write failed.
+
+    `write_audit` returns None both when no writer is installed and when the
+    writer raised; only the second is an incident. Without this flag a full
+    audit disk was indistinguishable from "audit not configured" on the wire
+    (review P0-4).
+    """
+    payload: dict[str, Any] = {"audit_id": _audit_id(event) if event else None}
+    if event is None and ctx.audit is not None:
+        payload["audit_unavailable"] = True
+    return payload
 
 
 class RateLimiter:
@@ -881,7 +951,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         # and a full view built from it would still say "online".
         current = ctx.registry.get(record.module_id, record.instance_id) if ctx.registry else record
         _publish_node(current or record, changes=changes)
-        return JSONResponse({"ok": True, "impact": impact, "audit_id": _audit_id(event) if event else None,
+        return JSONResponse({"ok": True, "impact": impact, **_audit_payload(ctx, event),
                              "id": record.node_id})
 
     async def revoke_node(request: Request) -> Response:
@@ -909,7 +979,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         ctx.stream.publish("node.remove", {"id": record.node_id})
         return JSONResponse({"ok": True, "connections_closed": len(closed),
                              "unbound": list(unbound),
-                             "audit_id": _audit_id(event) if event else None})
+                             **_audit_payload(ctx, event)})
 
     async def disconnect_node(request: Request) -> Response:
         session = guard(request)
@@ -920,7 +990,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
             module_id=record.module_id, instance_id=record.instance_id,
             method="POST /admin/api/nodes/{id}/disconnect", extra={},
         )
-        return JSONResponse({"ok": True, "audit_id": _audit_id(event) if event else None})
+        return JSONResponse({"ok": True, **_audit_payload(ctx, event)})
 
     # ------------------------------------------------------------------ invites
     async def create_invite(request: Request) -> Response:
@@ -1019,41 +1089,22 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         return JSONResponse({
             "applied": meta["mode"] == "hot",
             "needs_restart": meta["mode"] != "hot",
-            "audit_id": _audit_id(event) if event else None,
+            **_audit_payload(ctx, event),
         })
 
     async def config_usage(request: Request) -> Response:
         guard(request)
         day = time.strftime("%Y-%m-%d", time.gmtime())
-        reviews = proposals = tokens = 0
-        if ctx.audit is not None:
-            from ..audit.reader import AuditReader
-
-            reader = AuditReader(ctx.audit.path)
-            cursor = None
-            while True:
-                page = reader.query(kind="llm.call", limit=500, cursor=cursor)
-                for row in page["items"]:
-                    extra = row.get("extra") or {}
-                    # RFC-0005 §6.5 / A12: this budget gates SELF-EVOLUTION
-                    # only. Chat turns now write `llm.call` rows too
-                    # (`purpose="chat"`), so without this filter ordinary
-                    # conversation would silently eat the evolve budget.
-                    if extra.get("purpose") == "chat":
-                        continue
-                    if time.strftime("%Y-%m-%d", time.gmtime(row["ts"])) != day:
-                        continue
-                    tokens += int(extra.get("tokens") or 0)
-                # The reader clamps a page to 500 on purpose; a busy day of chat
-                # rows must not push the evolve rows out of view.
-                cursor = page.get("next_cursor")
-                if not cursor:
-                    break
+        # One aggregate SELECT against *today's* table, off the event loop, with
+        # a 60 s cache. The old body paged through every retained day table
+        # (30 by default) with no `await` anywhere: 26.9 s of a frozen loop on
+        # 200k rows, reachable by any read-only browser session.
+        tokens = await ctx.usage_tokens_today(day)
         return JSONResponse({
             "day": day, "tokens_used": tokens,
             "tokens_budget": ctx._config_overrides.get("evolve.daily_token_budget",
                                                        CONFIG_ITEMS["evolve.daily_token_budget"]["default"]),
-            "reviews_today": reviews, "proposals_today": proposals,
+            "reviews_today": 0, "proposals_today": 0,
         })
 
     # ------------------------------------------------------------------- layout

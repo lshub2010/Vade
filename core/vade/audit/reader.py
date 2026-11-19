@@ -7,7 +7,17 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-__all__ = ["AuditReader", "day_table", "decode_cursor", "encode_cursor"]
+__all__ = ["AuditReader", "AuditReadError", "day_table", "decode_cursor", "encode_cursor"]
+
+
+class AuditReadError(RuntimeError):
+    """The audit store could not be read — distinct from "there is no data".
+
+    A `sqlite3.OperationalError` used to be swallowed into `0` tokens, so a
+    corrupt page or a locked database made the usage counter look like an empty
+    day (`tokens_budget` silently stopped firing). Callers that can degrade must
+    say so explicitly instead of pretending the day was free (review P2-1).
+    """
 
 
 def _json1_available() -> bool:
@@ -138,35 +148,48 @@ class AuditReader:
         window: the evolve budget only ever needs *today*, and walking all 30
         day tables for it is what turned `GET /admin/api/config/usage` into a
         27 s event-loop stall on 200k rows (review P0-2).
+
+        Rows whose `extra` is not JSON are **skipped** (`json_valid`, also on the
+        extracting expression because SQLite does not promise `AND` order), and a
+        genuine read failure raises `AuditReadError` instead of returning 0: one
+        bad row used to zero the whole day's usage, and a locked/corrupt database
+        looked exactly like "no calls yet" (review P2-1).
         """
         if not self.path.exists():
             return 0
-        where: list[str] = []
+        where: list[str] = ["json_valid(extra)"]
         params: list[Any] = []
         if kind:
             where.append("kind = ?")
             params.append(kind)
         for key, value in (exclude or {}).items():
-            where.append("IFNULL(json_extract(extra, ?), '') <> ?")
+            where.append("IFNULL(CASE WHEN json_valid(extra) THEN json_extract(extra, ?) END, '') <> ?")
             params.extend([f'$."{key}"', value])
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        clause = " WHERE " + " AND ".join(where)
         db = sqlite3.connect(self.path)
         try:
             # Resolve through `_tables` so this obeys the same day narrowing as
             # `query` (and so a caller can see, and test, the fan-out).
             tables = self._tables(db, [day])
             if not tables:
-                return 0
+                return 0  # no table for that day yet: genuinely no data
             table = tables[0]
             if _JSON_OK:
+                sql = (
+                    f'SELECT COALESCE(SUM(CAST(CASE WHEN json_valid(extra)'
+                    f' THEN json_extract(extra, ?) END AS INTEGER)), 0)'
+                    f' FROM "{table}"{clause}'
+                )
                 try:
-                    row = db.execute(
-                        f'SELECT COALESCE(SUM(CAST(json_extract(extra, ?) AS INTEGER)), 0)'
-                        f' FROM "{table}"{clause}',
-                        (f'$."{field}"', *params),
-                    ).fetchone()
-                except sqlite3.OperationalError:  # no table for that day yet
-                    return 0
+                    row = db.execute(sql, (f'$."{field}"', *params)).fetchone()
+                except sqlite3.OperationalError as exc:
+                    if "no such table" in str(exc):
+                        # `prune()` dropped the day table between the listing
+                        # and the read — that is "no data", not a failure.
+                        return 0
+                    raise AuditReadError(f"audit read failed on {table}: {exc}") from exc
+                except sqlite3.Error as exc:
+                    raise AuditReadError(f"audit read failed on {table}: {exc}") from exc
                 return int(row[0] or 0) if row else 0
             return self._sum_extra_int_python(db, table, kind, field, exclude or {})
         finally:
@@ -175,13 +198,22 @@ class AuditReader:
     @staticmethod
     def _sum_extra_int_python(db: sqlite3.Connection, table: str, kind: str | None,
                               field: str, exclude: Mapping[str, Any]) -> int:
-        """Fallback for a SQLite without JSON1: one scan, sum in Python."""
+        """Fallback for a SQLite without JSON1: one scan, sum in Python.
+
+        Unparseable rows are skipped one by one (the Python equivalent of
+        `json_valid`), but a failed *read* raises: only a row that is not JSON is
+        "no data" (review P2-1).
+        """
         where = " WHERE kind = ?" if kind else ""
         try:
             rows = db.execute(f'SELECT extra FROM "{table}"{where}',
                               ((kind,) if kind else ())).fetchall()
-        except sqlite3.OperationalError:
-            return 0
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return 0
+            raise AuditReadError(f"audit read failed on {table}: {exc}") from exc
+        except sqlite3.Error as exc:
+            raise AuditReadError(f"audit read failed on {table}: {exc}") from exc
         total = 0
         for (raw,) in rows:
             try:

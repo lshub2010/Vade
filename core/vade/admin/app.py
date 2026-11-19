@@ -309,7 +309,12 @@ class AdminContext:
             return None
 
     def _count_usage_tokens(self, day: str) -> int:
-        """EVOLVE tokens spent on `day`; one aggregate SELECT over one table."""
+        """EVOLVE tokens spent on `day`; one aggregate SELECT over one table.
+
+        Raises `~vade.audit.reader.AuditReadError` when the store cannot be
+        read: the caller must tell "no calls" apart from "cannot tell"
+        (review P2-1).
+        """
         if self.audit is None:
             return 0
         from ..audit.reader import AuditReader
@@ -328,6 +333,9 @@ class AdminContext:
         The scan is pure sqlite: running it inline froze heartbeat, SSE and
         module RPC for as long as the table took (26.9 s on 200k rows), which
         is enough to time out every module connection (review P0-2).
+
+        A failed read propagates (`AuditReadError`) and is *not* cached: caching
+        it would turn one bad page into a minute of confident zeros.
         """
         cached = self._usage_cache
         now = time.monotonic()
@@ -427,6 +435,40 @@ def _audit_payload(ctx: "AdminContext", event: Any) -> dict[str, Any]:
     if event is None and ctx.audit is not None:
         payload["audit_unavailable"] = True
     return payload
+
+
+def _audit_health(ctx: "AdminContext") -> dict[str, Any]:
+    """Counters for the audit chain itself, surfaced by `/admin/api/health`.
+
+    `write_audit` can only count failures it *sees*, and in production the write
+    is asynchronous: `record()` returns a ULID as soon as the row is queued, so a
+    full disk or an unopenable `audit.db` never raises there (review P1-3). The
+    flusher keeps its own numbers, and this is where they become visible:
+
+    * `request_failures` — rows the API could not even enqueue (`ctx` counter);
+    * `writer_failures` — batches the flusher lost after its one retry;
+    * `write_retries` — batches that failed once and landed on the retry (a
+      healthy core under a racing `prune()`);
+    * `dead_letters` — rows parked in `deadletter_path` (they are recoverable,
+      so they are not the same incident as a lost batch);
+    * `total_failures` — `request_failures + writer_failures`, for one alert.
+    """
+    writer = ctx.audit
+    request_failures = int(ctx.audit_failures)
+    if writer is None:
+        return {"installed": False, "request_failures": request_failures}
+    writer_failures = int(getattr(writer, "write_failures", 0) or 0)
+    deadletter = getattr(writer, "deadletter_path", None)
+    return {
+        "installed": True,
+        "degraded": bool(getattr(writer, "degraded", False)),
+        "request_failures": request_failures,
+        "writer_failures": writer_failures,
+        "write_retries": int(getattr(writer, "write_retries", 0) or 0),
+        "dead_letters": int(getattr(writer, "dead_letters", 0) or 0),
+        "total_failures": request_failures + writer_failures,
+        "deadletter_path": str(deadletter) if deadletter is not None else None,
+    }
 
 
 class RateLimiter:
@@ -1138,13 +1180,32 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         # a 60 s cache. The old body paged through every retained day table
         # (30 by default) with no `await` anywhere: 26.9 s of a frozen loop on
         # 200k rows, reachable by any read-only browser session.
-        tokens = await ctx.usage_tokens_today(day)
-        return JSONResponse({
+        from ..audit.reader import AuditReadError
+
+        tokens = 0
+        unavailable = False
+        try:
+            tokens = await ctx.usage_tokens_today(day)
+        except AuditReadError as exc:
+            # A read failure is not "no calls yet". The counter keeps its shape
+            # (`tokens_used` stays an integer for the UI) but the flag says the
+            # number is meaningless — previously a corrupt/locked audit.db was
+            # reported as 0 with nothing to distinguish it, so the budget looked
+            # untouched and could never fire (review P2-1).
+            unavailable = True
+            log.error(
+                "usage read failed (day=%s): %s", day, exc,
+                extra={"code": None, "msg": "audit_unavailable"},
+            )
+        body: dict[str, Any] = {
             "day": day, "tokens_used": tokens,
             "tokens_budget": ctx._config_overrides.get("evolve.daily_token_budget",
                                                        CONFIG_ITEMS["evolve.daily_token_budget"]["default"]),
             "reviews_today": 0, "proposals_today": 0,
-        })
+        }
+        if unavailable:
+            body["tokens_unavailable"] = True
+        return JSONResponse(body)
 
     # ------------------------------------------------------------------- layout
     async def get_layout(request: Request) -> Response:
@@ -1206,7 +1267,14 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
 
     async def health(request: Request) -> Response:
         if _loopback(request):
-            return JSONResponse({"ok": True, "version": ctx.version, "e2e_enabled": ctx.e2e_enabled})
+            return JSONResponse({
+                "ok": True, "version": ctx.version, "e2e_enabled": ctx.e2e_enabled,
+                # The audit chain's own counters. `write_audit` only sees the
+                # synchronous failures; in production (`sync=False`) the rows
+                # die on the flusher thread, where nothing but this endpoint and
+                # the log can see them (review P1-3).
+                "audit": _audit_health(ctx),
+            })
         # Remote: alive is all a probe needs; the version is a fingerprinting gift.
         return JSONResponse({"ok": True})
 

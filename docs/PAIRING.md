@@ -150,6 +150,19 @@ curl -s -i -X POST http://127.0.0.1:8443/ui/session \
 成功是 `200` + `Set-Cookie: __Host-ac_ui=…`（同时还有 `__Host-ac_csrf`）；
 响应体是 `{"device_id":"ui-…"}`；之后用这个 cookie 升级 `/ws`。
 
+换 core / 退出前自吊销这个会话（同一个 cookie，无 body）：
+
+```bash
+curl -s -i -X DELETE http://127.0.0.1:8443/ui/session \
+  -H 'Origin: http://127.0.0.1:8080' \
+  -H 'Cookie: __Host-ac_ui=<token>; __Host-ac_csrf=<csrf>'
+```
+
+`204` = 已吊销（响应同时下发两个 cookie 的 `Max-Age=0`，旧 cookie 立即失效，
+它认证的 `/ws` 连接被关闭）；重复调用 / 无 cookie / cookie 已失效 → `401 AUTH_FAILED`，
+且**只**影响出示的那一个会话。浏览器会话不绑定设备记录（`ui-…` 是每次登录现铸的标签），
+所以没有设备需要一并吊销。契约：`schema/ui-api.yaml`；审计：`ui.unpaired`（`ok`/`denied`）。
+
 > ⚠️ **Windows git-bash 的坑**：把含汉字的码直接放进 `curl -d '{"pair_code":"青松-AAAAAA"}'`
 > 时，MSYS 会把命令行参数按 ANSI 代码页转码，到 core 那边已经不是合法 UTF-8，JSON 解析失败，
 > 接口回一个**会误导人**的 `400 INVALID_ARGUMENT: pair_code is required`（看起来像你没传字段）。

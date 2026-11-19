@@ -426,6 +426,10 @@ def _serve(
         policy_mode="allow_all" if app.config.get("dev.allow_all") else "default",
         # RFC-0004: `/ui/blob*` lives on this listener, mounted by `vade.blob`.
         blob=getattr(app, "blob", None),
+        # Same audit chain the admin plane writes to: `DELETE /ui/session`
+        # records `ui.unpaired` (ok/denied). `install_components` has already
+        # run, so this is the live `AuditAdapter`, not None.
+        audit=getattr(app, "audit", None),
     )
 
     tls_opts = {"ssl_certfile": cert, "ssl_keyfile": key} if tls_cert else {}

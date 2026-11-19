@@ -27,29 +27,61 @@ the store replaces it with an explicit, off-thread policy:
 
 * `schedule_checkpoint()` is the hot-path *probe*: one `os.stat()` of the
   `-wal` sidecar. When the file is over `checkpoint_bytes` (16 MiB default) it
-  hands the work to `asyncio.to_thread(checkpoint_passive)` and returns. It
+  hands the work to `asyncio.to_thread(checkpoint_restart)` and returns. It
   never touches the database, so the append that crossed the threshold pays
   nothing.
-* `checkpoint_passive()` runs `PRAGMA wal_checkpoint(PASSIVE)` on a **private
-  connection**, opened and closed on the worker thread. That is what keeps
-  `_lock` out of the checkpoint path: the shared connection is only ever used
-  by the loop thread's short transactions, so a checkpoint can neither make
-  the loop wait behind a page copy nor hold up a commit. PASSIVE never waits
-  for readers or writers, so it cannot deadlock against an open transaction
-  and cannot fail a commit with `SQLITE_BUSY`.
+* `checkpoint_restart()` runs `PRAGMA wal_checkpoint(PASSIVE)` and then
+  `PRAGMA wal_checkpoint(RESTART)` on a **private connection**, opened and
+  closed on the worker thread. That is what keeps `_lock` out of the
+  checkpoint path: the shared connection is only ever used by the loop
+  thread's short transactions, so a checkpoint can neither make the loop wait
+  behind a page copy nor hold up a commit.
+
+  RESTART, not PASSIVE: a PASSIVE checkpoint backfills frames but never waits,
+  so under a continuous writer the WAL tail moves on before the copy finishes,
+  the log is never restarted, and the sidecar only ever grows (measured on the
+  audit workload — 2 KB deltas at 100/s — PASSIVE reached 41.4 MiB in 20 s and
+  still climbed, while every checkpoint "succeeded"). RESTART waits for the
+  readers to drain and then resets the log, which is what makes
+  `journal_size_limit` actually give the space back: on the same workload the
+  file now peaks at the threshold plus whatever the writer adds while the copy
+  runs (16-22 MiB measured, against 41.4 and climbing).
+
+  RESTART is also the mode that takes the WAL write lock, and a commit that
+  lands during it waits. On a slow disk that wait is not "a few ms": one
+  RESTART over a 16 MiB WAL froze the writer for 0.5-3 s, long enough for a
+  concurrent commit to hit even a 5 s busy timeout (`database is locked`
+  reproduced in the p95 test). That is why the copy is split — PASSIVE without
+  the write lock, then RESTART for the tail written during it — and why the
+  wait is explicitly bounded by `WAL_CHECKPOINT_BUSY_TIMEOUT_S`. What remains
+  is a bounded window measured in hundreds of ms, never the whole file.
 * `PRAGMA journal_size_limit=0` is set on the writer connection: after a
-  completed PASSIVE checkpoint the next writer restarts the log, and the limit
-  is what makes the file actually give its space back instead of staying at
-  the largest burst it ever saw. "Bounded" then means bounded on disk, not
-  just logically.
-* `close()` runs one `wal_checkpoint(TRUNCATE)` — shutdown is the one place a
-  blocking checkpoint is free, and it leaves no sidecar behind.
+  completed RESTART the next writer restarts the log, and the limit is what
+  makes the file actually give its space back instead of staying at the
+  largest burst it ever saw. "Bounded" then means bounded on disk, not just
+  logically.
+* `close()` checkpoints on a private connection too, with a hard cap: one
+  `wal_checkpoint(TRUNCATE)` for at most `WAL_CLOSE_TRUNCATE_TIMEOUT_S`; if it
+  has to be interrupted, one `wal_checkpoint(RESTART)` for
+  `WAL_CLOSE_RESTART_TIMEOUT_S` and the rest is left to the next open (SQLite
+  recovers the WAL either way). It is still blocking, but `aclose()` — what
+  `SessionLog.close()` awaits — runs it on a worker thread, so shutdown never
+  parks the event loop behind a multi-MiB page copy.
 
 Known limit, inherited from SQLite: a long-lived read snapshot pins the WAL, so
 a checkpoint cannot backfill while it is open (`busy=1`); the file then keeps
 growing until that reader ends. The hot-path probe is rate-limited
 (`checkpoint_min_interval_s`) so a stuck checkpoint is retried, not attempted
 per append.
+
+Write path: one transaction per batch
+-------------------------------------
+`append()` persists messages/events/turns in one `BEGIN IMMEDIATE`.
+`append_sequenced()` is the same batch *with* the seq allocation inside that
+transaction: `next_seq()` commits on its own, so a streaming emit used to pay
+two commits (and two `sessions` page writes) per event. The manager uses
+`append_sequenced()` when the store has it and falls back to `next_seq()` +
+`append()` for any other backend.
 """
 
 from __future__ import annotations
@@ -61,6 +93,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -87,12 +120,38 @@ WAL_CHECKPOINT_BYTES = 16 * 1024 * 1024
 #: once per append; explicit `checkpoint_if_needed()` calls ignore this.
 WAL_CHECKPOINT_MIN_INTERVAL_S = 1.0
 
-#: How long `close()` waits for an in-flight background checkpoint before it
-#: gives up on truncating. A checkpoint copies the WAL into the database file
-#: and syncs it — on a slow disk that is seconds, and shutdown must not hang on
-#: an *optimisation*: the WAL is durable either way, and the next process to
-#: open the file recovers it.
-WAL_CLOSE_TRUNCATE_TIMEOUT_S = 2.0
+#: `busy_timeout` for the checkpoint's private connection. Explicit, because
+#: `sqlite3.connect` silently defaults to 5 s: RESTART *does* wait (it has to
+#: hold the WAL write lock for the reset, and waits for readers to drain), so
+#: with the default a pinned log parks a worker thread inside `_ckpt_lock` for
+#: seconds and every `close()` after it finds the lock taken. `0` is the other
+#: extreme — every overlap with a reader would come back `busy=1` and the log
+#: would never reset, which is the bug RESTART exists to fix. One second is the
+#: compromise: long enough for a short reader, short enough that a wedged one
+#: only costs one delayed probe.
+WAL_CHECKPOINT_BUSY_TIMEOUT_S = 1.0
+
+#: How long `close()` waits for an in-flight background checkpoint to release
+#: `_ckpt_lock` before it gives up on checkpointing. A checkpoint copies the WAL
+#: into the database file and syncs it — on a slow disk that is seconds, and
+#: shutdown must not hang on an *optimisation*: the WAL is durable either way,
+#: and the next process to open the file recovers it.
+WAL_CLOSE_LOCK_TIMEOUT_S = 2.0
+
+#: Hard cap on the closing `wal_checkpoint(TRUNCATE)`. Shutdown may not be
+#: proportional to the WAL: past this the pragma is interrupted and RESTART is
+#: tried instead (it resets the log without needing every frame backfilled).
+#: `aclose()` runs `close()` on a worker thread, so even this wait is off-loop.
+WAL_CLOSE_TRUNCATE_TIMEOUT_S = 5.0
+
+#: Cap on the RESTART fallback inside `close()`. RESTART is bounded by the
+#: private connection's `busy_timeout`, but the thread join must be too.
+WAL_CLOSE_RESTART_TIMEOUT_S = 1.0
+
+#: Grace after `Connection.interrupt()` before `close()` gives up on the
+#: checkpoint thread. Interrupting is checked per copied page, so this only has
+#: to cover a syscall in flight — not another copy.
+WAL_CLOSE_ABORT_GRACE_S = 0.25
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions(
@@ -418,12 +477,20 @@ class SQLiteStore(SessionStore):
             self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
     def close(self) -> None:
-        """Truncate the WAL, then close the connection.
+        """Checkpoint the WAL, then close the writing connection.
 
-        `TRUNCATE` (not the `PASSIVE` the background path uses) is right exactly
-        once, at shutdown: it backfills every frame *and* resets the `-wal` file
-        to zero bytes, so a clean exit leaves no 16 MiB sidecar behind. Shutdown
-        is also the one place a blocking checkpoint costs nothing.
+        Blocking, and deliberately so: it is `aclose()` — what
+        `SessionLog.close()` awaits — that owns the "never on the loop" rule.
+        A direct sync caller (a test, a CLI) gets a predictable function.
+
+        The checkpoint runs on a *private* connection, like the background one,
+        so the shared handle is only closed after the page copy is done. It is
+        TRUNCATE first, capped by `WAL_CLOSE_TRUNCATE_TIMEOUT_S` (shutdown must
+        not be proportional to the WAL: `aclose` makes even that wait off-loop).
+        A TRUNCATE that had to be interrupted falls back to RESTART for
+        `WAL_CLOSE_RESTART_TIMEOUT_S`; if that also fails, the WAL is left
+        where it is — it is durable, and the next process to open the file
+        recovers it.
 
         A failing checkpoint must not turn a clean shutdown into a crash, and
         must not mask the error the caller is already unwinding — so it is
@@ -432,32 +499,147 @@ class SQLiteStore(SessionStore):
 
         Idempotent (`SessionLog.close` racing a transport teardown): the second
         call is a no-op, not a `ProgrammingError` on a closed connection.
-
-        If a background checkpoint is already running, the wait is bounded by
-        `WAL_CLOSE_TRUNCATE_TIMEOUT_S` and the truncate is skipped when it
-        expires: shutdown must not hang behind an optimisation. The WAL is
-        durable regardless — the next process to open the file recovers it.
         """
         with self._lock:
             if self._closed:
                 return
-            # Held across the flag flip *and* the truncate: a worker that already
-            # entered `checkpoint_passive` finishes first, and one that has not
-            # yet will see `_closed` and do nothing.
-            acquired = self._ckpt_lock.acquire(timeout=WAL_CLOSE_TRUNCATE_TIMEOUT_S)
-            try:
-                self._closed = True
-                if acquired and not self._memory:
-                    try:
-                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    except sqlite3.Error as exc:
-                        log.warning("wal checkpoint(TRUNCATE) on close failed: %s", exc)
-                elif not acquired:
-                    log.warning("wal checkpoint(TRUNCATE) skipped: a checkpoint is still running")
-            finally:
-                if acquired:
-                    self._ckpt_lock.release()
+            # Held across the flag flip *and* the checkpoint: a writer thread
+            # still inside `append` finishes first, and one that has not yet
+            # started sees `_closed` (through `_lock`) and waits for the close.
+            # A background checkpoint that already entered `checkpoint_restart`
+            # is waited out for at most `WAL_CLOSE_LOCK_TIMEOUT_S`.
+            self._closed = True
+            if not self._memory:
+                acquired = self._ckpt_lock.acquire(timeout=WAL_CLOSE_LOCK_TIMEOUT_S)
+                try:
+                    if acquired:
+                        try:
+                            self._final_checkpoint()
+                        except Exception as exc:  # pragma: no cover - shutdown must not raise
+                            # Out of threads, a broken VFS: a checkpoint is
+                            # maintenance, never a reason to fail a close.
+                            log.warning("wal checkpoint on close failed: %s", exc)
+                    else:
+                        log.warning(
+                            "wal checkpoint on close skipped: a background checkpoint is still running"
+                        )
+                finally:
+                    if acquired:
+                        self._ckpt_lock.release()
             self._conn.close()
+
+    async def aclose(self) -> None:
+        """Shutdown entry point: stop the background task, close off the loop.
+
+        `close()` copies the WAL into the database file and truncates the
+        sidecar — `TRUNCATE` is a page copy plus a sync, so it is proportional
+        to the WAL and costs seconds on a slow disk. Running that on the event
+        loop parks every other coroutine, including the rest of shutdown.
+
+        So: cancel the in-flight background checkpoint (it is about to be
+        superseded, and `close()` would otherwise wait on its lock for nothing),
+        await it briefly, then `to_thread(close)`. Cancelling the *coroutine*
+        does not stop the thread it started — that is why `close()` still waits
+        on `_ckpt_lock` with a bound, and why `_closed` is checked again there.
+
+        A task belonging to another loop (a `SessionLog` closed from a second
+        `asyncio.run`) cannot be awaited at all; it is not awaited, and the
+        bounded lock wait in `close()` covers the overlap.
+        """
+        task = self._ckpt_task
+        if task is not None and not task.done():
+            try:
+                here = asyncio.get_running_loop()
+            except RuntimeError:  # pragma: no cover - aclose is async by contract
+                here = None
+            if here is not None and task.get_loop() is here:
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), WAL_CLOSE_LOCK_TIMEOUT_S)
+                except asyncio.CancelledError:
+                    if not task.cancelled():
+                        raise  # *we* were cancelled, not the checkpoint
+                except asyncio.TimeoutError:  # pragma: no cover - thread outlives the task
+                    log.warning("background wal checkpoint did not stop before close")
+                except Exception as exc:  # pragma: no cover - maintenance never raises
+                    log.warning("background wal checkpoint failed before close: %s", exc)
+        await asyncio.to_thread(self.close)
+
+    def _final_checkpoint(self) -> None:
+        """The closing checkpoint: TRUNCATE with a cap, RESTART as fallback.
+
+        Worst case is `WAL_CLOSE_TRUNCATE_TIMEOUT_S` + the abort grace +
+        `WAL_CLOSE_RESTART_TIMEOUT_S` + the abort grace (~6.5 s), not
+        "however long the WAL is": shutdown is not allowed to scale with the
+        sidecar. Whatever does not finish is left where it is — durable, and
+        recovered by the next process that opens the file.
+        """
+        if self._bounded_checkpoint("TRUNCATE", WAL_CLOSE_TRUNCATE_TIMEOUT_S):
+            return
+        log.warning(
+            "wal checkpoint(TRUNCATE) on close did not complete in %.1fs; trying RESTART",
+            WAL_CLOSE_TRUNCATE_TIMEOUT_S,
+        )
+        self._bounded_checkpoint("RESTART", WAL_CLOSE_RESTART_TIMEOUT_S)
+
+    def _bounded_checkpoint(self, mode: str, timeout_s: float) -> bool:
+        """One checkpoint on a private connection, never longer than `timeout_s`.
+
+        `PRAGMA wal_checkpoint` is a single blocking C call: a Python timeout
+        cannot interrupt it, but `sqlite3.Connection.interrupt()` can, from
+        another thread. So the pragma runs on a throwaway thread that owns its
+        connection, and this thread joins it for `timeout_s` before pulling the
+        plug. The connection is closed by the thread that opened it — closing a
+        handle while `sqlite3_step` is still inside it is exactly the kind of
+        cross-thread close this store avoids elsewhere.
+        """
+        state: dict[str, Any] = {"conn": None, "error": None}
+
+        def run() -> None:
+            conn: sqlite3.Connection | None = None
+            try:
+                conn = sqlite3.connect(
+                    str(self.path), isolation_level=None,
+                    timeout=WAL_CHECKPOINT_BUSY_TIMEOUT_S,
+                )
+                state["conn"] = conn
+                conn.execute(f"PRAGMA busy_timeout={int(WAL_CHECKPOINT_BUSY_TIMEOUT_S * 1000)}")
+                conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                state["error"] = exc
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:  # pragma: no cover - teardown noise
+                        pass
+
+        worker = threading.Thread(
+            target=run, name=f"vade-wal-close-{mode.lower()}", daemon=True,
+        )
+        worker.start()
+        worker.join(timeout_s)
+        aborted = False
+        if worker.is_alive():
+            aborted = True
+            conn = state.get("conn")
+            if conn is not None:
+                try:
+                    conn.interrupt()
+                except sqlite3.Error:  # pragma: no cover - already gone
+                    pass
+            worker.join(WAL_CLOSE_ABORT_GRACE_S)
+        error = state.get("error")
+        if aborted:
+            # Our interrupt won: the checkpoint did not finish, whatever the
+            # worker reported afterwards (usually `interrupted`). Not a
+            # failure to log twice — the caller's fallback is the answer.
+            if error is not None and "interrupt" not in str(error).lower():
+                log.warning("wal checkpoint(%s) on close failed: %s", mode, error)
+            return False
+        if error is not None:
+            log.warning("wal checkpoint(%s) on close failed: %s", mode, error)
+        return not worker.is_alive() and error is None
 
     # --------------------------------------------------------- wal checkpoint
     def wal_bytes(self) -> int:
@@ -473,8 +655,8 @@ class SQLiteStore(SessionStore):
         except OSError:
             return 0
 
-    def checkpoint_passive(self) -> tuple[int, int, int] | None:
-        """`PRAGMA wal_checkpoint(PASSIVE)` on a private connection.
+    def checkpoint_restart(self) -> tuple[int, int, int] | None:
+        """`PRAGMA wal_checkpoint(RESTART)` on a private connection.
 
         Blocking, on purpose: the caller is a worker thread
         (`asyncio.to_thread`) or a background thread, never the event loop.
@@ -482,11 +664,26 @@ class SQLiteStore(SessionStore):
         is only ever driven by the loop thread's short transactions, so a
         checkpoint cannot make `_lock` contended and cannot stretch a commit.
 
-        PASSIVE is the only mode that is safe off-thread: it never waits for
-        readers or writers, so it cannot deadlock against an open transaction
-        on the main connection and cannot fail a commit with `SQLITE_BUSY`. Its
-        cost is that it may backfill nothing while a reader pins an old
-        snapshot (`busy=1`); the next probe retries.
+        RESTART is the mode that actually bounds the file under a continuous
+        writer: it copies the frames, waits for the readers to drain, and
+        resets the log so the *next* writer starts it over (with
+        `journal_size_limit=0` that is also when the sidecar gives its space
+        back). PASSIVE does the copy but never the reset, so with a writer that
+        keeps appending the log tail is always moving and the file only grows —
+        that was the bug this replaced.
+
+        The copy is split in two on purpose: PASSIVE first (no write lock, the
+        writer keeps committing), then RESTART for the frames written during
+        that pass plus the reset. RESTART is the mode that holds the WAL write
+        lock, and holding it for a whole 16 MiB file is long enough for a
+        concurrent COMMIT to fail with `SQLITE_BUSY`; holding it for the few
+        hundred KiB that accumulated during the PASSIVE pass is not.
+
+        The wait is bounded by `WAL_CHECKPOINT_BUSY_TIMEOUT_S`, passed
+        explicitly to `connect()`: the default 5 s would park this worker
+        thread inside `_ckpt_lock` and make `close()` skip its checkpoint. If a
+        reader pins the snapshot the pragma returns `busy=1` and the next probe
+        retries.
 
         Returns the `PRAGMA` triple `(busy, log_frames, checkpointed_frames)`,
         or `None` for an in-memory/closed store or a SQLite error.
@@ -500,14 +697,29 @@ class SQLiteStore(SessionStore):
             # `checkpoint_bytes`), and a per-run connection has no lifecycle to
             # leak — nothing survives a crash, an exception, or `close()`.
             try:
-                conn = sqlite3.connect(str(self.path), isolation_level=None)
+                conn = sqlite3.connect(
+                    str(self.path), isolation_level=None,
+                    timeout=WAL_CHECKPOINT_BUSY_TIMEOUT_S,
+                )
             except sqlite3.Error as exc:
                 log.warning("wal checkpoint connection failed: %s", exc)
                 return None
             try:
-                row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                # Explicit, not inherited from `connect`: RESTART waits for
+                # readers on purpose, and that wait must be short and visible.
+                conn.execute(f"PRAGMA busy_timeout={int(WAL_CHECKPOINT_BUSY_TIMEOUT_S * 1000)}")
+                # Two passes, and the order is the whole point. PASSIVE copies
+                # frames without taking the WAL write lock, so the writer keeps
+                # committing through it. RESTART then has only the frames
+                # written *during* that copy left to move before it can reset
+                # the log — and RESTART is the one that holds the write lock.
+                # A single RESTART would hold it for the whole file (16 MiB,
+                # seconds on a slow disk), long enough for a concurrent COMMIT
+                # to give up with SQLITE_BUSY; measured, no less.
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                row = conn.execute("PRAGMA wal_checkpoint(RESTART)").fetchone()
             except sqlite3.Error as exc:
-                log.warning("wal checkpoint(PASSIVE) failed: %s", exc)
+                log.warning("wal checkpoint(RESTART) failed: %s", exc)
                 return None
             finally:
                 conn.close()
@@ -527,7 +739,7 @@ class SQLiteStore(SessionStore):
             return False
         if self.wal_bytes() <= self._checkpoint_bytes:
             return False
-        return self.checkpoint_passive() is not None
+        return self.checkpoint_restart() is not None
 
     def schedule_checkpoint(self) -> bool:
         """Hot-path probe: one `stat()`; the page copy happens in a thread.
@@ -550,13 +762,22 @@ class SQLiteStore(SessionStore):
             return False
         self._ckpt_inflight = True
         self._ckpt_after = now + self._checkpoint_min_interval_s
-        self._ckpt_task = loop.create_task(self._background_checkpoint())
+        try:
+            self._ckpt_task = loop.create_task(self._background_checkpoint())
+        except RuntimeError as exc:
+            # The loop is closing / already closed: the last append of a
+            # shutdown window is exactly where this lands. Latching
+            # `_ckpt_inflight` on would disable checkpointing for the rest of
+            # the store's life (and say nothing), so reset it and say why.
+            self._ckpt_inflight = False
+            log.warning("wal checkpoint not scheduled: %s", exc)
+            return False
         return True
 
     async def _background_checkpoint(self) -> None:
-        """`checkpoint_passive` on the default executor, never on the loop."""
+        """`checkpoint_restart` on the default executor, never on the loop."""
         try:
-            await asyncio.to_thread(self.checkpoint_passive)
+            await asyncio.to_thread(self.checkpoint_restart)
         except Exception as exc:  # pragma: no cover - maintenance never kills a turn
             # Includes the shutdown race (`to_thread` after the executor closed)
             # and anything sqlite raises outside the guarded PRAGMA: a
@@ -682,43 +903,125 @@ class SQLiteStore(SessionStore):
         events together, or a crash in between leaves a state no client can
         explain. `message_updates` is `[(message_id, superseded_by)]` — the only
         mutation a message row ever accepts (its content stays immutable).
+
+        The events arrive with their seqs already allocated (`next_seq`), which
+        is one commit of its own; `append_sequenced` is the same batch with the
+        allocation *inside* this transaction, and is what the write path uses.
         """
         if not msgs and not events and not turns and not message_updates:
             return
         with self._transaction() as conn:
-            # RFC-0010 §4.2: real ACTIVITY (a message or turn row landed) is
-            # what advances `updated_at` — the FR-8.26 list-order key. Attach /
-            # queue bookkeeping events carry neither and must not float a
-            # session to the top of "today" on every reconnect.
-            if msgs or turns:
-                conn.execute(
-                    "UPDATE sessions SET updated_at=? WHERE id=?", (now_ms(), sess_id)
-                )
-            for turn in turns:
-                self._upsert_turn(conn, sess_id, turn)
-            if msgs:
-                conn.executemany(
-                    "INSERT INTO messages(id, session_id, turn_id, role, content, seq, name,"
-                    " tool_call_id, created_at, partial, superseded_by, parts)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                    [
-                        (m.id, m.session_id, m.turn_id, m.role, m.content, m.seq,
-                         m.name, m.tool_call_id, m.created_at, int(bool(m.partial)),
-                         m.superseded_by, _parts_json(m))
-                        for m in msgs
-                    ],
-                )
-            for message_id, superseded_by in message_updates:
-                conn.execute(
-                    "UPDATE messages SET superseded_by=? WHERE session_id=? AND id=?",
-                    (superseded_by, sess_id, message_id),
-                )
+            self._write_batch(conn, sess_id, msgs, events, turns, message_updates)
+
+    def append_sequenced(
+        self,
+        sess_id: str,
+        msgs: Sequence[Message],
+        events: Sequence[Event],
+        *,
+        turns: Sequence[Turn] = (),
+        message_updates: Sequence[tuple[str, str | None]] = (),
+    ) -> list[Event]:
+        """`append`, with the `seq` allocation in the same transaction.
+
+        `next_seq` commits `UPDATE sessions SET seq_counter=...` on its own, so
+        a streaming emit paid two commits and wrote the `sessions` page twice
+        per event — roughly half of the WAL traffic of a delta stream. Here the
+        counter is bumped once, by `len(events)`, inside the batch's
+        `BEGIN IMMEDIATE`; the events are stamped from that range and every
+        message is anchored to the first seq, which is the shape `emit`
+        broadcasts.
+
+        `events` are drafts: their `seq` values are ignored. Returns the
+        persisted events — callers must broadcast *these*, not the drafts.
+        Raises `NOT_FOUND` (nothing written) when the session row is gone,
+        exactly like `next_seq`.
+        """
+        if not msgs and not events and not turns and not message_updates:
+            return []
+        with self._transaction() as conn:
+            stamped = list(events)
+            anchor = 0
             if events:
-                conn.executemany(
-                    "INSERT INTO events(session_id, seq, type, payload, ts, coalesce) VALUES(?,?,?,?,?,?)",
-                    [(e.session_id, e.seq, e.type, json.dumps(dict(e.payload), ensure_ascii=False),
-                      e.ts, 1 if e.coalesce else 0) for e in events],
-                )
+                if _SUPPORTS_RETURNING:
+                    row = conn.execute(
+                        "UPDATE sessions SET seq_counter = seq_counter + ? WHERE id=?"
+                        " RETURNING seq_counter",
+                        (len(events), sess_id),
+                    ).fetchone()
+                else:  # pragma: no cover - exercised only on ancient SQLite
+                    row = conn.execute(
+                        "SELECT seq_counter FROM sessions WHERE id=?", (sess_id,)
+                    ).fetchone()
+                    if row is not None:
+                        bumped = int(row[0]) + len(events)
+                        conn.execute(
+                            "UPDATE sessions SET seq_counter=? WHERE id=?", (bumped, sess_id)
+                        )
+                        row = (bumped,)
+                if row is None:
+                    raise VadeError("NOT_FOUND", f"session {sess_id!r} does not exist")
+                anchor = int(row[0]) - len(events) + 1
+                stamped = [
+                    replace(event, seq=anchor + offset)
+                    for offset, event in enumerate(events)
+                ]
+            self._write_batch(
+                conn, sess_id, msgs, stamped, turns, message_updates,
+                message_seq=anchor if events else None,
+            )
+        return stamped
+
+    def _write_batch(
+        self,
+        conn: sqlite3.Connection,
+        sess_id: str,
+        msgs: Sequence[Message],
+        events: Sequence[Event],
+        turns: Sequence[Turn],
+        message_updates: Sequence[tuple[str, str | None]],
+        *,
+        message_seq: int | None = None,
+    ) -> None:
+        """The body of one batch, inside a transaction the caller opened.
+
+        `message_seq` overrides every message's `seq` (the anchor of
+        `append_sequenced`); `None` keeps what the caller stamped.
+        """
+        # RFC-0010 §4.2: real ACTIVITY (a message or turn row landed) is
+        # what advances `updated_at` — the FR-8.26 list-order key. Attach /
+        # queue bookkeeping events carry neither and must not float a
+        # session to the top of "today" on every reconnect.
+        if msgs or turns:
+            conn.execute(
+                "UPDATE sessions SET updated_at=? WHERE id=?", (now_ms(), sess_id)
+            )
+        for turn in turns:
+            self._upsert_turn(conn, sess_id, turn)
+        if msgs:
+            conn.executemany(
+                "INSERT INTO messages(id, session_id, turn_id, role, content, seq, name,"
+                " tool_call_id, created_at, partial, superseded_by, parts)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (m.id, m.session_id, m.turn_id, m.role, m.content,
+                     m.seq if message_seq is None else message_seq,
+                     m.name, m.tool_call_id, m.created_at, int(bool(m.partial)),
+                     m.superseded_by, _parts_json(m))
+                    for m in msgs
+                ],
+            )
+        for message_id, superseded_by in message_updates:
+            conn.execute(
+                "UPDATE messages SET superseded_by=? WHERE session_id=? AND id=?",
+                (superseded_by, sess_id, message_id),
+            )
+        if events:
+            conn.executemany(
+                "INSERT INTO events(session_id, seq, type, payload, ts, coalesce) VALUES(?,?,?,?,?,?)",
+                [(e.session_id, e.seq, e.type, json.dumps(dict(e.payload), ensure_ascii=False),
+                  e.ts, 1 if e.coalesce else 0) for e in events],
+            )
 
     def _upsert_turn(self, conn: sqlite3.Connection, sess_id: str, turn: Turn) -> None:
         conn.execute(

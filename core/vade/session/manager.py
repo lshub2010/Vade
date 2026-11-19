@@ -680,19 +680,35 @@ class SessionLog:
             return []
 
         async with self._emit_lock(session_id):
-            stamped: list[Event] = []
-            for event_type, body in kept:
-                stamped.append(Event(
-                    session_id=session_id, seq=self._seq.next(session_id),
-                    type=event_type, payload=body, ts=int(self._clock()),
-                    coalesce=bool(coalesce),
+            sequenced = getattr(self.store, "append_sequenced", None)
+            if sequenced is not None:
+                # One transaction per batch: the store allocates the seqs of
+                # this batch inside the same BEGIN IMMEDIATE as the rows (see
+                # `SQLiteStore.append_sequenced`). The drafts carry no seq; the
+                # events it returns are the persisted ones, and those are what
+                # gets broadcast.
+                drafts = [
+                    Event(session_id=session_id, seq=0, type=event_type, payload=body,
+                          ts=int(self._clock()), coalesce=bool(coalesce))
+                    for event_type, body in kept
+                ]
+                stamped = list(sequenced(
+                    session_id, list(messages), drafts, turns=tuple(turns),
+                    message_updates=tuple(message_updates),
                 ))
-            anchor = stamped[0].seq if stamped else 0
-            stamped_messages = [replace(m, seq=anchor) for m in messages]
-            self.store.append(
-                session_id, stamped_messages, stamped, turns=tuple(turns),
-                message_updates=tuple(message_updates),
-            )
+            else:
+                stamped = [
+                    Event(session_id=session_id, seq=self._seq.next(session_id),
+                          type=event_type, payload=body, ts=int(self._clock()),
+                          coalesce=bool(coalesce))
+                    for event_type, body in kept
+                ]
+                anchor = stamped[0].seq if stamped else 0
+                stamped_messages = [replace(m, seq=anchor) for m in messages]
+                self.store.append(
+                    session_id, stamped_messages, stamped, turns=tuple(turns),
+                    message_updates=tuple(message_updates),
+                )
             # WAL maintenance is *scheduled* here, never run here: the hook is
             # one stat() and returns (the page copy happens on a worker thread
             # via `asyncio.to_thread` inside `SQLiteStore`). Called after the
@@ -1695,9 +1711,21 @@ class SessionLog:
             await self._end_session(session_id)
         for session_id in list(self._sinks):
             await self.detach(session_id)
-        close = getattr(self.store, "close", None)
-        if callable(close):
-            close()
+        # The store goes last, it is what everything above wrote through. Its
+        # `aclose()` runs the closing WAL checkpoint on a worker thread: a
+        # `TRUNCATE` is a page copy proportional to the WAL, and this coroutine
+        # is still the shutdown path (the transport, the audit writer and the
+        # process exit all wait on it). A store without `aclose` is closed on a
+        # thread too — same reason.
+        aclose = getattr(self.store, "aclose", None)
+        if callable(aclose):
+            result = aclose()
+            if inspect.isawaitable(result):
+                await result
+        else:
+            close = getattr(self.store, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
 
     async def _end_session(self, session_id: str) -> None:
         """Fire the end beat + close the dialogs of one session, exactly once.

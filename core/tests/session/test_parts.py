@@ -990,6 +990,7 @@ def test_failed_emit_unpins_the_blob(tmp_path):
             raise RuntimeError("disk full")
 
         log.store.append = boom  # type: ignore[method-assign]
+        log.store.append_sequenced = boom  # type: ignore[method-assign]
         with pytest.raises(RuntimeError):
             await log.submit(SESSION, [_image(image)], "c-1", device_id="dev-1")
         assert service.store.get_blob(image.file_id).pinned is False

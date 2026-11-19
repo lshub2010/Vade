@@ -1,6 +1,6 @@
 """WAL checkpoint policy: hot path stays off the checkpoint, WAL stays bounded.
 
-Pins the four properties the policy is supposed to have, against real SQLite:
+Pins the properties the policy is supposed to have, against real SQLite:
 
 1. `append()` never checkpoints — a burst that crosses SQLite's own 4 MiB /
    1000-frame auto-checkpoint watermark leaves the WAL over it and no
@@ -10,6 +10,12 @@ Pins the four properties the policy is supposed to have, against real SQLite:
 3. The WAL that outgrew the threshold falls back once the checkpoint has run.
 4. `close()` truncates the sidecar and a reopen sees every row; concurrent
    readers, writers and a checkpoint never produce "database is locked".
+5. A *sustained* stream (2 KB deltas at 100/s, 20 s) keeps the WAL under the
+   cap — the property PASSIVE silently lost, because a writer that never stops
+   meant the log was never reset.
+6. `aclose()` cancels an in-flight background checkpoint without blocking the
+   loop and without leaving a pending task behind.
+7. A `create_task` that fails (loop closing) does not latch the checkpoint off.
 """
 
 from __future__ import annotations
@@ -176,8 +182,9 @@ def test_wal_falls_back_after_the_threshold_triggers_a_checkpoint(tmp_path):
 
     assert store.checkpoint_if_needed() is True
     assert store._ckpt_runs == 1
-    # PASSIVE backfills every frame; the file itself is given back by the next
-    # writer's log restart (`journal_size_limit=0`), so poke it once.
+    # PASSIVE + RESTART backfill every frame and reset the log; the file itself
+    # is given back by the next writer's log restart (`journal_size_limit=0`),
+    # so poke it once.
     _append(store, "s1", 20)
     after = _wal_bytes(path)
 
@@ -256,7 +263,7 @@ def test_concurrent_reads_writes_and_checkpoints_never_lock(tmp_path):
     def checkpointer() -> None:
         try:
             while not stop.is_set():
-                result = store.checkpoint_passive()
+                result = store.checkpoint_restart()
                 assert result is None or result[0] in (0, 1)  # 1 = a reader won
                 time.sleep(0.01)
         except BaseException as exc:  # noqa: BLE001
@@ -277,4 +284,162 @@ def test_concurrent_reads_writes_and_checkpoints_never_lock(tmp_path):
     assert loaded is not None
     assert len(loaded.messages) == writers * per_writer
     assert len(store.read_since("s1", 0)) == writers * per_writer
+    store.close()
+
+
+# -------------------------------------- 5. sustained stream (the audit shape)
+def test_sustained_streaming_keeps_the_wal_under_the_cap(tmp_path):
+    """2 KB deltas at 100/s for 20 s: the WAL must come back, not climb.
+
+    This is the audit workload. PASSIVE reached 41.4 MiB here and was still
+    climbing, with every checkpoint reporting success: a continuous writer
+    meant the log was never reset, so the sidecar was append-only. RESTART
+    copies *and* resets, so the peak is the threshold plus the overshoot of one
+    checkpoint — 24 MiB is that headroom (16 MiB threshold), not a number
+    fitted to this disk.
+    """
+    path = tmp_path / "sessions.db"
+    store = SQLiteStore(path)
+    log = SessionLog(store, replay=ReplayBuffer(maxlen=40))
+    session = log.create_session()
+    body = "x" * 2000
+
+    async def scenario() -> tuple[int, list[float], int, int]:
+        latencies: list[float] = []
+        peak = 0
+        started = time.perf_counter()
+        i = 0
+        while time.perf_counter() - started < 20.0:
+            at = time.perf_counter()
+            await log.emit(session.id, "turn.delta",
+                           {"turn_id": "t1", "text": body, "part_index": 0, "kind": "text"})
+            latencies.append((time.perf_counter() - at) * 1000.0)
+            i += 1
+            peak = max(peak, _wal_bytes(path))
+            # Pace to 100/s on absolute time: a slow emit must not drag the
+            # rate down, or the test would quietly stop pressing the WAL.
+            await asyncio.sleep(max(0.0, started + i / 100 - time.perf_counter()))
+        peak = max(peak, _wal_bytes(path))
+        await _settle_async(store)
+        return i, latencies, peak, store._ckpt_runs
+
+    events, latencies, peak, checkpoints = asyncio.run(scenario())
+    assert checkpoints >= 1, "no checkpoint ran during 20 s: the test proves nothing"
+    assert events >= 1800, f"the stream ran too slowly to mean anything: {events} deltas"
+    assert peak < 24 * 1024 * 1024, f"WAL peaked at {peak / 1048576:.1f} MiB"
+    p95 = _pct(latencies, 0.95)
+    assert p95 < 10.0, f"p95 {p95:.2f} ms over {events} deltas"
+
+    asyncio.run(log.close())
+    assert _wal_bytes(path) == 0  # and shutdown leaves no sidecar behind
+
+
+# ------------------------------- 6. aclose: the checkpoint must not outlive it
+def test_aclose_cancels_a_running_checkpoint_without_blocking_the_loop(tmp_path):
+    """Shutdown while a checkpoint copies pages: cancel it, close off-loop.
+
+    `close()` runs a `wal_checkpoint(TRUNCATE)`, which is a page copy plus a
+    sync — seconds on a slow disk. Two things must hold: the loop keeps running
+    while it happens, and the background task is finished (not "destroyed but
+    pending") before `close()` returns.
+    """
+    path = tmp_path / "sessions.db"
+    store = SQLiteStore(path, checkpoint_bytes=64 * 1024)
+    store.create_session(Session(id="s1", created_at=1))
+    for i in range(20):
+        _append(store, "s1", i)
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_checkpoint() -> None:
+        # Hold the lock the real checkpoint holds while it copies pages: that
+        # is what makes `close()` have to wait, and what it must bound.
+        with store._ckpt_lock:
+            entered.set()
+            release.wait(30.0)  # a page copy that would outlive the test
+
+    store.checkpoint_restart = slow_checkpoint  # type: ignore[method-assign]
+
+    async def scenario() -> tuple[float, int, bool, bool]:
+        loop = asyncio.get_running_loop()
+        store._ckpt_inflight = True
+        task = loop.create_task(store._background_checkpoint())
+        store._ckpt_task = task
+        assert await asyncio.to_thread(entered.wait, 5.0), "checkpoint thread never started"
+
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        tick_task = loop.create_task(ticker())
+        started = time.perf_counter()
+        try:
+            await store.aclose()
+        finally:
+            elapsed = time.perf_counter() - started
+            tick_task.cancel()
+            release.set()  # let the abandoned worker thread finish
+        return elapsed, ticks, task.cancelled(), store._closed
+
+    elapsed, ticks, cancelled, closed = asyncio.run(scenario())
+
+    assert closed is True
+    assert cancelled is True, "the background checkpoint task was left pending"
+    # `close()` waits at most WAL_CLOSE_LOCK_TIMEOUT_S for the lock the slow
+    # copy holds; anything near 30 s means it waited for the copy itself.
+    assert elapsed < 5.0, f"aclose took {elapsed:.1f}s"
+    assert ticks >= 20, f"the loop only ticked {ticks} times in {elapsed:.1f}s: it was blocked"
+
+    reopened = SQLiteStore(path)
+    loaded = reopened.load("s1")
+    assert loaded is not None and len(loaded.messages) == 20  # the cancel lost nothing
+    reopened.close()
+
+
+# ---------------------------- 7. a loop that cannot take the task is not fatal
+def test_schedule_checkpoint_survives_a_create_task_failure(tmp_path):
+    """`create_task` on a closing loop must not latch checkpointing off.
+
+    The last append of a shutdown window is where this lands: if the flag
+    stayed True, the store would never checkpoint again and never log why.
+    """
+    path = tmp_path / "sessions.db"
+    store = SQLiteStore(path, checkpoint_bytes=64 * 1024, checkpoint_min_interval_s=0.0)
+    store.create_session(Session(id="s1", created_at=1))
+    for i in range(20):
+        _append(store, "s1", i)
+    assert _wal_bytes(path) > 64 * 1024
+
+    async def scenario() -> tuple[bool, bool, bool]:
+        loop = asyncio.get_running_loop()
+        real = loop.create_task
+        calls = {"n": 0}
+
+        def flaky(coro, **kwargs):  # noqa: ANN001, ANN003 - a loop stub
+            if calls["n"] == 0:
+                calls["n"] += 1
+                coro.close()  # not scheduled: never awaited
+                raise RuntimeError("Event loop is closed")
+            return real(coro, **kwargs)
+
+        loop.create_task = flaky  # type: ignore[method-assign]
+        try:
+            first = store.schedule_checkpoint()
+            latched = store._ckpt_inflight
+            second = store.schedule_checkpoint()
+        finally:
+            loop.create_task = real  # type: ignore[method-assign]
+        await _settle_async(store)
+        return first, latched, second
+
+    first, latched, second = asyncio.run(scenario())
+    assert first is False, "a failed create_task must report that nothing was scheduled"
+    assert latched is False, "_ckpt_inflight stayed True: checkpointing is latched off"
+    assert second is True, "the store never recovered"
+    assert store._ckpt_runs == 1
     store.close()

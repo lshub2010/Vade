@@ -52,16 +52,26 @@ class FailingTerminalWrite:
         self.attempts = 0
         self.rejected = 0
         self._real = store.append
+        self._sequenced = store.append_sequenced
 
-    def append(self, session_id: str, msgs: Sequence[Any], events: Sequence[Any],
-               **kwargs: Any) -> None:
+    def _admit(self, events: Sequence[Any]) -> None:
         if any(event.type in TERMINAL_EVENT_TYPES for event in events):
             self.attempts += 1
             if self.failures:
                 self.failures -= 1
                 self.rejected += 1
                 raise sqlite3.OperationalError("disk I/O error (injected)")
+
+    def append(self, session_id: str, msgs: Sequence[Any], events: Sequence[Any],
+               **kwargs: Any) -> None:
+        self._admit(events)
         self._real(session_id, msgs, events, **kwargs)
+
+    def append_sequenced(self, session_id: str, msgs: Sequence[Any],
+                         events: Sequence[Any], **kwargs: Any) -> list[Any]:
+        """The write path uses this one (`next_seq` folded into the batch)."""
+        self._admit(events)
+        return self._sequenced(session_id, msgs, events, **kwargs)
 
 
 class LoopErrors:
@@ -118,6 +128,10 @@ def _build(tmp_path, executor) -> tuple[SessionLog, FailingTerminalWrite]:
     log.set_executor(executor)
     injector = FailingTerminalWrite(store)
     store.append = injector.append  # type: ignore[method-assign]
+    # The live write path goes through `append_sequenced` (seq allocation folded
+    # into the batch); the injector has to sit on both entry points or the fault
+    # would never fire.
+    store.append_sequenced = injector.append_sequenced  # type: ignore[method-assign]
     return log, injector
 
 

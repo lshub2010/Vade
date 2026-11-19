@@ -59,6 +59,7 @@ class SessionStore(Protocol):
 - 调用方（loop / router / queue）**只依赖接口**，不出现 SQL 字面量。
 - `append` 是「一批写」而不是「一条一写」——换 PG 时这里是事务边界。
 - `next_seq` 必须在存储侧原子分配（SQLite 用 `UPDATE ... RETURNING`），不能「读 + 1 + 写」。
+- SQLite 实现另有 `append_sequenced()`：把这一批的 seq 分配放进 `append` 的同一个事务（一次提交而不是两次）。写路径优先用它（有则用、无则退回 `next_seq` + `append`），`append` 的语义不变。
 - 换 PG 时只需新增 `pg_store.py`，**不改 loop**。v1 不实现 PG，但接口签名冻结。
 
 表结构（SQLite，`data/sessions.db`）：

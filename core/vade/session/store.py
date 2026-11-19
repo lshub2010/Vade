@@ -34,6 +34,31 @@ class SessionStore(Protocol):
     def append(self, sess_id: str, msgs: Sequence[Message], events: Sequence[Event]) -> None:
         """Persist one batch (messages + events) atomically, before broadcast."""
 
+    # --- optional: one transaction instead of two ---------------------------
+    def append_sequenced(
+        self,
+        sess_id: str,
+        msgs: Sequence[Message],
+        events: Sequence[Event],
+        *,
+        turns: Sequence[Turn] = (),
+        message_updates: Sequence[tuple[str, str | None]] = (),
+    ) -> list[Event]:
+        """`append`, but allocating the events' `seq`s in the same transaction.
+
+        `next_seq()` commits on its own, so `next_seq` + `append` is two
+        transactions — and, on SQLite, two writes of the same `sessions` page —
+        per batch. A backend that can do the counter bump and the row inserts
+        in one transaction should implement this; the manager feature-detects
+        it and otherwise falls back to `next_seq()` + `append()`.
+
+        `events` are drafts (their `seq` is ignored); the returned events carry
+        the persisted seqs and are what must be broadcast. Must raise
+        `NOT_FOUND` — writing nothing — when the session row does not exist,
+        exactly like `next_seq`.
+        """
+        ...
+
     def read_since(self, sess_id: str, seq: int) -> list[Event]: ...
 
     def update_turn(self, sess_id: str, turn: Turn) -> None: ...

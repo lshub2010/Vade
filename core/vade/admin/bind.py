@@ -57,6 +57,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from ..errors import VadeError
 from .auth import run_argon2, verify_password_async, verify_signature
+from .setup import setup_commit_in_flight
 
 __all__ = [
     "BIND_PREFIX", "HELLO_TTL_S", "MAX_SKEW_S", "begin_hello", "complete",
@@ -83,6 +84,12 @@ _BIND_LOCK = threading.RLock()
 #: interleave `os.replace` on `admin.json` and one rollback could unlink the
 #: other's finished document, so the second is refused with the spec'd
 #: `BIND_SETUP_LOCKED` (423, retriable) instead.
+#:
+#: This counter is the *bind↔bind* fast path only. The process-wide guarantee
+#: is `setup.setup_commit_lock()`, which every first-run commit holds across
+#: [check → `admin.json` → token unlink] — the browser's `POST /admin/setup`
+#: included (review P1-5). `setup_commit_in_flight()` is how a reservation sees
+#: a browser commit that is already inside that section.
 _SETUP_COMMITS = 0
 
 _TICKET_ALPHABET = frozenset("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
@@ -248,9 +255,12 @@ async def complete(ctx: Any, body: dict[str, Any], *, ip: str | None) -> dict[st
         if ctx.devices.is_revoked(raw_pubkey):
             raise _unauthorized()
         if setup_required:
-            if _SETUP_COMMITS:
+            if _SETUP_COMMITS or setup_commit_in_flight():
                 # Two first-run commits would race on `admin.json`: the loser's
-                # rollback would unlink the winner's finished document.
+                # rollback would unlink the winner's finished document. The
+                # counter covers bind↔bind (the commit is outside `_BIND_LOCK`),
+                # the lock probe covers a browser `POST /admin/setup` that is
+                # already writing the same file (review P1-5).
                 raise VadeError("BIND_SETUP_LOCKED", "setup is in progress in another session")
             _SETUP_COMMITS += 1
         if not ctx.setup.consume_ticket(ticket):

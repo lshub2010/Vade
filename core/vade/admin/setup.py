@@ -31,6 +31,35 @@ TICKET_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 TICKET_LEN = 26
 TICKET_TTL_S = 600
 
+#: One process-wide lock for every **first-run commit**, whoever the caller is:
+#: `POST /admin/setup` (`initialize`) and the bind path (`initialize_bound` /
+#: `begin_initialize_bound`) both create `admin.json`, and the existence of that
+#: file is the *only* "initialised" flag this plane has. Held across
+#: [re-check `initialized()` → write `admin.json` → unlink `setup.token`] and
+#: never across the Argon2 digest, so the two entry points queue for the file
+#: write instead of interleaving it (review P1-5). `admin/bind.py` consults it
+#: through `setup_commit_in_flight()`.
+_SETUP_COMMIT_LOCK = threading.RLock()
+
+
+def setup_commit_lock() -> threading.RLock:
+    """The shared mutex object (bind holds it through `begin_initialize_bound`)."""
+    return _SETUP_COMMIT_LOCK
+
+
+def setup_commit_in_flight() -> bool:
+    """`True` while *another* thread is inside a first-run critical section.
+
+    Used by the bind reservation to answer `BIND_SETUP_LOCKED` (423, retriable)
+    instead of blocking a worker thread behind a browser that is finishing
+    `admin.json`. A same-thread holder would see `True` from `RLock.acquire`
+    re-entering, which is why this is only ever called from outside the lock.
+    """
+    if _SETUP_COMMIT_LOCK.acquire(blocking=False):
+        _SETUP_COMMIT_LOCK.release()
+        return False
+    return True
+
 
 @dataclass(frozen=True, slots=True)
 class InitializeSnapshot:
@@ -278,9 +307,19 @@ class SetupService:
         label: str = "first device",
         device_store: Any = None,
     ) -> dict[str, Any]:
+        """Create `admin.json` from the browser path (loopback or setup token).
+
+        The expensive part — the password digest — runs *before* the shared
+        commit lock, and the [re-check → `admin.json` → token unlink] trio is
+        `_commit_initial()`, which the bind path uses too: two writers meant the
+        loser's password silently stopped working (review P1-5).
+        """
         if self.initialized():
             raise VadeError("NOT_FOUND", "already initialised")
         if not loopback:
+            # Cheap pre-check so an unauthenticated remote caller never makes
+            # this process run an Argon2 digest; the authoritative re-check is
+            # the `initialized()` inside the commit section below.
             expected = setup_token.read_token(self.data_dir)
             if not setup_token.compare(expected, setup_token_value):
                 raise VadeError("SETUP_UNAUTHORIZED", "setup token is missing or wrong")
@@ -288,11 +327,10 @@ class SetupService:
             validate_password(password)
         except PasswordPolicyError as exc:
             raise VadeError("INVALID_ARGUMENT", str(exc)) from None
+        # Hash outside the lock: 64 MiB of Argon2 must not serialise the two
+        # entry points (a bind would queue behind it for no reason).
         doc = self._initial_doc(password, ip)
-        self._write_admin(doc)
-        # Only now: a crash between the two leaves a token that is ignored
-        # because admin.json exists, which is recoverable without `reset`.
-        setup_token.consume(self.data_dir)
+        self._commit_initial(doc, code="NOT_FOUND", message="already initialised")
         device = None
         if pubkey and device_store is not None:
             from .auth import normalize_pubkey
@@ -305,6 +343,33 @@ class SetupService:
                 label=label, ip=ip,
             )
         return {"initialized": True, "device": device.public() if device else None}
+
+    def _commit_initial(
+        self, doc: Mapping[str, Any], *, code: str, message: str
+    ) -> InitializeSnapshot:
+        """Re-check, write `admin.json`, unlink `setup.token` — one critical section.
+
+        `admin.json` existing *is* "initialised", so the check and both writes
+        have to be atomic across **both** entry points. `bind.py` used to guard
+        bind↔bind with `_SETUP_COMMITS` while the browser path held nothing, so
+        a phone and a browser finishing first-run together each wrote a document
+        and one password silently died with the overwritten file (review P1-5).
+
+        Returns the snapshot `rollback_initialize()` needs; the `admin.json` half
+        is always `None` because the plane was uninitialised inside the lock.
+        """
+        with _SETUP_COMMIT_LOCK:
+            if self.initialized():
+                raise VadeError(code, message)
+            snapshot = InitializeSnapshot(
+                admin_doc=self._read_admin_bytes(),
+                setup_token=setup_token.read_token(self.data_dir),
+            )
+            self._write_admin(doc)
+            # Only now: a crash between the two leaves a token that is ignored
+            # because admin.json exists, which is recoverable without `reset`.
+            setup_token.consume(self.data_dir)
+            return snapshot
 
     def _initial_doc(self, password: str, ip: str | None) -> dict[str, Any]:
         return {
@@ -325,15 +390,12 @@ class SetupService:
         never loopback, so `initialize()` would refuse it by design.
 
         Same crash ordering as `initialize()`: `admin.json` first, token second.
+        Shares `_commit_initial()` with it, so the bind commit and a browser
+        `POST /admin/setup` cannot both create the document (review P1-5).
         """
-        if self.initialized():
-            raise VadeError("BIND_UNAUTHORIZED", "admin plane is already initialised")
-        try:
-            validate_password(password)
-        except PasswordPolicyError as exc:
-            raise VadeError("INVALID_ARGUMENT", str(exc)) from None
-        self._write_admin(self._initial_doc(password, ip))
-        setup_token.consume(self.data_dir)
+        # One body for both: the bind path wants the rollback snapshot, callers
+        # that only need "make it initialised" do not.
+        self.begin_initialize_bound(password=password, ip=ip)
 
     def begin_initialize_bound(self, *, password: str, ip: str | None) -> InitializeSnapshot:
         """`initialize_bound` plus the snapshot that can undo it.
@@ -342,13 +404,24 @@ class SetupService:
         cannot be enrolled afterwards, `rollback_initialize()` puts the plane
         back to "setup required" and the caller keeps the ticket, so the same QR
         can be retried instead of needing `vade admin reset`.
+
+        The snapshot is taken **inside** the commit section: a snapshot read
+        before the lock could describe a plane another writer has since
+        initialised, and the rollback would then delete *their* document.
+
+        Losing the race is `BIND_SETUP_LOCKED` (423, retriable) — the same code
+        the reservation uses — not `BIND_UNAUTHORIZED`: the ticket is still
+        valid, and the App must retry instead of discarding the QR.
         """
-        snapshot = InitializeSnapshot(
-            admin_doc=self._read_admin_bytes(),
-            setup_token=setup_token.read_token(self.data_dir),
+        try:
+            validate_password(password)
+        except PasswordPolicyError as exc:
+            raise VadeError("INVALID_ARGUMENT", str(exc)) from None
+        return self._commit_initial(
+            self._initial_doc(password, ip),
+            code="BIND_SETUP_LOCKED",
+            message="setup is in progress in another session",
         )
-        self.initialize_bound(password=password, ip=ip)
-        return snapshot
 
     def rollback_initialize(self, snapshot: InitializeSnapshot) -> None:
         """Undo `begin_initialize_bound`, in the crash-safe order.
@@ -358,19 +431,24 @@ class SetupService:
         exists, and `ensure_setup_token()` unlinks it on the next start). The
         reverse order would leave "no password, no token", which is the state
         `initialize()` exists to avoid.
+
+        Runs under the same commit lock as the forward direction: an unlink that
+        slipped between another writer's check and its `admin.json` write would
+        delete a document this rollback does not own.
         """
-        if snapshot.setup_token:
-            self._atomic_write(
-                setup_token.token_path(self.data_dir), snapshot.setup_token.encode("ascii"),
-            )
-        path = self.admin_doc_path
-        if snapshot.admin_doc is None:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-        else:
-            self._atomic_write(path, snapshot.admin_doc)
+        with _SETUP_COMMIT_LOCK:
+            if snapshot.setup_token:
+                self._atomic_write(
+                    setup_token.token_path(self.data_dir), snapshot.setup_token.encode("ascii"),
+                )
+            path = self.admin_doc_path
+            if snapshot.admin_doc is None:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                self._atomic_write(path, snapshot.admin_doc)
 
     def change_password(self, old: str, new: str) -> None:
         from .auth import verify_password

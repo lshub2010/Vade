@@ -255,6 +255,11 @@ class SessionLog:
     ) -> None:
         self.store = store
         self.replay = replay or ReplayBuffer()
+        #: Optional store hook run after every committed batch. SQLite uses it
+        #: for the WAL checkpoint probe (`SQLiteStore.schedule_checkpoint`: one
+        #: stat, the page copy runs on a worker thread). Resolved once, so a
+        #: non-SQLite store or a test double simply has no hook.
+        self._after_commit = getattr(store, "schedule_checkpoint", None)
         self._clock = clock
         self._seq = SeqAllocator(store)
         self._queues: dict[str, TurnQueue] = {}
@@ -688,6 +693,14 @@ class SessionLog:
                 session_id, stamped_messages, stamped, turns=tuple(turns),
                 message_updates=tuple(message_updates),
             )
+            # WAL maintenance is *scheduled* here, never run here: the hook is
+            # one stat() and returns (the page copy happens on a worker thread
+            # via `asyncio.to_thread` inside `SQLiteStore`). Called after the
+            # commit — so the write that crossed the threshold pays nothing —
+            # and without awaiting, so it can never hold this session's emit
+            # lock or delay the broadcast below.
+            if self._after_commit is not None:
+                self._after_commit()
             for event in stamped:
                 self.replay.add(event)
             self._track(stamped)

@@ -74,11 +74,16 @@ TERMINAL_EVENT_TYPES = frozenset(
 #: one id per turn for the life of the process.
 _TOMBSTONE_LIMIT = 1024
 #: Room a replay must leave behind in the bounded per-connection sink queue:
-#: `session.attached` plus one live event. A backlog that does not fit is
+#: `session.attached`, the `turn.completed` + `queue.updated` pair a finalizing
+#: turn emits back to back, and slack for whatever live traffic arrives while
+#: the writer task has not been scheduled yet. A backlog that does not fit is
 #: answered with a snapshot instead of a replay the sink worker would silently
 #: drop (`SinkWorker.drop()` also unregisters itself, so the client would end up
 #: attached to nothing).
-ATTACH_REPLAY_RESERVE = 2
+#:
+#: It was 2 — exactly one short of that pair — so a backlog of `cap - 2` was
+#: accepted and then overflowed on the frames the attach itself provoked.
+ATTACH_REPLAY_RESERVE = 8
 
 #: RFC-0006 §6.4 reasons carried on `turn.queued` / `turn.superseded`.
 REASON_SUBMIT = "submit"
@@ -427,16 +432,32 @@ class SessionLog:
         The confirmation dialog is client-side (FR-8.26); core's only guard is
         the active-turn one — a deleted session with a running turn would
         leave the queue executor writing into rows that no longer exist.
+
+        The guard asks the QUEUE (`is_idle()`), not `state()`. `state()` only
+        reports turns that already have a `QueueItem`, so a `submit` that had
+        taken a pending slot (`claim`) but had not enqueued yet was invisible:
+        delete removed the session under it and the submit then allocated a seq
+        against rows that were gone (`next_seq` → `NOT_FOUND`) — an announced
+        turn with no session, or (worse) a turn row written into a
+        half-deleted session. `is_idle()` counts claims, so that window now
+        answers `turn_active` instead.
         """
         self._require_session(session_id)
         queue = self._queues.get(session_id)
-        state = queue.state() if queue is not None else None
-        if state and (state.get("running") or state.get("pending")):
-            raise VadeError(
-                "INVALID_ARGUMENT",
-                "session has queued or running turns; stop them before deleting",
-                data={"reason": "turn_active", "turn_id": state.get("running")},
-            )
+        if queue is not None:
+            if not queue.is_idle():
+                raise VadeError(
+                    "INVALID_ARGUMENT",
+                    "session has queued or running turns; stop them before deleting",
+                    data={"reason": "turn_active", "turn_id": queue.state().get("running")},
+                )
+            # Stop the queue BEFORE the rows go. `shutdown()` is the queue's
+            # terminal path and sets `_stopped` on its first line, so nothing
+            # can announce a `turn.started` into tables that are about to
+            # vanish; for the idle queue the guard just proved, it finalizes
+            # nothing and completes without yielding — which is what keeps
+            # this check-then-delete atomic against a concurrent submit.
+            await queue.shutdown()
         self.store.delete_session(session_id)
         # Truth first, then the announcement: persist-then-broadcast (§6.2).
         await self._fanout_session_list_changed(session_id, "removed", by=by)
@@ -736,20 +757,38 @@ class SessionLog:
                 for replayed in replay_events:
                     if replayed.coalesce:
                         continue  # droppable state; never occupies a queue slot
-                    worker.offer(replayed.to_wire())
-                event = await self.emit(
-                    session_id,
-                    "session.attached",
-                    {
-                        "session_id": session_id,
-                        "from_seq": last_seq + 1,
-                        "state": "open",
-                        "snapshot": False,
-                        "replay_count": len(replay_events),
-                    },
-                )
-                assert event is not None
-                return AttachResult(session_id, event.seq, None, replay_events, worker.sink_id)
+                    if not worker.offer(replayed.to_wire()):
+                        break  # the sink died mid-replay: snapshot below
+                else:
+                    # The reservation is only room if the replay has actually
+                    # MOVED OUT of the queue. Without this yield the queue is
+                    # still full at `cap - reserve` when `session.attached` is
+                    # offered a tick later, and the announcement itself is the
+                    # frame that overflows — that is how a "successful" attach
+                    # returned zero frames.
+                    await asyncio.sleep(0)
+                if not worker.dropped:
+                    event = await self.emit(
+                        session_id,
+                        "session.attached",
+                        {
+                            "session_id": session_id,
+                            "from_seq": last_seq + 1,
+                            "state": "open",
+                            "snapshot": False,
+                            "replay_count": len(replay_events),
+                        },
+                    )
+                    if event is not None and not worker.dropped:
+                        return AttachResult(session_id, event.seq, None, replay_events,
+                                            worker.sink_id)
+                # Losing the sink between the replay and its announcement is the
+                # silent-detach bug: `drop()` unregisters the worker, so
+                # returning here would tell the client it is attached while
+                # nothing is registered and no error is coming. Retire the
+                # corpse and answer with a snapshot instead — slower, but the
+                # client ends up attached to something that exists.
+                await self.detach(session_id, worker.sink_id)
 
         # Not covered (or a fresh client, or a backlog too large for the sink
         # queue): snapshot is the only honest answer.
@@ -919,6 +958,52 @@ class SessionLog:
             raise self._overloaded(queue)
         return queue, claim
 
+    async def _enqueue_and_refresh(
+        self,
+        queue: TurnQueue,
+        turn: Turn,
+        content: Sequence[Mapping[str, Any]],
+        *,
+        claim: int,
+        pinned: Sequence[str] = (),
+    ) -> int:
+        """Insert the turn, then publish the new queue state — one step.
+
+        The two writes have different failure contracts, and the old shape
+        (both at the call site, `enqueue` outside the `try` that guarded the
+        announcement) got them wrong in both directions:
+
+          * `enqueue` CONSUMES the claim, so an insert that never happened must
+            hand the slot back (`max_pending` would otherwise shrink for the
+            life of the queue) and un-pin its blobs (§4.7: pinned files are
+            exempt from TTL GC, so an orphan is storage nobody can free);
+          * a failed `queue.updated` happens AFTER `turn.queued` is durable and
+            broadcast. The turn IS in the queue, so the worker must still start
+            — otherwise an announced turn sits in `queued` forever, which is
+            exactly the state this claim-before-write shape exists to prevent.
+
+        `BaseException` is caught for the release so a cancelled caller cannot
+        take the slot with it; the refresh swallows only `Exception` (a
+        cancellation must still propagate).
+        """
+        try:
+            pos = queue.enqueue(turn, content, claim=claim)
+        except BaseException:
+            queue.release(claim)
+            self._unpin(pinned)
+            raise
+        try:
+            await self.emit(turn.session_id, "queue.updated", queue.state_payload())
+        except Exception as exc:
+            queue.ensure_worker()
+            log.warning("queue.updated after enqueue failed", extra={
+                "code": None, "session_id": turn.session_id,
+                "msg": f"turn={turn.id} error={exc}",
+            })
+            return pos
+        queue.ensure_worker()
+        return pos
+
     async def reconcile_restarts(self) -> int:
         """Startup: non-terminal turns from a dead process are `interrupted`.
 
@@ -1065,9 +1150,9 @@ class SessionLog:
             queue.release(claim)
             self._unpin(pinned)
             raise
-        pos = queue.enqueue(turn, parts, claim=claim)
-        await self.emit(session_id, "queue.updated", queue.state_payload())
-        queue.ensure_worker()
+        pos = await self._enqueue_and_refresh(
+            queue, turn, parts, claim=claim, pinned=pinned,
+        )
         return turn, pos
 
     # ------------------------------------------------------------------ blobs
@@ -1196,13 +1281,10 @@ class SessionLog:
             # claimed for a version that was never announced.
             queue.release(claim)
             raise
-        pos = queue.enqueue(
-            new_turn,
-            [{"type": "text", "text": user_message.content}],
+        pos = await self._enqueue_and_refresh(
+            queue, new_turn, [{"type": "text", "text": user_message.content}],
             claim=claim,
         )
-        await self.emit(session_id, "queue.updated", queue.state_payload())
-        queue.ensure_worker()
         return {
             "turn_id": new_turn_id, "root_turn_id": old.root_id,
             "version": new_turn.version, "supersedes_turn_id": old.id,
@@ -1322,9 +1404,7 @@ class SessionLog:
             # back instead of shrinking `max_pending` for the queue's life.
             queue.release(claim)
             raise
-        pos = queue.enqueue(new_turn, blocks, claim=claim)
-        await self.emit(session_id, "queue.updated", queue.state_payload())
-        queue.ensure_worker()
+        pos = await self._enqueue_and_refresh(queue, new_turn, blocks, claim=claim)
         return {
             "turn_id": new_turn_id, "message_id": new_message_id,
             "supersedes_turn_id": old_turn.id, "root_turn_id": old_turn.root_id,

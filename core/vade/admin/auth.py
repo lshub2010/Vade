@@ -12,6 +12,7 @@ The non-obvious rules, all from 31-C5a §T4:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -20,6 +21,7 @@ import ipaddress
 import os
 import secrets
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -33,9 +35,10 @@ from ..errors import VadeError
 
 __all__ = [
     "hash_password", "verify_password", "password_needs_rehash", "validate_password",
+    "verify_password_async", "run_argon2", "ARGON2_SLOTS",
     "PasswordPolicyError", "ChallengeStore", "SessionStore", "Session", "verify_signature",
     "normalize_pubkey", "is_loopback", "host_allowed", "origin_allowed",
-    "ADMIN_ORIGIN_SCHEME", "ARGON2_TIME_COST", "ARGON2_MEMORY_KIB",
+    "ADMIN_ORIGIN_SCHEME", "ARGON2_TIME_COST", "ARGON2_MEMORY_KIB", "SWEEP_EVERY",
 ]
 
 ADMIN_ORIGIN_SCHEME = "https"
@@ -140,6 +143,47 @@ def verify_password(password: str, stored: str | None) -> bool:
     return _verify_legacy_scrypt(password, stored)
 
 
+# ------------------------------------------------------- argon2 off the loop
+#: How many Argon2 calls may run at once. This is a *memory* ceiling, not
+#: politeness: each digest holds 64 MiB, so an unbounded fan-out of four logins
+#: is 256 MiB of transient RSS on a box that may have 5 GiB total. Two keeps a
+#: login at ~2x its single-digest latency and the peak at 128 MiB.
+ARGON2_SLOTS = 2
+
+#: `asyncio.Semaphore` binds itself to the first loop that has to *wait* on it,
+#: so one module-level instance raises `bound to a different event loop` under
+#: the second loop (pytest gives each test a fresh one). Keyed by loop, created
+#: on demand, weakly held so a finished loop is not kept alive.
+_SLOTS: "weakref.WeakKeyDictionary[Any, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+
+def _argon2_slots() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    semaphore = _SLOTS.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(ARGON2_SLOTS)
+        _SLOTS[loop] = semaphore
+    return semaphore
+
+
+async def run_argon2(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run a CPU-bound Argon2 call in a worker thread, `ARGON2_SLOTS` at a time.
+
+    m=64 MiB / t=3 is tens of milliseconds of pure CPU (hundreds on a small
+    box). On the event loop that stalls every websocket, every SSE frame and
+    every other admin request for the duration — including the requests of the
+    same login burst. `to_thread` moves the digest off the loop; the semaphore
+    keeps the memory ceiling. Every Argon2 call site goes through here.
+    """
+    async with _argon2_slots():
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+async def verify_password_async(password: str, stored: str | None) -> bool:
+    """`verify_password` without blocking the event loop (see `run_argon2`)."""
+    return await run_argon2(verify_password, password, stored)
+
+
 # -------------------------------------------------------------------- challenges
 @dataclass(slots=True)
 class _Challenge:
@@ -217,6 +261,15 @@ class Session:
     csrf: str = ""
 
 
+#: How many `guard()` calls pass between session-table sweeps. Mirrors
+#: `transport.server`'s `UiSessions.prune`: without it, an access row is only
+#: forgotten when the exact token is presented (`resolve`) and a refresh row
+#: only when it is rotated (`refresh`) — so every issued-and-abandoned token,
+#: and every rotated refresh chain, stays in the dict for the life of the
+#: process (refresh TTLs are 30 days, i.e. effectively forever).
+SWEEP_EVERY = 64
+
+
 class SessionStore:
     def __init__(
         self,
@@ -224,10 +277,13 @@ class SessionStore:
         access_ttl_s: float = 900.0,
         refresh_ttl_s: float = 30 * 86_400.0,
         wall: Callable[[], float] = time.time,
+        sweep_every: int = SWEEP_EVERY,
     ) -> None:
         self.access_ttl_s = access_ttl_s
         self.refresh_ttl_s = refresh_ttl_s
         self._wall = wall
+        self.sweep_every = int(sweep_every)
+        self._guard_calls = 0
         self._sessions: dict[str, Session] = {}
         self._refresh: dict[str, dict[str, Any]] = {}
         self._blacklist: set[str] = set()
@@ -328,6 +384,43 @@ class SessionStore:
 
     def active_count(self) -> int:
         return len(self._sessions)
+
+    # ------------------------------------------------------------------ sweep
+    def prune(self, now: float | None = None) -> dict[str, int]:
+        """Drop every expired access and refresh row; return the counts.
+
+        Same contract as `transport.server.UiSessions.prune`: it never touches a
+        live row, so it is safe to call between requests with no lock. Rows
+        minted under a previous password version are dead by definition
+        (`bump_password_version` clears the table, but a version bump from
+        another path must not leave orphans behind).
+        """
+        at = self._wall() if now is None else float(now)
+        dead_access = [
+            token for token, session in self._sessions.items()
+            if session.expires_at <= at or session.password_version != self._password_version
+        ]
+        for token in dead_access:
+            self._sessions.pop(token, None)
+        dead_refresh = [
+            key for key, entry in self._refresh.items()
+            if entry["expires_at"] <= at or entry["password_version"] != self._password_version
+        ]
+        for key in dead_refresh:
+            self._refresh.pop(key, None)
+        return {"access": len(dead_access), "refresh": len(dead_refresh)}
+
+    def sweep_if_due(self) -> dict[str, int]:
+        """`prune()` every `sweep_every` calls; `guard()` is the only caller.
+
+        A request already pays for a dict lookup, so the counter rides along
+        with it instead of a background task (this module owns no loop). `0`
+        disables the sweep, which the tests use to pin the un-swept behaviour.
+        """
+        self._guard_calls += 1
+        if self.sweep_every <= 0 or self._guard_calls % self.sweep_every:
+            return {"access": 0, "refresh": 0}
+        return self.prune()
 
 
 # --------------------------------------------------------------------- signature

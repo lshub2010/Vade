@@ -141,14 +141,15 @@ class AuditWriter:
             thread.join(timeout=2.0)
         self._drain()
         with self._lock:
-            if self._db is not None:
-                self._commit_locked()
+            self._commit_locked()
+            db = self._db
+            self._db = None
+            self._tables.clear()
+            if db is not None:
                 try:
-                    self._db.close()
+                    db.close()
                 except sqlite3.Error:
                     pass
-                self._db = None
-                self._tables.clear()
         self._thread = None
 
     @property

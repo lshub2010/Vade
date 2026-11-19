@@ -57,7 +57,10 @@ def test_chat_rows_never_count_against_the_evolve_budget(tmp_path):
 def test_the_evolve_total_survives_more_than_one_reader_page(tmp_path):
     """The oldest rows are on the last page (`ts DESC`); they must still be read."""
     ctx = make_context(tmp_path)
-    now = time.time() - 700
+    # Pin the rows to the START of the current UTC day: `time.time() - 700`
+    # lands on yesterday when the suite runs in the first ~12 minutes after
+    # midnight, and "today" is exactly what this endpoint counts.
+    now = time.time() - (time.time() % 86_400) + 1.0
     # Oldest first: the evolve row is the one the 500-row clamp would drop.
     ctx.audit.record(_row(ts=now, purpose="evolve", tokens=11))
     for index in range(600):
@@ -77,7 +80,9 @@ def test_the_evolve_total_survives_more_than_one_reader_page(tmp_path):
 # 26.9 s of a frozen loop, reachable from a read-only browser session.
 def _seed_days(ctx, *, today_rows: int = 200, days: int = 8, per_day: int = 25) -> float:
     """`today_rows` rows today (mostly chat) + `per_day` rows on each older day."""
-    now = time.time()
+    # Day-boundary safe: 01:00 UTC today, never a `now - N` that can slip into
+    # yesterday while the suite runs just after midnight.
+    now = time.time() - (time.time() % 86_400) + 3_600.0
     ctx.audit.record(_row(ts=now - 0.5, purpose="evolve", tokens=13))
     for index in range(today_rows - 1):
         ctx.audit.record(_row(ts=now - 1 - index * 0.001, purpose="chat", tokens=5))

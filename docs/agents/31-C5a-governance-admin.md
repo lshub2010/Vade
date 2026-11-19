@@ -101,7 +101,7 @@ servers:
 | DELETE | `/admin/api/skills/{name}` | 卸载：移到 `skills/.trash/<name>-<ts>/`，可恢复 |
 | PATCH | `/admin/api/skills/{name}` | `{status: "active"\|"disabled"}` —— **启停**，只改 `meta.json`，不改 frontmatter。与 `approve`（提案转正）是两件事，不要合并 |
 | GET | `/admin/api/stream` | SSE，`Last-Event-ID` 续传 |
-| GET | `/admin/api/health` | 无鉴权。回环绑定时返回 `{ok, version, e2e_enabled}`；**对外绑定时只返回 `{ok:true}`**（不泄露版本，供 F1 探活） |
+| GET | `/admin/api/health` | 无鉴权。回环绑定时返回 `{ok, version, e2e_enabled, audit}`（`audit` 是审计链计数器：`installed/degraded/request_failures/writer_failures/write_retries/dead_letters/total_failures/deadletter_path`，生产异步写路径的失败只在这里和日志可见）；**对外绑定时只返回 `{ok:true}`**（不泄露版本，供 F1 探活） |
 
 统一错误体：`{code, message}`，`code` 取自 `schema/errors.json`。
 

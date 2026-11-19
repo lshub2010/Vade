@@ -137,7 +137,28 @@ def test_degraded_mode_ends_when_the_queue_drains(tmp_path):
     assert sorted(_stored_tokens(path)) == [1, 2, 3]
 
 
-def test_the_flusher_survives_a_failed_batch(tmp_path):
+def test_the_writer_reconnects_after_a_failed_batch(tmp_path):
+    """A poisoned handle must not poison every later batch."""
+    path = tmp_path / "audit.db"
+    writer = AuditWriter(path, batch_ms=10)
+    writer.record(_row(tokens=1))
+    writer.flush()
+
+    writer._reset_db()
+    assert writer._db is None
+    writer.record(_row(tokens=2))
+    writer.flush()
+    assert sorted(_stored_tokens(path)) == [1, 2]
+
+
+def test_a_failed_batch_is_retried_before_anything_is_lost(tmp_path):
+    """One sqlite error must not cost the batch — and must not kill the thread.
+
+    The old loop logged "batch dropped" and moved on, so a transient
+    `SQLITE_BUSY` silently destroyed every row whose `audit_id` the caller
+    already held (review P1-4). A retry on a fresh handle is what that failure
+    actually needed.
+    """
     path = tmp_path / "audit.db"
     writer = AuditWriter(path, batch_ms=10, max_queue=100)
     calls: list[list[dict]] = []
@@ -153,35 +174,162 @@ def test_the_flusher_survives_a_failed_batch(tmp_path):
     try:
         writer.record(_row(tokens=1))
         deadline = time.monotonic() + 5.0
-        while writer.write_failures == 0 and time.monotonic() < deadline:
+        while writer.write_retries == 0 and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert writer.write_failures == 1, "the failed batch must be counted"
+        assert writer.write_retries == 1, "the failed batch was never retried"
+        assert len(calls) >= 2, "the batch reached `_write_many` only once"
+        assert writer.write_failures == 0, "a batch that landed on retry is not lost"
         assert writer._thread is not None and writer._thread.is_alive(), (
             "one sqlite error used to kill the flusher thread"
         )
 
         writer.record(_row(tokens=2))
-        while len(calls) < 2 and time.monotonic() < deadline:
+        while len(calls) < 3 and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert len(calls) >= 2, "the flusher stopped consuming after one bad batch"
+        assert len(calls) >= 3, "the flusher stopped consuming after one bad batch"
     finally:
         writer.close()
 
-    assert 2 in _stored_tokens(path), "the batch after the failure must land"
+    assert sorted(_stored_tokens(path)) == [1, 2], "the retried row must be on disk"
+    assert writer.write_failures == 0
+    assert writer.dead_letters == 0
 
 
-def test_the_writer_reconnects_after_a_failed_batch(tmp_path):
-    """A poisoned handle must not poison every later batch."""
+def test_a_batch_that_fails_twice_is_dead_lettered_with_its_audit_ids(tmp_path):
+    """Permanent failure: the rows go to `audit.deadletter.jsonl`, not nowhere.
+
+    The caller already has these `audit_id`s, so the loss has to be enumerable:
+    one JSON line per row, with the id and the original row, and a counter that
+    `/admin/api/health` reports (review P1-4).
+    """
     path = tmp_path / "audit.db"
-    writer = AuditWriter(path, batch_ms=10)
-    writer.record(_row(tokens=1))
-    writer.flush()
+    writer = AuditWriter(path, batch_ms=10, max_queue=100)
+    attempts: list[int] = []
 
-    writer._reset_db()
-    assert writer._db is None
-    writer.record(_row(tokens=2))
-    writer.flush()
-    assert sorted(_stored_tokens(path)) == [1, 2]
+    def broken(rows: list[dict]) -> None:
+        attempts.append(len(rows))
+        raise sqlite3.OperationalError("database or disk is full")
+
+    writer._write_many = broken  # type: ignore[method-assign]
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.DEBUG)
+    logger = logging.getLogger("vade.audit")
+    logger.addHandler(handler)
+    try:
+        ids = [writer.record(_row(tokens=n)) for n in (1, 2, 3)]
+        deadline = time.monotonic() + 5.0
+        while writer.dead_letters < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert writer.write_failures >= 1, "the lost batch must be counted"
+        assert writer.dead_letters == 3, "every row must be parked in the dead letter"
+        assert len(attempts) >= 2, "the batch was not retried before being parked"
+        assert writer._thread is not None and writer._thread.is_alive()
+
+        parked = writer.dead_letter_rows()
+        assert [entry["audit_id"] for entry in parked] == ids, parked
+        assert [entry["row"]["extra"]["tokens"] for entry in parked] == [1, 2, 3]
+        assert all("disk is full" in entry["error"] for entry in parked), parked
+        assert all(entry["batch_id"] for entry in parked), (
+            "every parked row must name the batch it came from"
+        )
+        assert len({entry["batch_id"] for entry in parked}) <= len(attempts), parked
+        assert writer.dead_letters == 3
+        assert len(_stored_tokens(path)) == 0 or not path.exists(), (
+            "nothing may have landed in the audit database"
+        )
+    finally:
+        logger.removeHandler(handler)
+        writer.close()
+
+    errors = [r.getMessage() for r in records if r.levelno >= logging.ERROR]
+    assert any("dead-lettered" in message for message in errors), errors
+    assert any(ids[0] in message for message in errors), (
+        f"the log must carry the lost audit ids, got {errors}"
+    )
+    # The ids stay queryable from the file, which is what an operator needs.
+    assert writer.deadletter_path.is_file()
+    assert writer.deadletter_path.name == "audit.deadletter.jsonl"
+
+
+def test_an_async_audit_failure_is_visible_on_health(tmp_path):
+    """Production shape (`sync=False`): nothing raises, so health must report it.
+
+    `record()` returns an ULID as soon as the row is queued, which means the
+    sqlite error happens on the flusher thread and `write_audit`'s `except` never
+    fires. Before `/admin/api/health` published the writer's counters, the only
+    trace of a dead audit chain was a log line (review P1-3).
+    """
+    ctx = make_context(tmp_path)
+    ctx.audit.close()
+    blocked = tmp_path / "audit-blocked"
+    blocked.mkdir()  # sqlite cannot open a directory as a database file
+    writer = AuditWriter(blocked, batch_ms=10, max_queue=100)  # sync defaults to False
+    ctx.audit = writer
+    app = create_admin_app(ctx)
+    try:
+        audit_id = ctx.write_audit(kind="admin.config", status="ok")
+        assert audit_id is not None, "the async path hands out the id before the write"
+        deadline = time.monotonic() + 5.0
+        while writer.write_failures == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert writer.write_failures >= 1, "the flusher never hit the blocked database"
+        assert ctx.audit_failures == 0, (
+            "sync=False failures never reach write_audit — that is the whole bug"
+        )
+
+        async def scenario():
+            local = await client_for(app).get("/admin/api/health")
+            remote = await client_for(app, ip="203.0.113.9").get("/admin/api/health")
+            return local, remote
+
+        local, remote = asyncio.run(scenario())
+        assert local.status_code == 200, local.text
+        audit = local.json()["audit"]
+        assert audit["installed"] is True
+        assert audit["writer_failures"] >= 1, audit
+        assert audit["dead_letters"] >= 1, audit
+        assert audit["total_failures"] == audit["request_failures"] + audit["writer_failures"]
+        assert audit["request_failures"] == 0
+        assert str(audit["deadletter_path"]).endswith(".deadletter.jsonl")
+        assert local.json()["ok"] is True, "a degraded audit must not fail liveness"
+        # Remote probes still get the bare document: no counters, no path.
+        assert remote.json() == {"ok": True}
+    finally:
+        writer.close()
+
+
+def test_health_reports_the_request_side_counter_too(tmp_path):
+    """`ctx.audit_failures` (a *synchronous* failure) reaches health as well."""
+    ctx = make_context(tmp_path)
+
+    class _Broken:
+        path = tmp_path / "audit" / "audit.db"
+        write_failures = 0
+        write_retries = 0
+        dead_letters = 0
+        degraded = False
+
+        def record(self, event):  # noqa: ANN001 - writer stand-in
+            raise sqlite3.OperationalError("database is locked")
+
+    ctx.audit = _Broken()  # type: ignore[assignment]
+    assert ctx.write_audit(kind="x", status="ok") is None
+    assert ctx.audit_failures == 1
+
+    async def scenario():
+        return await client_for(create_admin_app(ctx)).get("/admin/api/health")
+
+    response = asyncio.run(scenario())
+    audit = response.json()["audit"]
+    assert audit["request_failures"] == 1
+    assert audit["writer_failures"] == 0
+    assert audit["total_failures"] == 1
 
 
 def test_day_key_matches_the_table_the_writer_creates(tmp_path):

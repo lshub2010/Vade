@@ -1155,7 +1155,10 @@ paths:
       tags: [stream]
       summary: 探活（无鉴权）
       security: []
-      description: 回环 → `{ok, version, e2e_enabled}`；对外绑定 → **只** `{ok:true}`（不泄露版本）。
+      description: |
+        回环 → `{ok, version, e2e_enabled, audit}`；对外绑定 → **只** `{ok:true}`（不泄露版本）。
+        回环的 `audit` 是审计链自身的计数器：生产写路径是异步的（`record()` 入队即返回
+        `audit_id`），失败只发生在刷盘线程里，没有这组数字就只能翻日志。
       responses:
         "200":
           description: 存活
@@ -1167,6 +1170,31 @@ paths:
                   ok: {const: true}
                   version: {type: string}
                   e2e_enabled: {type: boolean}
+                  audit:
+                    type: object
+                    description: 审计写入健康（仅回环返回；`ok` 不为它翻转，探活语义不变）
+                    properties:
+                      installed: {type: boolean, description: "是否安装了 audit writer"}
+                      degraded: {type: boolean, description: "队列满而退化为同步写（仍在工作，但慢）"}
+                      request_failures:
+                        type: integer
+                        description: "`write_audit` 捕获的失败次数（入队/同步写就抛出的那部分）"
+                      writer_failures:
+                        type: integer
+                        description: "刷盘线程重试一次后仍未落盘的批次数（已进死信）"
+                      write_retries:
+                        type: integer
+                        description: "第一次失败、重试成功的批次数（健康系统在 prune 竞争下也会涨）"
+                      dead_letters:
+                        type: integer
+                        description: "已写入死信文件的行数（可恢复，和丢失不同）"
+                      total_failures:
+                        type: integer
+                        description: "`request_failures + writer_failures`，告警用单值"
+                      deadletter_path:
+                        type: [string, "null"]
+                        description: "死信文件路径（`audit.deadletter.jsonl`），每行一条带 `audit_id` 的 JSON"
+                    required: [installed, request_failures, writer_failures, dead_letters, total_failures]
                 required: [ok]
 
 components:

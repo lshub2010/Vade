@@ -429,6 +429,40 @@ def _audit_payload(ctx: "AdminContext", event: Any) -> dict[str, Any]:
     return payload
 
 
+def _audit_health(ctx: "AdminContext") -> dict[str, Any]:
+    """Counters for the audit chain itself, surfaced by `/admin/api/health`.
+
+    `write_audit` can only count failures it *sees*, and in production the write
+    is asynchronous: `record()` returns a ULID as soon as the row is queued, so a
+    full disk or an unopenable `audit.db` never raises there (review P1-3). The
+    flusher keeps its own numbers, and this is where they become visible:
+
+    * `request_failures` — rows the API could not even enqueue (`ctx` counter);
+    * `writer_failures` — batches the flusher lost after its one retry;
+    * `write_retries` — batches that failed once and landed on the retry (a
+      healthy core under a racing `prune()`);
+    * `dead_letters` — rows parked in `deadletter_path` (they are recoverable,
+      so they are not the same incident as a lost batch);
+    * `total_failures` — `request_failures + writer_failures`, for one alert.
+    """
+    writer = ctx.audit
+    request_failures = int(ctx.audit_failures)
+    if writer is None:
+        return {"installed": False, "request_failures": request_failures}
+    writer_failures = int(getattr(writer, "write_failures", 0) or 0)
+    deadletter = getattr(writer, "deadletter_path", None)
+    return {
+        "installed": True,
+        "degraded": bool(getattr(writer, "degraded", False)),
+        "request_failures": request_failures,
+        "writer_failures": writer_failures,
+        "write_retries": int(getattr(writer, "write_retries", 0) or 0),
+        "dead_letters": int(getattr(writer, "dead_letters", 0) or 0),
+        "total_failures": request_failures + writer_failures,
+        "deadletter_path": str(deadletter) if deadletter is not None else None,
+    }
+
+
 class RateLimiter:
     """Log hygiene, not a security boundary: 256-bit tokens cannot be guessed."""
 
@@ -1206,7 +1240,14 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
 
     async def health(request: Request) -> Response:
         if _loopback(request):
-            return JSONResponse({"ok": True, "version": ctx.version, "e2e_enabled": ctx.e2e_enabled})
+            return JSONResponse({
+                "ok": True, "version": ctx.version, "e2e_enabled": ctx.e2e_enabled,
+                # The audit chain's own counters. `write_audit` only sees the
+                # synchronous failures; in production (`sync=False`) the rows
+                # die on the flusher thread, where nothing but this endpoint and
+                # the log can see them (review P1-3).
+                "audit": _audit_health(ctx),
+            })
         # Remote: alive is all a probe needs; the version is a fingerprinting gift.
         return JSONResponse({"ok": True})
 

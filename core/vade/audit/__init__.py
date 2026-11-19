@@ -26,11 +26,14 @@ from typing import Any
 
 from ..config import ConfigError
 from .adapter import AuditAdapter
-from .reader import AuditReader
+from .reader import AuditReader, AuditReadError
 from .retention import RetentionJob
 from .writer import AuditWriter, new_audit_id
 
-__all__ = ["install", "AuditWriter", "AuditAdapter", "AuditReader", "RetentionJob", "new_audit_id"]
+__all__ = [
+    "install", "AuditWriter", "AuditAdapter", "AuditReader", "AuditReadError",
+    "RetentionJob", "new_audit_id",
+]
 
 #: Mirrors the C-18 default; retention.py's own default is the same number.
 DEFAULT_RETENTION_DAYS = 30

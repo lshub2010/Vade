@@ -11,10 +11,13 @@ the evolve rows that sit behind them.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 
+import pytest
+
 from vade.admin.app import create_admin_app
-from vade.audit.reader import AuditReader
+from vade.audit.reader import AuditReader, AuditReadError
 
 from .conftest import client_for, login_with_device, make_context, new_device
 
@@ -211,4 +214,97 @@ def test_usage_is_correct_without_json1(tmp_path, monkeypatch):
     body = asyncio.run(_usage(ctx))
     assert body["tokens_used"] == 13, body
     assert body["day"] == time.strftime("%Y-%m-%d", time.gmtime(now))
+    ctx.audit.close()
+
+
+# --------------------------------------------------------------------- P2-1
+# `sum_extra_int` turned **any** `sqlite3.OperationalError` into `0`. One row
+# whose `extra` is not JSON (an older build, a hand-edited database) therefore
+# zeroed the whole day, and a locked or corrupt database was indistinguishable
+# from "no calls yet" — so the budget could never fire and nothing said why.
+def _today_start(offset: float = 60.0) -> float:
+    """01:00-ish UTC today: never slips into yesterday mid-suite."""
+    return time.time() - (time.time() % 86_400) + offset
+
+
+def _break_today_table(path, day_start: float) -> str:
+    """Create `audit_<today>` with the right name and the wrong schema."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    day = time.strftime("%Y%m%d", time.gmtime(day_start))
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            f'CREATE TABLE "audit_{day}" (id INTEGER PRIMARY KEY, ts REAL, kind TEXT)'
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return day
+
+
+def test_a_malformed_extra_row_does_not_zero_the_day(tmp_path):
+    ctx = make_context(tmp_path)
+    now = _today_start()
+    ctx.audit.record(_row(ts=now, purpose="evolve", tokens=11))
+    ctx.audit.flush()
+
+    # Bypass the writer, which always emits valid JSON: this is the row an older
+    # build could have left behind.
+    table = f"audit_{time.strftime('%Y%m%d', time.gmtime(now))}"
+    connection = sqlite3.connect(ctx.audit.path)
+    try:
+        connection.execute(
+            f'INSERT INTO "{table}" (ts, kind, extra) VALUES (?, ?, ?)',
+            (now + 1, "llm.call", "{not json"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    body = asyncio.run(_usage(ctx))
+    assert body["tokens_used"] == 11, (
+        f"one non-JSON row zeroed the day's usage: {body}"
+    )
+    assert "tokens_unavailable" not in body
+    ctx.audit.close()
+
+
+def test_a_read_failure_is_an_error_not_a_zero(tmp_path):
+    """A real sqlite failure must not look like an empty day."""
+    path = tmp_path / "audit.db"
+    day = _break_today_table(path, _today_start())
+
+    with pytest.raises(AuditReadError, match="no such column"):
+        AuditReader(path).sum_extra_int(
+            day=day, kind="llm.call", field="tokens", exclude={"purpose": "chat"},
+        )
+
+
+def test_a_missing_day_table_is_no_data_not_an_error(tmp_path):
+    path = tmp_path / "audit.db"
+    sqlite3.connect(path).close()  # exists, but has no day tables at all
+    assert AuditReader(path).sum_extra_int(day="20200101") == 0
+    assert AuditReader(tmp_path / "nothing.db").sum_extra_int(day="20200101") == 0
+
+
+def test_the_json1_fallback_also_raises_instead_of_zeroing(tmp_path, monkeypatch):
+    import vade.audit.reader as reader_module
+
+    monkeypatch.setattr(reader_module, "_JSON_OK", False)
+    path = tmp_path / "audit.db"
+    day = _break_today_table(path, _today_start())
+    with pytest.raises(AuditReadError):
+        AuditReader(path).sum_extra_int(day=day, kind="llm.call", field="tokens")
+
+
+def test_usage_says_unavailable_when_the_audit_read_fails(tmp_path):
+    """The endpoint carries the marker: a 0 alone is what hid the failure."""
+    ctx = make_context(tmp_path)
+    _break_today_table(ctx.audit.path, _today_start())
+
+    body = asyncio.run(_usage(ctx))
+    assert body["tokens_used"] == 0
+    assert body["tokens_unavailable"] is True, (
+        f"a failed audit read was served as an ordinary empty day: {body}"
+    )
     ctx.audit.close()

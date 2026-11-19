@@ -732,6 +732,11 @@ paths:
                   tokens_budget: {type: integer}
                   reviews_today: {type: integer}
                   proposals_today: {type: integer}
+                  tokens_unavailable:
+                    type: boolean
+                    description: |
+                      审计库读失败（区别于「今天还没有调用」）。置位时 `tokens_used` 没有意义
+                      （仍为整数只为保持 UI 契约），消费方必须看这个标记而不是那个 0。
         "401": {$ref: "#/components/responses/Unauthorized"}
 
   # --------------------------------------------------------------- layout

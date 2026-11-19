@@ -309,7 +309,12 @@ class AdminContext:
             return None
 
     def _count_usage_tokens(self, day: str) -> int:
-        """EVOLVE tokens spent on `day`; one aggregate SELECT over one table."""
+        """EVOLVE tokens spent on `day`; one aggregate SELECT over one table.
+
+        Raises `~vade.audit.reader.AuditReadError` when the store cannot be
+        read: the caller must tell "no calls" apart from "cannot tell"
+        (review P2-1).
+        """
         if self.audit is None:
             return 0
         from ..audit.reader import AuditReader
@@ -328,6 +333,9 @@ class AdminContext:
         The scan is pure sqlite: running it inline froze heartbeat, SSE and
         module RPC for as long as the table took (26.9 s on 200k rows), which
         is enough to time out every module connection (review P0-2).
+
+        A failed read propagates (`AuditReadError`) and is *not* cached: caching
+        it would turn one bad page into a minute of confident zeros.
         """
         cached = self._usage_cache
         now = time.monotonic()
@@ -1172,13 +1180,32 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         # a 60 s cache. The old body paged through every retained day table
         # (30 by default) with no `await` anywhere: 26.9 s of a frozen loop on
         # 200k rows, reachable by any read-only browser session.
-        tokens = await ctx.usage_tokens_today(day)
-        return JSONResponse({
+        from ..audit.reader import AuditReadError
+
+        tokens = 0
+        unavailable = False
+        try:
+            tokens = await ctx.usage_tokens_today(day)
+        except AuditReadError as exc:
+            # A read failure is not "no calls yet". The counter keeps its shape
+            # (`tokens_used` stays an integer for the UI) but the flag says the
+            # number is meaningless — previously a corrupt/locked audit.db was
+            # reported as 0 with nothing to distinguish it, so the budget looked
+            # untouched and could never fire (review P2-1).
+            unavailable = True
+            log.error(
+                "usage read failed (day=%s): %s", day, exc,
+                extra={"code": None, "msg": "audit_unavailable"},
+            )
+        body: dict[str, Any] = {
             "day": day, "tokens_used": tokens,
             "tokens_budget": ctx._config_overrides.get("evolve.daily_token_budget",
                                                        CONFIG_ITEMS["evolve.daily_token_budget"]["default"]),
             "reviews_today": 0, "proposals_today": 0,
-        })
+        }
+        if unavailable:
+            body["tokens_unavailable"] = True
+        return JSONResponse(body)
 
     # ------------------------------------------------------------------- layout
     async def get_layout(request: Request) -> Response:

@@ -318,6 +318,14 @@ export function useTopology(): TopologyApi {
       const rawId = asString(data.id) ?? asString(data.node_id);
       const id = rawId ? rawId.replace(/^edge[:/]/, '') : '';
 
+      if (event.type === 'resync') {
+        // 环溢出：服务端不重放历史，只说明「你的 cursor 已经追不上了」。
+        // 丢掉水位并整表重拉，否则 node.remove 会永久丢失（幽灵节点）。
+        appliedSeq = 0;
+        void snapshot();
+        return;
+      }
+
       if (event.type === 'node.remove') {
         if (!id) return;
         setById((previous) => {
@@ -384,6 +392,9 @@ export function useTopology(): TopologyApi {
         openedOnce = true;
         setLive('live');
         setNextRetryAt(null);
+        // 快照与订阅之间有一个窗口：服务端对新订阅者从 head 起不回放，
+        // 窗口内发生的 node.remove 会静默丢失。订阅建立后再拉一次幂等快照收口。
+        void snapshot();
       };
       es.onmessage = (message: MessageEvent<string>) => {
         if (cancelled) return;

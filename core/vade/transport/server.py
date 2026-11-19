@@ -1,8 +1,9 @@
 """Data-plane ASGI app: HTTPS helpers + WS upgrade. Pure ASGI, no framework.
 
-Routes on this listener: `/healthz`, `/ui/session`, `/ws`. Nothing else — in
-particular `/admin*` **does not exist here** (404, not 403): running module
-JavaScript in `/app` on the same origin as the admin plane would hand the
+Routes on this listener: `/healthz`, `/ui/session` (`POST` mints a browser
+session, `DELETE` revokes the one that presented its cookie), `/ws`. Nothing
+else — in particular `/admin*` **does not exist here** (404, not 403): running
+module JavaScript in `/app` on the same origin as the admin plane would hand the
 admin API to third-party code. C5a owns 127.0.0.1:8444 separately.
 
 CORS: exact-match allowlist from `[server].ui_origins`, `Allow-Credentials:
@@ -58,6 +59,15 @@ UI_SESSION_TTL_S = 30 * 24 * 3600
 #: lookup regardless; this only bounds how long a dead row (and the socket it
 #: authenticated) keeps occupying memory.
 UI_SESSION_SWEEP_S = 60.0
+
+#: The data-plane HTTP surface owned by this module. Frozen in
+#: `schema/ui-api.yaml` and machine-compared by `tools/check_contracts.py`, so
+#: a route cannot exist in the code and be missing from the contract (or the
+#: reverse). `/ui/blob*` is RFC-0004's family and is not listed here.
+UI_SESSION_ROUTES: frozenset[tuple[str, str]] = frozenset({
+    ("POST", "/ui/session"),
+    ("DELETE", "/ui/session"),
+})
 
 #: Live connections by connection_id. CoreApp registers here by default so
 #: governance hooks (`App._close_connection`) see the same objects.
@@ -175,6 +185,7 @@ class CoreApp:
         trust_forwarded_for: bool = False,
         connections: dict[str, Connection] | None = None,
         blob: Any | None = None,
+        audit: Any | None = None,
         ui_session_ttl_s: float = UI_SESSION_TTL_S,
         ui_session_sweep_s: float = UI_SESSION_SWEEP_S,
     ) -> None:
@@ -207,6 +218,11 @@ class CoreApp:
         self._blob = blob
         if blob is not None and hasattr(blob, "bind_sessions"):
             blob.bind_sessions(self._sessions)
+        #: Audit sink for the data plane (`ui.unpaired` today). Duck-typed on
+        #: `record(event)` so this module does not import the audit package —
+        #: the admin plane and this listener share one `AuditWriter`, and a
+        #: test can hand in anything with that one method.
+        self._audit = audit
 
     # ------------------------------------------------------------------ ASGI
     async def __call__(self, scope: Mapping[str, Any], receive: Callable[[], Awaitable[dict[str, Any]]], send: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
@@ -276,10 +292,16 @@ class CoreApp:
             return
 
         if path == "/ui/session":
-            if method != "POST":
-                await self._json(send, 405, {"code": "INVALID_ARGUMENT", "message": "method not allowed"})
+            if method == "POST":
+                await self._ui_session(scope, receive, send, headers)
                 return
-            await self._ui_session(scope, receive, send, headers)
+            if method == "DELETE":
+                await self._ui_unpair(scope, send, headers)
+                return
+            await self._json(
+                send, 405, {"code": "INVALID_ARGUMENT", "message": "method not allowed"},
+                extra={"Allow": "POST, DELETE"},
+            )
             return
 
         if path == "/ui/blob" or path.startswith("/ui/blob/"):
@@ -355,6 +377,103 @@ class CoreApp:
         extra = {"Set-Cookie": [cookie, csrf_cookie]}
         await self._json(send, 200, {"device_id": device_id}, cors, extra)
         _ = record
+
+    async def _ui_unpair(self, scope: Mapping[str, Any], send: Callable[[dict[str, Any]], Awaitable[None]], headers: Mapping[str, str]) -> None:
+        """`DELETE /ui/session`: revoke exactly the session that presents its cookie.
+
+        Same credential model as `POST /ui/session`: the `__Host-ac_ui` cookie
+        (plus the same `[server].ui_origins` gate), no bearer, no body. The
+        client calls this before switching cores so the old core does not keep
+        a live session — and its open `/ws` socket — pointed at a core the user
+        has left.
+
+        Nothing else is revoked, and that is the whole model, not an omission:
+        the `device_id` a browser session carries (`ui-…`) is a per-session
+        label minted here. It is not a row in any device table — `DeviceStore`
+        (admin plane) keys devices by `SHA-256(pubkey)[:16]` for keys that can
+        sign challenges, and `Whitelist` keys module instances by
+        `module_id#instance_id`. A browser never owns a key, so there is no
+        device record to revoke alongside the session; `revoke_device(ui-…)`
+        would be a no-op by construction. A repeat call (or a cookie-less one)
+        is `401` and must not touch any other session.
+        """
+        origin = headers.get("origin")
+        cors = self._cors_headers(origin)
+        if origin and cors is None:
+            await self._json(send, 403, {"code": "ORIGIN_MISMATCH", "message": "origin not allowed"})
+            return
+
+        token = self._cookie(headers.get("cookie", ""), "__Host-ac_ui")
+        # `UiSessions.get` already treats an expired row as absent, so an
+        # expired cookie is the same 401 as a forged one.
+        row = self._sessions.get(token) if token is not None else None
+        if row is None:
+            self._note_unpaired("denied", None, scope, headers, reason="no live session")
+            await self._json(send, 401, {"code": "AUTH_FAILED", "message": "no live ui session"}, cors)
+            return
+
+        device_id = str(row.get("device_id") or "")
+        self._drop_tokens({token}, reason="session unpaired")
+        self._note_unpaired(
+            "ok", device_id or None, scope, headers,
+            client_name=str(row.get("client_name") or "")[:64] or None,
+        )
+        # 204 + expire both cookies: the browser must forget a credential whose
+        # row is gone, or its next request would carry a dead token that looks
+        # like an authentication failure rather than "already unpaired".
+        expired = [
+            "__Host-ac_ui=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0",
+            "__Host-ac_csrf=; Path=/; Secure; SameSite=Lax; Max-Age=0",
+        ]
+        await self._no_content(send, cors, extra={"Set-Cookie": expired})
+
+    def _note_unpaired(self, status: str, actor: str | None, scope: Mapping[str, Any], headers: Mapping[str, str], *, reason: str | None = None, client_name: str | None = None) -> None:
+        """One `ui.unpaired` row per attempt, refusals included.
+
+        The token never enters the row: the audit log is readable by a
+        read-only admin session, so persisting a live credential there would
+        hand out the very session the row is about.
+        """
+        audit = self._audit
+        if audit is None:
+            return
+        extra: dict[str, Any] = {}
+        ip = self._client_ip(scope, headers)
+        if ip:
+            extra["ip"] = ip
+        if reason:
+            extra["reason"] = reason
+        if client_name:
+            extra["client_name"] = client_name
+        try:
+            audit.record({
+                "kind": "ui.unpaired",
+                "status": status,
+                "actor": actor,
+                "method": "DELETE /ui/session",
+                "extra": extra,
+            })
+        except Exception as exc:  # noqa: BLE001 - a bad audit row must not 500 the revoke
+            log.error(
+                "audit write failed (kind=ui.unpaired): %s", exc,
+                extra={"code": None, "msg": "audit_unavailable"},
+            )
+
+    @staticmethod
+    async def _no_content(send: Callable[[dict[str, Any]], Awaitable[None]], cors: Mapping[str, str] | None = None, extra: Mapping[str, str | Sequence[str]] | None = None) -> None:
+        """`204 No Content` with the same header plumbing as `_json`."""
+        headers: list[tuple[bytes, bytes]] = [
+            (b"cache-control", b"no-store"),
+            (b"content-length", b"0"),
+        ]
+        for key, value in (cors or {}).items():
+            headers.append((key.lower().encode(), value.encode()))
+        for key, value in (extra or {}).items():
+            values = value if isinstance(value, (list, tuple)) else (value,)
+            for item in values:
+                headers.append((key.lower().encode(), str(item).encode()))
+        await send({"type": "http.response.start", "status": 204, "headers": headers})
+        await send({"type": "http.response.body", "body": b""})
 
     @staticmethod
     def _status_headers(exc: VadeError) -> dict[str, str]:

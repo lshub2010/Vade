@@ -1,0 +1,143 @@
+openapi: 3.1.0
+info:
+  title: Vade data-plane UI API
+  version: 1.0.0
+  x-vade:
+    plane: data
+    listener: "core.listen (default 127.0.0.1:8443)"
+    owner: C2
+    status: implemented
+    siblings:
+      - "schema/admin-api.yaml — 管理面 127.0.0.1:8444，另一套凭据（__Host-ac_admin / bearer）"
+      - "schema/rpc.json#http_endpoints — RFC-0004 /ui/blob* 上传通道"
+  description: |
+    浏览器 UI 面（数据面 listener）的 HTTP 契约。这里只有一条会话机制：
+    `POST /ui/session` 用一次性配对码换 `__Host-ac_ui` cookie，`DELETE /ui/session`
+    用同一个 cookie 自吊销。`/ws` 升级与 `/ui/blob*` 分别由 C2 传输契约与 RFC-0004
+    定义，不在此文件内。`GET /admin*` 在这个 listener 上一律 404。
+
+    ## 吊销模型
+    `DELETE /ui/session` 只吊销**出示 cookie 的那一个** session：服务端删除该 session
+    行并关闭它认证的 `/ws` 连接。浏览器 session 的 `device_id`（`ui-…`）是每次登录
+    现铸的标签，不是任何设备表里的行——管理面 `DeviceStore` 只收能签挑战的设备公钥
+    （`device_id = SHA-256(pubkey)[:16]`），`Whitelist` 只收模块实例
+    （`module_id#instance_id`）。浏览器不持有密钥，因此**没有**设备记录需要一并吊销。
+
+    无 cookie、cookie 已失效或已吊销 → `401 AUTH_FAILED`，且不影响其它 session。
+    每次调用（含被拒）写一条审计 `ui.unpaired`（`status: ok|denied`）。
+
+    ## 错误
+    `{code, message}`，`code` 取自 `schema/errors.json`。
+paths:
+  /ui/session:
+    post:
+      tags: [session]
+      summary: 用配对码换浏览器会话 cookie
+      description: |
+        码必须是一次性 `purpose=browser` 的配对码（`core/vade/identity/pairing.py`）。
+        成功返回 `200` 并设置 `__Host-ac_ui`（`Secure; HttpOnly; SameSite=Strict;
+        Path=/`，不带 `Domain`）与可被页面读取的 `__Host-ac_csrf`（double-submit 用）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pair_code:
+                  type: string
+                  description: 8 位配对码；服务端先 normalize()（NFKC / 去分隔符 / 字母大写）
+                client_name:
+                  type: string
+                  maxLength: 64
+              required: [pair_code]
+              additionalProperties: false
+      responses:
+        "200":
+          description: 会话已建立
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+              description: __Host-ac_ui 与 __Host-ac_csrf 各一行
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device_id:
+                    type: string
+                    description: 本次会话的标签（ui-…）
+                required: [device_id]
+                additionalProperties: false
+        "400": {$ref: "#/components/responses/CodeInvalid"}
+        "403": {$ref: "#/components/responses/OriginMismatch"}
+        "405": {$ref: "#/components/responses/MethodNotAllowed"}
+        "413": {$ref: "#/components/responses/PayloadTooLarge"}
+        "429": {$ref: "#/components/responses/AdminLocked"}
+    delete:
+      tags: [session]
+      summary: 自吊销当前浏览器会话（换 core 前调用）
+      description: |
+        凭 __Host-ac_ui cookie 识别会话，只吊销这一个：删除 session 行、关闭它认证的
+        /ws 连接，并返回失效的两个 cookie（Max-Age=0）。重复调用、无 cookie、cookie
+        已失效 → 401 AUTH_FAILED，其它 session 不受影响。
+
+        请求无 body。与 POST /ui/session 共用 [server].ui_origins 闸门：
+        带了不允许的 Origin → 403 ORIGIN_MISMATCH。
+      responses:
+        "204":
+          description: 已吊销（无 body）
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+              description: __Host-ac_ui 与 __Host-ac_csrf 的过期指令（两行）
+        "401": {$ref: "#/components/responses/AuthFailed"}
+        "403": {$ref: "#/components/responses/OriginMismatch"}
+        "405": {$ref: "#/components/responses/MethodNotAllowed"}
+components:
+  responses:
+    CodeInvalid:
+      description: 配对码无效 / 已用 / 过期 / 用途不符
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    AuthFailed:
+      description: 没有可吊销的活会话（无 cookie、未知或已吊销的 token）
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    OriginMismatch:
+      description: Origin 不在 [server].ui_origins 白名单内
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    MethodNotAllowed:
+      description: 该方法不在此路径上（响应带 Allow POST/DELETE）
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    PayloadTooLarge:
+      description: POST body 超过 64 KiB
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    AdminLocked:
+      description: 同一 IP 的失败预算耗尽
+      headers:
+        Retry-After:
+          schema: {type: integer}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+  schemas:
+    Error:
+      type: object
+      properties:
+        code:
+          type: string
+          description: schema/errors.json 的错误码
+        message:
+          type: string
+          maxLength: 300
+      required: [code, message]
+      additionalProperties: false

@@ -54,6 +54,10 @@ Checks (each one has broken at least once in review):
      the `http_endpoints` rows verbatim, `http_endpoints.auth.device` names
      the minting method, and the append block carries
      `adds=["ui/blob.token"]` / `rewrites: none` / 1.7.0.
+ 15. `schema/ui-api.yaml` (data plane) declares exactly the browser-session
+     HTTP surface the dispatcher serves — `POST /ui/session` and
+     `DELETE /ui/session` — and the revoke operation keeps its `204`/`401`
+     contract.
 
 Run:  python3 tools/check_contracts.py      (exit 0 = green)
 """
@@ -506,6 +510,64 @@ def check_blob_routes() -> None:
         declared == BLOB_ROUTES,
         "blob route drift vs RFC-0004 §4.1: "
         f"missing={sorted(BLOB_ROUTES - declared)} extra={sorted(declared - BLOB_ROUTES)}",
+    )
+
+
+def check_ui_api_routes() -> None:
+    """`schema/ui-api.yaml` declares exactly the data-plane session routes.
+
+    `POST /ui/session` (mint) and `DELETE /ui/session` (self-revoke) are the
+    whole browser-session HTTP surface on the data listener; `/ws` is a
+    protocol upgrade and `/ui/blob*` is RFC-0004's own table, so neither
+    belongs in this file. Comparing both directions means a route added to the
+    dispatcher without the contract — or frozen in the contract and never
+    implemented — goes red here instead of being found by a client.
+    """
+    path = SCHEMA / "ui-api.yaml"
+    try:
+        import yaml
+    except Exception as exc:  # pragma: no cover - pyyaml is a hard dependency
+        FAILURES.append(f"schema/ui-api.yaml: cannot import yaml ({type(exc).__name__}: {exc})")
+        return
+    try:
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        FAILURES.append("schema/ui-api.yaml: missing")
+        return
+    except Exception as exc:  # noqa: BLE001 - any parse failure is the finding
+        FAILURES.append(f"schema/ui-api.yaml: invalid YAML ({type(exc).__name__}: {exc})")
+        return
+
+    if str(ROOT / "core") not in sys.path:
+        sys.path.insert(0, str(ROOT / "core"))
+    try:
+        from vade.transport.server import UI_SESSION_ROUTES
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        FAILURES.append(
+            "core/vade/transport/server.py: cannot import UI_SESSION_ROUTES "
+            f"({type(exc).__name__}: {exc})"
+        )
+        return
+
+    verbs = {"get", "put", "post", "delete", "patch", "head", "options"}
+    paths = doc.get("paths") or {}
+    declared = {
+        (method.upper(), str(route))
+        for route, operations in paths.items()
+        for method in (operations or {})
+        if str(method).lower() in verbs
+    }
+    expected = set(UI_SESSION_ROUTES)
+    check(
+        declared == expected,
+        "ui-api route drift: "
+        f"missing={sorted(expected - declared)} extra={sorted(declared - expected)}",
+    )
+    delete = (paths.get("/ui/session") or {}).get("delete") or {}
+    codes = {str(code) for code in (delete.get("responses") or {})}
+    check(
+        {"204", "401"} <= codes,
+        "schema/ui-api.yaml: DELETE /ui/session must declare 204 (revoked) and 401 (no live session)",
     )
 
 
@@ -1711,6 +1773,7 @@ def main() -> int:
     check_usage(config)
     check_llm_append(config)
     check_blob_routes()
+    check_ui_api_routes()
     check_manifest_models(manifest)
     check_tasks(config)
     check_ui(config, manifest, rpc)

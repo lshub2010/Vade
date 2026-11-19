@@ -1125,8 +1125,15 @@ class SessionLog:
             id=message_id, session_id=session_id, turn_id=turn.id, role="user",
             content=user_text, parts=parts,
         )
-        pinned = self._pin(records, device_id)
+        # `_pin` runs INSIDE the try: a pin that raises must give the claim
+        # back exactly like a failed emit does. Claiming before the write is
+        # what makes `OVERLOADED` authoritative, but a claim dropped on a raise
+        # here is never consumed by `enqueue` — it would shrink `max_pending`
+        # and keep `is_idle()` False for the life of the queue, which answers
+        # `turn_active` to every `session/delete` forever.
+        pinned: list[str] = []
         try:
+            pinned = self._pin(records, device_id)
             await self.emit(
                 session_id, "turn.queued",
                 {

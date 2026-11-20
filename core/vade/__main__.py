@@ -430,6 +430,12 @@ def _serve(
         # records `ui.unpaired` (ok/denied). `install_components` has already
         # run, so this is the live `AuditAdapter`, not None.
         audit=getattr(app, "audit", None),
+        # Browser sessions outlive a core restart: the table is reloaded from
+        # `<data_dir>/ui_sessions.json` (digests only, 0600) so a browser that
+        # paired yesterday is not asked to pair again after an upgrade. Same
+        # directory as the identity and the pairing codes, so one backup covers
+        # all three, and deleting it is the "log everyone out" switch.
+        data_dir=data_dir,
     )
 
     tls_opts = {"ssl_certfile": cert, "ssl_keyfile": key} if tls_cert else {}

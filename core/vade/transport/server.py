@@ -24,23 +24,44 @@ lookups treat an expired row as absent, and a periodic sweep (plus the sweep on
 every lookup) is what removes it. `/ui/blob` holds this same object by
 reference, so expiry is enforced for uploads too — the check lives in the
 table, not in each caller.
+
+Surviving a restart: a core restart used to log every browser out, because the
+table was process memory only. `UiSessions` now optionally writes itself to
+`<data_dir>/ui_sessions.json` (0600, atomic `tmp` + `rename`) and reloads on
+startup. The file holds `sha256(token) -> row` — never the token: a backup of
+`data_dir`, or a directory listing an operator pastes into a ticket, must not
+be a credential. Callers keep passing the raw cookie value; the key transform
+happens inside the table (`session_key`), so no reader has to know.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
+import os
 import secrets
+import tempfile
+import threading
 import time
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from ..errors import VadeError, http_status
 from ..logging import get_logger
 from .connection import Connection
 
-__all__ = ["CoreApp", "AsgiWebSocket", "CONNECTIONS", "UiSessions", "UI_SESSION_TTL_S"]
+__all__ = [
+    "CoreApp",
+    "AsgiWebSocket",
+    "CONNECTIONS",
+    "UiSessions",
+    "UI_SESSION_TTL_S",
+    "UI_SESSIONS_FILE",
+    "session_key",
+]
 
 log = get_logger("vade.transport.server")
 
@@ -60,6 +81,15 @@ UI_SESSION_TTL_S = 30 * 24 * 3600
 #: authenticated) keeps occupying memory.
 UI_SESSION_SWEEP_S = 60.0
 
+#: Filename of the browser-session table inside `[core].data_dir`. Fixed (not
+#: configurable) so an operator knows exactly which file holds live sessions.
+UI_SESSIONS_FILE = "ui_sessions.json"
+
+#: On-disk shape version. An unknown version is ignored like a corrupt file:
+#: guessing at a newer layout could resurrect a revoked session, and the only
+#: cost of ignoring it is one re-pair.
+UI_SESSIONS_FILE_VERSION = 1
+
 #: The data-plane HTTP surface owned by this module. Frozen in
 #: `schema/ui-api.yaml` and machine-compared by `tools/check_contracts.py`, so
 #: a route cannot exist in the code and be missing from the contract (or the
@@ -77,26 +107,187 @@ CONNECTIONS: dict[str, Connection] = {}
 _MISSING = object()
 
 
+def session_key(token: Any) -> str:
+    """`sha256(token)` hex — the only shape a key has inside the table.
+
+    Every path into `UiSessions` (mint, lookup, revoke, load, persist) funnels
+    through this function, so there is exactly one place that decides what a
+    key is and no path that keeps a usable credential. Callers never see it:
+    they pass the cookie value and get the row.
+
+    A non-string (a `None` cookie, an already-hashed blob handed in by mistake)
+    becomes `""`, which no stored key can equal — a miss, never a crash and
+    never an accidental wildcard match.
+    """
+    if not isinstance(token, str):
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 class UiSessions(dict):
-    """`token -> session row` with a hard server-side TTL.
+    """`sha256(token) -> session row` with a hard server-side TTL.
 
     A `dict` subclass on purpose: `vade.blob`'s `/ui/blob` gate is handed this
     exact object by reference (`bind_sessions`) and only ever calls `.get()`.
     Replacing the table with a wrapper would need that component's cooperation;
     overriding the read paths means *every* reader — the WS upgrade, the blob
     cookie gate, governance — sees the same answer for "is this token still
-    alive", with no second place to forget the check.
+    alive", with no second place to forget the check. For the same reason the
+    key transform lives in the overrides: the blob gate passes the raw cookie
+    value and calls `.get()`, and it keeps working without knowing that the
+    stored key is a digest.
 
     A row without a numeric `created_at` (only hand-built fixtures or rows
     written by an older build) is treated as non-expiring: expiry is a function
     of a value the mint always writes, and inventing a timestamp for a row that
     has none would expire someone's session at process start.
+
+    Persistence is optional: with `path=None` this is process memory and
+    behaves exactly as before. With a path, the table loads at construction,
+    drops what has already expired, and writes the whole set after every
+    mutation (`mint`, `revoke`, `sweep`, lazy eviction) — atomically, via a
+    `0600` temp file in the same directory and `os.replace`, so a crash
+    mid-write leaves the previous file intact rather than a truncated one.
     """
 
-    def __init__(self, ttl_s: float = UI_SESSION_TTL_S, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        ttl_s: float = UI_SESSION_TTL_S,
+        *,
+        clock: Callable[[], float] = time.time,
+        path: str | os.PathLike[str] | None = None,
+    ) -> None:
         super().__init__()
         self.ttl_s = float(ttl_s)
         self._clock = clock
+        self.path: Path | None = Path(path) if path is not None else None
+        #: Serialises writers. `revoke_session` is also reachable from
+        #: governance hooks off the event loop, and two half-written files
+        #: would be worse than a late one.
+        self._write_lock = threading.Lock()
+        if self.path is not None:
+            self._load()
+
+    # ------------------------------------------------------------------ storage
+    def _write(self) -> None:
+        """Persist the whole table atomically. Never raises: a full disk must
+        not turn a successful login into a 500 — the session is still live in
+        memory, only its survival across a restart is at risk."""
+        path = self.path
+        if path is None:
+            return
+        with self._write_lock:
+            try:
+                rows = {key: _jsonable_row(row) for key, row in list(dict.items(self))}
+            except RuntimeError as exc:  # pragma: no cover - concurrent resize
+                log.warning("browser session snapshot skipped: %s", exc)
+                return
+            body = json.dumps(
+                {"version": UI_SESSIONS_FILE_VERSION, "sessions": rows},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            tmp: str | None = None
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=str(path.parent))
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(body)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, path)
+                tmp = None
+            except OSError as exc:
+                log.error("browser session store write failed: %s", exc)
+            finally:
+                if tmp is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
+
+    def _load(self) -> int:
+        """Read the persisted table; return how many rows were kept.
+
+        Anything unreadable — missing file, bad JSON, wrong shape, a key that
+        is not a digest, a row that already expired — is dropped, and the file
+        is rewritten so the next start does not see it again. A corrupt store
+        must never stop the core from serving: the worst case is that browsers
+        have to pair again, which is exactly the pre-persistence behaviour.
+        """
+        path = self.path
+        if path is None:
+            return 0
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return 0
+        except OSError as exc:
+            log.warning("browser session store unreadable, starting empty: %s", exc)
+            return 0
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            log.warning("browser session store is not valid JSON, ignoring it: %s", exc)
+            return 0
+        if not isinstance(payload, Mapping):
+            log.warning("browser session store has an unexpected shape, ignoring it")
+            return 0
+        if payload.get("version") != UI_SESSIONS_FILE_VERSION:
+            log.warning(
+                "browser session store version %r is not %r, ignoring it",
+                payload.get("version"), UI_SESSIONS_FILE_VERSION,
+            )
+            return 0
+        rows = payload.get("sessions")
+        if not isinstance(rows, Mapping):
+            log.warning("browser session store holds no `sessions` mapping, ignoring it")
+            return 0
+
+        kept = 0
+        dropped = 0
+        now = self._clock()
+        for key, row in rows.items():
+            if not _is_digest(key) or not isinstance(row, Mapping):
+                dropped += 1
+                continue
+            row = dict(row)
+            # `device_id` is the identity every reader names (`/ws` puts it on
+            # the connection, the blob gate puts it on the principal); a row
+            # without one is not a session, whatever else it says. The rest get
+            # the same defaults the mint writes, so a hand-edited file cannot
+            # turn a missing key into a `KeyError` on the WS upgrade path.
+            if not isinstance(row.get("device_id"), str) or not row["device_id"]:
+                dropped += 1
+                continue
+            row.setdefault("revoked", False)
+            row.setdefault("read_only", False)
+            row.setdefault("csrf_hash", "")
+            deadline = self.expires_at(row)
+            if deadline is not None and now >= deadline:
+                # Already dead: keeping it would only make the next sweep write
+                # the file again to remove it.
+                dropped += 1
+                continue
+            dict.__setitem__(self, key, row)
+            kept += 1
+        if dropped:
+            log.info(
+                "browser session store: %d row(s) recovered, %d dropped",
+                kept, dropped,
+            )
+            # Rewrite so a dead or malformed row is gone from disk too, not
+            # just from memory.
+            self._write()
+        return kept
+
+    # ------------------------------------------------------------------ keys
+    def __setitem__(self, token: Any, row: Any) -> None:  # type: ignore[override]
+        dict.__setitem__(self, session_key(token), row)
+        self._write()
+
+    def __delitem__(self, token: Any) -> None:  # type: ignore[override]
+        dict.__delitem__(self, session_key(token))
+        self._write()
 
     # ------------------------------------------------------------------ queries
     def expires_at(self, row: Mapping[str, Any] | None) -> float | None:
@@ -112,12 +303,15 @@ class UiSessions(dict):
         return deadline is not None and self._clock() >= deadline
 
     def get(self, token: Any, default: Any = None) -> Any:  # type: ignore[override]
-        row = super().get(token)
+        key = session_key(token)
+        row = dict.get(self, key)
         if row is None or self.is_expired(row):
             if row is not None:
                 # Lazy eviction: an expired token must stop working the moment
-                # it expires, not at the next sweep tick.
-                super().pop(token, None)
+                # it expires, not at the next sweep tick. The file has to agree,
+                # or a restart would resurrect the row this call just denied.
+                dict.pop(self, key, None)
+                self._write()
             return default
         return row
 
@@ -130,18 +324,89 @@ class UiSessions(dict):
     def __contains__(self, token: Any) -> bool:  # type: ignore[override]
         return self.get(token, _MISSING) is not _MISSING
 
+    def pop(self, token: Any, default: Any = _MISSING) -> Any:  # type: ignore[override]
+        key = session_key(token)
+        if default is _MISSING:
+            row = dict.pop(self, key)
+        else:
+            row = dict.pop(self, key, _MISSING)
+            if row is _MISSING:
+                return default
+        self._write()
+        return row
+
+    def setdefault(self, token: Any, default: Any = None) -> Any:  # type: ignore[override]
+        row = self.get(token)
+        if row is not None:
+            return row
+        self[token] = default
+        return default
+
+    def update(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        """Hash the keys of a bulk insert, exactly like `__setitem__` does."""
+        for token, row in dict(*args, **kwargs).items():
+            self[token] = row
+
+    def clear(self) -> None:  # type: ignore[override]
+        if not dict.__len__(self):
+            return
+        dict.clear(self)
+        self._write()
+
     # ------------------------------------------------------------------ maintenance
     def prune(self) -> list[str]:
-        """Drop every expired row; return the tokens that were removed."""
+        """Drop every expired row; return the hashed keys that were removed."""
         now = self._clock()
         dead = [
-            token
-            for token, row in list(dict.items(self))
+            key
+            for key, row in list(dict.items(self))
             if (deadline := self.expires_at(row)) is not None and now >= deadline
         ]
-        for token in dead:
-            dict.pop(self, token, None)
+        for key in dead:
+            dict.pop(self, key, None)
+        if dead:
+            self._write()
         return dead
+
+    def discard_many(self, keys: Iterable[str]) -> int:
+        """Remove already-hashed `keys` in one pass and one write.
+
+        `sweep_sessions`/`revoke_session` speak in keys (they read them back
+        out of `items()`), so they must not go through `pop`, which would hash
+        a digest a second time and silently remove nothing.
+        """
+        removed = 0
+        for key in keys:
+            if key and dict.pop(self, key, _MISSING) is not _MISSING:
+                removed += 1
+        if removed:
+            self._write()
+        return removed
+
+
+def _is_digest(value: Any) -> bool:
+    """A stored key must be a sha256 hex digest, or the file is not ours."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _jsonable_row(row: Any) -> dict[str, Any]:
+    """Keep only what `json.dumps` round-trips; a row is flat scalars today.
+
+    Filtering (rather than `default=str`) is deliberate: a session row that
+    somehow grew an object field must lose that field, not gain a stringified
+    repr that a later start would read back as a different value.
+    """
+    if not isinstance(row, Mapping):
+        return {}
+    return {
+        str(key): value
+        for key, value in row.items()
+        if value is None or isinstance(value, (str, int, float, bool))
+    }
 
 
 class AsgiWebSocket:
@@ -188,6 +453,8 @@ class CoreApp:
         audit: Any | None = None,
         ui_session_ttl_s: float = UI_SESSION_TTL_S,
         ui_session_sweep_s: float = UI_SESSION_SWEEP_S,
+        data_dir: str | os.PathLike[str] | None = None,
+        ui_session_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self.config = config
         self.identity = identity
@@ -207,9 +474,19 @@ class CoreApp:
         self._listen_hosts = tuple(config.get("server.listen_hosts", []) or [])
         self._ui_session_ttl_s = float(ui_session_ttl_s)
         self._ui_session_sweep_s = float(ui_session_sweep_s)
+        #: Where the table survives a restart. `data_dir` is the assembly
+        #: point's (`__main__._serve`) `[core].data_dir`; `ui_session_path`
+        #: overrides the file name. Neither given (the default in tests) means
+        #: process memory only, which is what every caller had before.
+        if ui_session_path is not None:
+            session_store = Path(ui_session_path)
+        elif data_dir is not None:
+            session_store = Path(data_dir) / UI_SESSIONS_FILE
+        else:
+            session_store = None
         #: Browser sessions. `UiSessions` is the authority on expiry: the WS
         #: upgrade, the blob cookie gate and `revoke_session` all read it.
-        self._sessions: UiSessions = UiSessions(self._ui_session_ttl_s)
+        self._sessions: UiSessions = UiSessions(self._ui_session_ttl_s, path=session_store)
         self._session_sweeper: asyncio.Task[None] | None = None
         self._connections: dict[str, Connection] = CONNECTIONS if connections is None else connections
         #: RFC-0004 `/ui/blob*` sub-app, installed by `vade.blob.install(app)`.
@@ -413,7 +690,7 @@ class CoreApp:
             return
 
         device_id = str(row.get("device_id") or "")
-        self._drop_tokens({token}, reason="session unpaired")
+        self._drop_sessions({session_key(token)}, reason="session unpaired")
         self._note_unpaired(
             "ok", device_id or None, scope, headers,
             client_name=str(row.get("client_name") or "")[:64] or None,
@@ -629,8 +906,8 @@ class CoreApp:
         A revoke used to return every browser connection id, which would have
         kicked every logged-in UI when one device was revoked.
         """
-        tokens = {token for token, meta in self._sessions.items() if meta["device_id"] == device_id}
-        return self._drop_tokens(tokens, reason="session revoked")
+        keys = {key for key, meta in self._sessions.items() if meta["device_id"] == device_id}
+        return self._drop_sessions(keys, reason="session revoked")
 
     def sweep_sessions(self) -> tuple[str, ...]:
         """Remove expired browser sessions and close the sockets they own.
@@ -644,14 +921,26 @@ class CoreApp:
         Sync on purpose: `Registry`/governance hooks run off-loop and need to
         call it, and the only effect is `pop` + `request_close` (thread-safe).
         """
-        return self._drop_tokens(set(self._sessions.prune()), reason="session expired")
+        return self._drop_sessions(set(self._sessions.prune()), reason="session expired")
 
-    def _drop_tokens(self, tokens: set[str], *, reason: str) -> tuple[str, ...]:
+    def _drop_sessions(self, keys: set[str], *, reason: str) -> tuple[str, ...]:
+        """Drop already-hashed `keys` from the table and close their sockets.
+
+        `keys` are hashes, because that is the only thing the table can hand
+        back (`items()`, `prune()`); the socket still carries the raw cookie
+        value in `ui_token`, so the comparison hashes it through the same
+        `session_key`. An empty set (or a `None`/empty token) must never match
+        a connection: `session_key` maps those to `""`, which is filtered out.
+        """
+        keys = {key for key in keys if key}
+        if not keys:
+            return ()
+        self._sessions.discard_many(keys)
         closed: list[str] = []
-        for token in tokens:
-            dict.pop(self._sessions, token, None)
         for connection in list(self._connections.values()):
-            if connection.browser_session and getattr(connection, "ui_token", None) in tokens:
+            if not connection.browser_session:
+                continue
+            if session_key(getattr(connection, "ui_token", None)) in keys:
                 closed.append(connection.connection_id)
                 connection.request_close(1001, reason)
         return tuple(closed)

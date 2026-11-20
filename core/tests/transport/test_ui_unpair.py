@@ -197,8 +197,9 @@ async def test_delete_revokes_only_the_session_that_presented_its_cookie(tmp_pat
     # The other browser never noticed.
     other = await _blob_get(app, token_b, csrf_b)
     assert other.status == 404, other.body
-    assert token_b in dict(app._sessions)  # type: ignore[attr-defined]
-    assert token_a not in dict(app._sessions)  # type: ignore[attr-defined]
+    assert token_b in app._sessions  # type: ignore[attr-defined]
+    assert token_a not in app._sessions  # type: ignore[attr-defined]
+    assert len(app._sessions) == 1  # type: ignore[attr-defined]
 
     # A live socket authenticated by the revoked cookie is closed with 1001.
     sock = _Socket()
@@ -224,15 +225,19 @@ async def test_a_repeat_delete_is_401_and_cannot_touch_another_session(tmp_path)
 
     assert (await _delete(app, _cookie(token_a, csrf_a))).status == 204
 
-    sessions = dict(app._sessions)  # type: ignore[attr-defined]
-    assert set(sessions) == {token_b}
+    # The table keys are digests, so "unchanged" is asserted through the API a
+    # reader uses: only B is still live, and nothing else appeared or vanished.
+    assert token_b in app._sessions  # type: ignore[attr-defined]
+    assert token_a not in app._sessions  # type: ignore[attr-defined]
+    assert len(app._sessions) == 1  # type: ignore[attr-defined]
 
     for _ in range(2):
         again = await _delete(app, _cookie(token_a, csrf_a))
         assert again.status == 401, again.body
         assert again.json["code"] == "AUTH_FAILED"
         # The refused call must not be a wildcard: the live row survives it.
-        assert dict(app._sessions) == sessions  # type: ignore[attr-defined]
+        assert len(app._sessions) == 1  # type: ignore[attr-defined]
+        assert token_b in app._sessions  # type: ignore[attr-defined]
 
     assert (await _blob_get(app, token_b, csrf_b)).status == 404
 

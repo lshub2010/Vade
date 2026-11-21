@@ -52,19 +52,21 @@ def _audit(data_dir: Path, **event: Any) -> None:
 
 
 def _require_not_running(data_dir: Path) -> None:
-    """`flock data/core.lock` is C2's single-instance guard; honour it here too."""
-    import fcntl
+    """Refuse to touch `data/` while a core holds `data/core.lock`.
 
-    lock_path = data_dir / "core.lock"
-    if not lock_path.exists():
-        return
-    handle = open(lock_path, "a+")
+    Same lock, same truth as `__main__._serve`: a CLI write to `devices.json`
+    while a core is running used to be erased by that core's next
+    `mark_used()` write-back (review P0-5). `DeviceStore` also invalidates its
+    cache on every stat, so a write that does land is at least not ignored —
+    but the supported contract is "stop the core first".
+    """
+    from .locks import acquire_instance_lock, release_instance_lock
+
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd = acquire_instance_lock(data_dir)
     except OSError:
-        raise SystemExit("core appears to be running (data/core.lock is held); stop it first")
-    finally:
-        handle.close()
+        raise SystemExit("core appears to be running (data/core.lock is held); stop it first") from None
+    release_instance_lock(fd)
 
 
 def _resolve_data_dir(args) -> Path:  # pragma: no cover - thin alias
@@ -170,6 +172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if command == "trust-key":
+        _require_not_running(data_dir)
         text = Path(args.pubkey_file).read_text(encoding="utf-8")
         alg, raw = normalize_pubkey(text, args.alg)
         store = DeviceStore(data_dir / "admin" / "devices.json")
@@ -181,6 +184,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if command == "revoke-device":
+        _require_not_running(data_dir)
         store = DeviceStore(data_dir / "admin" / "devices.json")
         if not store.revoke(args.id):
             raise SystemExit("unknown device id")

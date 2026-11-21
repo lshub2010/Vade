@@ -20,10 +20,36 @@ export class ApiError extends Error {
 }
 
 let accessToken: string | null = null;
+//: Double-submit token from the login/refresh response. Not a bearer secret,
+//: but losing it on reload made logout-after-refresh fail silently (review P1).
+//: sessionStorage is per-tab and cleared when the tab closes.
+const CSRF_STORAGE_KEY = "vade.admin.csrf";
+let csrfToken: string | null = (() => {
+  try {
+    return sessionStorage.getItem(CSRF_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+})();
 const unauthorizedListeners = new Set<() => void>();
 
 export function setAccessToken(token: string | null): void {
   accessToken = token;
+  if (token === null) setCsrfToken(null);
+}
+
+export function setCsrfToken(token: string | null): void {
+  csrfToken = token;
+  try {
+    if (token) sessionStorage.setItem(CSRF_STORAGE_KEY, token);
+    else sessionStorage.removeItem(CSRF_STORAGE_KEY);
+  } catch {
+    // Storage disabled: memory only, same as before.
+  }
+}
+
+export function getCsrfToken(): string | null {
+  return csrfToken;
 }
 
 export function getAccessToken(): string | null {
@@ -78,12 +104,14 @@ async function readJson(response: Response): Promise<unknown> {
 }
 
 export async function api<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const method = options.method ?? 'GET';
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (options.body !== undefined) headers['Content-Type'] = 'application/json';
   if (!options.anonymous && accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  if (!options.anonymous && csrfToken && method !== 'GET') headers['X-CSRF-Token'] = csrfToken;
 
   const response = await fetch(path, {
-    method: options.method ?? 'GET',
+    method,
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
     credentials: 'same-origin',

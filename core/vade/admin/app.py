@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -311,7 +312,13 @@ class AdminContext:
             identity=identity,
             setup=SetupService(config.data_dir, config.admin_host, identity.fp8),
             devices=DeviceStore(config.data_dir / "admin" / "devices.json"),
-            sessions=SessionStore(access_ttl_s=config.access_ttl_s, refresh_ttl_s=config.refresh_ttl_s),
+            sessions=SessionStore(
+                access_ttl_s=config.access_ttl_s, refresh_ttl_s=config.refresh_ttl_s,
+                # 31-C5a §T4 ⑥ / design §7.12.6: a 30-day refresh survives a
+                # core restart. Only sha256(refresh) + jti + device_id +
+                # password_version + expires_at are written (0600).
+                persist_path=config.data_dir / "admin" / "sessions.json",
+            ),
             challenges=ChallengeStore(ttl_s=config.challenge_ttl_s),
             registry=getattr(app, "registry", None),
             registry_api=getattr(app, "registry_api", None),
@@ -354,6 +361,10 @@ class AdminContext:
 
     def __post_init__(self) -> None:
         self.sessions.set_device_checker(self.devices.is_active)
+        # The session version must follow `admin.json`, not process memory: a
+        # restart (or an offline `admin reset-password`) has to invalidate the
+        # persisted refresh rows (review P2-20).
+        self.sessions.set_password_version_source(self.setup.password_version)
         self._load_overrides()
         self.bind_ports()
 
@@ -744,7 +755,92 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
                                 actor=session.device_id or "browser", method=request.method,
                                 extra={"path": request.url.path})
                 raise VadeError("READ_ONLY_SESSION", "browser sessions are read-only; use the Vade App")
+        # CSRF double-submit, for real: the token issued at login must come back
+        # in `x-csrf-token` on every state-changing request. 31 §T4 ⑤ names the
+        # browser as the reason (cookies are attached automatically), but the
+        # check is cheap and uniform — an App already receives `csrf_token` in
+        # its TokenPair, and a request that forgets it is exactly the case a
+        # stolen/ambient credential would also forget (review P1-5).
+        # Bearer (device) sessions do not carry ambient authority, so CSRF is
+        # meaningless for them; browser cookies do.
+        if (request.method not in {"GET", "HEAD", "OPTIONS"}
+                and session.mode == "browser"):
+            provided = request.headers.get(CSRF_HEADER) or ""
+            if not provided or not hmac.compare_digest(str(session.csrf), str(provided)):
+                ctx.write_audit(kind="admin.rejected", status="denied", code="ORIGIN_MISMATCH",
+                                actor=session.device_id or session.mode, method=request.method,
+                                extra={"reason": "csrf", "path": request.url.path})
+                raise VadeError("ORIGIN_MISMATCH", "CSRF token is missing or wrong")
         return session
+
+    def preauth_gate(request: Request, *, require_origin: bool = False) -> None:
+        """Origin / Sec-Fetch-Site / Content-Type gate for the unauthenticated routes.
+
+        `guard()` is never called on `PREAUTH_PREFIXES` or the login routes, so
+        those handlers used to accept a `text/plain` JSON body from any web
+        page: a cross-site `fetch(..., {mode:'no-cors'})` is a CORS-simple
+        request, needs no preflight, and — before this — could finish first-run
+        setup with the attacker's password (review P0-1). The three checks are
+        the same ones `guard()` applies, just without a session:
+
+        * Host must be the configured admin host (DNS rebinding);
+        * an `Origin` that is present must be the admin origin;
+        * `Sec-Fetch-Site` must be `same-origin` / `none` when present;
+        * every POST must be `application/json` — a `no-cors` form cannot send
+          that content type, and a cross-origin one triggers a preflight this
+          server never approves;
+        * `require_origin` additionally refuses a missing Origin from a
+          non-loopback peer (setup is the route that creates the administrator).
+        """
+        host = request.headers.get("host")
+        if host not in ctx.config.allowed_hosts:
+            ctx.write_audit(kind="admin.rejected", status="denied", code="ORIGIN_MISMATCH",
+                            extra={"reason": "host not allowed", "host": host, "path": request.url.path})
+            raise VadeError("ORIGIN_MISMATCH", "Host is not the configured admin host")
+        origin = request.headers.get("origin")
+        if origin and not origin_allowed(origin, ctx.config.admin_host):
+            ctx.write_audit(kind="admin.rejected", status="denied", code="ORIGIN_MISMATCH",
+                            extra={"reason": "origin mismatch", "origin": origin, "path": request.url.path})
+            raise VadeError("ORIGIN_MISMATCH", "Origin does not match the admin plane")
+        fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+        if fetch_site and fetch_site not in {"same-origin", "none"}:
+            ctx.write_audit(kind="admin.rejected", status="denied", code="ORIGIN_MISMATCH",
+                            extra={"reason": "cross-site fetch", "path": request.url.path,
+                                   "sec_fetch_site": fetch_site})
+            raise VadeError("ORIGIN_MISMATCH", "cross-site requests are refused")
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+            length = request.headers.get("content-length")
+            has_body = (length not in (None, "0")) or bool(request.headers.get("transfer-encoding"))
+            # A bodyless POST (the documented `login/challenge` shape) has
+            # nothing to smuggle; a body must be JSON, which a `no-cors`
+            # cross-site fetch cannot declare without a preflight.
+            if content_type != "application/json" and has_body:
+                ctx.write_audit(kind="admin.rejected", status="denied", code="ORIGIN_MISMATCH",
+                                extra={"reason": "content-type", "path": request.url.path,
+                                       "content_type": content_type})
+                raise VadeError("ORIGIN_MISMATCH", "Content-Type must be application/json")
+        if require_origin and not origin and not _loopback(request):
+            ctx.write_audit(kind="admin.rejected", status="denied", code="ORIGIN_MISMATCH",
+                            extra={"reason": "missing origin", "path": request.url.path})
+            raise VadeError("ORIGIN_MISMATCH", "Origin header is required for setup")
+
+    async def step_up(request: Request, password: str, session: Any, *, action: str) -> None:
+        """One password check for every step-up route, with one budget.
+
+        `add_device`, `password` and `devices/ticket` used to verify the
+        password without spending the login rate limit and without an audit row
+        (only `revoke_device` did both, review P1-6). A stolen 15-minute bearer
+        could therefore guess the password online for free and leave no trace.
+        """
+        ip = _client(request)
+        limiter.check_ip(ip)
+        if not await verify_password_async(password, ctx.setup.password_hash()):
+            limiter.hit(f"pw:{ip}", 300)
+            limiter.password_failure(ip)
+            ctx.write_audit(kind="admin.step_up", status="denied", code="AUTH_FAILED",
+                            actor=actor_of(session), extra={"ip": ip, "action": action})
+            raise VadeError("AUTH_FAILED", "password or device is incorrect")
 
     def require_initialized() -> None:
         if not ctx.setup.initialized():
@@ -755,6 +851,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
 
     # -------------------------------------------------------------------- setup
     async def get_setup(request: Request) -> Response:
+        preauth_gate(request)
         if ctx.setup.initialized():
             return RedirectResponse("/login", status_code=302)
         loopback = _loopback(request)
@@ -770,6 +867,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         return JSONResponse(body)
 
     async def post_setup_unlock(request: Request) -> Response:
+        preauth_gate(request)
         if ctx.setup.initialized():
             raise VadeError("NOT_FOUND", "admin plane is already initialised")
         ip = _client(request)
@@ -785,7 +883,16 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
                 limiter.hit(f"unlock:{ip}", 300)
         body = await _json(request)
         provided = body.get("setup_token")
-        payload = ctx.setup.unlock(provided if isinstance(provided, str) else "")
+        try:
+            payload = ctx.setup.unlock(provided if isinstance(provided, str) else "")
+        except VadeError as exc:
+            # unlock is the gate that decides who becomes administrator; a
+            # failed guess must leave a row in audit.db, not only a counter in
+            # the pairing ledger (review P1-7).
+            ctx.write_audit(kind="setup.attempt", status="denied", code=exc.code, actor=None,
+                            extra={"source": "loopback" if _loopback(request) else "token",
+                                   "ip": ip, "action": "unlock"})
+            raise
         token = secrets.token_urlsafe(32)
         ctx._unlocks[token] = time.time() + ctx.config.unlock_ttl_s
         ctx.write_audit(kind="setup.attempt", status="ok", code=None, actor=None,
@@ -800,6 +907,12 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         return response
 
     async def post_setup(request: Request) -> Response:
+        # Non-loopback first-run setup must carry an Origin: the request comes
+        # from a browser (a native client uses `/admin/bind`), and a browser
+        # POST always has one. A missing Origin from a remote peer is either a
+        # hand-rolled client or a stripped-header request — neither is allowed
+        # to create the administrator (review P0-1).
+        preauth_gate(request, require_origin=True)
         if ctx.setup.initialized():
             raise VadeError("NOT_FOUND", "admin plane is already initialised")
         body = await _json(request)
@@ -831,6 +944,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
 
     # --------------------------------------------------------------------- bind
     async def bind_info(request: Request) -> Response:
+        preauth_gate(request)
         ticket = request.headers.get("x-bind-ticket") or ""
         entry = ctx.setup.peek_ticket(ticket)
         if entry is None:
@@ -865,6 +979,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         """
         ip = _client(request)
         limiter.check_ip(ip)
+        preauth_gate(request)
         body = await _json(request)
         try:
             payload = await bind_service.complete(ctx, body, ip=ip)
@@ -878,6 +993,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
     # --------------------------------------------------------------------- auth
     async def login_challenge(request: Request) -> Response:
         require_initialized()
+        preauth_gate(request)
         limiter.hit(f"challenge:{_client(request)}", 60)
         if len(limiter._bucket(f"challenge:{_client(request)}", 60)) > 30:
             raise VadeError("OVERLOADED", "too many challenge requests")
@@ -888,6 +1004,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
 
     async def login(request: Request) -> Response:
         require_initialized()
+        preauth_gate(request)
         ip = _client(request)
         limiter.check_ip(ip)
         body = await _json(request)
@@ -975,7 +1092,13 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
 
     async def logout(request: Request) -> Response:
         session = guard(request, readonly_check=False)
-        ctx.sessions.revoke(session.token)
+        body = await _json(request, required=False)
+        provided = body.get("refresh_token")
+        # §7.12.6: delete the refresh row and blacklist its jti. Revoking only
+        # the 15-minute access row left a stolen 30-day refresh alive (review
+        # P1-6). The session carries the digest of the refresh minted with it,
+        # so the client does not have to echo the token.
+        ctx.sessions.logout(session, refresh_token=provided if isinstance(provided, str) else None)
         ctx.write_audit(kind="admin.logout", status="ok", actor=actor_of(session))
         response = JSONResponse({"ok": True})
         response.delete_cookie(COOKIE_NAME, path="/", secure=True, httponly=True, samesite="strict")
@@ -1002,11 +1125,23 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         new = str(body.get("new_password") or "")
         # Verify (64 MiB) + hash (64 MiB): both on the worker channel, so the
         # loop keeps serving while a password changes.
-        await run_argon2(ctx.setup.change_password, old, new)
+        ip = _client(request)
+        limiter.check_ip(ip)
+        try:
+            await run_argon2(ctx.setup.change_password, old, new)
+        except VadeError as exc:
+            if exc.code == "AUTH_FAILED":
+                # A wrong old password is a password guess: same budget, same
+                # audit trail as login (review P1-6).
+                limiter.hit(f"pw:{ip}", 300)
+                limiter.password_failure(ip)
+                ctx.write_audit(kind="admin.step_up", status="denied", code="AUTH_FAILED",
+                                actor=actor_of(session), extra={"ip": ip, "action": "password"})
+            raise
         # Keep the caller signed in, invalidate everyone else by version.
         mode, device_id = session.mode, session.device_id
         ctx.sessions.bump_password_version()
-        tokens = ctx.sessions.issue(mode=mode, device_id=device_id, ip=_client(request))
+        tokens = ctx.sessions.issue(mode=mode, device_id=device_id, ip=ip)
         ctx.write_audit(kind="admin.password_changed", status="ok", actor=actor_of(session))
         payload: dict[str, Any] = {"ok": True, "expires_in": tokens["expires_in"], "mode": mode}
         response = JSONResponse(payload)
@@ -1020,6 +1155,8 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
             return response
         payload["access_token"] = tokens["access_token"]
         payload["refresh_token"] = tokens["refresh_token"]
+        payload["refresh_jti"] = tokens["refresh_jti"]
+        payload["csrf_token"] = tokens["csrf_token"]
         return JSONResponse(payload)
 
     # ------------------------------------------------------------------ devices
@@ -1033,8 +1170,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         password = str(body.get("password") or "")
         # step-up: the only load-bearing check on this path. A logged-in
         # attacker with a stolen cookie must not be able to enrol a new key.
-        if not await verify_password_async(password, ctx.setup.password_hash()):
-            raise VadeError("AUTH_FAILED", "password or device is incorrect")
+        await step_up(request, password, session, action="device.add")
         alg, raw = normalize_pubkey(str(body.get("pubkey") or ""), body.get("alg"))
         device = ctx.devices.add(
             pubkey_b64=base64.b64encode(raw).decode(), alg=alg,
@@ -1051,14 +1187,10 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         body = await _json(request, required=False)
         if body.get("password"):
             # A wrong password here guesses the same secret as `login`, so it
-            # spends the same budget: without this, a session holder could
-            # brute-force the password offline of every login-side limit.
-            ip = _client(request)
-            limiter.check_ip(ip)
-            if not await verify_password_async(str(body["password"]), ctx.setup.password_hash()):
-                limiter.hit(f"pw:{ip}", 300)
-                limiter.password_failure(ip)
-                raise VadeError("AUTH_FAILED", "password or device is incorrect")
+            # spends the same budget and leaves the same audit row (review
+            # P1-6): without this, a session holder could brute-force the
+            # password offline of every login-side limit.
+            await step_up(request, str(body["password"]), session, action="device.revoke")
         if not ctx.devices.revoke(device_id):
             raise VadeError("NOT_FOUND", "unknown device")
         ctx.sessions.revoke_device(device_id)
@@ -1069,8 +1201,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
     async def device_ticket(request: Request) -> Response:
         session = guard(request)
         body = await _json(request)
-        if not await verify_password_async(str(body.get("password") or ""), ctx.setup.password_hash()):
-            raise VadeError("AUTH_FAILED", "password or device is incorrect")
+        await step_up(request, str(body.get("password") or ""), session, action="device.ticket")
         ticket = ctx.setup.create_ticket()
         ctx.write_audit(kind="device.ticket", status="ok", actor=actor_of(session),
                         extra={"expires_at": ticket["expires_at"]})

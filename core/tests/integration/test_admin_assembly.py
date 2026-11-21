@@ -68,7 +68,8 @@ async def _login(client: httpx.AsyncClient) -> dict[str, str]:
     )
     assert login.status_code == 200, login.text
     assert login.json()["mode"] == "device"
-    return {"Authorization": f"Bearer {login.json()['access_token']}"}
+    body = login.json()
+    return {"Authorization": f"Bearer {body['access_token']}", "x-csrf-token": body["csrf_token"]}
 
 
 def test_install_components_binds_the_ports_owned_by_later_components(app: App) -> None:

@@ -51,6 +51,10 @@ export interface TokenPair {
   refresh_token: string;
   expires_in: number;
   mode: 'device';
+  /** Session-bound double-submit token: every non-GET must send it. */
+  csrf_token?: string;
+  /** What the refresh signature covers; native layer keeps it with the token. */
+  refresh_jti?: string;
 }
 
 export interface BrowserSession {

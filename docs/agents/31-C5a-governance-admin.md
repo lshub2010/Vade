@@ -79,8 +79,8 @@ servers:
 | POST | `/admin/api/invites` | 创建邀请位（返回 pair_code + QR payload，**仅此一次明文**） |
 | DELETE | `/admin/api/invites/{id}` | 撤销邀请 |
 | GET | `/admin/api/audit` | `from/to/module_id/limit/cursor` |
-| GET | `/admin/api/config` | `{items:[{key, value, default, source, mode:"hot"|"restart", min?, max?}]}`；**只返回 §7.9 白名单键**，密钥类一律不返回 |
-| PUT | `/admin/api/config` | `{key, value, confirm?}` → `{applied, needs_restart?, audit_id}`。未知键/越界 → 400；三项危险项缺 `confirm:true` → 409 `CONFIRM_REQUIRED` |
+| GET | `/admin/api/config` | `{items:[{key, value, default, source, mode:"hot"\|"restart", min?, max?}]}`；**只返回 §7.9 白名单键**，密钥类一律不返回。`value`/`source` 取自**已加载的 `app.config`**（`default` / `core.toml` / `overrides` / `env`），不是把 schema 默认值再抄一遍；`default`/`min`/`max`/`values` 一律现读 `schema/config.schema.json` |
+| PUT | `/admin/api/config` | `{key, value, confirm?}` → `{applied, needs_restart, audit_id}`。未知键/越界 → 400；三项危险项缺 `confirm:true` → 409 `CONFIRM_REQUIRED`。**白名单键必须是 schema 里真实存在的叶子**（否则写进 `overrides.json` 会让下次 `load_config()` 以 `UNKNOWN_CONFIG_KEY` 启动失败），写盘一律嵌套（`{"evolve": {"enabled": false}}`），不写扁平点号键。`applied=true` 只在有真实热生效实现时返回，否则 `needs_restart=true` |
 | GET | `/admin/api/config/usage` | `{day, tokens_used, tokens_budget, reviews_today, proposals_today}`；页面进度条用，**不含任何记忆内容** |
 | GET | `/admin/api/layout` | 全量布局 |
 | PATCH | `/admin/api/layout` | `{rev, nodes:[{id,x,y,label,group_id}]}`，冲突 409。**L1 布局（含 `label`）不记审计**——改了别名就写审计，审计表会被拖垮 |
@@ -416,13 +416,14 @@ admin-ui/
      - **不显示公钥原文**，只显示 `fp8`。
   3. **加一台设备的备用方式**（折叠，给开发者）：文本框接受 `ssh-ed25519 AAAA...`，同样要 step-up。
   4. **登出全部**：二次确认（破坏性）；文案写清「包括当前这台设备」。
-  5. **记忆与进化策略（可改，热生效）**：10 项，字段与范围见 `design.md §7.9`。控件：数字 `input[type=number]` + 前后端同范围校验，布尔用 switch；每项右侧常显 `当前值 / 默认值 / 来源`。
+  5. **记忆与进化策略（可改，热生效）**：**8 项**，字段与范围见 `design.md §7.9`；键名、默认值、上下界一律以 `schema/config.schema.json` 为准，页面后端不得自建副本（旧副本把 `evolve.enabled` 默认写成 true、还塞了 4 个 schema 里根本不存在的键，写进 `overrides.json` 会让下次启动 `UNKNOWN_CONFIG_KEY`）。控件：数字 `input[type=number]` + 前后端同范围校验，布尔用 switch；每项右侧常显 `当前值 / 默认值 / 来源`。
      - 保存：`PUT /admin/api/config`，body `{key, value}`；返回 `{applied:true}` 或 `{applied:false, needs_restart:true}` 或 `{error:"..."}`。
+     - **`mode=hot` 必须有真实热生效实现**：`core.log_level`（改 root logger 级别）、`policy.approval_timeout_s`（下一次审批的 deadline 就用新值）。没有消费者的键（本版本的 `evolve.*`，M4b 未落地）如实报 `restart` + `needs_restart:true`，**不许假热**。
      - **三项必须二次确认**：关 `evolve.enabled`、`evolve.daily_token_budget=0`、`evolve.nudge_interval<5`。确认弹窗要写清后果（如「关闭后不再产生新记忆与提案，已有内容保留」）。
      - `nudge_interval` 下方实时显示「按最近 7 天均值 ≈ N 次/天、≈ M token/天」——不显示成本的调速旋钮等于让人蒙眼花钱。
      - `daily_token_budget` 显示今日已用进度条（`GET /admin/api/config/usage`）。
      - 校验失败就地红字，**不 reload 页面**（reload 会把用户其它未保存的改动冲掉）。
-  6. **其余生效配置（只读）**：监听地址、管理面 host、**core 身份指纹 `fp8`**、`policy.approval_timeout_s`、审计保留天数、`e2e` 开关，以及 §7.9 的「需重启」组。每项显示 `value` 与 `source`（`default` / `core.toml` / `overrides` / `env` / `cli`）——这是为了回答「我改了 toml 怎么没生效」。**不给编辑框**。
+  6. **其余生效配置（只读）**：监听地址、管理面 host、**core 身份指纹 `fp8`**、`policy.approval_timeout_s`、审计保留天数，以及 §7.9 的「需重启」组。每项显示 `value` 与 `source`（`default` / `core.toml` / `overrides` / `env` / `cli`）——这是为了回答「我改了 toml 怎么没生效」。**不给编辑框**。（本版本没有 `e2e.enabled` 这个配置键；`/admin/api/health` 的 `e2e_enabled` 只是能力开关的镜像。）
 - **`/skills`**：列表（名 / 当前 rev / 状态 / 来源）+ 详情抽屉。
   - 详情里显示 `pending` 提案的 **diff**（后端算好，`GET /admin/api/skills/{name}` 返回），左旧右新，按行高亮。
   - 三个操作：通过（`approve`）、驳回（`reject`，必填理由）、回滚（`rollback`，选目标 rev）。
@@ -544,7 +545,10 @@ cd admin-ui && npm ci && npm run build && git diff --exit-code dist
 | **设备上限** | 已有 5 台再绑定 → `BIND_DEVICE_LIMIT`，`devices.json` 不变 |
 | **吊销设备** | `revoke` 后该设备的 access/refresh 立刻 401；重启 core 后仍 401（落盘，不是内存黑名单） |
 | **core 身份指纹稳定** | 换 TLS 证书后 `admin print-fingerprint` 不变；重启不变 |
-| **策略项热生效** | `PUT /admin/api/config {key:"evolve.nudge_interval", value:5}` → 200；`GET` 返回 5、`source=overrides`；`core.toml` **未变**；重启后仍为 5 |
+| **策略项热生效** | `PUT /admin/api/config {key:"core.log_level", value:"debug"}` → 200、`applied=true`；进程 root logger 级别立刻变 DEBUG，`GET` 返回 `debug`、`source=overrides`；`core.toml` **未变**；重启后仍为 `debug` |
+| **审批超时热生效** | `PUT {key:"policy.approval_timeout_s", value:120}` → `applied=true`；下一次审批的 deadline = now+120s（`ApprovalManager.open_request` 实算） |
+| **写盘嵌套且能重启** | PUT 后 `data/config.overrides.json` 是 `{"evolve":{"nudge_interval":5}}`（**没有** `"evolve.nudge_interval"` 这种扁平键）；同一 `data_dir` 重新 `load_config()` 不抛 `UNKNOWN_CONFIG_KEY` |
+| **非热项如实说** | 没有消费者的键（本版本 `evolve.*`）PUT → `{applied:false, needs_restart:true}`，`GET` 的 `mode=restart`；**不得报 applied=true** |
 | **未知键被拒** | `PUT` 一个 `evolve.foo` → 400 `UNKNOWN_CONFIG_KEY`；进程未重启也未被污染 |
 | **危险项要确认** | 不带 `confirm` 关 `evolve.enabled` → 409 `CONFIRM_REQUIRED`；带 `confirm:true` → 200，审计有 `config.changed{key,old,new}` |
 | **用量可见且不泄漏** | 跑 12 轮后 `GET /admin/api/config/usage` 返回 `reviews_today=1`、`tokens_used>0`；响应体里 grep 不到任何记忆文本 |

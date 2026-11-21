@@ -23,10 +23,12 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import secrets
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -37,6 +39,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response, Stream
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from ..config import ENV_NESTING, ENV_PREFIX, SCHEMA_PATH
 from ..errors import VadeError, http_status
 from ..identity.pairing import Purpose
 from ..logging import get_logger
@@ -91,24 +94,105 @@ def readonly_exempt(path: str) -> bool:
     """True iff a browser session may issue a non-GET request to `path`."""
     return path in READONLY_EXEMPT or path.startswith(PREAUTH_PREFIXES)
 
-#: §7.9 whitelist. Anything not listed here is `UNKNOWN_CONFIG_KEY` on PUT and
-#: absent from GET — the config page cannot become a config-file editor.
+#: §7.9 whitelist: the ONLY config keys the admin plane lists or writes.
+#:
+#: Every name here must be a real leaf of `schema/config.schema.json`. That is
+#: not cosmetic — `load_config()` rejects an unknown key in `overrides.json`
+#: with UNKNOWN_CONFIG_KEY, so a whitelist entry that is not a config key turns
+#: one admin write into a core that refuses to start. The previous table had
+#: four such names (`memory.global_limit`, `memory.staging_ttl_days`,
+#: `evolve.review_interval`, `e2e.enabled`).
+#:
+#: Only `danger` lives here: a C5a UX rule with no schema equivalent. Everything
+#: the API reports about an item — default, type, bounds, enum, and the schema's
+#: own `x-vade.apply` — is read from the schema at request time. The copy that
+#: used to sit here had already drifted (`evolve.enabled` default `True` while
+#: the schema says `False`), and nothing could catch it.
 CONFIG_ITEMS: dict[str, dict[str, Any]] = {
-    "evolve.enabled": {"default": True, "type": "bool", "mode": "hot", "danger": "off"},
-    "evolve.daily_token_budget": {"default": 200_000, "type": "int", "mode": "hot",
-                                  "min": 0, "max": 10_000_000, "danger": "zero"},
-    "evolve.nudge_interval": {"default": 10, "type": "int", "mode": "hot",
-                              "min": 1, "max": 100, "danger": "low"},
-    "evolve.review_interval": {"default": 20, "type": "int", "mode": "hot", "min": 1, "max": 200},
-    "memory.global_limit": {"default": 5000, "type": "int", "mode": "restart", "min": 100, "max": 100_000},
-    "memory.staging_ttl_days": {"default": 14, "type": "int", "mode": "restart", "min": 1, "max": 90},
-    "policy.approval_timeout_s": {"default": 60, "type": "int", "mode": "hot", "min": 10, "max": 600},
-    "audit.retention_days": {"default": 30, "type": "int", "mode": "restart",
-                             "min": 1, "max": 3650},
-    "core.log_level": {"default": "info", "type": "enum", "mode": "hot",
-                       "values": ["debug", "info", "warning", "error"]},
-    "e2e.enabled": {"default": False, "type": "bool", "mode": "restart"},
+    "evolve.enabled": {"danger": "off"},
+    "evolve.daily_token_budget": {"danger": "zero"},
+    "evolve.nudge_interval": {"danger": "low"},
+    "memory.global_capacity": {},
+    "memory.ttl_days": {},
+    "policy.approval_timeout_s": {},
+    "audit.retention_days": {},
+    "core.log_level": {},
 }
+
+
+@lru_cache(maxsize=1)
+def config_schema() -> Mapping[str, Any]:
+    """`schema/config.schema.json`, parsed once per process.
+
+    Same file `load_config()` reads, so the config page cannot disagree with the
+    loader about a key's name, default or bounds.
+    """
+    return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def schema_leaf(dotted: str) -> Mapping[str, Any]:
+    """The schema node for `a.b.c`, or `{}` when the key does not exist.
+
+    A missing node is how a stale whitelist entry is *detected*: the item test
+    asserts every `CONFIG_ITEMS` key resolves to a leaf carrying a `default`.
+    """
+    node: Any = config_schema()
+    for part in dotted.split("."):
+        props = node.get("properties") if isinstance(node, Mapping) else None
+        if not isinstance(props, Mapping) or part not in props:
+            return {}
+        node = props[part]
+    return node if isinstance(node, Mapping) else {}
+
+
+def env_name(dotted: str) -> str:
+    """`core.log_level` → `VADE_CORE__LOG_LEVEL` (C-18 nesting)."""
+    return ENV_PREFIX + dotted.upper().replace(".", ENV_NESTING)
+
+
+def item_mode(key: str) -> str:
+    """`hot` only when the schema says hot AND an applier is registered.
+
+    The schema's `x-vade.apply` is the contract for *who can change it*, but a
+    label alone applies nothing. Reporting `hot` for a key no component re-reads
+    is the fake-hot bug: the page said 已生效 while the running core kept the old
+    value. Keys without an applier report `restart`, and PUT answers
+    `{applied: false, needs_restart: true}`.
+    """
+    if schema_leaf(key).get("x-vade", {}).get("apply") != "hot":
+        return "restart"
+    return "hot" if key in HOT_APPLIERS else "restart"
+
+
+def dotted_get(node: Mapping[str, Any], dotted: str, default: Any = None) -> Any:
+    current: Any = node
+    for part in dotted.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            return default
+        current = current[part]
+    return current
+
+
+def has_dotted(node: Mapping[str, Any], dotted: str) -> bool:
+    sentinel = object()
+    return dotted_get(node, dotted, sentinel) is not sentinel
+
+
+def set_dotted(node: dict[str, Any], dotted: str, value: Any) -> None:
+    """Write `a.b.c` *as nested tables* — never as a flat dotted key.
+
+    `load_config()` walks `properties` per level; a flat `{"evolve.enabled": …}`
+    is an unknown section named `evolve.enabled` and aborts startup.
+    """
+    parts = dotted.split(".")
+    cursor: dict[str, Any] = node
+    for part in parts[:-1]:
+        child = cursor.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            cursor[part] = child
+        cursor = child
+    cursor[parts[-1]] = value
 
 
 # --------------------------------------------------------------------- payloads
@@ -182,6 +266,11 @@ class AdminContext:
     whitelist: Any = None
     stream: EventStream = field(default_factory=EventStream)
     sessions_provider: Callable[[], int] | None = None
+    #: The loaded `vade.config.Config` (`app.config`). GET reads values from here
+    #: so the page shows what the process actually holds, not the schema default
+    #: it used to echo for every key (`source: "default"` forever, even when
+    #: core.toml or overrides said otherwise).
+    app_config: Any = None
     version: str = "1.0.0"
     e2e_enabled: bool = False
     allow_remote_readonly: bool = True
@@ -231,6 +320,7 @@ class AdminContext:
             pairing=getattr(app, "pairing", None),
             whitelist=getattr(app, "whitelist", None),
             skills=getattr(app, "skill_loader", None),
+            app_config=getattr(app, "config", None),
             version=config.version,
             e2e_enabled=config.e2e_enabled,
             allow_remote_readonly=config.allow_remote_readonly,
@@ -273,10 +363,45 @@ class AdminContext:
         return Path(self.config.data_dir) / "config.overrides.json"
 
     def _load_overrides(self) -> None:
+        """Read `config.overrides.json`, repairing the flat-key shape.
+
+        The old PUT handler dumped `{"evolve.enabled": false}`. `load_config()`
+        only understands nested tables, so the next start answered
+        UNKNOWN_CONFIG_KEY with `evolve.enabled` as the *section* name — one
+        admin write and the core never came up again. Expanding a flat key here
+        (and rewriting the file) rescues a data dir that already holds that
+        shape; a nested table and a flat key for the same leaf: last one wins.
+        """
         try:
-            self._config_overrides = json.loads(self.overrides_path.read_text(encoding="utf-8"))
+            data = json.loads(self.overrides_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError):
             self._config_overrides = {}
+            return
+        if not isinstance(data, dict):
+            self._config_overrides = {}
+            return
+        flat = [key for key in data if "." in key]
+        if not flat:
+            self._config_overrides = data
+            return
+        nested: dict[str, Any] = {}
+        for key, value in data.items():
+            if "." in key:
+                set_dotted(nested, key, value)
+            elif isinstance(value, dict) and isinstance(nested.get(key), dict):
+                nested[key] = {**nested[key], **value}
+            else:
+                nested[key] = value
+        self._config_overrides = nested
+        log.warning(
+            "config.overrides.json held flat keys %s; rewrote them as nested tables",
+            flat, extra={"code": None, "msg": "overrides_flat_keys_repaired"},
+        )
+        try:
+            self._save_overrides()
+        except OSError:  # noqa: BLE001 - a read-only data dir must not block startup
+            log.error("could not rewrite the repaired overrides file",
+                      extra={"code": None, "msg": "overrides_repair_failed"})
 
     def _save_overrides(self) -> None:
         path = self.overrides_path
@@ -284,6 +409,65 @@ class AdminContext:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._config_overrides, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)
+
+    # ------------------------------------------------------- live config values
+    def live_value(self, key: str, default: Any = None) -> Any:
+        """What `app.config.get(key)` answers right now.
+
+        Falls back to the overrides file only when no `Config` is attached (a
+        hand-built context in a test), so production always reports the loaded
+        value rather than a copy kept on the side.
+        """
+        if self.app_config is not None:
+            return self.app_config.get(key, default)
+        return dotted_get(self._config_overrides, key, default)
+
+    def source_of(self, key: str) -> str:
+        """Which layer the effective value comes from, in `load_config()` order.
+
+        `env` beats `overrides` beats `core.toml` beats the default. `cli` is
+        indistinguishable from a config object alone, so a value that is neither
+        the default nor explained by env/overrides is reported as `core.toml`.
+        """
+        if env_name(key) in os.environ:
+            return "env"
+        if has_dotted(self._config_overrides, key):
+            return "overrides"
+        default = schema_leaf(key).get("default")
+        if self.app_config is not None and self.live_value(key, default) != default:
+            return "core.toml"
+        return "default"
+
+    def set_live(self, key: str, value: Any) -> None:
+        """Write the value into `app.config` so live readers see it at once.
+
+        `Config.values` is a plain nested dict behind a frozen dataclass; the
+        freeze blocks rebinding attributes, not the values. Components that call
+        `config.get(...)` per use therefore see the new value immediately, while
+        components that snapshot at install time only get it on the next start —
+        which is exactly what `needs_restart` reports.
+        """
+        values = getattr(self.app_config, "values", None)
+        if isinstance(values, dict):
+            set_dotted(values, key, value)
+
+    def apply_hot(self, key: str, value: Any) -> bool:
+        """Run the registered applier for a hot key. False = it did not apply.
+
+        A failure is logged and reported as `needs_restart`, never swallowed
+        into a success response: a `hot` key that only *looks* applied is worse
+        than an honest restart.
+        """
+        applier = HOT_APPLIERS.get(key)
+        if applier is None:
+            return False
+        try:
+            applier(self, value)
+        except Exception as exc:  # noqa: BLE001 - report, never 500 a saved write
+            log.error("hot apply failed (key=%s): %s", key, exc,
+                      extra={"code": None, "msg": "config_apply_failed"})
+            return False
+        return True
 
     # ------------------------------------------------------------------- audit
     def write_audit(self, **event: Any) -> str | None:
@@ -1131,15 +1315,29 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
 
     # ------------------------------------------------------------------- config
     def _config_items() -> list[dict[str, Any]]:
+        """One row per whitelisted key: live value, origin, and honest mode.
+
+        `value`/`source` come from the loaded config (`ctx.app_config`), not from
+        a copy of the defaults: the page exists to answer 改了 toml 为什么没生效,
+        and echoing the schema default for every key answered nothing.
+        """
         items = []
-        for key, meta in CONFIG_ITEMS.items():
-            value = ctx._config_overrides.get(key, meta["default"])
-            source = "overrides" if key in ctx._config_overrides else "default"
-            item = {"key": key, "value": value, "default": meta["default"],
-                    "source": source, "mode": meta["mode"]}
-            for extra in ("min", "max", "values"):
-                if extra in meta:
-                    item[extra] = meta[extra]
+        for key in CONFIG_ITEMS:
+            leaf = schema_leaf(key)
+            default = leaf.get("default")
+            item: dict[str, Any] = {
+                "key": key,
+                "value": ctx.live_value(key, default),
+                "default": default,
+                "source": ctx.source_of(key),
+                "mode": item_mode(key),
+            }
+            if "minimum" in leaf:
+                item["min"] = leaf["minimum"]
+            if "maximum" in leaf:
+                item["max"] = leaf["maximum"]
+            if "enum" in leaf:
+                item["values"] = list(leaf["enum"])
             items.append(item)
         return items
 
@@ -1152,24 +1350,43 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         body = await _json(request)
         key = str(body.get("key") or "")
         if key not in CONFIG_ITEMS:
+            # Refusing here is what keeps a bad key out of overrides.json: the
+            # loader treats an unknown key there as a fatal startup error, so a
+            # 400 now is the difference between a rejected write and a core that
+            # cannot boot again.
             raise VadeError("UNKNOWN_CONFIG_KEY", f"unknown config key {key!r}")
-        meta = CONFIG_ITEMS[key]
-        value = body.get("value")
-        value = _coerce(key, meta, value)
-        danger = _danger(key, meta, value)
+        leaf = schema_leaf(key)
+        value = _coerce_item(key, leaf, body.get("value"))
+        old = ctx.live_value(key, leaf.get("default"))
+        danger = _danger(key, value, old)
         if danger and body.get("confirm") is not True:
             raise VadeError("CONFIRM_REQUIRED", f"{key}={value!r} needs confirm:true ({danger})")
-        old = ctx._config_overrides.get(key, meta["default"])
-        ctx._config_overrides[key] = value
-        ctx._save_overrides()
+        # Nested, always: `set_dotted` turns `a.b.c` into {"a": {"b": {"c": …}}}
+        # because a flat dotted key is an unknown *section* to `load_config()`.
+        previous = ctx._config_overrides
+        # Deep enough that the revert below really restores nested tables, and
+        # cheap because every value here is already JSON-native.
+        updated = json.loads(json.dumps(previous)) if previous else {}
+        set_dotted(updated, key, value)
+        ctx._config_overrides = updated
+        try:
+            ctx._save_overrides()
+        except OSError as exc:
+            ctx._config_overrides = previous
+            raise VadeError("INTERNAL", f"cannot persist {key}: {exc}") from None
+        # The running config follows every accepted write; `needs_restart` is
+        # what says whether the components have actually picked it up.
+        ctx.set_live(key, value)
+        mode = item_mode(key)
+        applied = bool(mode == "hot" and ctx.apply_hot(key, value))
         event = ctx.write_audit(
             kind="config.changed", status="ok", code=None, actor=actor_of(session),
             method="PUT /admin/api/config",
-            extra={"key": key, "old": old, "new": value, "mode": meta["mode"]},
+            extra={"key": key, "old": old, "new": value, "mode": mode, "applied": applied},
         )
         return JSONResponse({
-            "applied": meta["mode"] == "hot",
-            "needs_restart": meta["mode"] != "hot",
+            "applied": applied,
+            "needs_restart": not applied,
             **_audit_payload(ctx, event),
         })
 
@@ -1199,8 +1416,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
             )
         body: dict[str, Any] = {
             "day": day, "tokens_used": tokens,
-            "tokens_budget": ctx._config_overrides.get("evolve.daily_token_budget",
-                                                       CONFIG_ITEMS["evolve.daily_token_budget"]["default"]),
+            "tokens_budget": ctx.live_value("evolve.daily_token_budget", 0),
             "reviews_today": 0, "proposals_today": 0,
         }
         if unavailable:
@@ -1409,36 +1625,99 @@ def _num(value: str | None) -> float | None:
         raise VadeError("INVALID_ARGUMENT", f"{value!r} is not a number") from None
 
 
-def _coerce(key: str, meta: Mapping[str, Any], value: Any) -> Any:
-    kind = meta.get("type")
-    if kind == "bool":
+def _coerce_item(key: str, leaf: Mapping[str, Any], value: Any) -> Any:
+    """Validate against the *schema leaf* (type/bounds/enum), not a local copy.
+
+    Every bound here is the contract's: `policy.approval_timeout_s` is 5..3600
+    because the schema says so, and the old table's 10..600 silently rejected
+    legal values while accepting none that the loader would.
+    """
+    declared = leaf.get("type")
+    types = declared if isinstance(declared, list) else [declared] if declared else []
+    if "boolean" in types:
         if not isinstance(value, bool):
             raise VadeError("INVALID_ARGUMENT", f"{key} must be a boolean")
-        return value
-    if kind == "int":
+    elif "integer" in types:
         if isinstance(value, bool) or not isinstance(value, int):
             raise VadeError("INVALID_ARGUMENT", f"{key} must be an integer")
-        if "min" in meta and value < meta["min"]:
-            raise VadeError("INVALID_ARGUMENT", f"{key} must be >= {meta['min']}")
-        if "max" in meta and value > meta["max"]:
-            raise VadeError("INVALID_ARGUMENT", f"{key} must be <= {meta['max']}")
-        return value
-    if kind == "enum":
-        if value not in meta.get("values", []):
-            raise VadeError("INVALID_ARGUMENT", f"{key} must be one of {meta.get('values')}")
-        return value
+    elif "number" in types:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise VadeError("INVALID_ARGUMENT", f"{key} must be a number")
+    elif "string" in types:
+        if not isinstance(value, str):
+            raise VadeError("INVALID_ARGUMENT", f"{key} must be a string")
+        choices = leaf.get("enum")
+        if choices is not None and value not in choices:
+            raise VadeError("INVALID_ARGUMENT", f"{key} must be one of {list(choices)}")
+    minimum, maximum = leaf.get("minimum"), leaf.get("maximum")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if minimum is not None and value < minimum:
+            raise VadeError("INVALID_ARGUMENT", f"{key} must be >= {minimum}")
+        if maximum is not None and value > maximum:
+            raise VadeError("INVALID_ARGUMENT", f"{key} must be <= {maximum}")
     return value
 
 
-def _danger(key: str, meta: Mapping[str, Any], value: Any) -> str | None:
-    rule = meta.get("danger")
+def _danger(key: str, value: Any, old: Any) -> str | None:
+    """Confirm gate for the three changes that cost money or stop learning.
+
+    Only fires when the value actually changes. `evolve.enabled` defaults to
+    False (schema), so re-saving `false` is not "turning evolution off" and must
+    not demand a confirm the caller has no reason to give.
+    """
+    if value == old:
+        return None
+    rule = CONFIG_ITEMS.get(key, {}).get("danger")
     if rule == "off" and value is False:
         return "turning evolution off stops new memories and proposals"
     if rule == "zero" and value == 0:
         return "a zero budget stops generation for the rest of the day"
     if rule == "low" and isinstance(value, int) and value < 5:
-        return "an interval below 5 minutes will spend tokens quickly"
+        return "an interval below 5 turns will spend tokens quickly"
     return None
+
+
+# ------------------------------------------------------------------ hot appliers
+def _apply_log_level(ctx: "AdminContext", value: Any) -> None:
+    """`core.log_level`: change the live root logger level.
+
+    `App.startup()` calls `setup_logging(level)` once, so before this the key was
+    "hot" only in the schema — the process kept logging at the old level until a
+    restart, which the page never said.
+    """
+    numeric = getattr(logging, str(value).upper(), None)
+    if not isinstance(numeric, int):
+        raise VadeError("INVALID_ARGUMENT", f"not a log level: {value!r}")
+    logging.getLogger().setLevel(numeric)
+    for handler in logging.getLogger().handlers:
+        handler.setLevel(numeric)
+
+
+def _apply_approval_timeout(ctx: "AdminContext", value: Any) -> None:
+    """`policy.approval_timeout_s`: the next approval waits the new number.
+
+    `ApprovalManager` reads `self.timeout_s` when it mints a request
+    (`deadline = now + timeout_s`), so writing the attribute is the hot path.
+    Resolved through `app.approvals` at call time: `admin` installs before
+    `policy` (alphabetical), and `bind_ports()` may already have captured None.
+    """
+    manager = getattr(ctx._app, "approvals", None) if ctx._app is not None else None
+    if manager is None:
+        manager = ctx.approvals
+    if manager is None:
+        raise VadeError("UNSUPPORTED", "the approval channel is not installed in this core")
+    manager.timeout_s = float(value)
+
+
+#: Keys whose `hot` label is backed by code that changes the running process.
+#: A key missing here reports `mode: "restart"` no matter what the schema says —
+#: the schema describes C-18 ownership, not whether this build re-reads the
+#: value. `evolve.*` has no consumer in this core yet (M4b is not built), so
+#: claiming it applied would be exactly the fake-hot bug.
+HOT_APPLIERS: dict[str, Callable[["AdminContext", Any], None]] = {
+    "core.log_level": _apply_log_level,
+    "policy.approval_timeout_s": _apply_approval_timeout,
+}
 
 
 class GuardedApp:

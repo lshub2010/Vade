@@ -1317,9 +1317,14 @@ components:
       properties:
         access_token: {type: string}
         refresh_token: {type: string}
+        refresh_jti:
+          type: string
+          description: 刷新签名的对象包含它（`refresh_message(jti, device_id)`）；`/admin/api/token/refresh` 用它防「只偷到 refresh token」
         expires_in: {type: integer, const: 900}
         mode: {type: string, const: device}
-        csrf_token: {type: string}
+        csrf_token:
+          type: string
+          description: 非 GET 请求必须回传 `x-csrf-token`（double-submit）
       required: [access_token, refresh_token, expires_in, mode]
     BrowserSession:
       type: object

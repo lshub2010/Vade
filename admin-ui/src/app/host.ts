@@ -16,6 +16,12 @@ export interface HostSession {
   /** 只存内存；refresh_token 永远不进页面。 */
   access_token: string;
   expires_in?: number;
+  /**
+   * 会话绑定的 double-submit token。core 对**所有**非 GET 请求都验它，
+   * 而写请求由页面代发，所以原生登录后必须把 `csrf_token` 一并交给页面
+   * （与 access_token 同级、同样只存内存）。
+   */
+  csrf_token?: string;
 }
 
 export interface HostInjection {

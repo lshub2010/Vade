@@ -20,10 +20,23 @@ export class ApiError extends Error {
 }
 
 let accessToken: string | null = null;
+//: Double-submit token from the login/refresh response. Required by the core on
+//: every non-GET request; it is session-bound, so it never leaves this module's
+//: memory (same rule as the access token).
+let csrfToken: string | null = null;
 const unauthorizedListeners = new Set<() => void>();
 
 export function setAccessToken(token: string | null): void {
   accessToken = token;
+  if (token === null) csrfToken = null;
+}
+
+export function setCsrfToken(token: string | null): void {
+  csrfToken = token;
+}
+
+export function getCsrfToken(): string | null {
+  return csrfToken;
 }
 
 export function getAccessToken(): string | null {
@@ -78,12 +91,14 @@ async function readJson(response: Response): Promise<unknown> {
 }
 
 export async function api<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const method = options.method ?? 'GET';
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (options.body !== undefined) headers['Content-Type'] = 'application/json';
   if (!options.anonymous && accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  if (!options.anonymous && csrfToken && method !== 'GET') headers['X-CSRF-Token'] = csrfToken;
 
   const response = await fetch(path, {
-    method: options.method ?? 'GET',
+    method,
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
     credentials: 'same-origin',

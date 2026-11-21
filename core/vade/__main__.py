@@ -374,9 +374,12 @@ def _serve(
 
     from .admin import server as admin_server
     from .admin.app import create_admin_app
+    from .admin.locks import acquire_instance_lock
     from .admin.setup_token import ensure_setup_token
     from .app import install_components, make_rpc_handler
     from .transport.server import CoreApp
+
+    data_dir = Path(str(app.config.get("core.data_dir", "./data")))
 
     admin_host, admin_port = admin_server.parse_bind(app.config.get("core.admin_host"))
     data_host_raw, _, data_port_text = str(app.config.get("core.listen")).rpartition(":")
@@ -395,10 +398,25 @@ def _serve(
             "set [core].admin_host to a different port",
         )
 
+    # design.md:899 / 31 §T4: exactly one core per data directory. Acquired
+    # after the cheap config refusals above (which must not create `data/`) and
+    # before *any* side effect (`startup()` writes, token rotation, listeners):
+    # a second process would rotate `setup.token` under the first one (D59)
+    # and keep a private DeviceStore/SessionStore the others cannot see.
+    # `main()` turns this into one readable line and exit code 2.
+    try:
+        instance_lock_fd = acquire_instance_lock(data_dir)
+    except OSError:
+        raise VadeError(
+            "INTERNAL",
+            f"another core is already running with data dir {data_dir} "
+            f"(held: {data_dir / 'core.lock'})",
+        ) from None
+    _ = instance_lock_fd  # held for the lifetime of the process; fd lives on
+
     asyncio.run(app.startup())
     install_components(app, strict=strict)
 
-    data_dir = Path(str(app.config.get("core.data_dir", "./data")))
     admin_ctx = getattr(app, "admin", None)
     admin_app = create_admin_app(admin_ctx) if admin_ctx is not None else None
     setup_token_value: str | None = None

@@ -66,13 +66,30 @@ class DeviceStore:
         self._devices: dict[str, Device] | None = None
         self._revoked: set[str] | None = None
         self._version = 0
+        #: `(st_mtime_ns, st_size, st_ino)` of the file the cached table came
+        #: from. A running core and `vade admin trust-key` are separate
+        #: processes over one `devices.json`; without this check the core kept
+        #: its first read forever and the next `mark_used()` wrote the stale
+        #: table back, erasing the rescue key and resurrecting revoked devices
+        #: (review P0-5).
+        self._stat_key: tuple[int, int, int] | None = None
 
     # ------------------------------------------------------------------ storage
+    def _current_stat(self) -> tuple[int, int, int] | None:
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+
+    def _stale(self) -> bool:
+        return self._devices is None or self._stat_key != self._current_stat()
+
     def _load(self) -> dict[str, Device]:
-        if self._devices is not None:
+        if self._devices is not None and not self._stale():
             return self._devices
         with self._lock:
-            if self._devices is not None:
+            if self._devices is not None and not self._stale():
                 return self._devices
             items: dict[str, Device] = {}
             doc: dict[str, Any] = {}
@@ -90,6 +107,7 @@ class DeviceStore:
             self._devices = items
             self._revoked = {str(item) for item in doc.get("revoked", []) if item}
             self._version = int(doc.get("version", 0)) if isinstance(doc, dict) else 0
+            self._stat_key = self._current_stat()
             return items
 
     def _save(self) -> None:
@@ -113,6 +131,7 @@ class DeviceStore:
             os.close(fd)
         os.replace(tmp, self.path)
         os.chmod(self.path, 0o600)
+        self._stat_key = self._current_stat()
 
     # ------------------------------------------------------------------ queries
     @property

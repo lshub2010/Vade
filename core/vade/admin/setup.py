@@ -90,6 +90,8 @@ class SetupService:
     _lock: Any = field(default_factory=threading.RLock)
     #: `(stat key, stored hash)` — see `password_hash()`.
     _hash_cache: tuple[tuple[int, int, int], str | None] | None = None
+    #: `(stat key, version)` — see `password_version()`.
+    _version_cache: tuple[tuple[int, int, int], int] | None = None
 
     # ------------------------------------------------------------------ state
     @property
@@ -139,6 +141,38 @@ class SetupService:
         # credential change must never be served from a stale read even if a
         # filesystem reports a coarse `st_mtime_ns`.
         self._hash_cache = None
+        self._version_cache = None
+
+    def password_version(self) -> int:
+        """A monotonic-enough number that changes with every password change.
+
+        `SessionStore` stamps refresh rows with it and compares on every
+        refresh; deriving it from `admin.json` (instead of a process counter)
+        means a restart does not replay version 0, and a password reset
+        performed by `vade admin reset-password` while the core was stopped
+        still invalidates the persisted refresh rows (review P2-20).
+
+        Millisecond resolution, cached by the file's identity like
+        `password_hash()`: the only caller sits on every authenticated request.
+        """
+        try:
+            stat = self.admin_doc_path.stat()
+        except OSError:
+            self._version_cache = None
+            return 0
+        key = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        if self._version_cache is not None and self._version_cache[0] == key:
+            return self._version_cache[1]
+        doc = self.load_admin()
+        changed = (doc or {}).get("password_changed_at")
+        version = 0
+        if changed is not None:
+            try:
+                version = int(float(changed) * 1000)
+            except (TypeError, ValueError):
+                version = 0
+        self._version_cache = (key, version)
+        return version
 
     @staticmethod
     def _atomic_write(path: Path, raw: bytes) -> None:

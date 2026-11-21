@@ -18,12 +18,14 @@ import binascii
 import hashlib
 import hmac
 import ipaddress
+import json
 import os
 import secrets
 import time
 import weakref
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Mapping
 
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHashError, VerificationError
@@ -32,6 +34,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils as asym_utils
 
 from ..errors import VadeError
+from ..logging import get_logger
 
 __all__ = [
     "hash_password", "verify_password", "password_needs_rehash", "validate_password",
@@ -259,6 +262,17 @@ class Session:
     password_version: int
     ip: str | None = None
     csrf: str = ""
+    #: sha256 of the refresh token minted together with this access row. Only
+    #: the digest is held (and persisted), so a memory dump or a backup of
+    #: `sessions.json` cannot be replayed as a refresh credential.
+    refresh_hash: str = ""
+    #: The refresh row's jti; put on the blacklist by `logout()`.
+    refresh_jti: str = ""
+    refresh_expires_at: float = 0.0
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 #: How many `guard()` calls pass between session-table sweeps. Mirrors
@@ -269,8 +283,27 @@ class Session:
 #: process (refresh TTLs are 30 days, i.e. effectively forever).
 SWEEP_EVERY = 64
 
+#: `data/admin/sessions.json` format version.
+SESSIONS_FILE_VERSION = 1
+
 
 class SessionStore:
+    """Access tokens in memory, refresh tokens on disk.
+
+    Access rows are 15-minute bearers: losing them to a restart costs one
+    `/admin/api/token/refresh`, which the client is designed to do. Refresh rows
+    are 30-day credentials stored in a device keychain; the whole point of that
+    design is that `core` may restart and the App stays signed in, so they are
+    written to `sessions.json` (0600, tmp+`os.replace`).
+
+    What is persisted, per design §7.12.6: **sha256(refresh)** only — never the
+    token — plus `jti`, `device_id`, `mode`, `password_version` and
+    `expires_at`. The password version follows `admin.json`'s
+    `password_changed_at` (see `set_password_version_source`), so a password
+    change made by the running core *or* by `vade admin reset-password` while it
+    was stopped invalidates every persisted refresh.
+    """
+
     def __init__(
         self,
         *,
@@ -278,6 +311,7 @@ class SessionStore:
         refresh_ttl_s: float = 30 * 86_400.0,
         wall: Callable[[], float] = time.time,
         sweep_every: int = SWEEP_EVERY,
+        persist_path: Path | str | None = None,
     ) -> None:
         self.access_ttl_s = access_ttl_s
         self.refresh_ttl_s = refresh_ttl_s
@@ -285,45 +319,193 @@ class SessionStore:
         self.sweep_every = int(sweep_every)
         self._guard_calls = 0
         self._sessions: dict[str, Session] = {}
+        # Keyed by sha256(refresh token), never by the token itself.
         self._refresh: dict[str, dict[str, Any]] = {}
-        self._blacklist: set[str] = set()
+        #: jti → expiry. A logged-out refresh row is deleted outright; the
+        #: blacklist is the second lock, and it is persisted so a restart does
+        #: not resurrect a jti whose row is still in flight/rotated.
+        self._blacklist: dict[str, float] = {}
         self._password_version = 0
+        self._password_version_source: Callable[[], int] | None = None
         self._device_check: Callable[[str], bool] | None = None
+        self.persist_path = Path(persist_path) if persist_path is not None else None
+        self._load_persisted()
 
     def set_device_checker(self, check: Callable[[str], bool]) -> None:
         self._device_check = check
 
+    def set_password_version_source(self, source: Callable[[], int] | None) -> None:
+        """Tie the session version to `admin.json`, not to process memory.
+
+        `SetupService.password_version()` derives it from
+        `password_changed_at`, so both `POST /admin/api/password` and an offline
+        `vade admin reset-password` invalidate persisted refresh rows on the
+        next read — without this, restarting after a CLI password reset replayed
+        the old version (0) and every 30-day refresh still worked (review
+        P2-20).
+        """
+        self._password_version_source = source
+
     @property
     def password_version(self) -> int:
+        source = self._password_version_source
+        if source is not None:
+            try:
+                return int(source())
+            except Exception:  # noqa: BLE001 - a broken source must not 500 a request
+                pass
         return self._password_version
 
+    # ------------------------------------------------------------- persistence
+    def _load_persisted(self) -> None:
+        path = self.persist_path
+        if path is None:
+            return
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return
+        if not isinstance(doc, dict):
+            return
+        try:
+            self._password_version = int(doc.get("password_version", 0) or 0)
+        except (TypeError, ValueError):
+            self._password_version = 0
+        now = self._wall()
+        for row in doc.get("refresh") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                digest = str(row["token_hash"])
+                jti = str(row["jti"])
+                expires_at = float(row["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not digest or not jti or expires_at <= now:
+                continue
+            self._refresh[digest] = {
+                "device_id": row.get("device_id"),
+                "mode": str(row.get("mode") or "device"),
+                "expires_at": expires_at,
+                "password_version": int(row.get("password_version") or 0),
+                "jti": jti,
+            }
+        for row in doc.get("blacklist") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                jti = str(row["jti"])
+                expires_at = float(row["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if jti and expires_at > now:
+                self._blacklist[jti] = expires_at
+
+    def _persist(self) -> None:
+        path = self.persist_path
+        if path is None:
+            return
+        doc = {
+            "version": SESSIONS_FILE_VERSION,
+            "password_version": int(self.password_version),
+            "refresh": [
+                {
+                    "token_hash": digest, "jti": entry["jti"],
+                    "device_id": entry.get("device_id"), "mode": entry.get("mode"),
+                    "password_version": int(entry.get("password_version") or 0),
+                    "expires_at": float(entry["expires_at"]),
+                }
+                for digest, entry in sorted(self._refresh.items())
+            ],
+            "blacklist": [
+                {"jti": jti, "expires_at": expires_at}
+                for jti, expires_at in sorted(self._blacklist.items())
+            ],
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(path.parent, 0o700)
+            tmp = path.with_suffix(".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            # A login that already proved the password must not turn into a 500
+            # because the disk is full; the access token it just minted is
+            # still valid, only the refresh is lost.
+            get_logger("vade.admin").error(
+                "sessions.json write failed: %s", exc,
+                extra={"code": None, "msg": "session_persist_failed"},
+            )
+
+    # ---------------------------------------------------------------- mutation
     def issue(self, *, mode: str, device_id: str | None = None, ip: str | None = None) -> dict[str, Any]:
         now = self._wall()
         token = "acc_" + secrets.token_urlsafe(32)
         refresh = "ref_" + secrets.token_urlsafe(32)
+        jti = secrets.token_urlsafe(12)
         csrf = secrets.token_urlsafe(24)
+        if device_id:
+            # §7.12.6: one active refresh per device, new login kicks the old.
+            # Dropping the old *access* rows too means a stolen bearer does not
+            # outlive the login that replaced it by 15 minutes.
+            self._kick_device(device_id)
         session = Session(
             token=token, mode=mode, device_id=device_id, created_at=now,
-            expires_at=now + self.access_ttl_s, password_version=self._password_version,
+            expires_at=now + self.access_ttl_s, password_version=self.password_version,
             ip=ip, csrf=csrf,
+            refresh_hash=_token_hash(refresh), refresh_jti=jti,
+            refresh_expires_at=now + self.refresh_ttl_s,
         )
         self._sessions[token] = session
-        self._refresh[refresh] = {
-            "device_id": device_id, "mode": mode, "expires_at": now + self.refresh_ttl_s,
-            "password_version": self._password_version, "jti": secrets.token_urlsafe(12),
+        self._refresh[session.refresh_hash] = {
+            "device_id": device_id, "mode": mode, "expires_at": session.refresh_expires_at,
+            "password_version": session.password_version, "jti": jti,
         }
+        self._persist()
         return {
-            "access_token": token, "refresh_token": refresh,
+            "access_token": token, "refresh_token": refresh, "refresh_jti": jti,
             "expires_in": int(self.access_ttl_s), "mode": mode, "csrf_token": csrf,
         }
 
+    def _kick_device(self, device_id: str) -> None:
+        for digest in [d for d, e in self._refresh.items() if e.get("device_id") == device_id]:
+            entry = self._refresh.pop(digest, None)
+            if entry:
+                self._blacklist_jti(entry)
+        for token in [t for t, s in self._sessions.items() if s.device_id == device_id]:
+            self._sessions.pop(token, None)
+
+    def _blacklist_jti(self, entry: Mapping[str, Any]) -> None:
+        jti = str(entry.get("jti") or "")
+        if not jti:
+            return
+        expires_at = float(entry.get("expires_at") or self._wall() + self.refresh_ttl_s)
+        if expires_at > self._wall():
+            self._blacklist[jti] = expires_at
+
+    def _is_blacklisted(self, jti: str) -> bool:
+        expires_at = self._blacklist.get(jti)
+        if expires_at is None:
+            return False
+        if expires_at <= self._wall():
+            self._blacklist.pop(jti, None)
+            return False
+        return True
+
+    # ----------------------------------------------------------------- queries
     def resolve(self, token: str | None) -> Session | None:
         if not token:
             return None
         session = self._sessions.get(token)
         if session is None:
             return None
-        if session.expires_at <= self._wall() or session.password_version != self._password_version:
+        if session.expires_at <= self._wall() or session.password_version != self.password_version:
             self._sessions.pop(token, None)
             return None
         if session.device_id and self._device_check is not None and not self._device_check(session.device_id):
@@ -333,54 +515,101 @@ class SessionStore:
         return session
 
     def refresh(self, refresh_token: str, *, device_id: str | None) -> dict[str, Any] | None:
-        entry = self._refresh.get(refresh_token)
+        digest = _token_hash(refresh_token)
+        entry = self._refresh.get(digest)
         if entry is None:
             return None
-        if entry["expires_at"] <= self._wall() or entry["password_version"] != self._password_version:
-            self._refresh.pop(refresh_token, None)
+        if (entry["expires_at"] <= self._wall()
+                or entry["password_version"] != self.password_version
+                or self._is_blacklisted(str(entry.get("jti") or ""))):
+            self._refresh.pop(digest, None)
+            self._persist()
             return None
         if device_id and entry["device_id"] != device_id:
             return None
         if entry["device_id"] and self._device_check is not None and not self._device_check(entry["device_id"]):
-            self._refresh.pop(refresh_token, None)
+            self._refresh.pop(digest, None)
+            self._persist()
             return None
-        self._refresh.pop(refresh_token, None)
+        self._refresh.pop(digest, None)
         return self.issue(mode=entry["mode"], device_id=entry["device_id"])
 
     def peek_refresh(self, refresh_token: str) -> dict[str, Any] | None:
         """Metadata needed to verify the refresh signature *before* rotation."""
-        entry = self._refresh.get(refresh_token)
+        entry = self._refresh.get(_token_hash(refresh_token))
         if entry is None or entry["expires_at"] <= self._wall():
             return None
-        if entry["password_version"] != self._password_version:
+        if entry["password_version"] != self.password_version:
+            return None
+        if self._is_blacklisted(str(entry.get("jti") or "")):
             return None
         return dict(entry)
 
     def drop_refresh(self, refresh_token: str) -> None:
-        self._refresh.pop(refresh_token, None)
+        digest = _token_hash(refresh_token)
+        entry = self._refresh.pop(digest, None)
+        if entry is not None:
+            self._blacklist_jti(entry)
+            self._persist()
 
     def revoke(self, token: str) -> None:
         self._sessions.pop(token, None)
+
+    def logout(self, session: Session, *, refresh_token: str | None = None) -> None:
+        """§7.12.6: delete the refresh row and blacklist its jti.
+
+        Before this existed, logout only popped the 15-minute access row; the
+        30-day refresh stayed valid, so a copy taken before logout kept the
+        device signed in (review P1-6).
+        """
+        if session.refresh_hash:
+            entry = self._refresh.pop(session.refresh_hash, None)
+            if entry is not None:
+                self._blacklist_jti(entry)
+        if refresh_token:
+            self.drop_refresh(refresh_token)
+        elif session.refresh_jti:
+            self._blacklist[session.refresh_jti] = (
+                session.refresh_expires_at or self._wall() + self.refresh_ttl_s
+            )
+        self._sessions.pop(session.token, None)
+        self._persist()
 
     def revoke_device(self, device_id: str) -> int:
         dead = [t for t, s in self._sessions.items() if s.device_id == device_id]
         for token in dead:
             self._sessions.pop(token, None)
-        for key in [k for k, v in self._refresh.items() if v["device_id"] == device_id]:
-            self._refresh.pop(key, None)
+        changed = bool(dead)
+        for digest in [d for d, e in self._refresh.items() if e["device_id"] == device_id]:
+            entry = self._refresh.pop(digest, None)
+            if entry:
+                self._blacklist_jti(entry)
+                changed = True
+        if changed:
+            self._persist()
         return len(dead)
 
     def revoke_all(self) -> int:
         count = len(self._sessions)
+        for entry in self._refresh.values():
+            self._blacklist_jti(entry)
         self._sessions.clear()
         self._refresh.clear()
+        self._persist()
         return count
 
     def bump_password_version(self) -> None:
         """Invalidates every session by version, not by waiting out the TTL."""
-        self._password_version += 1
+        if self._password_version_source is None:
+            # With a live source the version already moved (admin.json was
+            # rewritten before this call); incrementing a shadow counter would
+            # desynchronise the two.
+            self._password_version += 1
+        for entry in self._refresh.values():
+            self._blacklist_jti(entry)
         self._sessions.clear()
         self._refresh.clear()
+        self._persist()
 
     def active_count(self) -> int:
         return len(self._sessions)
@@ -396,18 +625,24 @@ class SessionStore:
         another path must not leave orphans behind).
         """
         at = self._wall() if now is None else float(now)
+        version = self.password_version
         dead_access = [
             token for token, session in self._sessions.items()
-            if session.expires_at <= at or session.password_version != self._password_version
+            if session.expires_at <= at or session.password_version != version
         ]
         for token in dead_access:
             self._sessions.pop(token, None)
         dead_refresh = [
             key for key, entry in self._refresh.items()
-            if entry["expires_at"] <= at or entry["password_version"] != self._password_version
+            if entry["expires_at"] <= at or entry["password_version"] != version
         ]
         for key in dead_refresh:
             self._refresh.pop(key, None)
+        dead_blacklist = [jti for jti, expires_at in self._blacklist.items() if expires_at <= at]
+        for jti in dead_blacklist:
+            self._blacklist.pop(jti, None)
+        if dead_refresh or dead_blacklist:
+            self._persist()
         return {"access": len(dead_access), "refresh": len(dead_refresh)}
 
     def sweep_if_due(self) -> dict[str, int]:

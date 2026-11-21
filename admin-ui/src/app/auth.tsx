@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
-import { api, onUnauthorized, setAccessToken } from './api';
+import { api, onUnauthorized, setAccessToken, setCsrfToken } from './api';
 import { hostMode, readHost } from './host';
 import type { HostMode } from './host';
 import { injectedSession, nativeLogin } from './nativeBridge';
@@ -68,6 +68,7 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactElemen
       const session = injectedSession();
       if (session) {
         setAccessToken(session.access_token);
+        if (session.csrf_token) setCsrfToken(session.csrf_token);
         setPhase('authed');
       } else {
         setPhase('anon');
@@ -116,13 +117,17 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactElemen
       quietAuthFailure: true,
     });
     // browser 模式响应体不含 token，鉴权靠 Set-Cookie；device 模式才有 Bearer。
+    // 两种模式都返回 `csrf_token`：非 GET 请求的 double-submit 必须带上它。
+    // 先设 access（null 会清掉 csrf），再设 csrf。
     setAccessToken('access_token' in result ? result.access_token : null);
+    if (result.csrf_token) setCsrfToken(result.csrf_token);
     setPhase('authed');
   }, []);
 
   const loginWithDevice = useCallback(async (): Promise<void> => {
     const session = await nativeLogin();
     setAccessToken(session.access_token);
+    if (session.csrf_token) setCsrfToken(session.csrf_token);
     setPhase('authed');
   }, []);
 

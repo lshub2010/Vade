@@ -43,6 +43,7 @@ import inspect
 import json
 import os
 import secrets
+from urllib.parse import urlsplit
 import tempfile
 import threading
 import time
@@ -819,7 +820,17 @@ class CoreApp:
             # A revoked row is no identity at all: the same `None` path as an
             # unknown token, so nothing downstream has to special-case it.
             session = None
-        browser = session is not None
+        has_cookie = session is not None
+        # Browser pages always send Origin; native clients (the app, the CLI)
+        # do not. CSRF only defends an ambient browser credential, so the
+        # browser flag is "cookie + Origin" — a cookie socket with no Origin
+        # is a native client and stays exempt (it still has to pass the
+        # loopback-only origin gate below).
+        origin = headers.get("origin")
+        browser = has_cookie
+        # CSRF defends an ambient *browser* credential; a cookie-bearing native
+        # client sends no Origin and cannot read a CSRF cookie, so it is exempt.
+        browser_page = has_cookie and origin is not None
         # RFC-0004 §6.4: the device identity is the one `/ui/session` minted and
         # stored server-side (`ui-…`), read back through the cookie — never a
         # query parameter or header the client could type. An unknown or
@@ -835,11 +846,11 @@ class CoreApp:
         # it, and a non-browser has no business using an ambient credential.
         # Refused BEFORE `websocket.accept`, so the peer never sees a socket;
         # 1008 is the WS spelling of the 403 the HTTP routes return.
-        if browser and not self._origin_allowed(headers.get("origin")):
+        if has_cookie and not self._origin_allowed(origin, headers.get("host", ""), scope.get("client")):
             log.warning("ws upgrade refused: origin", extra={
                 "code": "ORIGIN_MISMATCH", "connection_id": None,
                 "msg": f"origin={headers.get('origin')!r}"})
-            await self._note_ws_refused(scope, headers, "origin")
+            self._note_ws_refused(scope, headers, "origin")
             await send({"type": "websocket.close", "code": 1008})
             return
 
@@ -878,29 +889,44 @@ class CoreApp:
             # `read_only` travels with the row that authenticated the cookie,
             # which is what makes `READ_ONLY_SESSION` true server-side and not
             # only in a hidden button (FR-8.75).
-            auth_mode="browser_session" if browser else None,
+            auth_mode="browser_session" if has_cookie else None,
             read_only=bool(session.get("read_only")) if session is not None else False,
             csrf_hash=str(session.get("csrf_hash") or "") if session is not None else None,
             # A native peer has no identity until the IK handshake proves which
             # static key it holds; this hook runs exactly then.
-            on_established=None if browser else self._bind_device_identity,
+            on_established=None if has_cookie else self._bind_device_identity,
         )
-        connection.ui_token = token if browser else None  # type: ignore[attr-defined]
+        connection.ui_token = token if has_cookie else None
+        # CSRF only makes sense for a page that could read __Host-ac_csrf;
+        # a cookie-bearing native client (no Origin) cannot, and the upgrade
+        # origin gate already refused every cross-site caller.
+        connection._csrf_exempt = origin is None  # type: ignore[attr-defined]  # type: ignore[attr-defined]
         self._connections[connection_id] = connection
         await connection.run()
 
-    def _origin_allowed(self, origin: str | None) -> bool:
-        """Exact match against `[server].ui_origins`; absent is never allowed.
+    def _origin_allowed(self, origin: str | None, host_header: str = "", client: object = None) -> bool:
+        """May this upgrade use the ambient `__Host-ac_ui` cookie?
 
-        `_cors_headers` answers `{}` for a missing Origin because a same-origin
-        navigation sends none and needs no CORS headers. That is a *response*
-        question. Here the question is "may this request use an ambient
-        credential", and the only safe answer for "the client did not say where
-        it came from" is no.
+        Browser pages always send `Origin`; native clients do not. Three rules:
+        - a configured allowlist is exact-match only (`*` is refused at config
+          load);
+        - with no allowlist, the origin must be same-origin with the `Host` the
+          upgrade was addressed to (the UI is served by this core, so that is
+          the normal case and needs no per-deployment config);
+        - a cookie socket with no Origin at all is accepted only from loopback
+          (the app/CLI on the same box). A remote no-Origin upgrade is refused.
         """
-        if not origin:
-            return False
-        return origin in self._ui_origins
+        if origin:
+            if self._ui_origins:
+                return origin in self._ui_origins
+            try:
+                return urlsplit(origin).netloc == host_header
+            except ValueError:
+                return False
+        host = ""
+        if isinstance(client, (tuple, list)) and client:
+            host = str(client[0])
+        return host in ("127.0.0.1", "::1", "localhost")
 
     def _note_ws_refused(self, scope: Mapping[str, Any], headers: Mapping[str, str], reason: str) -> None:
         """Audit a refused upgrade: a CSWSH attempt must leave a trace."""

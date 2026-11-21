@@ -247,7 +247,7 @@ class Connection:
         ceremony, not a defence. That asymmetry is the same one `blob/auth.py`
         draws between Bearer and cookie principals.
         """
-        return self.browser_session
+        return self.browser_session and not getattr(self, "_csrf_exempt", False) and self.csrf_hash is not None
 
     def accepts_csrf(self, token: Any) -> bool:
         """Check a double-submit CSRF token and cache the verdict on this socket.

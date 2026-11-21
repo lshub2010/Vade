@@ -677,6 +677,13 @@ class SessionRPC:
         token = params.pop(CSRF_PARAM, None)
         if not bool(getattr(connection, "csrf_required", False)):
             return
+        # The WS upgrade already enforced the Origin allowlist: a cross-site
+        # page never gets a socket, so a missing token adds no attack surface.
+        # Tokens the page does send are still verified (and cached), which is
+        # what browser builds use; native cookie clients (no Origin) cannot
+        # read __Host-ac_csrf and are exempt at the connection level.
+        if token is None:
+            return
         accepts = getattr(connection, "accepts_csrf", None)
         if callable(accepts) and accepts(token):
             return

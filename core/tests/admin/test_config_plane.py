@@ -195,6 +195,17 @@ def test_a_flat_overrides_file_from_the_old_writer_is_repaired(tmp_path):
     assert reloaded.get("core.log_level") == "debug"
 
 
+def test_load_config_expands_flat_keys_before_the_schema_walk(tmp_path):
+    """The old admin writer left `a.b` keys; startup must not need AdminContext."""
+    overrides_at(tmp_path).write_text(
+        json.dumps({"policy.approval_timeout_s": 30, "core.log_level": "debug"}),
+        encoding="utf-8",
+    )
+    cfg = load_config(overrides_path=overrides_at(tmp_path), environ={})
+    assert cfg.get("policy.approval_timeout_s") == 30
+    assert cfg.get("core.log_level") == "debug"
+
+
 def test_an_unknown_key_is_rejected_and_leaves_a_bootable_data_dir(tmp_path):
     ctx, app = wire(tmp_path)
 

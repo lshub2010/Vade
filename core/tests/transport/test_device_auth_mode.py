@@ -30,7 +30,9 @@ def test_a_whitelisted_module_key_is_not_a_device_approver():
     """`module_id#instance_id` must stay module_key: a module cannot approve itself."""
     conn = _bind("mod.echo#inst-1")
     assert conn.auth_mode == "module_key"
-    assert conn.device_id is None
+    # The identity stays for blob ownership; the credential class is what
+    # keeps it out of the approver set.
+    assert conn.device_id == "mod.echo#inst-1"
     assert conn.device_key == "fp-1"
 
 

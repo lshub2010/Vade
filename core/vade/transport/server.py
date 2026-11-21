@@ -995,9 +995,12 @@ class CoreApp:
         if not callable(resolver):
             return
         device_id = resolver(str(fingerprint))
-        if device_id and "#" not in str(device_id) and str(device_id).startswith("ui-"):
+        if device_id:
+            # The identity is still recorded for blob ownership; only the
+            # *credential class* distinguishes a UI device from a module.
             connection.device_id = str(device_id)
-            connection.auth_mode = "device_key"
+            if "#" not in str(device_id) and str(device_id).startswith("ui-"):
+                connection.auth_mode = "device_key"
 
     @staticmethod
     def _cookie(header: str, name: str) -> str | None:

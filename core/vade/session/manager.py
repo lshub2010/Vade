@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import re
 import time
 from collections import OrderedDict
@@ -29,7 +30,7 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError
 from ..logging import get_logger
-from ..transport.connection import CLOSE_TRY_AGAIN
+from ..transport.connection import CLOSE_TRY_AGAIN, MAX_REPLY_BYTES
 from .limits import check_content_limits, content_text
 from .search import LIMIT_DEFAULT, validate_query
 from .models import (
@@ -85,6 +86,18 @@ _TOMBSTONE_LIMIT = 1024
 #: It was 2 — exactly one short of that pair — so a backlog of `cap - 2` was
 #: accepted and then overflowed on the frames the attach itself provoked.
 ATTACH_REPLAY_RESERVE = 8
+
+#: Bytes of a `ui/attach` reply reserved for the JSON-RPC envelope and the
+#: `{session_id, from_seq, snapshot}` wrapper. `snapshot` is bounded against
+#: `MAX_REPLY_BYTES - this`, because `Connection._send_result` judges the
+#: ENCODED envelope: a snapshot that only fits on its own does not fit at all,
+#: and the whole reply is replaced by PAYLOAD_TOO_LARGE when it does not.
+SNAPSHOT_ENVELOPE_RESERVE = 2048
+
+
+def _wire_size(obj: Any) -> int:
+    """UTF-8 byte count of the exact encoding the transport seals."""
+    return len(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 #: RFC-0006 §6.4 reasons carried on `turn.queued` / `turn.superseded`.
 REASON_SUBMIT = "submit"
@@ -853,7 +866,13 @@ class SessionLog:
         else:
             session = self._require_session(session_id)
 
-        if last_seq is not None and last_seq >= 0 and self.replay.covers(session_id, last_seq):
+        # `durable_last_seq` is what makes the upper bound honest: the replay
+        # window only holds coalescible-free events, so a client whose cursor
+        # sits on a `task.progress` (RFC-0007 §9.4) is still covered by the
+        # store even though the buffer's own newest is older.
+        if (last_seq is not None and last_seq >= 0
+                and self.replay.covers(session_id, last_seq,
+                                       durable_last_seq=self.store.last_seq(session_id))):
             # Coalesced rows are droppable by contract (RFC-0007 §5.5 R5):
             # they must not force a snapshot, and they must not consume sink
             # queue slots. `result.replay` still reports the full row set so
@@ -961,12 +980,30 @@ class SessionLog:
 
     # ------------------------------------------------------------------ snapshot
     def snapshot(self, session_id: str) -> dict[str, Any]:
+        """The wire truth for one session, bounded to fit ONE RPC frame.
+
+        `ui/attach` is the only channel that returns history (C-05 has no
+        paged-history method), so a snapshot that cannot fit the 65 519-byte
+        frame cap makes the session permanently unopenable — not slow, not
+        truncated, unopenable. Three things keep it honest:
+
+        * the text travels once (`Message.to_snapshot` / `Turn.to_snapshot`),
+          instead of `content` + `parts[].text` + `turns[].user_text`;
+        * when that is still too much, the OLDEST rows are dropped and the
+          caller is told (`truncated`/`omitted`/`truncated_before_seq`);
+        * a single row bigger than the whole budget is clipped, never refused
+          (`content_truncated` + per-row `truncated`), and every truncated
+          attach leaves an audit row.
+        """
         session = self._require_session(session_id)
         queue = self._queues.get(session_id)
         pending: list[Any] = []
         if self.approval_port is not None and hasattr(self.approval_port, "pending"):
             try:
-                pending = list(self.approval_port.pending(session_id))
+                # Copy: `_bound_snapshot` clips these rows in place when the
+                # frame is over budget, and the port owns the originals.
+                pending = [dict(row) if isinstance(row, Mapping) else row
+                           for row in self.approval_port.pending(session_id)]
             except Exception:  # pragma: no cover - approval port is C5a's
                 pending = []
         # RFC-0008 §8.2: a reconnecting client that fell outside the replay
@@ -975,9 +1012,23 @@ class SessionLog:
         pending_inputs: list[dict[str, Any]] = []
         if self.input_port is not None and hasattr(self.input_port, "pending"):
             try:
-                pending_inputs = list(self.input_port.pending(session_id))
+                pending_inputs = [dict(row) for row in self.input_port.pending(session_id)]
             except Exception:  # pragma: no cover - input port is RFC-0008's
                 pending_inputs = []
+        queue_state = queue.state() if queue is not None else {"running": None, "pending": []}
+        # RFC-0006 §4.2: the assistant text already streamed for the running
+        # turn lives ONLY in `turn.delta` events and in the process-local
+        # accumulator — never in a message row until the turn finalises. A
+        # client that attaches mid-turn used to get the user message and
+        # `queue.running`, then only the SECOND half of the deltas, so that
+        # answer stayed half-rendered forever (no event ever says "re-snapshot
+        # now"). `pending_inputs` solved the same "state only in events" hole.
+        running_turn_id = queue_state.get("running")
+        running_text = self.partial_text(running_turn_id) if isinstance(running_turn_id, str) else ""
+        running_partial = (
+            {"turn_id": running_turn_id, "text": running_text, "chars": len(running_text)}
+            if isinstance(running_turn_id, str) else None
+        )
         snapshot: dict[str, Any] = {
             "from_seq": self.store.last_seq(session_id),
             "session": {
@@ -990,13 +1041,21 @@ class SessionLog:
                 # must not have to call session/model.get first.
                 "model": self._model_block(session),
             },
-            "messages": session.message_tree(),
+            "messages": [message.to_snapshot() for message in session.messages],
             # RFC-0006 §6.1: the version chain is stored, not a client-side
             # "greyed out" set — a refresh has to show the same thing.
-            "turns": [turn.to_dict() for turn in session.turns],
-            "queue": queue.state() if queue is not None else {"running": None, "pending": []},
+            "turns": [turn.to_snapshot() for turn in session.turns],
+            "queue": queue_state,
             "pending_approvals": pending,
             "pending_inputs": pending_inputs,
+            # Additive, always present so the shape does not change only when
+            # a session happens to be large (C-05 `ui/attach`).
+            "running_partial": running_partial,
+            "truncated": False,
+            "omitted": 0,
+            "omitted_turns": 0,
+            "truncated_before_seq": None,
+            "content_truncated": False,
         }
         if self.tasks is not None:
             # RFC-0007 §5.6: `attach()` sends a snapshot *instead of* the events
@@ -1006,7 +1065,173 @@ class SessionLog:
             tasks, truncated = self.tasks.snapshot(session_id)
             snapshot["tasks"] = tasks
             snapshot["tasks_truncated"] = bool(truncated)
+        return self._bound_snapshot(session_id, snapshot)
+
+    def _reply_bytes(self, session_id: str, snapshot: dict[str, Any]) -> int:
+        """Bytes the `ui/attach` reply occupies with this snapshot inside it.
+
+        Measured on the same wrapper `SessionRPC.ui_attach` returns, not on the
+        snapshot alone: the frame carries the envelope and `session_id`, and
+        `_send_result` refuses the whole reply when the total is over the cap.
+        """
+        return _wire_size({
+            "session_id": session_id,
+            "from_seq": snapshot.get("from_seq"),
+            "snapshot": snapshot,
+        })
+
+    def _bound_snapshot(self, session_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Trim `snapshot` until it fits one frame; never return a refusal.
+
+        Order matters: the recent rows are what a client renders, so the oldest
+        go first; a running turn's partial is the newest text and survives
+        longest; a single message may still be larger than the entire budget
+        (RFC-0006 §8 allows 32 000 code points ≈ 96 KB of CJK), which is the
+        one case where clipping is the only answer.
+        """
+        budget = MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE
+        size = self._reply_bytes(session_id, snapshot)
+        if size <= budget:
+            return snapshot
+
+        # ① Messages, oldest first. Subtractive sizes keep this O(n) for a
+        # 1 000-row session instead of re-encoding the snapshot per row. The
+        # NEWEST message is never dropped here: a single row may be larger than
+        # the whole budget (next step clips it), and losing the most recent
+        # context is the worst of the available outcomes.
+        messages = snapshot["messages"]
+        while len(messages) > 1 and size > budget:
+            size -= _wire_size(messages.pop(0)) + 1
+            snapshot["omitted"] += 1
+        # ② Turns, oldest first. The queue's own tail (queued/running) is at
+        # the end of the list, so it is the last thing to go.
+        turns = snapshot["turns"]
+        while turns and size > budget:
+            size -= _wire_size(turns.pop(0)) + 1
+            snapshot["omitted_turns"] += 1
+        # ③ Clip the largest remaining text fields until the exact size fits.
+        # Halving each time bounds this to O(log n) rounds, and `_clip_one_text`
+        # refuses once every field is already short, so it cannot spin.
+        while self._reply_bytes(session_id, snapshot) > budget and self._clip_one_text(snapshot):
+            pass
+        # ④ Last resort: optional blocks go before the session does. A client
+        # loses task progress (it can `task/list`) but keeps the conversation
+        # and its cursor — and `truncated` says so.
+        if self._reply_bytes(session_id, snapshot) > budget:
+            snapshot["tasks"] = []
+            snapshot["tasks_truncated"] = True
+            snapshot["pending_inputs"] = []
+            snapshot["pending_approvals"] = []
+            while self._reply_bytes(session_id, snapshot) > budget and self._clip_one_text(snapshot):
+                pass
+        # ⑤ Absolute floor: no reply the transport will refuse. Reached only by
+        # a pathological session (thousands of one-word rows), but "attach is
+        # impossible" must not be reachable at all.
+        while snapshot["messages"] and self._reply_bytes(session_id, snapshot) > budget:
+            snapshot["messages"].pop(0)
+            snapshot["omitted"] += 1
+        while len(snapshot["turns"]) > 1 and self._reply_bytes(session_id, snapshot) > budget:
+            snapshot["turns"].pop(0)
+            snapshot["omitted_turns"] += 1
+        # ⑥ The floor under ⑤: metadata alone can be over the budget (a turn
+        # carrying a 32 000-character tool-call argument). Clearing the optional
+        # blocks keeps attach reachable; the counters still describe the loss.
+        if self._reply_bytes(session_id, snapshot) > budget:  # pragma: no cover
+            snapshot["omitted"] += len(snapshot["messages"])
+            snapshot["messages"] = []
+            snapshot["omitted_turns"] += len(snapshot["turns"])
+            snapshot["turns"] = []
+            snapshot["tasks"] = []
+            snapshot["pending_inputs"] = []
+            snapshot["pending_approvals"] = []
+
+        if snapshot["omitted"]:
+            kept = snapshot["messages"]
+            first = kept[0].get("seq") if kept else None
+            if isinstance(first, int) and first > 0:
+                snapshot["truncated_before_seq"] = first
+            else:
+                snapshot["truncated_before_seq"] = int(snapshot["from_seq"]) + (0 if kept else 1)
+        if snapshot["omitted"] or snapshot["omitted_turns"] or snapshot["content_truncated"]:
+            snapshot["truncated"] = True
+            self._audit_snapshot_truncated(session_id, snapshot)
         return snapshot
+
+    def _clip_one_text(self, snapshot: dict[str, Any]) -> bool:
+        """Shorten the largest text field; False when nothing is left to cut.
+
+        A completed message keeps its HEAD (it is read top-down); a running
+        partial keeps its TAIL, so the deltas that arrive after this snapshot
+        still land on the end of that bubble instead of leaving a hole in the
+        middle. Both cases set `truncated` on the row, so a clipped row is never
+        mistakable for a short one.
+        """
+        candidates: list[tuple[dict[str, Any], str]] = []
+        for message in snapshot.get("messages", ()):
+            if isinstance(message.get("content"), str) and len(message["content"]) > 64:
+                candidates.append((message, "content"))
+        running = snapshot.get("running_partial")
+        if isinstance(running, dict) and len(str(running.get("text") or "")) > 64:
+            candidates.append((running, "text"))
+        for block in ("pending_inputs", "pending_approvals"):
+            for row in snapshot.get(block) or ():
+                if not isinstance(row, dict):
+                    continue
+                for key in ("prompt", "detail", "title", "question", "summary"):
+                    if isinstance(row.get(key), str) and len(row[key]) > 256:
+                        candidates.append((row, key))
+        if not candidates:
+            return False
+        container, key = max(candidates, key=lambda item: len(item[0][item[1]]))
+        text = container[key]
+        keep = max(64, len(text) // 2)
+        if container is running:
+            # A running partial keeps its tail: the deltas that follow this
+            # snapshot append to the end of the bubble, so dropping the tail
+            # would leave a hole right where the stream continues.
+            container["text"] = text[-keep:]
+            container["chars"] = len(container["text"])
+        else:
+            container[key] = text[:keep]
+            if "parts" in container:
+                # `parts[].text` is the projection `content` was clipped from;
+                # leaving it whole would keep the very copy this clip removed.
+                for part in container["parts"]:
+                    part_text = part.get("text")
+                    if part.get("type") == "text" and isinstance(part_text, str):
+                        part["text"] = part_text[:keep]
+                container["content"] = parts_text(container["parts"]) or container[key]
+        container["truncated"] = True
+        container["omitted_chars"] = max(0, len(text) - len(container.get(key) or ""))
+        snapshot["content_truncated"] = True
+        return True
+
+    def _audit_snapshot_truncated(self, session_id: str, snapshot: dict[str, Any]) -> None:
+        """A truncated attach is an outcome, not noise: leave a row."""
+        detail = {
+            "omitted": snapshot["omitted"],
+            "omitted_turns": snapshot["omitted_turns"],
+            "truncated_before_seq": snapshot["truncated_before_seq"],
+            "content_truncated": snapshot["content_truncated"],
+            "bytes": self._reply_bytes(session_id, snapshot),
+            "budget": MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE,
+        }
+        log.warning("attach snapshot truncated", extra={
+            "code": None, "msg": f"session={session_id} {detail}"})
+        audit = self.audit
+        if audit is None:
+            return
+        try:
+            audit.record({
+                "kind": "session.snapshot_truncated",
+                "status": "ok",
+                "session_id": session_id,
+                "method": "ui/attach",
+                "extra": detail,
+            })
+        except Exception as exc:  # pragma: no cover - audit must never break attach
+            log.error("audit write failed (kind=session.snapshot_truncated): %s", exc,
+                      extra={"code": None, "msg": "audit_unavailable"})
 
     def _model_block(self, session: Session) -> dict[str, Any]:
         if self.models is None:

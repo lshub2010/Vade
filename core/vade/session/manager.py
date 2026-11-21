@@ -13,8 +13,8 @@ several events atomically: an interrupt (turn row + partial message +
 message + `turn.superseded`/`message.edited` + `turn.queued`).
 
 Sinks are decoupled through a bounded per-connection queue. A slow or dead UI
-never blocks a turn — the queue fills, the connection is dropped, the turn goes
-on.
+never blocks a turn — the queue fills, the socket is closed with 1013 and an
+audit row is written, and the turn goes on.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ..errors import VadeError
 from ..logging import get_logger
+from ..transport.connection import CLOSE_TRY_AGAIN
 from .limits import check_content_limits, content_text
 from .search import LIMIT_DEFAULT, validate_query
 from .models import (
@@ -176,15 +177,30 @@ def _validate_sort_order(value: Any) -> int:
 
 
 class SinkWorker:
-    """Bounded outbound queue + writer task for one attached connection."""
+    """Bounded outbound queue + writer task for one attached connection.
 
-    def __init__(self, sink: EventSink, *, maxsize: int = 256, on_drop: Callable[[str], None] | None = None) -> None:
+    Overflow is a first-class outcome, not a silent detach. `offer` used to
+    return `False`, `_broadcast` threw the value away, and `drop()` quietly
+    unregistered the worker: the client stayed "attached" to a session it
+    would never hear from again, with no error and no close. Now an overflow
+    calls `on_overflow`, which the log uses to write an audit row and close the
+    socket with 1013 — a client that cannot keep up loses the connection (and
+    reconnects to a snapshot), never the truth.
+    """
+
+    def __init__(self, sink: EventSink, *, maxsize: int = 256,
+                 on_drop: Callable[[str], None] | None = None,
+                 on_overflow: Callable[["SinkWorker"], None] | None = None) -> None:
         self.sink = sink
         self.sink_id = new_id()
         self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=maxsize)
         self._task: asyncio.Task[None] | None = None
         self._on_drop = on_drop
+        self._on_overflow = on_overflow
         self.dropped = False
+        #: Frames that never made it into the queue. Counted, not swallowed:
+        #: the audit row and the close code both come from this event.
+        self.overflowed = 0
 
     def start(self) -> None:
         if self._task is None:
@@ -197,8 +213,20 @@ class SinkWorker:
             self._queue.put_nowait(event)
             return True
         except asyncio.QueueFull:
-            self.drop()
+            self._overflow()
             return False
+
+    def _overflow(self) -> None:
+        """Full queue: stop accepting, then tell the owner (close + audit)."""
+        if self.dropped:
+            return
+        self.overflowed += 1
+        self.drop()
+        if self._on_overflow is not None:
+            try:
+                self._on_overflow(self)
+            except Exception:  # pragma: no cover - never let a hook break the turn
+                pass
 
     def drop(self) -> None:
         if self.dropped:
@@ -211,6 +239,7 @@ class SinkWorker:
                 self._on_drop(self.sink_id)
             except Exception:  # pragma: no cover - never let a hook break the turn
                 pass
+
 
     async def _writer(self) -> None:
         while True:
@@ -297,6 +326,11 @@ class SessionLog:
         #: its unfinished child runs before the terminal event). `None` means
         #: the subagents component is absent and turns end exactly as before.
         self.subagents: Any = None
+        #: Audit sink (duck-typed `record(event)`), wired by `install()` from
+        #: `app.audit`. Today only the slow-consumer close writes a row here: a
+        #: client dropped for backpressure must leave a trace, otherwise the
+        #: only evidence is a socket that vanished.
+        self.audit: Any = None
         self._closed = False
         #: `app.on_session_end` hooks (C3d's `session.closed` beat, C5a's grant
         #: cleanup). Stored by REFERENCE: components append after this install.
@@ -749,8 +783,63 @@ class SessionLog:
         return turn_id in self._terminal
 
     async def _broadcast(self, session_id: str, event: Event) -> None:
+        """Fan one committed event out to every sink of THIS session.
+
+        `SinkWorker.offer` returning `False` is an outcome, not noise: the
+        worker refused the frame (queue full or already dropped). Ignoring it
+        is how a "successful" broadcast ended up delivered to nobody, so the
+        value is consumed here — the sink has already unregistered itself and
+        `_sink_overflowed` has closed its socket with 1013.
+        """
+        wire = event.to_wire()
         for worker in list(self._sinks.get(session_id, {}).values()):
-            worker.offer(event.to_wire())
+            if not worker.offer(wire):
+                log.warning("sink refused a frame", extra={
+                    "code": None, "msg": f"session={session_id} sink={worker.sink_id[:8]} "
+                                          f"overflowed={worker.overflowed}"})
+
+    def _sink_overflowed(self, session_id: str, worker: SinkWorker) -> None:
+        """A UI that cannot keep up loses the socket, not the events.
+
+        Two obligations, both synchronous so they survive any caller: leave a
+        row in the audit trail, and close the connection with 1013 (the WS
+        code for "try again later") so the client reconnects and resumes from
+        a snapshot instead of believing it is still attached. `drop()` has
+        already unregistered the worker, so no further frame can be offered to
+        it; the socket close is what makes the failure visible to the peer.
+        """
+        self._audit_sink_overflow(session_id, worker)
+        connection = getattr(getattr(worker, "sink", None), "connection", None)
+        request_close = getattr(connection, "request_close", None)
+        if not callable(request_close):
+            return
+        try:
+            request_close(CLOSE_TRY_AGAIN, "slow consumer: event sink overflow")
+        except Exception:  # pragma: no cover - a dead loop must not break the turn
+            pass
+
+    def _audit_sink_overflow(self, session_id: str, worker: SinkWorker) -> None:
+        audit = self.audit
+        if audit is None:
+            return
+        try:
+            audit.record({
+                "kind": "session.sink_overflow",
+                "status": "closed",
+                "session_id": session_id,
+                "method": "event/broadcast",
+                "extra": {
+                    "sink_id": worker.sink_id,
+                    "queue_max": self._sink_queue,
+                    "overflowed": worker.overflowed,
+                    "close_code": CLOSE_TRY_AGAIN,
+                    "reason": "slow_consumer",
+                },
+            })
+        except Exception as exc:  # pragma: no cover - audit must never break a turn
+            log.error("audit write failed (kind=session.sink_overflow): %s", exc,
+                      extra={"code": None, "msg": "audit_unavailable"})
+
 
     # ------------------------------------------------------------------ attach
     async def attach(self, session_id: str | None, last_seq: int | None, sink: EventSink) -> AttachResult:
@@ -842,6 +931,10 @@ class SessionLog:
             sink,
             maxsize=self._sink_queue,
             on_drop=lambda sink_id: self._sinks.get(session_id, {}).pop(sink_id, None),
+            # Overflow has its own hook: `on_drop` is also the "the writer
+            # died" path and must stay quiet, while a full queue is the one
+            # case the client has to be told about (close 1013 + audit).
+            on_overflow=lambda worker: self._sink_overflowed(session_id, worker),
         )
         worker.start()
         self._sinks.setdefault(session_id, {})[worker.sink_id] = worker

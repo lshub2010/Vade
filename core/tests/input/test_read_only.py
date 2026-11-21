@@ -36,11 +36,11 @@ def test_read_only_session_cannot_answer_or_cancel(tmp_path):
         # Refused means untouched: the request is still open.
         assert manager.pending_count == 1
 
-        # Only the input methods are gated: `ui/interrupt` answers NOT_FOUND
-        # (nothing is running under that id), not READ_ONLY_SESSION.
+        # Every write is gated, including `ui/interrupt`: a read-only session
+        # must not mutate a turn just because the id happens not to exist.
         other = await rpc.dispatch(readonly, "ui/interrupt",
                                    {"session_id": session.id, "turn_id": "nope"})
-        assert getattr(other, "code", None) == "NOT_FOUND"
+        assert getattr(other, "code", None) == "READ_ONLY_SESSION"
 
         # A writable connection answers normally through the same handler.
         result = await rpc.dispatch(Conn(), "turn/input",

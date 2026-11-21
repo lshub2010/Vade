@@ -42,6 +42,10 @@ from vade.transport.framing import FrameHeader, FrameType, decode_handshake, enc
 from vade.transport.server import CoreApp
 
 SESSION_ID = "s-device"
+#: The page origin a real browser sends on the WS handshake. A cookie upgrade
+#: without one is refused by design (CSWSH gate), so every browser socket here
+#: carries it — the same header Chrome/Firefox attach automatically.
+ORIGIN = "http://127.0.0.1:8080"
 
 
 # --------------------------------------------------------------------- harness
@@ -98,7 +102,8 @@ class _PassthroughCrypto:
 
 
 def _config(tmp_path) -> Any:
-    return load_config(cli={"core.data_dir": str(tmp_path)})
+    return load_config(cli={"core.data_dir": str(tmp_path),
+                            "server.ui_origins": [ORIGIN]})
 
 
 async def _wait(predicate, timeout: float = 2.0, what: str = "condition") -> Any:
@@ -118,7 +123,12 @@ def _outbound(sock: _Socket) -> list[bytes]:
 
 async def _open(app: CoreApp, conns: dict[str, Any], *, cookie: str | None = None):
     sock = _Socket()
-    headers = [(b"cookie", f"__Host-ac_ui={cookie}".encode())] if cookie else []
+    headers: list[tuple[bytes, bytes]] = []
+    if cookie:
+        # A cookie and an Origin travel together: the browser adds both, and
+        # the core refuses a cookie upgrade that does not name its page.
+        headers = [(b"cookie", f"__Host-ac_ui={cookie}".encode()),
+                   (b"origin", ORIGIN.encode())]
     scope = {"type": "websocket", "path": "/ws", "headers": headers}
     task = asyncio.create_task(app(scope, sock.receive, sock.send))
     connection = await _wait(lambda: next(iter(conns.values()), None), what="the connection")

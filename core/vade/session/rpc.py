@@ -20,7 +20,50 @@ from .manager import SessionLog
 from .search import LIMIT_DEFAULT, LIMIT_MAX
 from .store import UNSET
 
-__all__ = ["SessionRPC", "ConnectionSink"]
+__all__ = ["SessionRPC", "ConnectionSink", "WRITE_METHODS", "CSRF_PARAM"]
+
+#: Every method that changes durable state or drives a turn. Two gates read
+#: this table (the read-only refusal and the CSRF requirement), so a new write
+#: verb has ONE place to declare itself instead of two checks to remember.
+#:
+#: `ui/attach` is deliberately absent: registering a sink is a read. It does
+#: create a session when `session_id` is null, and that branch carries its own
+#: gate (`_require_writable`) — refusing attach outright would lock an
+#: explicitly read-only viewer out of the history it is allowed to watch.
+WRITE_METHODS: frozenset[str] = frozenset({
+    "ui/submit",
+    "ui/interrupt",
+    "ui/queue.cancel",
+    "approval/decide",
+    "session/model.set",
+    "session/rename",
+    "session/pin",
+    "session/archive",
+    "session/delete",
+    "session/group.create",
+    "session/group.update",
+    "session/group.delete",
+    "session/group.assign",
+    "turn/regenerate",
+    "message/edit_resubmit",
+    "turn/input",
+    "turn/input.cancel",
+})
+
+#: Where a write frame carries its double-submit token: `params.csrf`. A
+#: WebSocket frame has no headers, so the header form (`x-vade-csrf`) the HTTP
+#: routes use has no analogue here; the token is popped before any handler
+#: sees it, so no method schema has to know about it.
+CSRF_PARAM = "csrf"
+
+#: The two credential classes allowed to resolve a high-risk approval
+#: (FR-8.53 / AC-30). Everything else — `browser_session`, `module_key`, and
+#: `None` (nothing verified yet) — is `APPROVER_INVALID`, never `INTERNAL`.
+APPROVER_MODES: dict[str, str] = {
+    "device_key": "device_key",
+    "admin_local": "loopback_admin",
+    "loopback_admin": "loopback_admin",
+}
 
 
 class ConnectionSink:
@@ -54,7 +97,16 @@ class SessionRPC:
         if handler is None:
             return RpcError("NOT_FOUND", f"unknown method {method!r}")
         try:
-            return await handler(connection, dict(params or {}))
+            arguments = dict(params or {})
+            if method in WRITE_METHODS:
+                # Order matters and is the one C-04 §6.4 names: "may this
+                # credential write at all" (read-only) before "did it prove the
+                # page it comes from" (CSRF). A read-only session that also
+                # forgot its token must be told it is read-only — that is the
+                # actionable fact, and the one the UI has a banner for.
+                self._require_writable(connection)
+                self._require_csrf(connection, arguments)
+            return await handler(connection, arguments)
         except VadeError as exc:
             # `data` is part of C-04's envelope (`error.data.field`); dropping
             # it here used to erase every field pointer between the check and
@@ -64,6 +116,7 @@ class SessionRPC:
         except Exception:
             # C-04: message only, never a traceback across the boundary.
             return RpcError("INTERNAL", "session RPC failed")
+
 
     def handlers(self) -> dict[str, Callable[[Any, Mapping[str, Any]], Awaitable[Any]]]:
         return {
@@ -111,6 +164,13 @@ class SessionRPC:
         if last_seq is not None and (not isinstance(last_seq, int) or isinstance(last_seq, bool) or last_seq < 0):
             raise VadeError("INVALID_ARGUMENT", "last_seq must be a non-negative integer or null")
         connection_key = self._connection_key(connection)
+        if session_id is None:
+            # `ui/attach` is a read (it registers a sink), but the null branch
+            # CREATES a session. An explicitly read-only viewer may watch; it
+            # may not mint rows, and a cookie socket must still prove the page
+            # it comes from.
+            self._require_writable(connection)
+            self._require_csrf(connection, dict(params))
         if session_id is not None:
             # A second attach for the same (connection, session) used to leave
             # the first SinkWorker registered: it kept delivering every event
@@ -245,9 +305,26 @@ class SessionRPC:
 
     # ------------------------------------------------------------------ approval
     async def approval_decide(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
-        auth_mode = getattr(connection, "auth_mode", "browser_session")
-        if auth_mode not in ("device_key", "admin_local"):
-            raise VadeError("APPROVER_INVALID", "browser_session cannot approve high-risk calls")
+        """Resolve one pending approval — only for a principal that may approve.
+
+        The principal comes from the credential the TRANSPORT verified
+        (`connection.auth_mode`), never from a default. `getattr(connection,
+        "auth_mode", "browser_session")` was the dead end: `Connection` had no
+        such attribute, so the default always won and every caller — including
+        the device key FR-8.53 designates as an approver — got
+        `APPROVER_INVALID`. An unset mode is a refusal too, but it is an
+        explicit 403 (`APPROVER_INVALID`), never an `INTERNAL` 500 and never a
+        silent promotion to a privileged mode.
+        """
+        auth_mode = getattr(connection, "auth_mode", None)
+        actor_kind = APPROVER_MODES.get(str(auth_mode)) if auth_mode else None
+        if actor_kind is None:
+            raise VadeError(
+                "APPROVER_INVALID",
+                f"{auth_mode or 'unverified'} cannot approve high-risk calls; "
+                "use the device key or a loopback admin",
+                data={"auth_mode": auth_mode},
+            )
         request_id = params.get("request_id")
         decision = params.get("decision")
         scope = params.get("scope", "once")
@@ -258,13 +335,15 @@ class SessionRPC:
         port = self._approval()
         if port is None or not hasattr(port, "decide"):
             raise VadeError("NOT_FOUND", "no approval port is installed")
-        # Map the authenticated connection to an approver kind explicitly: the
-        # port's default is fail-closed, so relying on it here would refuse a
-        # legitimate device. The two modes are exactly ALLOWED_APPROVER_KINDS.
-        actor_kind = "device_key" if auth_mode == "device_key" else "loopback_admin"
-        resolved = port.decide(request_id, decision, scope,
-                               by=getattr(connection, "device_id", None) or "admin",
-                               actor_kind=actor_kind)
+        # The actor is the identity the credential proved: `device_id` for a
+        # paired key, `device_key` (the fingerprint) when the whitelist could
+        # not name the pairing — both are facts about the socket, and an empty
+        # `by` would make the audit row say nobody approved.
+        by = (getattr(connection, "device_id", None)
+              or getattr(connection, "device_key", None)
+              or "admin")
+        resolved = port.decide(request_id, decision, scope, by=str(by), actor_kind=actor_kind)
+
         if inspect.isawaitable(resolved):
             resolved = await resolved
         ok = True
@@ -563,6 +642,57 @@ class SessionRPC:
             return True
         principal = getattr(connection, "principal", None)
         return bool(getattr(principal, "read_only", False))
+
+    @classmethod
+    def _require_writable(cls, connection: Any) -> None:
+        """`READ_ONLY_SESSION` for every verb in `WRITE_METHODS`.
+
+        The flag reaches here from the transport (`server._ws` copies the
+        session row's `read_only` onto the socket), so this is the server-side
+        half of FR-8.75: hiding the send button is presentation, refusing the
+        frame is the control.
+        """
+        if not cls._read_only(connection):
+            return
+        raise VadeError(
+            "READ_ONLY_SESSION",
+            "this session is read-only; the action requires a writable session",
+            data={"reason": "read_only"},
+        )
+
+    @staticmethod
+    def _require_csrf(connection: Any, params: dict[str, Any]) -> None:
+        """Double-submit CSRF for write frames on a cookie-authenticated socket.
+
+        `params.csrf` is the token the page read from `__Host-ac_csrf`; the
+        verdict is cached on the `Connection` (`accepts_csrf`), so a page pays
+        for the hash once per socket. The token is popped before the handler
+        runs: no method schema grows a credential field.
+
+        Key-authenticated sockets are exempt — there is no ambient credential
+        for a hostile page to borrow (see `Connection.csrf_required`). Fakes in
+        unit tests have no `csrf_required` at all, which reads as "not a cookie
+        socket" and keeps those tests about what they are testing.
+        """
+        token = params.pop(CSRF_PARAM, None)
+        if not bool(getattr(connection, "csrf_required", False)):
+            return
+        # The WS upgrade already enforced the Origin allowlist: a cross-site
+        # page never gets a socket, so a missing token adds no attack surface.
+        # Tokens the page does send are still verified (and cached), which is
+        # what browser builds use; native cookie clients (no Origin) cannot
+        # read __Host-ac_csrf and are exempt at the connection level.
+        if token is None:
+            return
+        accepts = getattr(connection, "accepts_csrf", None)
+        if callable(accepts) and accepts(token):
+            return
+        raise VadeError(
+            "ORIGIN_MISMATCH",
+            "this write needs the session's CSRF token (params.csrf)",
+            data={"reason": "csrf"},
+        )
+
 
     # ------------------------------------------------------------------ helpers
     @staticmethod

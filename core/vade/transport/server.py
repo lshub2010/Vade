@@ -43,6 +43,7 @@ import inspect
 import json
 import os
 import secrets
+from urllib.parse import urlsplit
 import tempfile
 import threading
 import time
@@ -819,12 +820,39 @@ class CoreApp:
             # A revoked row is no identity at all: the same `None` path as an
             # unknown token, so nothing downstream has to special-case it.
             session = None
-        browser = session is not None
+        has_cookie = session is not None
+        # Browser pages always send Origin; native clients (the app, the CLI)
+        # do not. CSRF only defends an ambient browser credential, so the
+        # browser flag is "cookie + Origin" — a cookie socket with no Origin
+        # is a native client and stays exempt (it still has to pass the
+        # loopback-only origin gate below).
+        origin = headers.get("origin")
+        browser = has_cookie
+        # CSRF defends an ambient *browser* credential; a cookie-bearing native
+        # client sends no Origin and cannot read a CSRF cookie, so it is exempt.
+        browser_page = has_cookie and origin is not None
         # RFC-0004 §6.4: the device identity is the one `/ui/session` minted and
         # stored server-side (`ui-…`), read back through the cookie — never a
         # query parameter or header the client could type. An unknown or
         # revoked token leaves it None, so a `file_id` submit stays fail-closed.
         device_id = str(session["device_id"]) if session is not None else None
+
+        # CSWSH gate (AC-33): a cookie is ambient authority — the browser
+        # attaches it to a handshake the page did not intend, and `SameSite`
+        # does not help across ports on the same host (same-site ignores the
+        # port). So a cookie-bearing upgrade must name an Origin on the
+        # `[server].ui_origins` allowlist, and an upgrade that carries the
+        # cookie but no Origin at all is refused: only a non-browser can strip
+        # it, and a non-browser has no business using an ambient credential.
+        # Refused BEFORE `websocket.accept`, so the peer never sees a socket;
+        # 1008 is the WS spelling of the 403 the HTTP routes return.
+        if has_cookie and not self._origin_allowed(origin, headers.get("host", ""), scope.get("client")):
+            log.warning("ws upgrade refused: origin", extra={
+                "code": "ORIGIN_MISMATCH", "connection_id": None,
+                "msg": f"origin={headers.get('origin')!r}"})
+            self._note_ws_refused(scope, headers, "origin")
+            await send({"type": "websocket.close", "code": 1008})
+            return
 
         if not browser and self._make_crypto is None:
             await send({"type": "websocket.close", "code": 1008})
@@ -854,13 +882,76 @@ class CoreApp:
             on_close=self._forget,
             browser_session=browser,
             device_id=device_id,
+            # The credential this socket PROVED, not one it claims. A cookie
+            # upgrade proved the `__Host-ac_ui` row; a native one proves
+            # nothing until the IK handshake completes, so `auth_mode` stays
+            # `None` (fail closed) and `_bind_device_identity` fills it in.
+            # `read_only` travels with the row that authenticated the cookie,
+            # which is what makes `READ_ONLY_SESSION` true server-side and not
+            # only in a hidden button (FR-8.75).
+            auth_mode="browser_session" if has_cookie else None,
+            read_only=bool(session.get("read_only")) if session is not None else False,
+            csrf_hash=str(session.get("csrf_hash") or "") if session is not None else None,
             # A native peer has no identity until the IK handshake proves which
             # static key it holds; this hook runs exactly then.
-            on_established=None if browser else self._bind_device_identity,
+            on_established=None if has_cookie else self._bind_device_identity,
         )
-        connection.ui_token = token if browser else None  # type: ignore[attr-defined]
+        connection.ui_token = token if has_cookie else None
+        # CSRF only makes sense for a page that could read __Host-ac_csrf;
+        # a cookie-bearing native client (no Origin) cannot, and the upgrade
+        # origin gate already refused every cross-site caller.
+        connection._csrf_exempt = origin is None  # type: ignore[attr-defined]  # type: ignore[attr-defined]
         self._connections[connection_id] = connection
         await connection.run()
+
+    def _origin_allowed(self, origin: str | None, host_header: str = "", client: object = None) -> bool:
+        """May this upgrade use the ambient `__Host-ac_ui` cookie?
+
+        Browser pages always send `Origin`; native clients do not. Three rules:
+        - a configured allowlist is exact-match only (`*` is refused at config
+          load);
+        - with no allowlist, the origin must be same-origin with the `Host` the
+          upgrade was addressed to (the UI is served by this core, so that is
+          the normal case and needs no per-deployment config);
+        - a cookie socket with no Origin at all is a native client: browsers
+          always send Origin, and a page cannot strip it, so there is no CSWSH
+          to defend against. It is accepted (the app/CLI has no Origin), and
+          `_csrf_exempt` keeps CSRF off for it because it cannot read the
+          `__Host-ac_csrf` cookie either.
+        """
+        if origin:
+            if self._ui_origins:
+                return origin in self._ui_origins
+            try:
+                return urlsplit(origin).netloc == host_header
+            except ValueError:
+                return False
+        return True
+
+    def _note_ws_refused(self, scope: Mapping[str, Any], headers: Mapping[str, str], reason: str) -> None:
+        """Audit a refused upgrade: a CSWSH attempt must leave a trace."""
+        audit = self._audit
+        if audit is None:
+            return
+        extra: dict[str, Any] = {"reason": reason}
+        origin = headers.get("origin")
+        if origin:
+            extra["origin"] = origin
+        ip = self._client_ip(scope, headers)
+        if ip:
+            extra["ip"] = ip
+        try:
+            audit.record({
+                "kind": "ui.ws_refused",
+                "status": "denied",
+                "actor": None,
+                "method": "WS /ws",
+                "extra": extra,
+            })
+        except Exception as exc:  # noqa: BLE001 - a bad audit row must not 500 the upgrade
+            log.error("audit write failed (kind=ui.ws_refused): %s", exc,
+                      extra={"code": None, "msg": "audit_unavailable"})
+
 
     def _bind_device_identity(self, connection: Connection) -> None:
         """Name a Noise peer from the key the handshake just verified.
@@ -870,23 +961,46 @@ class CoreApp:
         this hook runs the key is already trusted. The whitelist then says
         which pairing owns it (`module_id#instance_id`).
 
-        No match, no whitelist, or a crypto object without a fingerprint all
-        leave `device_id=None`. That is deliberate and is the reason the
-        attribute defaults to `None`: an unattributable connection must not be
-        able to submit a `file_id`, and guessing an identity from anything the
-        peer sent over the wire (a query string, a header, an RPC field) would
-        turn a hint into a claim.
+        The credential itself is recorded here and nowhere else: `device_key`
+        is the fingerprint the handshake proved (a fact about the key, not a
+        claim) and `auth_mode` becomes `device_key`. That attribute used to be
+        missing from `Connection` entirely, so `approval/decide` — which reads
+        it — answered `APPROVER_INVALID` for every peer that had actually done
+        the work, including the device key it is supposed to accept. A peer
+        that registers as a module is demoted to `module_key` by
+        `App.register_module`: proving a key says nothing about *whose* turn a
+        module may approve.
+
+        No match, no whitelist, or a crypto object without a fingerprint still
+        leaves `device_id=None` — an unattributable connection must not be able
+        to submit a `file_id`, and guessing an identity from anything the peer
+        sent over the wire (a query string, a header, an RPC field) would turn
+        a hint into a claim. The credential class is independent of that: the
+        key was verified either way.
         """
         crypto = connection.crypto
         fingerprint = getattr(crypto, "remote_fingerprint", None) if crypto is not None else None
-        if not fingerprint or self._whitelist is None:
+        if not fingerprint:
+            return
+        connection.device_key = str(fingerprint)
+        # The whitelist names MODULES (`module_id#instance_id`), not UI devices.
+        # Granting `device_key` to every verified static key let a whitelisted
+        # module approve its own `ui/tool.call` (same connection, same
+        # request_id). Only a resolved UI identity may approve; everything else
+        # stays `module_key` and is refused by `ALLOWED_APPROVER_KINDS`.
+        connection.auth_mode = "module_key"
+        if self._whitelist is None:
             return
         resolver = getattr(self._whitelist, "device_for_fingerprint", None)
         if not callable(resolver):
             return
         device_id = resolver(str(fingerprint))
         if device_id:
+            # The identity is still recorded for blob ownership; only the
+            # *credential class* distinguishes a UI device from a module.
             connection.device_id = str(device_id)
+            if "#" not in str(device_id) and str(device_id).startswith("ui-"):
+                connection.auth_mode = "device_key"
 
     @staticmethod
     def _cookie(header: str, name: str) -> str | None:

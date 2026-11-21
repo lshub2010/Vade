@@ -331,6 +331,14 @@ class App:
 
         kind = "device" if manifest.role == "ui" else "module"
         auth_mode = "module_key"
+        # The credential class follows the ROLE the key proved at registration
+        # (21-C2 §"kind 与 auth_mode 由握手时的 role 决定"): `role=ui` keeps the
+        # `device_key` the handshake gave it — a device may approve — while a
+        # tool/evolve module is demoted to `module_key`, which is NOT an
+        # approvals principal. Without this a whitelisted module could approve
+        # the high-risk call it is waiting on, i.e. approve itself.
+        if kind == "module" or getattr(connection, "auth_mode", None) is None:
+            connection.auth_mode = auth_mode
         try:
             registration = self.registry.register(
                 manifest,

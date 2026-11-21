@@ -913,8 +913,11 @@ class CoreApp:
         - with no allowlist, the origin must be same-origin with the `Host` the
           upgrade was addressed to (the UI is served by this core, so that is
           the normal case and needs no per-deployment config);
-        - a cookie socket with no Origin at all is accepted only from loopback
-          (the app/CLI on the same box). A remote no-Origin upgrade is refused.
+        - a cookie socket with no Origin at all is a native client: browsers
+          always send Origin, and a page cannot strip it, so there is no CSWSH
+          to defend against. It is accepted (the app/CLI has no Origin), and
+          `_csrf_exempt` keeps CSRF off for it because it cannot read the
+          `__Host-ac_csrf` cookie either.
         """
         if origin:
             if self._ui_origins:
@@ -923,10 +926,7 @@ class CoreApp:
                 return urlsplit(origin).netloc == host_header
             except ValueError:
                 return False
-        host = ""
-        if isinstance(client, (tuple, list)) and client:
-            host = str(client[0])
-        return host in ("127.0.0.1", "::1", "localhost")
+        return True
 
     def _note_ws_refused(self, scope: Mapping[str, Any], headers: Mapping[str, str], reason: str) -> None:
         """Audit a refused upgrade: a CSWSH attempt must leave a trace."""
@@ -983,17 +983,21 @@ class CoreApp:
         if not fingerprint:
             return
         connection.device_key = str(fingerprint)
-        # A verified static key is the `device_key` principal FR-8.53 names as
-        # an approver. `module_key` is assigned later, at registration.
-        connection.auth_mode = "device_key"
+        # The whitelist names MODULES (`module_id#instance_id`), not UI devices.
+        # Granting `device_key` to every verified static key let a whitelisted
+        # module approve its own `ui/tool.call` (same connection, same
+        # request_id). Only a resolved UI identity may approve; everything else
+        # stays `module_key` and is refused by `ALLOWED_APPROVER_KINDS`.
+        connection.auth_mode = "module_key"
         if self._whitelist is None:
             return
         resolver = getattr(self._whitelist, "device_for_fingerprint", None)
         if not callable(resolver):
             return
         device_id = resolver(str(fingerprint))
-        if device_id:
+        if device_id and "#" not in str(device_id) and str(device_id).startswith("ui-"):
             connection.device_id = str(device_id)
+            connection.auth_mode = "device_key"
 
     @staticmethod
     def _cookie(header: str, name: str) -> str | None:

@@ -184,13 +184,19 @@ async def _delete(app: CoreApp, cookie: str | None) -> Response:
 
 
 async def _ws_first_frame(app: CoreApp, token: str) -> dict[str, Any]:
-    """Open `/ws` with `token` as the cookie; return the first frame sent."""
+    """Open `/ws` with `token` as the cookie; return the first frame sent.
+
+    `origin` is not decoration: a cookie-bearing upgrade without one is
+    refused (the CSWSH gate), so a helper that omitted it would only be able
+    to test the refusal.
+    """
     sock = _Socket()
     task = asyncio.create_task(app(
         {
             "type": "websocket",
             "path": "/ws",
-            "headers": [(b"cookie", f"__Host-ac_ui={token}".encode())],
+            "headers": [(b"cookie", f"__Host-ac_ui={token}".encode()),
+                        (b"origin", ORIGIN.encode())],
         },
         sock.receive, sock.send,
     ))

@@ -405,9 +405,20 @@ class Event:
                 "payload": dict(self.payload), "ts": self.ts, "coalesce": self.coalesce}
 
     def to_wire(self) -> dict[str, Any]:
-        """Event frame shape: `{type, seq, payload}` (session known per conn)."""
+        """Event frame shape: `{type, seq, payload, session_id}`.
+
+        `session_id` is a C-06 envelope append, not payload: ONE socket may be
+        attached to several sessions (`ui/attach` can run twice on a
+        connection), and a client that only saw `{type, seq}` had no way to
+        tell which session's seq space a frame belonged to — two sessions with
+        overlapping seqs rendered into one timeline, i.e. events crossing
+        sessions. Reading it from the envelope means every event carries it,
+        including the ones whose payload legitimately has no `session_id`
+        (`task.progress`, `queue.updated`, …).
+        """
         frame: dict[str, Any] = {
             "type": self.type, "seq": self.seq, "payload": dict(self.payload),
+            "session_id": self.session_id,
         }
         if self.coalesce:
             frame["x-vade"] = {"coalesce": True}

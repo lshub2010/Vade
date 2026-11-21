@@ -254,6 +254,10 @@ def install(app: Any) -> Any:
     )
     log.approval_port = approval
     log.input_port = getattr(app, "input_port", None)
+    # The audit sink for transport-level session facts (a sink overflow closing
+    # a socket). `audit` installs before `session` (alphabetical), so the
+    # adapter already exists; `None` on a bare App simply disables the row.
+    log.audit = getattr(app, "audit", None)
     # `app.on_session_end` is the slot every component appends to (C3d's
     # `session.closed` beat, C5a's grant cleanup). Without this line the list
     # was never traversed, so `SessionLog.close()` published nothing. It is

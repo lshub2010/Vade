@@ -35,11 +35,21 @@ the peer performs a *new handshake*, because rekey does not refresh forward
 secrecy. Every seal runs under `_seal_lock` — `seal()` (which advances the
 send counter) and the queue put must not be split, or the peer sees a counter
 gap and drops the connection.
+
+Credentials: `auth_mode` / `device_key` / `read_only` are set by whoever
+verified the credential (the WS upgrade for a cookie, the handshake hook for a
+static key) and are never taken from the peer. `auth_mode=None` means "nothing
+verified yet" and authority checks must fail closed on it. `read_only` is the
+session row's flag, so `READ_ONLY_SESSION` and the socket agree by
+construction, and the CSRF verdict for a cookie socket is cached in `csrf_ok`
+because the transport is the only layer that sees the row's digest.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import time
 from collections import deque
@@ -156,6 +166,10 @@ class Connection:
         on_close: Callable[["Connection"], None] | None = None,
         browser_session: bool = False,
         device_id: str | None = None,
+        auth_mode: str | None = None,
+        device_key: str | None = None,
+        read_only: bool = False,
+        csrf_hash: str | None = None,
         on_established: Callable[["Connection"], None] | None = None,
         rekey_interval_s: float = REKEY_INTERVAL_DEFAULT,
         rekey_bytes: int = REKEY_BYTES_DEFAULT,
@@ -171,6 +185,31 @@ class Connection:
         #: cannot be attributed, so it is refused. It is set by the transport
         #: from a credential it verified itself — never from a client claim.
         self.device_id = device_id
+        #: WHICH credential this socket proved: `browser_session` (the
+        #: `__Host-ac_ui` cookie), `device_key` (a Noise static key) or
+        #: `module_key` (a Noise key that registered as a module). `None` means
+        #: "no credential has been verified yet" and every authority question
+        #: must fail closed against it — it must never read as a permissive
+        #: default. `approval/decide` is the caller that depends on this: it
+        #: used to `getattr(connection, "auth_mode", "browser_session")`, and
+        #: because the attribute was never set, every legitimate approver was
+        #: answered `APPROVER_INVALID` (the dead end this field closes).
+        self.auth_mode = auth_mode
+        #: The verified static-key fingerprint behind a native handshake. Not a
+        #: client claim either: `CryptoSession` computes it from the key that
+        #: completed the IK exchange, and `None` for cookie sessions.
+        self.device_key = device_key
+        #: Explicit read-only session (AMEND-22 #14): the transport copies
+        #: `ui_sessions['read_only']` here at upgrade, so `READ_ONLY_SESSION`
+        #: is decided by the same row that authenticated the socket.
+        self.read_only = bool(read_only)
+        #: `sha256(__Host-ac_csrf)` of the session row, never the token. The
+        #: write gate compares against it and caches success in `csrf_ok`.
+        self.csrf_hash = csrf_hash or None
+        #: Cached CSRF verdict for this socket ("验 CSRF，缓存到 Connection"):
+        #: a browser connection pays the check once, not per frame.
+        self.csrf_ok = False
+
         self._on_established = on_established
         self._queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=max_queue)
         self._heartbeat_interval = heartbeat_interval_s
@@ -197,6 +236,39 @@ class Connection:
         self._sealed_frames = 0
         self._rekeys = 0
         self._established_at: float | None = None
+
+    # ------------------------------------------------------------------ credentials
+    @property
+    def csrf_required(self) -> bool:
+        """Only cookie credentials carry ambient authority, so only they need CSRF.
+
+        A native peer proved possession of a static key on this socket; there is
+        no browser that could be tricked into attaching it, so a token would be
+        ceremony, not a defence. That asymmetry is the same one `blob/auth.py`
+        draws between Bearer and cookie principals.
+        """
+        return self.browser_session
+
+    def accepts_csrf(self, token: Any) -> bool:
+        """Check a double-submit CSRF token and cache the verdict on this socket.
+
+        `csrf_hash` is `sha256(__Host-ac_csrf)` copied from the session row at
+        upgrade; the raw token is never stored. A success is sticky
+        (`csrf_ok`): the socket has already proved it belongs to a page that
+        can read the paired cookie, and re-proving that per frame would only
+        add a hash to every write. A failure is NOT cached — a client that
+        fixes its token may retry.
+        """
+        if self.csrf_ok:
+            return True
+        hash_ = self.csrf_hash
+        if not hash_ or not isinstance(token, str) or not token:
+            return False
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        if hmac.compare_digest(digest, hash_):
+            self.csrf_ok = True
+            return True
+        return False
 
     # ------------------------------------------------------------------ lifecycle
     async def run(self) -> None:

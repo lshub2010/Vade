@@ -221,10 +221,13 @@
       "method": "string",
       "params": "object"
     },
+    "event": "C-06 notification on the data plane: {jsonrpc:'2.0', method:'event', params:{session_id, type, seq, payload}}",
     "notes": [
       "`error.code` is always a C-04 name, never a number and never a custom string.",
       "`error.data` carries structured fields only (field pointer, retry_after). Never a stack trace.",
-      "Notifications (no `id`) must not be answered. modules MUST NOT call core tools back (design §2.5)."
+      "Notifications (no `id`) must not be answered. modules MUST NOT call core tools back (design §2.5).",
+      "Event frames (`method:'event'`) carry the C-06 envelope verbatim (schema/events.json). `params.session_id` is the C-06 envelope append recorded in `x-vade.envelope_append`: `seq` is per session and one socket may be attached to several sessions, so a client MUST route events by that field and must not assume one connection is one session.",
+      "Write methods (`ui/submit`, `ui/interrupt`, `ui/queue.cancel`, `session/delete`, `turn/regenerate`, `message/edit_resubmit`, `approval/decide`, `session/model.set`, `session/rename|pin|archive`, `session/group.*`, `turn/input[.cancel]`) accept an optional `params.csrf` on a cookie-authenticated socket. A WebSocket frame has no headers, so this is the `x-vade-csrf` double-submit token from `__Host-ac_csrf`; core verifies it against the session row once and caches the verdict on that connection (server-side `ORIGIN_MISMATCH` with `data.reason='csrf'` otherwise). Key-authenticated peers (Noise) need none: they carry no ambient credential."
     ]
   },
   "tool_result": {

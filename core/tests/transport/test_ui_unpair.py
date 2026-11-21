@@ -205,7 +205,8 @@ async def test_delete_revokes_only_the_session_that_presented_its_cookie(tmp_pat
     sock = _Socket()
     task = asyncio.create_task(app(
         {"type": "websocket", "path": "/ws",
-         "headers": [(b"cookie", f"__Host-ac_ui={token_b}".encode())]},
+         "headers": [(b"cookie", f"__Host-ac_ui={token_b}".encode()),
+                     (b"origin", ORIGIN.encode())]},
         sock.receive, sock.send,
     ))
     await _wait(lambda: any(f["type"] == "websocket.accept" for f in sock.frames), what="accept")

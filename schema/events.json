@@ -5,11 +5,12 @@
   "frozen_at": "2026-11-13",
   "owner": "C3",
   "source_of_truth": "docs/design.md §2.5, §2.6",
-  "transport": "JSON-RPC 2.0 notification on the data plane: {jsonrpc:'2.0', method:'event', params:{type, seq, payload}}",
+  "transport": "JSON-RPC 2.0 notification on the data plane: {jsonrpc:'2.0', method:'event', params:{session_id, type, seq, payload}}",
   "envelope": {
     "type": "string (domain.action, past tense)",
     "seq": "int >= 1, per session, allocated by core",
     "payload": "object",
+    "session_id": "string — envelope append (x-vade.envelope_append, C-06 unchanged otherwise): the session whose `seq` space this frame belongs to. ONE data-plane socket may carry several attached sessions, so a client MUST route by this field and MUST NOT assume a connection is one session.",
     "x-vade": "optional `x-vade.coalesce: true` on the frame — the event is droppable/self-contained (RFC-0007 §5.5 R5); a client MUST NOT treat a seq gap made only of such events as a hole."
   },
   "rules": [
@@ -19,7 +20,8 @@
     "Every turn's STATE-CHANGE event carries `state` (see turn.state): turn.queued, turn.started, turn.completed, turn.failed, turn.interrupted, turn.cancelled and turn.approval_resolved. turn.delta / turn.tool_call / turn.tool_result are payload-only and never carry `state`; a UI keeps the last state event and applies these deltas on top of it.",
     "errors inside payloads use C-04 names only; no traceback ever appears in an event.",
     "C3d may APPEND session.turn / session.closed (C-14); this file may not be rewritten by other batches.",
-    "RFC-0008 §6.4: a client that does not know an event type MUST ignore it and advance `last_seq` (never disconnect); a client that does not know a turn state MUST render it as `running`. `waiting_input` is the state this rule exists for (C-06 2.0.0 widened the enum)."
+    "RFC-0008 §6.4: a client that does not know an event type MUST ignore it and advance `last_seq` (never disconnect); a client that does not know a turn state MUST render it as `running`. `waiting_input` is the state this rule exists for (C-06 2.0.0 widened the enum).",
+    "Envelope append (x-vade.envelope_append): every event frame carries `session_id` next to `type`/`seq`/`payload`. seq is per session, so without it two attached sessions interleave into one indistinguishable stream; a client routes on this field, never on arrival order or on the payload (payload `session_id` is per-event and some payload-only events have none)."
   ],
   "turn_states": [
     "queued",
@@ -682,6 +684,16 @@
     }
   },
   "x-vade": {
+    "envelope_append": {
+      "contract": "C-06",
+      "version": "envelope-only (no header bump)",
+      "owner": "C2",
+      "doc": "docs/agents/21-C2-transport-registry.md",
+      "adds": ["envelope.session_id"],
+      "rewrites": "none. This block APPENDS one envelope field; no `events` entry, `required` array, rule, `turn_states`/`task_states`/`subagent_states` entry, or the top-level `version` (2.0.0, owned by RFC-0008's enum widening) is touched. The core emitter is `Event.to_wire()` (`core/vade/session/models.py`), which is the single place an event becomes a frame, so no event type can be missed.",
+      "why": "`seq` is allocated per session (`SeqAllocator(store)`), and `/ws` allows ONE connection to attach several sessions (`SessionRPC._sinks` is keyed by `(connection, session)`). With only `{type, seq, payload}` a client could not tell which session's seq space a frame belonged to: two sessions with overlapping counters rendered into one timeline, and a payload-level `session_id` is only present on the events that happen to carry one. The envelope is the only place every frame has it.",
+      "compat": "Additive for decoders (an unknown key is ignored by the frozen rule 7), and REQUIRED for any client that attaches to more than one session on one socket. A client attached to exactly one session may ignore it."
+    },
     "rfc0005_append": {
       "contract": "RFC-0005",
       "owner": "C3",

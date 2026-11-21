@@ -209,6 +209,37 @@ def _check_origins(cfg: Config) -> None:
             )
 
 
+def _expand_dotted_overrides(data: Mapping[str, Any]) -> dict[str, Any]:
+    """`{"a.b": 1}` -> `{"a": {"b": 1}}`; explicit nested keys win on collision."""
+    flat: dict[str, Any] = {}
+    nested: dict[str, Any] = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or "." not in key:
+            nested[key] = value
+            continue
+        node: dict[str, Any] = flat
+        parts = key.split(".")
+        for part in parts[:-1]:
+            child = node.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                node[part] = child
+            node = child
+        node[parts[-1]] = value
+    expanded: dict[str, Any] = {}
+    _merge_plain(expanded, flat)
+    _merge_plain(expanded, nested)
+    return expanded
+
+
+def _merge_plain(base: dict[str, Any], overlay: Mapping[str, Any]) -> None:
+    for key, value in overlay.items():
+        if isinstance(value, Mapping) and isinstance(base.get(key), dict):
+            _merge_plain(base[key], value)  # type: ignore[arg-type]
+        else:
+            base[key] = value
+
+
 def load_config(
     *,
     toml_path: Path | str | None = None,
@@ -229,6 +260,11 @@ def load_config(
         data = json.loads(overrides_target.read_text(encoding="utf-8"))
         if not isinstance(data, Mapping):
             raise ConfigError("overrides", "root must be an object", code="INVALID_ARGUMENT")
+        # Older admin builds wrote flat dotted keys (`policy.approval_timeout_s`).
+        # Expand them HERE, before `_deep_merge` walks the schema: otherwise a
+        # data dir written by that build can never start again (the merge
+        # rejects the dotted root key before AdminContext's migration runs).
+        data = _expand_dotted_overrides(data)
         _deep_merge(merged, data, source="overrides.json", schema=schema)
 
     env_overlay = _from_env(schema, environ if environ is not None else os.environ)

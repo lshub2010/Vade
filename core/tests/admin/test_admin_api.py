@@ -440,21 +440,33 @@ def test_config_rejects_unknown_keys_and_dangerous_changes_need_confirm(ctx, app
         assert unknown.status_code == 400
         assert unknown.json()["code"] == "UNKNOWN_CONFIG_KEY"
 
+        # `evolve.enabled` defaults to False (schema), so switching it ON is not
+        # the dangerous direction, and re-saving the default is not a change at
+        # all — the confirm gate must not fire on either.
+        enabled = await client.put("/admin/api/config",
+                                   json={"key": "evolve.enabled", "value": True},
+                                   headers=bearer(token))
+        assert enabled.status_code == 200, enabled.text
+
         needs_confirm = await client.put("/admin/api/config",
                                          json={"key": "evolve.enabled", "value": False},
                                          headers=bearer(token))
         assert needs_confirm.status_code == 409
         assert needs_confirm.json()["code"] == "CONFIRM_REQUIRED"
 
-        applied = await client.put("/admin/api/config",
-                                   json={"key": "evolve.enabled", "value": False, "confirm": True},
-                                   headers=bearer(token))
-        assert applied.status_code == 200
-        assert applied.json()["applied"] is True
+        saved = await client.put("/admin/api/config",
+                                 json={"key": "evolve.enabled", "value": False, "confirm": True},
+                                 headers=bearer(token))
+        assert saved.status_code == 200, saved.text
+        # No evolve component exists in this core, so nothing picks the value up
+        # live: the honest answer is needs_restart, not a fake `applied: true`.
+        assert saved.json()["applied"] is False
+        assert saved.json()["needs_restart"] is True
 
         items = {i["key"]: i for i in (await client.get("/admin/api/config", headers=bearer(token))).json()["items"]}
         assert items["evolve.enabled"]["value"] is False
         assert items["evolve.enabled"]["source"] == "overrides"
+        assert items["evolve.enabled"]["mode"] == "restart"
 
     asyncio.run(scenario())
 

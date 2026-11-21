@@ -300,6 +300,44 @@ def test_one_oversized_message_is_clipped_not_refused(tmp_path):
     asyncio.run(scenario())
 
 
+def test_two_text_parts_plus_an_image_do_not_spin_the_clipper(tmp_path):
+    """A legal message can carry two 6k-CJK text parts plus an image.
+
+    Halving `content` and rebuilding it from the two untouched parts was a
+    no-op: `_bound_snapshot` looped forever inside a synchronous attach and
+    blocked the event loop. The attach must finish and mark the row clipped.
+    """
+    async def scenario():
+        log = _log(tmp_path)
+        session = log.create_session()
+        left = "甲" * 6_000
+        right = "乙" * 6_000
+        message = Message(
+            id="m-multi", session_id=session.id, role="user",
+            content=left + right, turn_id="turn-multi",
+            parts=(
+                {"type": "text", "text": left},
+                {"type": "image", "file_id": "f1", "mime": "image/png"},
+                {"type": "text", "text": right},
+            ),
+        )
+        await log.emit(session.id, "session.updated", {"session_id": session.id},
+                       messages=[message])
+        rpc = _rpc(log)
+        result = await asyncio.wait_for(
+            rpc.ui_attach(Conn(), {"session_id": session.id, "last_seq": None}),
+            timeout=5,
+        )
+        snapshot = result["snapshot"]
+        assert snapshot["truncated"] is True
+        [row] = snapshot["messages"]
+        assert row["truncated"] is True
+        assert len(row["content"]) < len(left) + len(right)
+        await log.close()
+
+    asyncio.run(scenario())
+
+
 def test_the_snapshot_carries_each_text_once(tmp_path):
     """`content` xor `parts` per message; no `user_text` on the turn."""
     async def scenario():

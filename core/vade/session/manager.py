@@ -1112,8 +1112,12 @@ class SessionLog:
         # ③ Clip the largest remaining text fields until the exact size fits.
         # Halving each time bounds this to O(log n) rounds, and `_clip_one_text`
         # refuses once every field is already short, so it cannot spin.
-        while self._reply_bytes(session_id, snapshot) > budget and self._clip_one_text(snapshot):
-            pass
+        while True:
+            before = self._reply_bytes(session_id, snapshot)
+            if before <= budget or not self._clip_one_text(snapshot):
+                break
+            if self._reply_bytes(session_id, snapshot) >= before:
+                break  # no progress: never spin on a floor-sized field
         # ④ Last resort: optional blocks go before the session does. A client
         # loses task progress (it can `task/list`) but keeps the conversation
         # and its cursor — and `truncated` says so.
@@ -1122,8 +1126,12 @@ class SessionLog:
             snapshot["tasks_truncated"] = True
             snapshot["pending_inputs"] = []
             snapshot["pending_approvals"] = []
-            while self._reply_bytes(session_id, snapshot) > budget and self._clip_one_text(snapshot):
-                pass
+            while True:
+                before = self._reply_bytes(session_id, snapshot)
+                if before <= budget or not self._clip_one_text(snapshot):
+                    break
+                if self._reply_bytes(session_id, snapshot) >= before:
+                    break
         # ⑤ Absolute floor: no reply the transport will refuse. Reached only by
         # a pathological session (thousands of one-word rows), but "attach is
         # impossible" must not be reachable at all.
@@ -1194,12 +1202,17 @@ class SessionLog:
         else:
             container[key] = text[:keep]
             if "parts" in container:
-                # `parts[].text` is the projection `content` was clipped from;
-                # leaving it whole would keep the very copy this clip removed.
-                for part in container["parts"]:
-                    part_text = part.get("text")
-                    if part.get("type") == "text" and isinstance(part_text, str):
-                        part["text"] = part_text[:keep]
+                # Clip the largest text part, not the derived `content`: with
+                # two 6k-character parts, halving `content` and then rebuilding
+                # it from two 6k parts is a no-op that used to spin forever.
+                text_parts = [
+                    part for part in container["parts"]
+                    if part.get("type") == "text" and isinstance(part.get("text"), str)
+                    and len(part["text"]) > 64
+                ]
+                if text_parts:
+                    largest = max(text_parts, key=lambda part: len(part["text"]))
+                    largest["text"] = largest["text"][: max(64, len(largest["text"]) // 2)]
                 container["content"] = parts_text(container["parts"]) or container[key]
         container["truncated"] = True
         container["omitted_chars"] = max(0, len(text) - len(container.get(key) or ""))

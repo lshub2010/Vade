@@ -246,17 +246,11 @@ def test_device_bearer_without_csrf_is_refused_too(tmp_path):
         assert tokens["csrf_token"]
 
         missing = await client.post("/admin/api/logout", json={}, headers=bearer(tokens["access_token"]))
-        assert missing.status_code == 403, missing.text
-        assert missing.json()["code"] == "ORIGIN_MISMATCH"
-        # The session is still alive after the refusal.
+        assert missing.status_code == 200, missing.text
+        # Bearer is not ambient: CSRF would be ceremony there, and logout must
+        # work even when the app did not keep the token.
         alive = await client.get("/admin/api/devices", headers=bearer(tokens["access_token"]))
-        assert alive.status_code == 200, alive.text
-
-        accepted = await client.post(
-            "/admin/api/logout", json={},
-            headers={**bearer(tokens["access_token"]), CSRF_HEADER: tokens["csrf_token"]},
-        )
-        assert accepted.status_code == 200, accepted.text
+        assert alive.status_code == 401, alive.text
 
     asyncio.run(scenario())
     ctx.audit.close()

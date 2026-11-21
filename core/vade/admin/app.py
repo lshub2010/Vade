@@ -577,7 +577,10 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         # check is cheap and uniform — an App already receives `csrf_token` in
         # its TokenPair, and a request that forgets it is exactly the case a
         # stolen/ambient credential would also forget (review P1-5).
-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        # Bearer (device) sessions do not carry ambient authority, so CSRF is
+        # meaningless for them; browser cookies do.
+        if (request.method not in {"GET", "HEAD", "OPTIONS"}
+                and session.mode == "browser"):
             provided = request.headers.get(CSRF_HEADER) or ""
             if not provided or not hmac.compare_digest(str(session.csrf), str(provided)):
                 ctx.write_audit(kind="admin.rejected", status="denied", code="ORIGIN_MISMATCH",

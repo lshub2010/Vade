@@ -56,17 +56,43 @@ class ReplayBuffer:
             buf.popleft()
         return buf
 
-    def covers(self, session_id: str, last_seq: int) -> bool:
-        """True iff every seq in `last_seq+1 .. newest` is still retained.
+    def covers(self, session_id: str, last_seq: int, *, durable_last_seq: int | None = None) -> bool:
+        """True iff `last_seq+1 .. newest` is retained and `last_seq` is real.
 
-        A brand-new session with `last_seq == 0` is covered (nothing to replay);
-        any other empty buffer means "I cannot prove continuity" -> snapshot.
+        Both ends are checked.
+
+        * Lower bound: `oldest <= last_seq + 1` — the classic trim test.
+        * Upper bound: `last_seq <= newest`. A cursor AHEAD of the newest event
+          is not "caught up", it is unverifiable: it is either a cursor carried
+          over from another session (one client, one variable) or one that was
+          incremented twice. Answering "covered" there returned `snapshot=null`
+          and zero events, so the history the client did not have was silently
+          declared present (`from_seq=last_seq+1` made it permanent).
+
+        An empty buffer proves nothing: it is either a brand-new session or a
+        process that restarted after the events were written, and from here the
+        two are indistinguishable. Treating them alike made `attach(last_seq=0)`
+        after a restart replay "ok" with `snapshot=null` while every state item
+        that is persisted WITHOUT an event (`session/model.set` is the proof)
+        never reached the client. `durable_last_seq == 0` does not rescue the
+        fresh case either: `create_session()` + `set_session_model()` writes a
+        session with state and zero events, so "no event was ever written" is
+        not "there is nothing to send". Only a non-empty window can prove
+        continuity; everything else gets a snapshot, which is always correct
+        and, on an empty session, nearly free.
+
+        `durable_last_seq` is the store's `last_seq` (callers that have a store
+        pass it). It is the ceiling for the upper bound: the replay window only
+        holds non-coalescible events, so a client whose cursor sits on a
+        `task.progress` (RFC-0007 §9.4) is still covered by the store even
+        though the buffer's own newest is older.
         """
         buf = self._prune(session_id)
         if not buf:
-            return last_seq == 0
+            return False
         oldest = buf[0][0]
-        return oldest <= last_seq + 1
+        newest = buf[-1][0] if durable_last_seq is None else durable_last_seq
+        return oldest <= last_seq + 1 and last_seq <= newest
 
     def oldest(self, session_id: str) -> int | None:
         buf = self._prune(session_id)

@@ -846,13 +846,23 @@ def test_legacy_to_llm_payload_is_byte_identical(tmp_path):
     store.close()
 
 
-def test_legacy_row_appears_in_the_snapshot_with_a_synthesised_part(tmp_path):
+def test_legacy_row_appears_in_the_snapshot_as_plain_content(tmp_path):
+    """A pre-parts row is readable from `content` alone, and travels once.
+
+    `Message.to_snapshot` drops text-only `parts`: they are exactly the
+    projection of `content`, and sending both is what put a legal session over
+    the 65 519-byte frame cap (f9-audit P0-1). A client that only knows
+    `content` renders the legacy row unchanged; a client that reads `parts`
+    synthesises the same text part it always did.
+    """
     path = tmp_path / "sessions.db"
     _legacy_db(path)
     log = SessionLog(SQLiteStore(path), replay=ReplayBuffer())
     snapshot = log.snapshot(SESSION)
-    assert snapshot["messages"][0]["parts"] == [{"type": "text", "text": "旧消息 hello"}]
     assert snapshot["messages"][0]["content"] == "旧消息 hello"
+    assert "parts" not in snapshot["messages"][0]
+    assert log.store.load(SESSION).messages[0].wire_parts() == [
+        {"type": "text", "text": "旧消息 hello"}]
     log.store.close()
 
 

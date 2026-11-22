@@ -110,7 +110,18 @@ def test_full_turn_event_sequence_and_replay_chain(tmp_path):
     asyncio.run(scenario())
 
 
-def test_replay_from_a_restarted_core_reconstructs_the_call_chain(tmp_path):
+def test_a_restart_snapshot_reconstructs_the_call_chain(tmp_path):
+    """After a restart, `attach(last_seq=0)` re-syncs with a snapshot.
+
+    It used to replay the durable events and answer `snapshot: null`, which
+    looked cheaper — but a restarted core cannot prove that everything the
+    client is missing has an event. `session/model.set` writes a column and
+    emits nothing, so a replay-only attach silently dropped it (f9-audit
+    P1-2). The snapshot is the declared substitute for "the events that led
+    here": it has to reconstruct the same conversation, and it does — the user
+    message, the tool row and the final answer are all in `messages`.
+    """
+
     async def scenario():
         log, _, rpc, _ = _build(tmp_path, [
             [Delta(tool_calls=(ToolCallDelta(index=0, id="c1", name="fs__read_file",
@@ -124,6 +135,7 @@ def test_replay_from_a_restarted_core_reconstructs_the_call_chain(tmp_path):
 
         # New process, empty in-memory replay buffer, same SQLite file.
         store = SQLiteStore(tmp_path / "sessions.db")
+        last_before = store.last_seq(session.id)
         fresh = SessionLog(store, replay=ReplayBuffer(maxlen=1000))
         sink_events: list[dict] = []
 
@@ -133,12 +145,17 @@ def test_replay_from_a_restarted_core_reconstructs_the_call_chain(tmp_path):
 
         result = await fresh.attach(session.id, 0, Sink())
         await asyncio.sleep(0.05)
-        assert result.snapshot is None
-        assert [e.seq for e in result.replay] == list(range(1, len(result.replay) + 1))
-        types = [e.type for e in result.replay]
-        assert "turn.tool_call" in types and "turn.tool_result" in types
-        assert "turn.completed" in types
-        assert [e["seq"] for e in sink_events] == list(range(1, len(sink_events) + 1))
+        assert result.snapshot is not None, "an empty buffer cannot prove continuity"
+        assert result.replay == ()
+        snapshot = result.snapshot
+        assert snapshot["from_seq"] == last_before
+        assert [m["role"] for m in snapshot["messages"]] == [
+            "user", "assistant", "tool", "assistant"]
+        assert snapshot["messages"][-1]["content"] == "done"
+        assert snapshot["queue"] == {"running": None, "pending": []}
+        assert [event["type"] for event in sink_events] == ["session.attached"]
+        assert sink_events[0]["payload"]["snapshot"] is True
+        assert sink_events[0]["seq"] == last_before + 1
         await fresh.close()
 
     asyncio.run(scenario())

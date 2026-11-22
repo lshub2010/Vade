@@ -214,6 +214,26 @@ class Message:
             "parts": self.wire_parts(),
         }
 
+    def to_snapshot(self) -> dict[str, Any]:
+        """`ui/attach` shape: the text travels ONCE.
+
+        `to_dict()` writes both `content` and the text parts it projects, and
+        `Turn.to_dict()` writes `user_text` a third time — the same bytes three
+        times for a user message. That is invisible to an in-process caller and
+        fatal on the wire: one frame is capped at 65 519 bytes, so a session
+        with ~7 100 CJK characters of user text could never be attached again.
+
+        Text-only `parts` add nothing a client cannot derive from `content`
+        (legacy rows were synthesising exactly that part on read), so they are
+        dropped here. A message with an image/file part keeps `parts` — and
+        `content`, its projection — for clients that render one or the other.
+        `content` is never dropped: every existing client reads it.
+        """
+        data = self.to_dict()
+        if all(part.get("type") == "text" for part in data["parts"]):
+            data.pop("parts")
+        return data
+
 
 @dataclass(frozen=True, slots=True)
 class Turn:
@@ -281,6 +301,18 @@ class Turn:
             "partial_message_id": self.partial_message_id,
             "user_parts": list(self.user_parts),
         }
+
+    def to_snapshot(self) -> dict[str, Any]:
+        """`ui/attach` shape: no `user_text`.
+
+        It is the projection of the turn's user message (`user_message_id`),
+        and `snapshot.messages[]` already carries that row — the third copy of
+        the same bytes (see `Message.to_snapshot`). The field stays on
+        `to_dict()` for in-process callers.
+        """
+        data = self.to_dict()
+        data.pop("user_text", None)
+        return data
 
 
 @dataclass(frozen=True, slots=True)

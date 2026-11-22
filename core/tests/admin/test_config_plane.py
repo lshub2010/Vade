@@ -20,6 +20,7 @@ same data dir, which is the only thing that would have caught defect 1.
 from __future__ import annotations
 
 import asyncio
+import pytest
 import json
 import logging
 from pathlib import Path
@@ -366,7 +367,7 @@ def test_hot_approval_timeout_changes_the_next_approval_deadline(tmp_path):
             pending, reason = await manager.open_request(request)
             assert reason == "approval_required"
             assert pending is not None
-            assert pending.deadline - pending.started == 120.0
+            assert pending.deadline - pending.started == pytest.approx(120.0)
 
         asyncio.run(scenario())
     finally:

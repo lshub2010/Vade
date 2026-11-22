@@ -76,8 +76,11 @@ CREATE TABLE events(session_id TEXT, seq INTEGER, type TEXT, payload TEXT, ts IN
 - `seq` **只由 core 分配**，在一个 session 内严格 `+1`，不允许跳号、不允许客户端指定。
 - 每个对外事件（`turn.*` / `queue.updated` / `module.status`）都先落 `events` 再广播；**先落盘后推送**，否则重连补发会缺条。
 - replay buffer 内存里保留最近 1000 条或 24h（先到为准）；`attach(last_seq)`：
-  - 覆盖 → 从 `last_seq+1` 补发，再切实时；
+  - 覆盖（**两端**：`oldest <= last_seq+1` 且 `last_seq <= store.last_seq`）→ 从 `last_seq+1` 补发，再切实时；
   - 不覆盖 → 返回 `snapshot`（消息树 + 队列 + 待审批），`from_seq` = 快照点。
+  - 空 buffer **一律**走快照：重启后的 buffer 从空开始，replay-only 的 attach 拿不到「只落库不落事件」的状态（`session/model.set` 是实证），而全新会话走快照的代价近似为零。
+  - 快照必须装进一帧（65519 字节）：文本只出现一次（`messages[].content`、非 text 才带 `parts`、`turns[]` 不带 `user_text`）；仍超预算就丢最旧的 `messages`/`turns` 并带 `truncated/omitted/truncated_before_seq`，单条超预算则截断（`content_truncated`），**绝不**回 `PAYLOAD_TOO_LARGE`；每次截断写 `session.snapshot_truncated` 审计。
+  - 快照带 `running_partial{turn_id,text,chars}`：进行中回合已经流出的正文只在 `turn.delta` 里，快照不带它就等于新 attach 的客户端永久少一段。
 - 客户端可能收到重叠片段，**客户端按 seq 去重**（写进 `schema/events.json` 的说明）。
 
 ### T2 · 队列与中断（1 天）
@@ -332,6 +335,9 @@ pytest core/tests/e2e/test_turn_lifecycle.py -q -s
 | interrupt | 500ms 内 `interrupted`，下一个 turn 立刻开始；模块不响应 cancel 也不阻塞 |
 | replay 覆盖 | `attach(last_seq=N)` 补发 N+1 起，无重复无缺失 |
 | replay 不覆盖 | 返回 snapshot，消息树与队列与当前一致 |
+| `last_seq` 超前 / 空 buffer | 回 snapshot（不是 `snapshot:null`+零事件）；重启后 `last_seq=0` 能看到 `session/model.set` 的模型 |
+| 长会话 attach | 一帧内返回，`truncated`/`omitted`/`truncated_before_seq` 与实际丢弃一致，有审计行；单条 32 000 字不失败 |
+| 进行中快照 | `running_partial.text` == 已经流出的 delta 拼接；空闲时为 `null` |
 | 熔断 | 连续 5 次超时 → 后续快速失败 `UNAVAILABLE`；30s 后 half-open |
 | 工具名冲突 | `fs__read_file` 与 `fs2__read_file` 各自路由正确 |
 | 未知工具 | 不崩，模型收到可读错误并继续 |

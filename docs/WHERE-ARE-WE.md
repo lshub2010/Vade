@@ -6,13 +6,13 @@
 
 ## 已完成（本仓可核实）
 
-- 契约：C-05 `rpc.json` **1.7.0**，方法 **49**（ui_to_core 36 / core_to_module 7 / module_to_core 6）；C-06 `events.json` **2.0.0**，事件 **34**（含 `turn.state` 枚举条目，不含则 33）；C-04 **34** 错误码；append 登记 **12+9+3=24** 块，**无** `x-vade.rfc0015_pending` 之类占位块（出处：四份 schema 重算；`tools/check_ledger.py` → `ledger: OK (16 RFC rows; rpc 1.7.0 49 methods …, appends 12+9+3)`）。
+- 契约：C-05 `rpc.json` **1.8.0**，方法 **49**（ui_to_core 36 / core_to_module 7 / module_to_core 6）；C-06 `events.json` **2.0.0**，事件 **34**（含 `turn.state` 枚举条目，不含则 33）；C-04 **34** 错误码；append 登记 **13+9+3=25** 块，**无** `x-vade.rfc0015_pending` 之类占位块（出处：四份 schema 重算；`tools/check_ledger.py` → `ledger: OK (16 RFC rows; rpc 1.8.0 49 methods …, appends 13+9+3)`）。
 - 服务端测试：**1203 passed**（出处 `shots/s-blob-impl/RESULT.md`：`1203 passed, 9 warnings in 526.67s`，基线 `7941b93` = 1165 + 本批 38）。**当前 HEAD `be16ebe` 只做了收集计数：`pytest core/tests -q --collect-only` → 1383 tests collected（2026-11-17 复跑），全量未复跑，故本页不给 HEAD 的 passed 数**。历史口径：1165（`s-rfc0015-register`）、1089（2026-11-14）。
 - 契约门禁：`tools/check_contracts.py` → exit 0（含 `RFC-0016 blob token green`；出处 `docs/rfc/LEDGER.md` §1、`shots/s-blob-impl/RESULT.md`）。
 - docs 门禁：`docs/check_docs.py` → exit 0（12 项，失败 0 项；本 worktree 2026-11-17 复跑）。
-- 契约登记全部在案：RFC-0001～0009 各有 `x-vade.appends` 块；RFC-0015 第 **11** 块（C-05 1.6.0）、RFC-0016 第 **12** 块（C-05 1.7.0）；RFC-0007 的 4 个 `task.*` 事件补登记为 events.json 第 **9** 块（C-06 1.1.0，追溯登记，随块保留原 `x-vade.append_rfc0007` 作史料）。
+- 契约登记全部在案：RFC-0001～0009 各有 `x-vade.appends` 块；RFC-0015 第 **11** 块（C-05 1.6.0）、RFC-0016 第 **12** 块（C-05 1.7.0）、f15 snapshot contract 第 **13** 块（C-05 1.8.0）；RFC-0007 的 4 个 `task.*` 事件补登记为 events.json 第 **9** 块（C-06 1.1.0，追溯登记，随块保留原 `x-vade.append_rfc0007` 作史料）。
 - RFC-0001～0009：已批准（frontmatter `status: approved`；0001/0002 为正文状态表）且已实现合并；frontmatter `stage` 已由 `s-hygiene`（`a9c7dcc`）回填为「已实现并合并」，`docs/rfc/README.md` 状态列同批同步（见 `docs/rfc/HYGIENE-RESULT.md` §1-4）。
-- RFC-0010 / 0012 / 0013 / 0014 / 0015 / 0016：core 侧已实现（各自 `core/vade/*/RESULT-rfc*.md`；契约块 1.3.0 / 1.4.0 / 1.2.0 / 1.5.0 / 1.6.0 / 1.7.0 均在案）。
+- RFC-0010 / 0012 / 0013 / 0014 / 0015 / 0016：core 侧已实现（各自 `core/vade/*/RESULT-rfc*.md`；契约块 1.3.0 / 1.4.0 / 1.2.0 / 1.5.0 / 1.6.0 / 1.7.0 均在案）；f15 snapshot contract 块 1.8.0（登记纯文本 `parts`/`user_text` 删除与 snapshot 计数键）在案。
 - RFC-0004 数据面 `/ui/blob` 六路由 + content parts 定型（`core/vade/blob/http.py`、`core/vade/session/parts.py`；RESULT-parts.md 539 passed）。
 - RFC-0016 `ui/blob.token`：`BlobTokenRPC`（`core/vade/blob/rpc.py`，严格参数 / 拒 cookie / 绑 `connection.device_id`）经 `handler_providers` 双路发布；解绑设备即清 token（`Whitelist.revoke` → `BlobService.revoke_device`）；新增 32 + 5 + 1 条测试（含真 socket 的 铸 token → HTTP 上传 → `ui/submit` → 新连接 `ui/attach` 取回）。
 

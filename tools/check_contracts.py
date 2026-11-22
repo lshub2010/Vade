@@ -1183,9 +1183,10 @@ def check_subagent_events(events: dict, declared_events: dict, schema_events: se
         & (set(directions.get("module_to_core") or {}) | set(directions.get("core_to_module") or {}))
     )
     check(not elsewhere, f"rpc.json: RFC-0012 methods must not be module-facing: {elsewhere}")
-    check(rpc.get("version") in ("1.4.0", "1.5.0", "1.6.0", "1.7.0"),
-          f"rpc.json: version must be 1.4.0 (RFC-0012), 1.5.0 (RFC-0014), 1.6.0 (RFC-0015) "
-          f"or 1.7.0 (RFC-0016, the current head) (got {rpc.get('version')!r})")
+    check(rpc.get("version") in ("1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0"),
+          f"rpc.json: version must be 1.4.0 (RFC-0012), 1.5.0 (RFC-0014), 1.6.0 (RFC-0015), "
+          f"1.7.0 (RFC-0016) or 1.8.0 (f15 snapshot contract, the current head) "
+          f"(got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0012" in str(b.get("doc") or "")), None)
     check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0012")
@@ -1444,9 +1445,10 @@ def check_session_meta(rpc: dict, events: dict) -> None:
             check(field in entry, f"rpc.json {name}: missing {field}")
         unknown = sorted(set(entry.get("errors") or []) - codes)
         check(not unknown, f"rpc.json {name}: errors not declared in C-04: {unknown}")
-    check(rpc.get("version") in ("1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0"),
+    check(rpc.get("version") in ("1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0"),
           f"rpc.json: version must be 1.3.0 (RFC-0010), 1.4.0 (RFC-0012), 1.5.0 (RFC-0014), "
-          f"1.6.0 (RFC-0015) or 1.7.0 (RFC-0016, the current head) (got {rpc.get('version')!r})")
+          f"1.6.0 (RFC-0015), 1.7.0 (RFC-0016) or 1.8.0 (f15 snapshot contract, the current head) "
+          f"(got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0010" in str(b.get("doc") or "")), None)
     check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0010")
@@ -1569,9 +1571,10 @@ def check_session_search(rpc: dict) -> None:
                   f"rpc.json session/search hit-row shape drifted: {sorted(set(rows[0]) ^ SESSION_SEARCH_HIT_KEYS)}")
         else:
             check(False, "rpc.json session/search.result.results: must declare the hit-row shape (one object)")
-    check(rpc.get("version") in ("1.5.0", "1.6.0", "1.7.0"),
-          f"rpc.json: version must be 1.5.0 (RFC-0014), 1.6.0 (RFC-0015) or "
-          f"1.7.0 (RFC-0016, the current head) after the RFC-0014 append (got {rpc.get('version')!r})")
+    check(rpc.get("version") in ("1.5.0", "1.6.0", "1.7.0", "1.8.0"),
+          f"rpc.json: version must be 1.5.0 (RFC-0014), 1.6.0 (RFC-0015), 1.7.0 (RFC-0016) or "
+          f"1.8.0 (f15 snapshot contract, the current head) after the RFC-0014 append "
+          f"(got {rpc.get('version')!r})")
 
     if str(ROOT / "core") not in sys.path:
         sys.path.insert(0, str(ROOT / "core"))
@@ -1674,8 +1677,9 @@ def check_blob_token(rpc: dict) -> None:
         check(set(entry.get("errors") or []) == BLOB_TOKEN_ERRORS,
               "rpc.json ui/blob.token.errors must be exactly the four reused C-04 codes (no new code)")
 
-    check(rpc.get("version") == "1.7.0",
-          f"rpc.json: version must be 1.7.0 (RFC-0016 owns the C-05 head) (got {rpc.get('version')!r})")
+    check(rpc.get("version") == "1.8.0",
+          f"rpc.json: version must be 1.8.0 (the f15 snapshot-contract append owns the C-05 "
+          f"head; RFC-0016's 1.7.0 block stays) (got {rpc.get('version')!r})")
 
     if str(ROOT / "core") not in sys.path:
         sys.path.insert(0, str(ROOT / "core"))
@@ -1716,6 +1720,53 @@ def check_blob_token(rpc: dict) -> None:
               "rpc.json: the RFC-0016 append must be rewrite-free")
         check(block.get("contract") == "C-05" and block.get("owner") == "C2",
               "rpc.json: the RFC-0016 append block must carry contract C-05 / owner C2")
+
+
+def check_snapshot_contract(rpc: dict) -> None:
+    """f15: the bounded-snapshot wire changes are a registered C-05 append.
+
+    Four things must stay true or the gate goes red:
+      1. top-level version is 1.8.0 (append-per-minor, not a silent edit);
+      2. an append block exists and registers every new snapshot key;
+      3. the registered removal (`parts` on text-only rows, `turns[].user_text`)
+         is spelled out in `rewrites` — it is the one non-additive change;
+      4. the old note claiming `parts` is "the minimal field set all three
+         clients must render" is gone: `content` is the minimal field, and a
+         client that read only `parts` must fall back to it.
+    """
+    check(rpc.get("version") == "1.8.0",
+          f"rpc.json: version must be 1.8.0 (f15 snapshot contract) (got {rpc.get('version')!r})")
+    blocks = (rpc.get("x-vade") or {}).get("appends") or []
+    block = next((b for b in blocks if isinstance(b, dict)
+                  and "f15-snapshot-contract" in str(b.get("doc") or "")), None)
+    check(block is not None, "rpc.json: missing the f15-snapshot-contract append block")
+    if block is None:
+        return
+    check(block.get("contract") == "C-05",
+          "rpc.json: the f15 append block must carry contract C-05")
+    check(block.get("version") == "1.8.0",
+          "rpc.json: the f15 append block must carry version 1.8.0")
+    check(block.get("adds") == [],
+          "rpc.json: the f15 append adds no method (snapshot keys live in notes)")
+    notes = " ".join(str(note) for note in (block.get("notes") or []))
+    for key in ("truncated", "omitted", "omitted_turns", "truncated_before_seq",
+                "content_truncated", "running_partial", "pending_truncated",
+                "omitted_approvals", "omitted_inputs", "omitted_tasks",
+                "args_truncated", "args_omitted_chars"):
+        check(key in notes, f"rpc.json f15 append notes: `{key}` is not registered")
+    rewrites = str(block.get("rewrites") or "")
+    check("parts" in rewrites and "user_text" in rewrites,
+          "rpc.json f15 append rewrites: the text-only `parts` / `turns[].user_text` "
+          "removal must be registered explicitly")
+    attach = ((rpc.get("directions") or {}).get("ui_to_core") or {}).get("ui/attach") or {}
+    attach_notes = str(attach.get("notes") or "")
+    check("the minimal field set all three clients must render" not in attach_notes,
+          "rpc.json ui/attach notes: still claims `parts` is mandatory for every message "
+          "(contradicts text-only `parts` removal)")
+    check("`content` is the minimal field" in attach_notes,
+          "rpc.json ui/attach notes: must state that `content` is the minimal field to render")
+    check("pending_truncated" in attach_notes,
+          "rpc.json ui/attach notes: must document `pending_truncated`")
 
 
 def main() -> int:
@@ -1779,6 +1830,7 @@ def main() -> int:
     check_ui(config, manifest, rpc)
     check_submit_parts(rpc)
     check_http_endpoints(rpc)
+    check_snapshot_contract(rpc)
 
     methods = {
         "module/register", "module/capabilities.update", "module/heartbeat",

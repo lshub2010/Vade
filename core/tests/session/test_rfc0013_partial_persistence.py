@@ -482,9 +482,10 @@ def test_rpc_json_documents_the_partial_field():
     # Frozen history untouched: RFC-0013 itself never bumps the top-level version.
     # 1.3.0 was RFC-0010's bump; RFC-0012 then appended subagent/list|get and owns
     # 1.4.0; RFC-0014 (session/search) owned 1.5.0; RFC-0015 (ui/modules) owned
-    # 1.6.0; RFC-0016 (ui/blob.token) owns 1.7.0. Assert against whoever last
+    # 1.6.0; RFC-0016 (ui/blob.token) owned 1.7.0; the f15 snapshot contract owns
+    # 1.8.0. Assert against whoever last
     # appended, so this test keeps guarding
     # the real invariant ("RFC-0013 adds no top-level bump") instead of a stale
     # number.
-    assert data["version"] == "1.7.0"
+    assert data["version"] == "1.8.0"
     assert data["x-vade"]["appends"][0]["rewrites"] == "none"

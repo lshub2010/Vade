@@ -96,6 +96,7 @@ if over_budget:
 | `test_a_32k_approval_argument_is_clipped_not_dropped` | 32 000 汉字的嵌套 `args` 被折半，审批行仍在；`args_truncated`/`args_omitted_chars`；`pending_truncated=false`；`truncated=true`；审计一行；端口原 args 未被改写；信封 ≤ `MAX_REPLY_BYTES` |
 | `test_a_huge_task_list_does_not_take_the_approvals_with_it` | 20×4 000 字 tasks 先被丢（`omitted_tasks=20`），小审批**保留**；证明 ④ 丢 tasks 后重测 |
 | `test_dropped_pending_is_counted_flagged_and_audited` | 400 条审批（detail 200 字，低于裁剪阈值）被丢：`pending_truncated=true`、`omitted_approvals=400`、`truncated=true`；`tasks`/`tasks_truncated`/`omitted_tasks` **三键都不存在**；审计带计数 |
+| `test_dropped_pending_inputs_are_counted_too` | 400 条输入（prompt 200 字，低于裁剪阈值）被丢：`omitted_inputs=400`、`omitted_approvals=0`、`pending_truncated=true`、`truncated=true`；无 tasks 组件时三键仍不存在；审计带 `omitted_inputs` |
 | `test_rpc_json_registers_the_snapshot_contract` | schema gate：1.8.0 + 第 13 块 + 12 个键登记 + `rewrites` 含 `parts`/`user_text` + 旧矛盾句已消失 + `content` 最小字段 |
 
 ## 5. 门禁与全量
@@ -105,11 +106,22 @@ python3 tools/check_contracts.py     # contracts: OK (… RFC-0016 blob token gr
 python3 docs/check_docs.py           # 合计 12 项，失败 0 项
 python3 tools/check_ledger.py        # ledger: OK (16 RFC rows; rpc 1.8.0 49 methods …,
                                      #            appends 13+9+3)
-python3 -m pytest core/tests/session -q   # 245 passed
+python3 -m pytest core/tests/session -q   # 246 passed
 python3 -m pytest core/tests -q           # 见下
 ```
 
-全量：`__FULL_PYTEST__`
+全量：`1553 passed, 14 warnings in 394.94s (0:06:34)`（`PYTHONPATH=core:protocol/core/python`）。
+本机按「Rust 大构建禁本地」未执行 `cargo build`：`protocol/core/python/libvade_protocol.so`
+复用 `k4-transport` worktree 中由同一 protocol 源码（最后一次改动 `5e0c47c`）产出的预编译产物
+（md5 `ac78e707c1b4492f02bff87ee5ba9543`，`.gitignore` 已忽略）；CI 的 `cargo build --features uniffi`
+步骤等价。缺该 `.so` 时裸跑 18 failed / 23 errors；除 1 条子进程缺 `PYTHONPATH` 外全部是
+`OSError: libvade_protocol.so`（在基线 `fcf638e` 上对 `.so` 相关子集复现同样的 11 failed / 23 errors），
+与本棒代码无关。
+
+对照（加 `test_dropped_pending_inputs_are_counted_too` 之前、不带 `.so`、无 CI `PYTHONPATH` 的裸跑）：
+`1511 passed, 18 failed, 23 errors`；其中 `core/tests/admin/test_admin_hardening.py::test_second_instance_cannot_take_the_data_directory`
+是子进程 `ModuleNotFoundError: vade`（CI 用 `PYTHONPATH=core:protocol/core/python`，补上即 passed），
+其余均为 `.so` 缺失。全量绿是在补齐 `.so` + CI `PYTHONPATH` 后取得。
 
 ## 6. 线上 diff（`ui/attach.result.snapshot`）
 

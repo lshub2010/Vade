@@ -596,6 +596,58 @@ def test_dropped_pending_is_counted_flagged_and_audited(tmp_path):
     asyncio.run(scenario())
 
 
+def test_dropped_pending_inputs_are_counted_too(tmp_path):
+    """A dropped `pending_inputs` row is blocking state as well: same flags.
+
+    `_drop_pending` handles both blocks; covering only approvals would leave
+    the input half free to regress into the old silent sweep. The task
+    component is absent here, so the snapshot must not grow `tasks` keys just
+    because bounding ran.
+    """
+    async def scenario():
+        log = _log(tmp_path)
+        audit = Audit()
+        log.audit = audit
+        session = log.create_session()
+
+        class InputPort:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def pending(self, session_id):
+                return self.rows
+
+        # 200 chars is BELOW the 256-char clip threshold: nothing here can be
+        # clipped away, so the only way to fit is to drop the block — counted.
+        log.input_port = InputPort([
+            {"input_id": f"in-{index}", "session_id": session.id,
+             "turn_id": f"turn-{index}", "kind": "text",
+             "prompt": "q" * 200, "created_at": index, "expires_at": index + 60}
+            for index in range(400)
+        ])
+
+        snapshot = log.snapshot(session.id)
+
+        assert snapshot["pending_inputs"] == []
+        assert snapshot["pending_truncated"] is True
+        assert snapshot["omitted_inputs"] == 400
+        assert snapshot["omitted_approvals"] == 0
+        assert snapshot["truncated"] is True
+        assert snapshot["content_truncated"] is False
+        assert "tasks" not in snapshot
+        assert "tasks_truncated" not in snapshot
+        assert "omitted_tasks" not in snapshot
+        assert _reply_size(session.id, {
+            "from_seq": snapshot["from_seq"], "snapshot": snapshot,
+        }, reply_id="a" * 36) <= MAX_REPLY_BYTES
+        assert [r["kind"] for r in audit.rows] == ["session.snapshot_truncated"]
+        assert audit.rows[0]["extra"]["pending_truncated"] is True
+        assert audit.rows[0]["extra"]["omitted_inputs"] == 400
+        await log.close()
+
+    asyncio.run(scenario())
+
+
 def test_rpc_json_registers_the_snapshot_contract():
     """C-05 gate: the f15 wire changes are a registered append, not a silent edit.
 

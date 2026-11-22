@@ -79,7 +79,7 @@ CREATE TABLE events(session_id TEXT, seq INTEGER, type TEXT, payload TEXT, ts IN
   - 覆盖（**两端**：`oldest <= last_seq+1` 且 `last_seq <= store.last_seq`）→ 从 `last_seq+1` 补发，再切实时；
   - 不覆盖 → 返回 `snapshot`（消息树 + 队列 + 待审批），`from_seq` = 快照点。
   - 空 buffer **一律**走快照：重启后的 buffer 从空开始，replay-only 的 attach 拿不到「只落库不落事件」的状态（`session/model.set` 是实证），而全新会话走快照的代价近似为零。
-  - 快照必须装进一帧（65519 字节）：文本只出现一次（`messages[].content`、非 text 才带 `parts`、`turns[]` 不带 `user_text`）；仍超预算就丢最旧的 `messages`/`turns` 并带 `truncated/omitted/truncated_before_seq`，单条超预算则截断（`content_truncated`；`pending_approvals[].args` 按最长字符串叶子截断并标 `args_truncated`）；再不够先丢 `tasks` 并**重新测量**，只有仍超才丢 `pending_approvals`/`pending_inputs`，且必须带 `pending_truncated` + `omitted_approvals`/`omitted_inputs` + `truncated=true`；没有 tasks 组件时不得注入空 `tasks`。**绝不**回 `PAYLOAD_TOO_LARGE`；每次截断写 `session.snapshot_truncated` 审计。
+  - 快照必须装进一帧（65519 字节）：C-05 1.7.0 冻结，**不删字段**——`messages[]` 同时带 `content` 与 `parts`，`turns[]` 带 `user_text`（旧 turn 的 `user_message_id` 为 NULL 时用 `messages[].turn_id` 兜底）。超预算时**先丢可恢复的 `tasks` 并重新测量**（`tasks` 有 `task/list` 恢复通道，对话没有），再丢最旧的 `messages`/`turns` 并带 `truncated/omitted/truncated_before_seq`，单条超预算则截断（`content_truncated`；`pending_approvals[].args` 按最长字符串叶子截断并标 `args_truncated`，裁不动/太深则整行保留并计入 `pending_copy_failed`）；只有仍超才丢 `pending_approvals`/`pending_inputs`，且必须带 `pending_truncated` + `omitted_approvals`/`omitted_inputs` + `truncated=true`；没有 tasks 组件时不得注入空 `tasks`。**绝不**回 `PAYLOAD_TOO_LARGE`；每次截断写 `session.snapshot_truncated` 审计。
   - 快照带 `running_partial{turn_id,text,chars}`：进行中回合已经流出的正文只在 `turn.delta` 里，快照不带它就等于新 attach 的客户端永久少一段。
 - 客户端可能收到重叠片段，**客户端按 seq 去重**（写进 `schema/events.json` 的说明）。
 

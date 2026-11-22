@@ -25,6 +25,10 @@ import asyncio
 import json
 from typing import Any
 
+from vade.loop.ports import ApprovalRequest
+from vade.policy.adapter import PolicyAdapter
+from vade.policy.approval import ApprovalManager
+from vade.policy.engine import PolicyEngine
 from vade.session.manager import SNAPSHOT_ENVELOPE_RESERVE, SessionLog
 from vade.session.models import Message
 from vade.session.replay import ReplayBuffer
@@ -294,7 +298,7 @@ def test_one_oversized_message_is_clipped_not_refused(tmp_path):
         assert message["omitted_chars"] > 0
         assert message["content"] and len(message["content"]) < len(text)
         assert text.startswith(message["content"]), "a completed row keeps its head"
-        assert _reply_size(session.id, result, reply_id="a" * 36) <= MAX_REPLY_BYTES
+        assert _reply_size(session.id, result, reply_id="a" * 36) <= MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE
         await log.close()
 
     asyncio.run(scenario())
@@ -338,8 +342,15 @@ def test_two_text_parts_plus_an_image_do_not_spin_the_clipper(tmp_path):
     asyncio.run(scenario())
 
 
-def test_the_snapshot_carries_each_text_once(tmp_path):
-    """`content` xor `parts` per message; no `user_text` on the turn."""
+def test_the_snapshot_keeps_parts_and_user_text(tmp_path):
+    """C-05 1.7.0 is frozen: no wire field is dropped from a snapshot.
+
+    An earlier f15 revision removed text-only `parts` and `turns[].user_text`
+    from `ui/attach` and called the removal an append; no RFC owned it. The
+    snapshot keeps the full row, and the legacy fallback for turns is still
+    part of the contract: `user_message_id` -> `messages[]`, and when that
+    column is NULL (rows written before RFC-0006) `messages[].turn_id`.
+    """
     async def scenario():
         log = _log(tmp_path)
         session = log.create_session()
@@ -349,12 +360,14 @@ def test_the_snapshot_carries_each_text_once(tmp_path):
         snapshot = log.snapshot(session.id)
         user = next(m for m in snapshot["messages"] if m["role"] == "user")
         assert user["content"] == "hello"
-        assert "parts" not in user, "a text-only parts list is the projection of content"
-        assert all("user_text" not in turn for turn in snapshot["turns"])
-        # The in-process shape still has both, for callers that want them.
-        assert log.get_session(session.id).message_tree()[0]["parts"] == [
-            {"type": "text", "text": "hello"}]
-        assert log.get_session(session.id).turns[0].to_dict()["user_text"] == "hello"
+        assert user["parts"] == [{"type": "text", "text": "hello"}]
+        [turn] = snapshot["turns"]
+        assert turn["user_text"] == "hello"
+        # The fallback chain clients rely on: the turn's user row is findable
+        # by id, and also by `turn_id` when `user_message_id` is NULL.
+        assert user["id"] == turn["user_message_id"] or turn["user_message_id"] is None
+        assert next(m for m in snapshot["messages"]
+                    if m.get("turn_id") == turn["id"])["content"] == "hello"
         await log.close()
 
     asyncio.run(scenario())
@@ -421,18 +434,25 @@ def test_a_running_partial_bigger_than_the_frame_is_clipped(tmp_path):
         log.set_executor(gate)
         turn, _ = await log.submit(session.id, [{"type": "text", "text": "hi"}], "c2")
         assert await wait_until(lambda: log.queue_state(session.id)["running"] == turn.id)
-        await log.emit(session.id, "turn.delta", {"turn_id": turn.id, "text": "字" * 32_000})
+        # 32 000 DISTINCT characters: a head-keeping clip can never equal the
+        # tail, so the assertion below is not a tautology on repeated text.
+        text = "".join(chr(0x4E00 + (index % 2_000)) for index in range(32_000))
+        await log.emit(session.id, "turn.delta", {"turn_id": turn.id, "text": text})
 
         snapshot = log.snapshot(session.id)
         partial = snapshot["running_partial"]
         assert partial["truncated"] is True
         assert partial["omitted_chars"] > 0
-        assert partial["text"].endswith("字")  # the tail survives: deltas append
+        # Real tail assertion: the THOUSANDS of characters are unique, so this
+        # fails if the clipper keeps the head (the old `endswith("字")` was a
+        # no-op when every character was the same).
+        assert len(partial["text"]) < len(text)
+        assert partial["text"] == text[-len(partial["text"]):]
         assert partial["chars"] == len(partial["text"])
         assert snapshot["content_truncated"] is True
         assert _reply_size(session.id, {
             "from_seq": snapshot["from_seq"], "snapshot": snapshot,
-        }, reply_id="a" * 36) <= MAX_REPLY_BYTES
+        }, reply_id="a" * 36) <= MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE
         gate.gate.set()
         await log.wait_idle(session.id)
         await log.close()
@@ -460,7 +480,14 @@ class TaskPort:
         return [dict(row) for row in self.rows], self.truncated
 
 
-def _approval_row(index: int, *, detail: str = "write a file", args=None):
+def _approval_row(index: int, *, args=None):
+    """The exact shape `ApprovalManager._row()` publishes (no invented keys).
+
+    A fake port must not invent fields (`detail` was one): the real approval
+    row is `request_id/session_id/turn_id/tool/args/risk/created_at/deadline/
+    task_id/task_name/depth`, and a test that pads with a field the port never
+    sends proves nothing about a real row being dropped.
+    """
     return {
         "request_id": f"req-{index}",
         "session_id": "s",
@@ -473,7 +500,6 @@ def _approval_row(index: int, *, detail: str = "write a file", args=None):
         "task_id": None,
         "task_name": None,
         "depth": 0,
-        "detail": detail,
     }
 
 
@@ -484,7 +510,7 @@ def test_a_32k_approval_argument_is_clipped_not_dropped(tmp_path):
     the old clipper knew. One `fs__write_file` request with 32 000 CJK
     characters blew the frame and step ④ dropped the approval — a turn that
     then only ends by timeout. The row survives, clipped and marked, and the
-    port's live request is untouched (it is deep-copied before clipping).
+    port's live request is untouched (it is detached before clipping).
     """
     async def scenario():
         log = _log(tmp_path)
@@ -512,9 +538,11 @@ def test_a_32k_approval_argument_is_clipped_not_dropped(tmp_path):
         assert len(row["args"]["file"]["content"]) == 32_000
         assert _reply_size(session.id, {
             "from_seq": snapshot["from_seq"], "snapshot": snapshot,
-        }, reply_id="a" * 36) <= MAX_REPLY_BYTES
+        }, reply_id="a" * 36) <= MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE
         assert [r["kind"] for r in audit.rows] == ["session.snapshot_truncated"]
         assert audit.rows[0]["extra"]["pending_truncated"] is False
+        assert audit.rows[0]["extra"]["args_truncated"] is True
+        assert audit.rows[0]["extra"]["args_omitted_chars"] > 0
         await log.close()
 
     asyncio.run(scenario())
@@ -552,7 +580,155 @@ def test_a_huge_task_list_does_not_take_the_approvals_with_it(tmp_path):
         assert audit.rows[0]["extra"]["omitted_tasks"] == 20
         assert _reply_size(session.id, {
             "from_seq": snapshot["from_seq"], "snapshot": snapshot,
-        }, reply_id="a" * 36) <= MAX_REPLY_BYTES
+        }, reply_id="a" * 36) <= MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def _deep_value(depth: int, leaf: str = "leaf") -> Any:
+    value: Any = leaf
+    for _ in range(depth):
+        value = {"n": value}
+    return value
+
+
+async def _open_approval(manager: ApprovalManager, session_id: str, turn_id: str,
+                         args: dict[str, Any]):
+    request = ApprovalRequest(
+        session_id=session_id, turn_id=turn_id, tool_id="fs__write_file",
+        args=args, risk="high", expires_at=0, emit=None,
+    )
+    pending, reason = await manager.open_request(request)
+    assert pending is not None and reason == "approval_required"
+    return pending
+
+
+def test_a_deeply_nested_approval_is_kept_and_counted_not_cleared(tmp_path):
+    """P0: a 900-level `args` must not deep-copy-fail every dialog away.
+
+    Real `ApprovalManager` + `PolicyAdapter` (not a fake port): the manager
+    mints a legal 6.3 KB request whose args nest 900 levels, `deepcopy` raises
+    RecursionError, and the old snapshot swallowed it as `pending=[]` with
+    `pending_truncated=false` and no audit — the exact silent-loss bug f15
+    exists to kill. The row must survive WHOLE, be counted, and the sibling
+    approval must not be collateral damage.
+    """
+    async def scenario():
+        log = _log(tmp_path)
+        audit = Audit()
+        log.audit = audit
+        session = log.create_session()
+        manager = ApprovalManager(timeout_s=30.0, engine=PolicyEngine(), audit=None)
+        log.approval_port = PolicyAdapter(manager)
+
+        deep = await _open_approval(
+            manager, session.id, "turn-deep",
+            {"file": {"path": "/tmp/deep.txt", "content": _deep_value(900)}})
+        shallow = await _open_approval(
+            manager, session.id, "turn-shallow", {"path": "/tmp/plain.txt"})
+
+        snapshot = log.snapshot(session.id)
+
+        rows = {row["request_id"]: row for row in snapshot["pending_approvals"]}
+        assert set(rows) == {deep.request_id, shallow.request_id}, \
+            "one uncopyable row must not clear the whole pending block"
+        deep_row = rows[deep.request_id]
+        node: Any = deep_row["args"]["file"]["content"]
+        depth = 0
+        while isinstance(node, dict):
+            node = node["n"]
+            depth += 1
+        assert (depth, node) == (900, "leaf"), "the row is kept whole"
+        assert "args_truncated" not in deep_row, "shared args must never be clipped"
+        # The shallow row was detached and is unaffected.
+        assert rows[shallow.request_id]["args"] == {"path": "/tmp/plain.txt"}
+
+        assert snapshot["pending_copy_failed"] == 1
+        assert snapshot["pending_truncated"] is True
+        assert snapshot["omitted_approvals"] == 0, "kept, not dropped"
+        assert snapshot["truncated"] is True
+        assert [row["kind"] for row in audit.rows] == ["session.snapshot_truncated"]
+        extra = audit.rows[0]["extra"]
+        assert extra["pending_copy_failed"] == 1
+        assert extra["omitted_approvals"] == 0
+        # The live request is byte-for-byte untouched.
+        live = {row["request_id"]: row for row in manager.pending_requests()}
+        node = live[deep.request_id]["args"]["file"]["content"]
+        for _ in range(900):
+            node = node["n"]
+        assert node == "leaf"
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_huge_task_list_does_not_eat_the_conversation(tmp_path):
+    """P1-1: tasks go before MESSAGES, not just before pending dialogs.
+
+    The old order dropped messages and clipped their text first and only then
+    dropped `tasks`; a big task list left one 64-character message. The task
+    list has `task/list` as a recovery channel — conversation rows do not.
+    """
+    async def scenario():
+        log = _log(tmp_path)
+        session = log.create_session()
+        for index in range(40):
+            await _write_message(log, session.id, "user",
+                                 f"{index:04d}-" + "x" * 1_995,
+                                 turn_id=f"turn-{index}")
+        log.tasks = TaskPort([
+            {"task_id": f"t-{index}", "session_id": session.id,
+             "state": "running", "summary": "y" * 4_000}
+            for index in range(20)
+        ])
+
+        snapshot = log.snapshot(session.id)
+
+        assert snapshot["tasks"] == []
+        assert snapshot["omitted_tasks"] == 20
+        kept = snapshot["messages"]
+        assert len(kept) >= 5, "tasks must be dropped before conversation rows"
+        assert all(len(message["content"]) == 2_000 for message in kept)
+        assert snapshot["omitted"] + len(kept) == 40
+        assert snapshot["content_truncated"] is False
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_huge_task_list_does_not_shrink_approval_args(tmp_path):
+    """P1-1b: with tasks first, a legal 32k argument survives at ~16k, not 64.
+
+    The old order clipped `pending_approvals[].args` in ③ and dropped `tasks`
+    in ④: the approver saw the first 64 characters of the file that would be
+    written. Dropping the recoverable task list first keeps the request legible
+    (and `args_truncated` still says it is not the whole body).
+    """
+    async def scenario():
+        log = _log(tmp_path)
+        audit = Audit()
+        log.audit = audit
+        session = log.create_session()
+        huge = "字" * 32_000
+        log.tasks = TaskPort([
+            {"task_id": f"t-{index}", "session_id": session.id,
+             "state": "running", "summary": "y" * 4_000}
+            for index in range(20)
+        ])
+        log.approval_port = ApprovalPort([
+            _approval_row(1, args={"file": {"path": "/tmp/a.txt", "content": huge}})])
+
+        snapshot = log.snapshot(session.id)
+
+        assert snapshot["tasks"] == [] and snapshot["omitted_tasks"] == 20
+        [row] = snapshot["pending_approvals"]
+        kept = row["args"]["file"]["content"]
+        assert len(kept) >= 8_000, "the old order left only 64 characters"
+        assert len(kept) < 32_000
+        assert row["args_truncated"] is True
+        assert snapshot["pending_truncated"] is False
+        assert snapshot["omitted_approvals"] == 0
         await log.close()
 
     asyncio.run(scenario())
@@ -571,7 +747,7 @@ def test_dropped_pending_is_counted_flagged_and_audited(tmp_path):
         audit = Audit()
         log.audit = audit
         session = log.create_session()
-        rows = [_approval_row(index, detail="d" * 200) for index in range(400)]
+        rows = [_approval_row(index) for index in range(400)]
         log.approval_port = ApprovalPort(rows)
 
         snapshot = log.snapshot(session.id)
@@ -587,7 +763,7 @@ def test_dropped_pending_is_counted_flagged_and_audited(tmp_path):
         assert "omitted_tasks" not in snapshot
         assert _reply_size(session.id, {
             "from_seq": snapshot["from_seq"], "snapshot": snapshot,
-        }, reply_id="a" * 36) <= MAX_REPLY_BYTES
+        }, reply_id="a" * 36) <= MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE
         assert [r["kind"] for r in audit.rows] == ["session.snapshot_truncated"]
         assert audit.rows[0]["extra"]["pending_truncated"] is True
         assert audit.rows[0]["extra"]["omitted_approvals"] == 400
@@ -639,7 +815,7 @@ def test_dropped_pending_inputs_are_counted_too(tmp_path):
         assert "omitted_tasks" not in snapshot
         assert _reply_size(session.id, {
             "from_seq": snapshot["from_seq"], "snapshot": snapshot,
-        }, reply_id="a" * 36) <= MAX_REPLY_BYTES
+        }, reply_id="a" * 36) <= MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE
         assert [r["kind"] for r in audit.rows] == ["session.snapshot_truncated"]
         assert audit.rows[0]["extra"]["pending_truncated"] is True
         assert audit.rows[0]["extra"]["omitted_inputs"] == 400
@@ -648,35 +824,70 @@ def test_dropped_pending_inputs_are_counted_too(tmp_path):
     asyncio.run(scenario())
 
 
-def test_rpc_json_registers_the_snapshot_contract():
-    """C-05 gate: the f15 wire changes are a registered append, not a silent edit.
+def test_both_pending_blocks_are_counted_when_dropped(tmp_path):
+    """Approvals and inputs can be over budget together; both counts must move."""
+    async def scenario():
+        log = _log(tmp_path)
+        audit = Audit()
+        log.audit = audit
+        session = log.create_session()
 
-    `parts` on text-only messages and `turns[].user_text` are REMOVED from the
-    wire; new snapshot keys are added. Both need an append block and a version
-    bump, and the notes must stop claiming `parts` is mandatory for every
-    message — a client that reads only `parts` has to fall back to `content`.
+        class InputPort:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def pending(self, session_id):
+                return self.rows
+
+        log.approval_port = ApprovalPort(
+            [_approval_row(index) for index in range(300)])
+        log.input_port = InputPort([
+            {"input_id": f"in-{index}", "session_id": session.id,
+             "turn_id": f"turn-{index}", "kind": "text",
+             "prompt": "q" * 200, "created_at": index, "expires_at": index + 60}
+            for index in range(300)
+        ])
+
+        snapshot = log.snapshot(session.id)
+
+        assert snapshot["pending_approvals"] == []
+        assert snapshot["pending_inputs"] == []
+        assert snapshot["pending_truncated"] is True
+        assert snapshot["omitted_approvals"] == 300
+        assert snapshot["omitted_inputs"] == 300
+        assert snapshot["truncated"] is True
+        assert audit.rows[0]["extra"]["omitted_approvals"] == 300
+        assert audit.rows[0]["extra"]["omitted_inputs"] == 300
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_rpc_json_keeps_the_snapshot_contract_compliant():
+    """C-05 1.7.0: f15 adds no method, removes no field, registers no append.
+
+    The rejected revision bumped the frozen contract to 1.8.0 with `adds=[]`
+    and a free-text "removal" that no RFC owned. The wire now keeps `parts`
+    and `user_text`; the bounding keys are additive notes; `check_contracts`
+    enforces the same facts.
     """
     from pathlib import Path
 
     rpc = json.loads(
         (Path(__file__).resolve().parents[3] / "schema" / "rpc.json").read_text(encoding="utf-8"))
-    assert rpc["version"] == "1.8.0"
-    block = next(
-        (b for b in rpc["x-vade"]["appends"]
-         if "f15-snapshot-contract" in str(b.get("doc") or "")),
-        None,
-    )
-    assert block is not None, "missing the C-05 1.8.0 append block"
-    assert block["contract"] == "C-05"
-    assert block["version"] == "1.8.0"
-    notes = " ".join(block.get("notes") or [])
-    for key in ("pending_truncated", "omitted_approvals", "omitted_inputs",
-                "omitted_tasks", "args_truncated", "running_partial", "content_truncated"):
-        assert key in notes, f"append notes do not register {key}"
-    rewrites = str(block.get("rewrites") or "")
-    assert "parts" in rewrites and "user_text" in rewrites
+    assert rpc["version"] == "1.7.0"
+    assert not [
+        block for block in rpc["x-vade"]["appends"]
+        if "f15-snapshot-contract" in str(block.get("doc") or "")
+    ], "f15 must not register a non-RFC append block"
 
-    attach_notes = rpc["directions"]["ui_to_core"]["ui/attach"]["notes"]
-    assert "the minimal field set all three clients must render" not in attach_notes
-    assert "`content` is the minimal field" in attach_notes
-    assert "pending_truncated" in attach_notes
+    notes = rpc["directions"]["ui_to_core"]["ui/attach"]["notes"]
+    for needle in ("`content`", "`parts`", "`user_text`", "`user_message_id`", "turn_id"):
+        assert needle in notes, f"ui/attach notes do not document {needle}"
+    assert "no key was renamed or removed" in notes
+    assert "no longer sent" not in notes and "omits `user_text`" not in notes
+    for key in ("pending_truncated", "omitted_approvals", "omitted_inputs",
+                "omitted_tasks", "args_truncated", "pending_copy_failed",
+                "running_partial", "content_truncated"):
+        assert key in notes, f"ui/attach notes do not document {key}"
+    assert "dropped FIRST" in notes

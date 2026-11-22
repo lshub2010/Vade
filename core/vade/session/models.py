@@ -215,24 +215,16 @@ class Message:
         }
 
     def to_snapshot(self) -> dict[str, Any]:
-        """`ui/attach` shape: the text travels ONCE.
+        """`ui/attach` shape: the full C-05 row, text fields included.
 
-        `to_dict()` writes both `content` and the text parts it projects, and
-        `Turn.to_dict()` writes `user_text` a third time — the same bytes three
-        times for a user message. That is invisible to an in-process caller and
-        fatal on the wire: one frame is capped at 65 519 bytes, so a session
-        with ~7 100 CJK characters of user text could never be attached again.
-
-        Text-only `parts` add nothing a client cannot derive from `content`
-        (legacy rows were synthesising exactly that part on read), so they are
-        dropped here. A message with an image/file part keeps `parts` — and
-        `content`, its projection — for clients that render one or the other.
-        `content` is never dropped: every existing client reads it.
+        C-05 1.7.0 is frozen and the snapshot's wire shape is part of it: a
+        client may read `content`, `parts[].text` or (on a turn) `user_text`.
+        Dropping the derived copies was a wire-shape change that no RFC owned,
+        so the snapshot keeps all three. Bounding still fits one frame — it
+        drops the oldest rows and clips a single oversized row — it just does
+        not get to redefine a frozen field set (f15 review P1-2).
         """
-        data = self.to_dict()
-        if all(part.get("type") == "text" for part in data["parts"]):
-            data.pop("parts")
-        return data
+        return self.to_dict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,16 +295,16 @@ class Turn:
         }
 
     def to_snapshot(self) -> dict[str, Any]:
-        """`ui/attach` shape: no `user_text`.
+        """`ui/attach` shape: same fields as `to_dict()`, `user_text` included.
 
-        It is the projection of the turn's user message (`user_message_id`),
-        and `snapshot.messages[]` already carries that row — the third copy of
-        the same bytes (see `Message.to_snapshot`). The field stays on
-        `to_dict()` for in-process callers.
+        C-05 1.7.0 is frozen: `turns[].user_text` is a field clients read, and
+        removing it without an RFC was not a legal change. It stays. A client
+        that resolves the turn's user message by id still has to handle legacy
+        turns whose `user_message_id` is NULL (the column postdates RFC-0006):
+        the fallback is `messages[].turn_id == turn.id`, documented in the
+        `ui/attach` notes.
         """
-        data = self.to_dict()
-        data.pop("user_text", None)
-        return data
+        return self.to_dict()
 
 
 @dataclass(frozen=True, slots=True)

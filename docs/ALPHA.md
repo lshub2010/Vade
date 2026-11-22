@@ -22,7 +22,7 @@ G1–G5 是**发布级**目标（端到端 + SDK 冻结 / 审批审计闭环 / �
 | **B 可交付 alpha** | A + `fs` 与 `model` 两个真模块 + APK 真机验证 + Web 可写安全评审 | 1.5–2.5 周 | 要给外部试用者 |
 | **C G1–G5 全绿** | 六模块齐 + admin 闭环 + 抓包 0 泄漏 | 3–5 周 | 正式发布前 |
 
-**估算不是承诺**，表内估时是 2026-11-13～14 的一次性估算（**当时口径**），不外推到剩余工作。依据是 2026-11-13～14 的实测速度——当时：服务端 378 → 1041 测试、客户端 21 → 154 测试、单棒 28–69 分钟、12 路并行；**现为**服务端 1203 passed、客户端 1442 tests（见 §三 A6，tmp/s-alpha-truth2 本轮实测）。若回执质量不达一半，估时要 +50%。
+**估算不是承诺**，表内估时是 2026-11-13～14 的一次性估算（**当时口径**），不外推到剩余工作。依据是 2026-11-13～14 的实测速度——当时：服务端 378 → 1041 测试、客户端 21 → 154 测试、单棒 28–69 分钟、12 路并行；**现为**服务端 1557 passed（2026-11-22 f15 复跑）、客户端 1442 tests（见 §三 A6，tmp/s-alpha-truth2 本轮实测）。若回执质量不达一半，估时要 +50%。
 
 ## 三、口径 A 的验收条件（逐条可验）
 
@@ -55,7 +55,7 @@ G1–G5 是**发布级**目标（端到端 + SDK 冻结 / 审批审计闭环 / �
 - [x] 干净机器上能启动（不依赖本机 `D:/Hermes/tools` 里的任何路径） — 证据：app-image 241 个文件 + 95 个 jar 的 23,721 个 zip 条目字节级扫描，`D:/Hermes`、`C:/Users`、`D:/Android`、`GRADLE_USER_HOME` 等致命路径命中 **0**，剥离环境变量后启动成功（`vade-client: shots/g-clean/RESULT.md` §2、`vade-client: shots/g-clean/scan-report.txt`、`vade-client: shots/g-clean/isolated-launch-window.png`；本轮逐路径 `test -e` 在盘）。口径：**环境隔离**；真·第二台无 JDK 机器未验（见 §七 N6）。
 
 ### A6 质量门
-- [x] 服务端全量测试全绿（当前基线 1203）、契约检查 OK、文档门禁 12/12 — 证据：本轮（tmp/s-alpha-truth2，@ `f24313a`，补 gitignored `vade_protocol.dll` 后）`pytest core/tests -q` → **1203 passed, 9 warnings in 133.68s**（0 failed；前轮 tmp/s-alpha-truth 曾见 `core/tests/admin/test_config_usage.py` 一次性冷跑抖动、单跑与 3 连跑全绿，本轮未复现）；`tools/check_contracts.py` → `contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 34 error codes, …)`；`docs/check_docs.py` → `合计 12 项，失败 0 项`；`tools/check_ledger.py` → `ledger: OK (16 RFC rows; rpc 1.7.0 49 methods in 3 directions, events 2.0.0 34 entries, 34 error codes, appends 12+8+3)`。台账出处 `docs/rfc/LEDGER.md` §1。
+- [x] 服务端全量测试全绿（2026-11-22 复跑基线 1557；下列证据保留 2026-11-15 的 1203 历史跑）、契约检查 OK、文档门禁 12/12 — 证据：本轮（tmp/s-alpha-truth2，@ `f24313a`，补 gitignored `vade_protocol.dll` 后）`pytest core/tests -q` → **1203 passed, 9 warnings in 133.68s**（0 failed；前轮 tmp/s-alpha-truth 曾见 `core/tests/admin/test_config_usage.py` 一次性冷跑抖动、单跑与 3 连跑全绿，本轮未复现）；`tools/check_contracts.py` → `contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 34 error codes, …)`；`docs/check_docs.py` → `合计 12 项，失败 0 项`；`tools/check_ledger.py` → `ledger: OK (16 RFC rows; rpc 1.7.0 49 methods in 3 directions, events 2.0.0 34 entries, 34 error codes, appends 12+9+3)`。台账出处 `docs/rfc/LEDGER.md` §1。
 - [x] 客户端全量测试全绿（当前基线 1442）、三端编译通过 — 证据：本轮 @ `vade-client: 3fda055`：`gradle :composeApp:desktopTest --rerun` 逐 XML 求和 **files=154 / tests=1467 / failures=0 / errors=0 / skipped=1**（`a3668f7`，第二批 `a4-new-session`+`a3-tool-cards` 合入后；连跑 2 次均绿）（skip = `VadeClientSmokeTest.attachSubmitAndLiveEventsAgainstARealCore`，需 `VADE_SMOKE_PORT` 真核的既有 env 门）+ `assembleDebug` BUILD SUCCESSFUL（APK 22,845,270 B）+ `compileKotlinWasmJs` BUILD SUCCESSFUL（三目标本轮全亲跑）；e2e 启动预算 **180 s** 死锁保险 + 失败消息可 grep 判词（`vade-client: composeApp/src/desktopTest/kotlin/vade/ui/e2e/CoreBootDiagnostics.kt` 的 `CoreBootBudget.READY_TIMEOUT_MS = 180_000L`；满载 8 轮全绿、81 轮 972 次起核全 READY，`vade-client: shots/g-e2e-budget2/RESULT.md`）。
 - [x] `gitleaks` 与私钥 grep **工作区** 0 命中（B4 定稿口径；全历史存量如实记录、历史重写明确不做） — 证据：本轮亲跑——主仓 `gitleaks dir`（工作区，含未跟踪）**0 命中**、客户端 `gitleaks dir` **0 命中**、两仓 `git grep -nE "BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY"` 工作区 **0 / 0**；全历史（`--log-opts=--all`）gitleaks **5 条存量**命中（均为 `core/tests/` 夹具旧提交：`test_audit.py` / `test_args_redaction.py` / `test_passwords.py`，工作区现行文件已 0）、私钥 grep 全历史 **1200 行**（同属存量）；规则零削弱：`.gitleaks.toml` 仅 4 条路径级排除、零 allowlist、金丝雀反向自证 PASS（主仓 `shots/s-gitleaks-final/`、客户端同构证据 `vade-client: shots/s-gitleaks-final/`，客户端规则定稿于 `83d2b0e`）。
 - [x] 桌面真机截图 ≥3 张（亮/暗、会话/能力/活动） — 证据：`vade-client: shots/w2-final2/light.png` 与 `vade-client: shots/w2-final2/dark.png`（本轮复核 md5 不同：`497a6a71…` vs `365825fa…`，暗色修复后的真图）、`vade-client: shots/w2-bottombar-fix/phone-activity.png`（活动）、`vade-client: shots/w2-bottombar-fix/phone-capabilities.png`（能力）。
@@ -123,9 +123,9 @@ G1–G5 是**发布级**目标（端到端 + SDK 冻结 / 审批审计闭环 / �
 ---
 
 **校准依据（2026-11-15；第一批 `tmp/s-alpha-truth2` @ `f24313a` + 客户端 `3fda055` 亲自复跑；第二批由父代在 `a4-new-session`/`a3-tool-cards` 合入后复跑，客户端 @ `a3668f7`）**：
-- 服务端 `pytest core/tests -q` → **1203 passed, 9 warnings in 133.68s**（0 failed）
+- 服务端 `pytest core/tests -q` → **1203 passed, 9 warnings in 133.68s**（0 failed；2026-11-22 f15 复跑 **1557 passed, 14 warnings in 481.82s**）
 - 客户端 `gradle :composeApp:desktopTest --rerun` → 逐 XML 求和 **files=154 / tests=1467 / failures=0 / errors=0 / skipped=1**（`a3668f7`，第二批 `a4-new-session`+`a3-tool-cards` 合入后；连跑 2 次均绿）；`assembleDebug`、`compileKotlinWasmJs` 均 BUILD SUCCESSFUL
-- `tools/check_contracts.py` → `contracts: OK`；`tools/check_ledger.py` → `ledger: OK (16 RFC rows; rpc 1.7.0 49 methods in 3 directions, events 2.0.0 34 entries, 34 error codes, appends 12+8+3)`；`docs/check_docs.py` → 12 项 / 失败 0
+- `tools/check_contracts.py` → `contracts: OK`；`tools/check_ledger.py` → `ledger: OK (16 RFC rows; rpc 1.7.0 49 methods in 3 directions, events 2.0.0 34 entries, 34 error codes, appends 12+9+3)`；`docs/check_docs.py` → 12 项 / 失败 0
 - gitleaks：主仓与客户端工作区 `dir` 扫描 **0 命中**、私钥 grep 工作区 **0/0**（全历史存量：gitleaks 5 / 私钥 grep 1200，历史重写明确不做）
 - §三 证据路径逐条 `test -e`：**59/59 在盘**（本轮重写后清点；§八 引用的 `vade-client: shots/…` 证据路径另计、亦全部在盘）
 

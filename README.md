@@ -20,7 +20,7 @@ core 只做四件事：**连接、路由、回合循环、密钥与审计**。�
 |---|---|
 | 版本 | **`0.0.1-alpha`**（pre-release） |
 | 契约 | rpc **1.7.0**，三方向 **49** 个方法，事件 **2.0.0**（34 项），错误码 **34** |
-| 服务端测试 | `pytest core/tests` → **1203 passed** |
+| 服务端测试 | `pytest core/tests` → **1557 passed**（2026-11-22，worktree `tmp/f15-contract`） |
 | 客户端 | 独立仓 [lshub2010/vade-client](https://github.com/lshub2010/vade-client)（Android / 桌面 / Web） |
 | 验收台账 | [`docs/ALPHA.md`](docs/ALPHA.md) —— 21 条 alpha 范围逐条标注证据，0 阻断，已知缺陷见 §八 |
 

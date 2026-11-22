@@ -1,5 +1,7 @@
 # f15 · core 快照契约 / 待审批截断标记
 
+> **2026-11-22 返工（见 `batch-results/f15-fix2.md`）**：本文 §1 的 ④ 顺序与计数仍有效，但其后代码已改为「`tasks` 最先丢、再动对话/参数」；§1 的 P1-3 行所述的 **1.8.0 / 第 13 块 append 已撤销**——无 RFC 不得删除冻结字段 `parts`/`user_text`，两者保留，C-05 保持 1.7.0。`deepcopy` 也已换成有界复制（900 层 args 不再触发 `pending=[]`）。
+
 基线 `fcf638e`（`tmp/f12-attach` 顶端，含 P0-1 防死循环），分支 `tmp/f15-contract`。
 修的是 `batch-results/f12-attach-review.md` 的 P1-2 与 P1-3：
 

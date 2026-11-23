@@ -1,0 +1,160 @@
+name: Release 0.0.2
+
+# One release page with every 0.0.2 artifact:
+#   core tarballs (x86_64 + aarch64), module wheels, and the client assets
+#   already published by lshub2010/vade-client for the same tag.
+#
+# Ordering: publish the client release first, wait for its Release build to
+# finish, then push the matching tag here. The client job downloads those
+# assets by tag and fails loudly if they are missing.
+on:
+  push:
+    tags:
+      - "v0.0.2-alpha"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag, e.g. v0.0.2-alpha"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  core:
+    name: core / linux-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build protocol native library
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: "--release --features uniffi --lib"
+          working-directory: protocol/core
+      - name: Locate native library
+        id: so
+        run: |
+          so="protocol/core/target/${{ matrix.target }}/release/libvade_protocol.so"
+          if [ ! -f "$so" ]; then
+            so="protocol/core/target/release/libvade_protocol.so"
+          fi
+          test -f "$so" || { echo "missing libvade_protocol.so"; find protocol/core/target -name 'libvade_protocol.so' -print; exit 1; }
+          echo "path=$so" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build admin UI
+        working-directory: admin-ui
+        run: |
+          npm ci
+          npm run build
+      - name: Package
+        run: |
+          chmod +x tools/package_core.sh
+          mkdir -p dist
+          VERSION="${RELEASE_TAG#v}"
+          tools/package_core.sh "$VERSION" "${{ matrix.arch }}" "${{ steps.so.outputs.path }}" dist
+          ls -lh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  modules:
+    name: module / ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [echo, fs, shell, web, model]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel from the matching module tag
+        run: |
+          git clone --depth 1 --branch "$RELEASE_TAG" \
+            "https://github.com/lshub2010/vade-module-${{ matrix.module }}.git" src
+          python -m pip install -U pip build
+          cd src
+          python -m build --outdir ../dist
+          cp manifest.json ../dist/
+          ls -lh ../dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-${{ matrix.module }}
+          path: dist/*
+          if-no-files-found: error
+
+  client:
+    name: client / release assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download client assets for the same tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist/client
+          gh release download "$RELEASE_TAG" \
+            -R lshub2010/vade-client \
+            -D dist/client --clobber
+          ls -lh dist/client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client
+          path: dist/client/*
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: [core, modules, client]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten and checksum
+        run: |
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+          cd dist
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum > SHA256SUMS
+          ls -lh
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Vade 0.0.2-alpha
+          prerelease: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*

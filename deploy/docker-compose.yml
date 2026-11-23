@@ -1,0 +1,72 @@
+# docker-compose sample for the Vade core.
+#
+#   cp deploy/core.toml.example deploy/core.toml     # edit data_dir? see below
+#   cp deploy/env.example   deploy/vade.env          # put the real key in it
+#   chmod 600 deploy/vade.env
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   docker compose -f deploy/docker-compose.yml logs -f vade-core
+#
+# No image is published upstream; the build uses deploy/Dockerfile and the
+# release tarball. Bump VADE_VERSION for upgrades.
+#
+# The data plane is published on 127.0.0.1:8443 only, so put Caddy/Nginx on
+# the host in front of it (deploy/Caddyfile, deploy/nginx.conf). The admin
+# plane stays inside the container:
+#   docker compose -f deploy/docker-compose.yml exec vade-core \
+#     /opt/vade/.venv/bin/python -m vade admin print-setup-token \
+#     --data-dir /var/lib/vade/data
+
+services:
+  vade-core:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        VADE_VERSION: "0.0.2-alpha"
+        VADE_ARCH: "x86_64"          # or aarch64
+    image: vade-core:0.0.2-alpha
+    container_name: vade-core
+    restart: unless-stopped
+    user: "10001:10001"
+
+    # `listen` comes from the mounted core.toml (127.0.0.1:8443); the
+    # Dockerfile CMD overrides it with --bind 0.0.0.0:8443.
+    # data_dir is overridden here so the sample core.toml can keep the host
+    # path /var/lib/vade/data.
+    environment:
+      VADE_CORE__DATA_DIR: /var/lib/vade/data
+
+    env_file:
+      - ./vade.env                   # VADE_LLM_API_KEY=... (0600, not in git)
+
+    ports:
+      - "127.0.0.1:8443:8443"        # data plane, loopback on the host
+      # Do not publish 8444: the admin plane binds 127.0.0.1 inside the
+      # container and its Host allow-list would reject a published address.
+
+    volumes:
+      - vade-data:/var/lib/vade
+      - ./core.toml:/etc/vade/core.toml:ro
+      - ./tls:/etc/vade/tls:ro       # only if the core itself terminates TLS
+
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    stop_grace_period: 30s
+
+    healthcheck:
+      test: ["CMD", "/opt/vade/.venv/bin/python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8443/healthz', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  vade-data:

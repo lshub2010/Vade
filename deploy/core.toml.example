@@ -1,0 +1,75 @@
+# Vade core configuration — sample for a host install.
+#
+# Copy to /etc/vade/core.toml, then:
+#   sudo chown root:vade /etc/vade/core.toml
+#   sudo chmod 0640 /etc/vade/core.toml
+#
+# Every key below exists in schema/config.schema.json. The root object is
+# `additionalProperties: false`: a typo aborts startup with
+# `UNKNOWN_CONFIG_KEY: <dotted.key>` — it is never silently defaulted.
+#
+# Precedence: CLI > environment > <data_dir>/config.overrides.json > this file
+# > schema defaults. Environment form is VADE_<SECTION>__<KEY>, e.g.
+#   VADE_CORE__LOG_LEVEL=debug
+#   VADE_SERVER__UI_ORIGINS='["https://vade.example.com"]'
+
+[core]
+# Data plane. Pattern is ^[^:]+:[0-9]{1,5}$ — no IPv6 literal.
+# Keep it on loopback and let Caddy/Nginx publish 443.
+listen     = "127.0.0.1:8443"
+
+# Admin plane. This value is ALSO the Host/Origin this listener accepts, so a
+# reverse proxy under a public hostname gets 403 ORIGIN_MISMATCH. Leave it on
+# loopback and use an SSH tunnel (docs/DEPLOYMENT.md §10.3).
+admin_host = "127.0.0.1:8444"
+
+# Absolute path. A relative one is resolved against the process working
+# directory, not against this file.
+data_dir   = "/var/lib/vade/data"
+
+log_level  = "info"          # debug | info | warning | error
+
+# ---------------------------------------------------------------------------
+# TLS
+#
+# Leave this section out when a reverse proxy terminates TLS (recommended).
+# Set BOTH keys to have the core serve https/wss itself; setting only one of
+# them silently produces plaintext. The files must exist or startup fails.
+# There is no certificate auto-generation at startup in 0.0.2 — see
+# docs/DEPLOYMENT.md §6.4.
+# ---------------------------------------------------------------------------
+# [tls]
+# cert = "/etc/vade/tls/server.crt"
+# key  = "/etc/vade/tls/server.key"
+
+# ---------------------------------------------------------------------------
+# LLM routing (core-side only). Secrets are environment variable NAMES.
+# A literal `sk-...` here is refused at load time.
+# ---------------------------------------------------------------------------
+[llm]
+provider    = "openai_compatible"            # openai_compatible | module | mock
+base_url    = "https://api.deepseek.com/v1"  # must include /v1; core appends /chat/completions
+model       = "deepseek-chat"
+api_key_env = "VADE_LLM_API_KEY"             # export this in /etc/vade/vade.env
+
+# ---------------------------------------------------------------------------
+# Optional / commonly adjusted. Defaults shown.
+# ---------------------------------------------------------------------------
+# [server]
+# # Exact-match CORS allowlist for /ui/session. Empty = no CORS headers, which
+# # is correct when the browser UI is served from the same origin as the core
+# # (i.e. through the same proxy). "*" is refused at load time.
+# ui_origins = []
+# # A ui_origins host must also be listed here, or startup is refused.
+# listen_hosts = ["127.0.0.1", "localhost"]
+
+# [audit]
+# retention_days = 30
+# path = "data/audit.sqlite3"   # the literal default means <data_dir>/audit/audit.db
+
+# [attach]
+# max_bytes = 104857600         # 100 MiB — size the proxy body limit above this
+# quota_bytes = 2147483648      # 2 GiB per device
+
+# [dev]
+# allow_all = false             # must stay false in production

@@ -1,0 +1,56 @@
+# Caddy v2 sample — reverse proxy for the Vade core DATA PLANE only.
+#
+# install:
+#   sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+#   sudo caddy validate --config /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# The core runs on 127.0.0.1:8443 with no TLS of its own; Caddy owns the
+# certificate and renewal. Caddy passes the original Host header through by
+# default, which is what the core's same-origin WebSocket check compares
+# against — do not add `header_up Host {upstream_hostport}` here.
+#
+# The ADMIN plane (127.0.0.1:8444) is deliberately NOT proxied: its Host
+# allow-list is built from [core].admin_host and only accepts
+# 127.0.0.1:8444 / localhost:8444. A vhost here would answer 403
+# ORIGIN_MISMATCH. Use an SSH tunnel — see docs/DEPLOYMENT.md §10.3.
+
+vade.example.com {
+	encode zstd gzip
+
+	# Optional: uncomment to cap uploads. The core's own ceiling is
+	# [attach].max_bytes (default 100 MiB); keep this slightly above it so the
+	# core returns its JSON 413 rather than Caddy returning a plain error.
+	# request_body {
+	# 	max_size 110MB
+	# }
+
+	reverse_proxy 127.0.0.1:8443 {
+		# Streaming responses / long-lived WebSockets: do not buffer.
+		flush_interval -1
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
+	log {
+		output file /var/log/caddy/vade-access.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Do not do this (kept commented as a warning):
+#
+# admin.vade.example.com {
+# 	reverse_proxy 127.0.0.1:8444
+# }
+#
+# It returns 403 ORIGIN_MISMATCH for every request, because the admin plane
+# only accepts Host/Origin == [core].admin_host (default 127.0.0.1:8444).
+# ---------------------------------------------------------------------------

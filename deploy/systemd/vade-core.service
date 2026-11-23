@@ -1,0 +1,69 @@
+# systemd unit for Vade core — sample, edit before use.
+#
+# install:
+#   sudo cp deploy/systemd/vade-core.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vade-core
+#
+# assumptions (all from docs/DEPLOYMENT.md §3–§4):
+#   * release unpacked at /opt/vade/releases/vade-core-<version>-linux-<arch>
+#     with the symlink /opt/vade/current pointing at it
+#   * venv created by that tree's install.sh → /opt/vade/current/.venv
+#   * config at /etc/vade/core.toml (0640 root:vade)
+#   * optional secrets at /etc/vade/vade.env (0640 root:vade)
+#   * user/group `vade` with no shell
+
+[Unit]
+Description=Vade core (data plane :8443, admin plane :8444)
+Documentation=file:/opt/vade/current/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vade
+Group=vade
+
+# Relative PYTHONPATH in the docs works because of this; absolute paths below
+# are what actually matter, so a wrong cwd cannot break the import.
+WorkingDirectory=/opt/vade/current
+Environment=PYTHONPATH=/opt/vade/current/core:/opt/vade/current/protocol/core/python
+# Leading '-' = the file may be absent (core works without an LLM key).
+EnvironmentFile=-/etc/vade/vade.env
+
+# --strict: abort if session/policy/audit components are missing instead of
+# logging "dev mode only". SIGTERM is handled by the core; both listeners stop.
+ExecStart=/opt/vade/current/.venv/bin/python -m vade --config /etc/vade/core.toml --strict
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=3
+
+# 0077 keeps the SQLite files and data/blobs created at runtime at 0600/0700;
+# the core chmods its key files itself but not the databases.
+UMask=0077
+
+# /var/lib/vade, mode 0700, owned by User. `data_dir` inside it is created by
+# the core on first start (/var/lib/vade/data in the sample core.toml).
+StateDirectory=vade
+StateDirectoryMode=0700
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# AF_NETLINK is needed by getaddrinfo() for source-address selection.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# One fd per live WebSocket plus SQLite handles.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

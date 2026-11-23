@@ -1718,6 +1718,12 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         routes.append(Route(path, unsupported, methods=["GET", "POST", "PATCH", "DELETE", "PUT"]))
 
     starlette_app = Starlette(routes=routes)
+    # The SPA's JS/CSS live under `/assets`; serving only `index.html` gives an
+    # empty `#root`. Mount the prebuilt bundle next to the HTML.
+    if static_dist and (Path(static_dist) / "index.html").is_file():
+        from .static import mount_static
+
+        mount_static(starlette_app, static_dist)
     # Health flips (heartbeat restored / disconnected / stale) have no HTTP
     # request behind them; bind the registry listener at app construction too,
     # so an SSE client that was already connected gets them.

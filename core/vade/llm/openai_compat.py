@@ -82,6 +82,32 @@ class OpenAICompatProvider:
             headers["Authorization"] = f"Bearer {key}"
         return headers
 
+    async def list_models(self) -> list[str]:
+        """Return the upstream `/models` ids, in server order.
+
+        This is discovery, not routing: the catalog still owns which ids are
+        selectable. Only `data[].id` strings are returned — capability fields
+        are never inferred from a model name. A non-2xx response is an error
+        (the caller decides whether to keep its last good list); it is never
+        reported as an empty catalog.
+        """
+        import httpx  # local import: the core must start without httpx
+
+        async with httpx.AsyncClient(timeout=self.timeout_s, transport=self._transport) as client:
+            response = await client.get(f"{self.base_url}/models", headers=self._headers())
+            response.raise_for_status()
+            payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            raise RuntimeError("LLM /models response is not a list")
+        ids: list[str] = []
+        for row in rows:
+            if isinstance(row, dict) and isinstance(row.get("id"), str):
+                model_id = row["id"].strip()
+                if model_id and model_id not in ids:
+                    ids.append(model_id)
+        return ids
+
     async def chat(
         self,
         messages: Sequence[Mapping[str, Any]],

@@ -1,308 +1,224 @@
 # Vade
 
-**Vade**（中文名「偕行」）是一个**内核极薄、能力全靠模块**的 Agent 运行时。
+English | [简体中文](README.zh-CN.md)
 
-core 只做四件事：**连接、路由、回合循环、密钥与审计**。模型、工具、记忆、界面全部是独立进程，主动接入——换模型、加能力、换客户端，都不动内核。
+**Vade** (偕行, "walking together") is a thin-core, module-first agent runtime.
 
-> 名字取自拉丁语 `vade`（走），`vade mecum` 意为「与我同行」；中文取《诗经》「与子偕行」。
+The core does four jobs: **connect, route, run the turn loop, and manage keys and audit**. Models, tools, memory, and clients are separate processes that attach to it. Adding a capability, swapping a model, or replacing a client does not touch the core.
+
+> The name is Latin *vade* ("go"), as in *vade mecum*, "go with me". The Chinese name 偕行 comes from the Book of Songs: 「与子偕行」, "walk together with you".
 
 > [!WARNING]
-> **项目处于起步阶段（alpha）**：功能尚不完善，协议、数据格式与界面行为都可能随时变化。**不建议用于生产环境**，也不要用它存放不可恢复的重要数据；升级前请自行备份。
+> **Alpha software (`0.0.2-alpha`).** The protocol, data formats, and UI behavior can change without notice. Do not make it the only copy of anything you cannot afford to lose. If you self-host it or run it in production, follow the [deployment guide](docs/DEPLOYMENT.md), harden it for your environment, and accept the risk. The project is AI-assisted: the code has automated tests and human review, but style, comments, and edge-case coverage are not uniform. Audit and harden it before using it for anything critical.
 
-> [!WARNING]
-> **本项目由 AI 辅助开发**：代码在 AI 生成的基础上经过自动化测试与人工审查，但**不保证**代码风格统一、可读性良好、注释完备，也**不保证**所有边界条件与异常路径都已覆盖。用于关键场景前，请自行审计、加固并补充测试。
+> **Deploying Vade?** Read the [deployment guide](docs/DEPLOYMENT.md) (English) or the [中文部署教程](docs/DEPLOYMENT.zh-CN.md) before exposing it. They cover self-hosting and the production hardening checklist.
 
----
+## What is Vade?
 
-## 当前发布
+Vade is an agent runtime built around one rule: **the core must not know what a model, a tool, or a client is.**
 
-| 项 | 值 |
+- The core opens connections, authenticates peers, validates module manifests, routes RPC, runs the turn loop, persists sessions and events, asks for approvals, and writes audit records. That is all.
+- Tools, model providers, and UI pages are contributed by **modules** — independent processes that connect to the core and declare what they provide.
+- A client is not special: Android, desktop, and Web clients speak the same `ui/*` contract as any other module speaks `module/*`.
+- `schema/` is the source of truth. The server and every client validate against the same JSON contract; the wire protocol is implemented in Rust and exposed to Python.
+
+| | |
 |---|---|
-| 版本 | **`0.0.1-alpha`**（pre-release） |
-| 契约 | rpc **1.7.0**，三方向 **49** 个方法，事件 **2.0.0**（34 项），错误码 **34** |
-| 服务端测试 | `pytest core/tests` → **1557 passed**（2026-11-22，worktree `tmp/f15-contract`） |
-| 客户端 | 独立仓 [lshub2010/vade-client](https://github.com/lshub2010/vade-client)（Android / 桌面 / Web） |
-| 验收台账 | [`docs/ALPHA.md`](docs/ALPHA.md) —— 21 条 alpha 范围逐条标注证据，0 阻断，已知缺陷见 §八 |
+| Release | `v0.0.2-alpha` (pre-release) |
+| Contract | rpc `1.7.0` — 49 methods in 3 directions · events `2.0.0` — 34 events · 34 error codes |
+| Verification | [`docs/ALPHA.md`](docs/ALPHA.md) — evidence per alpha criterion and the known-defect list |
 
-alpha 的含义：**协议与数据格式不稳定**，可以随时变；不要拿它存长期数据。
+## Why?
 
----
+Most agent frameworks put tool, model, and memory abstractions inside the core. Every new capability edits the core, couples to its language and release cycle, and can take the whole process down when it fails.
 
-## 30 秒理解架构
+Vade inverts that:
 
+- **Capabilities are processes.** A module can be written in any language, run on another machine, and be restarted or removed without stopping the core.
+- **The contract is the integration point.** A module declares tools, model capabilities, and optional UI pages in a manifest; the core routes requests by capability, not by module name.
+- **Clients are replaceable.** The core exposes sessions and events; any client that implements the `ui/*` contract can attach, and several clients can watch the same session.
+- **The model is a backend, not the architecture.** Use the built-in OpenAI-compatible adapter, or move the model into its own module.
+
+The trade-off is operational: you run and supervise more than one process, and alpha packaging is still basic.
+
+## Architecture
+
+```text
+      Android · Windows desktop · Web                 modules
+             (ui/* RPC)                    echo · fs · shell · web · model
+                 │                                       │ (module/* RPC)
+                 └──────────────►  core  ◄───────────────┘
+                             connect · route · turn loop
+                             keys · audit · SQLite store
+
+       data plane :8443                         admin plane :8444
+
+  schema/      the contract — rpc 1.7.0 (49 methods / 3 directions),
+               events 2.0.0 (34 events), 34 error codes
+  protocol/    Rust wire protocol: Noise IK/XXpsk3 + ChaCha20-Poly1305,
+               with the Python binding used by the core
+  sdk/         module-side SDK (Python): manifest, tools, pairing, transport
+  admin-ui/    React admin served by the core (browser read-only;
+               app WebView can write)
+  modules/     index only — every module lives in its own repository
 ```
-   客户端 (Android/桌面/Web)          模块 (工具/模型/记忆/页面)
-        │  ui/*  →                       │  module/* →
-        └──────────►  core  ◄────────────┘
-                 连接 · 路由 · 回合循环
-                 密钥 · 审计 · 存储(SQLite)
+
+- **core** contains no model, tool, or memory logic. It knows how to route a turn to whichever module registered the required capability.
+- **Modules are processes, not plugins.** A module starts its own process, connects to the core, and declares its capabilities and pages. The reference implementation is the echo module in its own repository.
+- **`schema/` wins.** When code and contract disagree, the contract is the bug report.
+
+## What is in 0.0.2-alpha
+
+| Area | What is there |
+|---|---|
+| Core | WebSocket data plane on `:8443`; Noise handshakes for devices and modules, cookie sessions for browsers; module registry and routing; FIFO turn queue with `queue_pos` and interrupt; event stream with `seq` and replay; SQLite sessions and attach snapshots; inline approvals; append-only audit; usage budgets |
+| Models | Built-in OpenAI-compatible adapter (`/v1/chat/completions`), `provider = "module"` for model modules, and a `mock` provider for offline UI work |
+| Clients | Android, Windows desktop, and Web (wasm); fixtures by default, real core when explicitly enabled; chat send / stream / interrupt, session and group management, inline approvals, module pages |
+| Admin | Admin listener on `:8444` with a React UI. Login and node governance are implemented; setup, audit, and settings pages are still placeholders |
+| Modules | Five separate module repositories: echo (reference), fs, shell, web, model — each with its own CI and tests |
+
+## Download
+
+All `0.0.2-alpha` artifacts use the tag `v0.0.2-alpha`.
+
+| Component | Artifact | Where |
+|---|---|---|
+| Core (Linux) | `vade-core-0.0.2-alpha-linux-x86_64.tar.gz` and `...-aarch64.tar.gz`, with SHA-256 checksums | [Vade `v0.0.2-alpha`](https://github.com/lshub2010/Vade/releases/tag/v0.0.2-alpha) |
+| Clients | Debug-signed APK; Windows MSI and portable zip; Web (wasm) zip | [vade-client releases](https://github.com/lshub2010/vade-client/releases) |
+| Modules | `py3-none-any` wheel plus `manifest.json` for each module | Each module repository's Releases page (links below) |
+
+The core archive contains the `core` package, the Python protocol binding (`libvade_protocol.so`), `schema/`, the Python SDK, the built admin UI, `install.sh`, and the license files. Python dependencies are not vendored: `install.sh` creates a virtualenv and installs `requirements.txt`.
+
+The core archive is Linux-only (`x86_64`, `aarch64`). On Windows or macOS, run from source. The Android APK is debug-signed and the Windows artifacts are unsigned — see [Not in 0.0.2-alpha](#not-in-002-alpha).
+
+## Install from the release package (Linux)
+
+```bash
+ARCH=x86_64   # or aarch64
+BASE=https://github.com/lshub2010/Vade/releases/download/v0.0.2-alpha
+
+curl -LO "$BASE/vade-core-0.0.2-alpha-linux-$ARCH.tar.gz"
+sha256sum "vade-core-0.0.2-alpha-linux-$ARCH.tar.gz"   # compare with the checksum on the release page
+
+tar xzf "vade-core-0.0.2-alpha-linux-$ARCH.tar.gz"
+cd "vade-core-0.0.2-alpha-linux-$ARCH"
+./install.sh
 ```
 
-- **core 不含任何智能**：它不知道什么是「模型」，只知道怎么把一次回合的请求路由给注册了该能力的模块。
-- **模块是进程，不是插件**：模块自己起进程、自己连 core、声明自己的能力和页面（参考实现是独立仓的 echo 模块；本仓 `modules/README.md` 只保留索引）。
-- **契约先于实现**：`schema/` 下的 JSON 是唯一真相，服务端与客户端都从它生成/校验。
+`install.sh` creates `.venv/` and installs the runtime requirements. Then create a minimal config and start the core:
 
----
+```bash
+cat > core.toml <<'EOF'
+[core]
+listen   = "127.0.0.1:8443"
+data_dir = "./data"
+EOF
 
-## 快速开始
+PYTHONPATH="core:protocol/core/python" .venv/bin/python -m vade --config core.toml
+```
 
-### 环境
+On first start the core prints a pairing code to **stdout**:
 
-Python **3.11+**（core）、SQLite（内置）。可选：Rust 1.100（重编协议 SDK）、JDK 21 + Android SDK（客户端）。
+```text
+pair_code=青松-AAAAAA purpose=browser expires_in=600s
+```
+
+The code is two Chinese characters plus six base32 characters, single-use, and valid for 600 seconds. Enter it in the client's pairing screen. `--no-pair-banner` suppresses the code (and the mint).
+
+To make a desktop client attach to this core, launch it with `VADE_SOURCE=real`, `VADE_HOST=127.0.0.1`, `VADE_PORT=8443`, and `VADE_PAIR_CODE=<code>`. The Android client reads the same values from the intent extras `source`, `host`, `port`, and `pair_code` (bare keys, no `vade.` prefix).
+
+## Run from source
+
+Prerequisites: Python **3.11+**, and Rust **1.85+** only if you need to rebuild the protocol binding. The binding (`libvade_protocol.so` / `.dll`) is not committed, so a fresh clone must build it.
 
 ```bash
 git clone https://github.com/lshub2010/Vade.git
 cd Vade
-```
-
-### 起一个 core
-
-```bash
-# Windows（git-bash / PowerShell 7）：PYTHONPATH 分隔符是分号
-python -m venv .venv
-.venv/Scripts/python.exe -m pip install -r requirements.txt
-export PYTHONPATH="core;protocol/core/python"
-.venv/Scripts/python.exe -m vade --config core.toml
-
-# Linux / macOS：分隔符是冒号
 python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/pip install -r requirements-dev.txt
+
+cd protocol/core
+cargo build --features uniffi --lib
+cp target/debug/libvade_protocol.so python/     # Windows: libvade_protocol.dll
+cd ../..
+
 export PYTHONPATH="core:protocol/core/python"
 .venv/bin/python -m vade --config core.toml
 ```
 
-`PYTHONPATH` 里**两处都必须在**，缺一个都起不来：
+Both `PYTHONPATH` entries are required: `core` provides the `vade` package, and `protocol/core/python` provides the native `vade_protocol` binding. On Windows use `.venv\Scripts\python.exe` and a semicolon (`core;protocol/core/python`).
 
-| 路径 | 提供什么 | 缺了会怎样 |
-|---|---|---|
-| `core` | `vade` 包本身 | `No module named vade` |
-| `protocol/core/python` | 原生绑定 `vade_protocol` | `protocol core python binding is not importable` |
-
-两条都是相对路径 ⇒ 必须先 `cd` 到仓库根（写绝对路径也行）。细节见 [`docs/PAIRING.md`](docs/PAIRING.md)。
-
-第一次启动会做 setup（生成密钥、设备绑定），并打印一行
-`pair_code=茶源-45JV2U purpose=browser expires_in=600s`：**2 汉字 + 6 位 base32，一次性、600 秒（10 分钟）有效**。
-`--no-pair-banner` 可关掉这次打印。
-
-### 接一个客户端
-
-客户端仓见 [lshub2010/vade-client](https://github.com/lshub2010/vade-client)。它默认跑假数据，连真 core 只要传四个键：
+Run the tests and contract gates:
 
 ```bash
-# 桌面
-VADE_SOURCE=real VADE_HOST=127.0.0.1 VADE_PORT=8443 VADE_PAIR_CODE=<配对码> ./vade-ui
-# Android
-adb shell am start -n vade.ui/.MainActivity --es source real --es host 127.0.0.1 --es port 8443 --es pair_code <配对码>
+.venv/bin/python -m pytest core/tests -q
+.venv/bin/python tools/check_contracts.py
+.venv/bin/python tools/check_ledger.py
+.venv/bin/python docs/check_docs.py
 ```
 
-### 写一个模块（最小骨架）
+## Connect a model
 
-模块 = 一个连 core 的进程，声明 `manifest`（能力 + 页面），然后处理 core 发来的请求：
-
-```python
-# 1) 启动时向 core 注册：manifest 里声明能力与页面
-# 2) 收到 core 的 RPC 就回结果；core 不认识你现在有什么，只认 manifest
-```
-
-模块按设计**不在主仓**：每个模块一个独立仓（为了避免 core 出现具体模块名，见 [`modules/README.md`](modules/README.md)）。
-写模块需要的东西都在本仓公开：模块侧 SDK 在 [`sdk/python`](sdk/python)，
-目录结构与职责约定在 [`docs/design.md`](docs/design.md) §15.1，
-需要声明什么能力/页面看 [`schema/manifest.schema.json`](schema/manifest.schema.json)，
-协议逐条在 [`docs/rfc/`](docs/rfc)（模块方向：`model/chat`、`tool/call`、`page/render` 等）。
-
-### 常用命令
-
-```bash
-python -m pytest core/tests -q          # 服务端全量测试
-python tools/check_contracts.py         # 契约自检（冻结项 / appends / 事件门禁）
-python tools/check_ledger.py            # RFC 台账与实现路径核对
-python docs/check_docs.py               # 文档一致性（12 项）
-```
-
----
-
-## 接一个模型
-
-core **自己不含模型**——它只做路由。要用真模型，两条路：
-
-### 路线 A：内置适配器（OpenAI 兼容，先走这条）
-
-任何讲 OpenAI `/v1/chat/completions` 的服务都能接：OpenAI、DeepSeek、Moonshot、通义、vLLM、Ollama、LM Studio……
-
-在 `core.toml` 里加一段 `[llm]`：
+The core ships with an OpenAI-compatible adapter. Add an `[llm]` section to `core.toml`:
 
 ```toml
-[core]
-listen   = "127.0.0.1:8443"
-data_dir = "./data"
-
 [llm]
-provider    = "openai_compatible"            # 默认值，可省略
-base_url    = "https://api.deepseek.com/v1"  # 必须写到 /v1 这一级：core 会拼 /chat/completions
+base_url    = "https://api.deepseek.com/v1"
 model       = "deepseek-chat"
-api_key_env = "VADE_LLM_API_KEY"             # 只写变量名，密钥本身不写进配置文件
+api_key_env = "VADE_LLM_API_KEY"
 ```
 
-密钥放进环境变量（**core 只从环境读**，不落配置、不进日志）：
+The core appends `/chat/completions` to `base_url`, so keep the `/v1` suffix. The key is read only from the environment variable named by `api_key_env`; it is never written to the config file or the logs. The model then appears in the client as `builtin/<model>`.
 
-```bash
-export VADE_LLM_API_KEY="sk-..."        # PowerShell: $env:VADE_LLM_API_KEY="sk-..."
-export PYTHONPATH="core;protocol/core/python"
-.venv/Scripts/python.exe -m vade --config core.toml
-```
+Set `provider = "mock"` to run a turn loop without a network call, or `provider = "module"` to serve chat from a model module (see [`docs/rfc/RFC-0005-model-capabilities-usage.md`](docs/rfc/RFC-0005-model-capabilities-usage.md)).
 
-起来后客户端模型 chip 里会出现 **`builtin/deepseek-chat`**（模型 id 形如 `builtin/<model>`），选中它就能对话。
+## Modules
 
-`[llm]` 一共只有下面 8 个键，**多一个都会拒绝启动**（拼错键名不会被默默忽略）：
+Modules are not in this repository; [`modules/README.md`](modules/README.md) is only an index.
 
-| 键 | 默认 | 作用 |
+| Module | What it does | Repository |
 |---|---|---|
-| `provider` | `openai_compatible` | `openai_compatible` / `module` / `mock` |
-| `base_url` | 空 | 端点根；**含 `/v1`**，core 只在后面拼 `/chat/completions` |
-| `model` | 空 | 默认模型名（如 `deepseek-chat`） |
-| `api_key_env` | 空 → 兜底 `VADE_LLM_API_KEY` | 存放密钥的**环境变量名** |
-| `default_model` | 空 | 全局默认模型：会话没显式选模型时用它；会话的选择永远优先、不会被静默替换 |
-| `model_module` | 空 | `provider="module"` 时限定只问哪个模块；空 = 任何声明了 `chat` 的模块 |
-| `fallback_to_builtin` | `true` | 模块离线时是否回落到内置适配器 |
-| `capabilities` | `{}` | 声明模型能力：`display_name` / `supports_tools` / `context_window` / `input_modalities` / `max_image_bytes` / `max_image_px` / `max_images_per_turn` |
+| echo | Reference implementation: four trivial tools that prove manifest → RPC → result | [vade-module-echo](https://github.com/lshub2010/vade-module-echo) |
+| fs | `list` / `stat` / `read` / `write` / `delete` under allow-listed roots | [vade-module-fs](https://github.com/lshub2010/vade-module-fs) |
+| shell | Command execution with a cwd allow-list, timeout, and output truncation | [vade-module-shell](https://github.com/lshub2010/vade-module-shell) |
+| web | `fetch` / `head` with SSRF protection | [vade-module-web](https://github.com/lshub2010/vade-module-web) |
+| model | OpenAI-compatible model provider (`chat`) | [vade-module-model](https://github.com/lshub2010/vade-module-model) |
 
-**连不上怎么查**：
+To write a module, start with the Python SDK in [`sdk/python`](sdk/python), the directory conventions in [`docs/design.md`](docs/design.md) §15.1, and the manifest contract in [`schema/manifest.schema.json`](schema/manifest.schema.json). A module connects to the core, registers its manifest, and then serves the calls the core routes to it.
 
-| 现象 | 原因 | 处理 |
-|---|---|---|
-| 启动即报 `UNKNOWN_CONFIG_KEY: llm.xxx` | `[llm]` 里键名拼错或写多 | 只保留上表 8 个键 |
-| 回合失败 `401` | 环境变量没设，或 `api_key_env` 名字与真实变量名不一致 | `echo $VADE_LLM_API_KEY` 确认非空 |
-| 回合失败 `404` / `405` | `base_url` 少了 `/v1`（拼成了 `/v1/v1` 或根域名） | 只到 `/v1` 为止 |
-| `ImportError: httpx` | 运行环境缺 `httpx`（内置适配器才需要） | `pip install -r requirements.txt`（已包含） |
-| 请求发出但没回复 | `model` 名与端点上的名字不符 | 用端点自己列出的模型名 |
+## Documentation
 
-### 路线 B：模型做成模块（进程隔离）
-
-模型可以完全不在 core 里，而是一个独立进程，通过契约注册进来：
-
-```toml
-[llm]
-provider            = "module"
-model_module        = "com.example.model"   # 留空 = 任何声明了 chat 的模块都可服务
-fallback_to_builtin = true                  # 模块离线时回落内置（false 则直接 turn.failed(UNAVAILABLE)）
-```
-
-模块在 manifest 的 `capabilities.models[]` 里声明它提供哪些模型（名字、上下文窗口、是否支持工具与图片），
-core 把在线模块的声明聚合成 `model/list`，客户端 chip 直接读这份列表。协议细节见 [`docs/rfc/RFC-0005-model-capabilities-usage.md`](docs/rfc/RFC-0005-model-capabilities-usage.md)。
-
-### 先不接模型：`provider = "mock"`
-
-```toml
-[llm]
-provider = "mock"
-```
-
-此时模型列表里只有 `builtin/mock`，回合不联网——用来验证「core 起没起来、客户端连没连上」，不花一分钱。
-
-### 用量与预算
-
-同一个配置文件里的 `[usage]` 管用量：
-
-| 键 | 默认 | 含义 |
-|---|---|---|
-| `enabled` | `true` | 是否统计用量 |
-| `session_tokens` | `0` | 单会话 token 预算；**0 = 不限** |
-| `daily_tokens` | `0` | 每日 token 预算；**0 = 不限** |
-| `warn_ratio` | `0.8` | 用到预算的多少比例开始告警 |
-| `include_aux` | `true` | 辅助调用（压缩 / 记忆 / 自演化）是否也计入；`false` = 只算对话 |
-| `enforce` | `"block"` | `block` = 超预算直接拒绝 `ui/submit`（`BUDGET_EXCEEDED`）；`warn` = 只告警不拦。台账不可信时会自动降级成告警，避免误吞消息 |
-
-## 仓库结构
-
-```
-.
-├── core/              core 进程（会话、回合、路由、密钥、审计、blob、模块页）
-├── schema/            契约：rpc / events / errors / skill / manifest（唯一真相）
-├── protocol/          Rust 协议 SDK（Noise + AEAD），UniFFI 导出 Kotlin/Swift/Python/JS
-├── modules/           模块索引（模块本身在各自的独立仓）
-├── sdk/               模块侧 SDK（Python / Kotlin）
-├── admin-ui/          管理面前端（core 内置托管，仅回环与 App WebView）
-├── docs/              设计、RFC、任务书、alpha 台账
-└── deploy/            部署样例
-```
-
-## 文档
-
-| 想看什么 | 去哪 |
+| Read this | For |
 |---|---|
-| 一页总览 | [`docs/OVERVIEW.md`](docs/OVERVIEW.md) / [`overview.html`](overview.html) |
-| 需求与决策台账（D1–D110） | [`docs/requirements.md`](docs/requirements.md) |
-| 技术方案 | [`docs/design.md`](docs/design.md) |
-| 协议契约（逐条 RFC） | [`docs/rfc/`](docs/rfc) + [`schema/`](schema) |
-| alpha 验收台账与已知缺陷 | [`docs/ALPHA.md`](docs/ALPHA.md) |
-| 配对与设备绑定 | [`docs/PAIRING.md`](docs/PAIRING.md) |
-| 批次状态 / 里程碑 | [`docs/status.md`](docs/status.md) |
-| 开发任务书 | [`docs/agents/`](docs/agents) |
+| [`docs/OVERVIEW.md`](docs/OVERVIEW.md) | One-page overview |
+| [`docs/QUICKSTART.md`](docs/QUICKSTART.md) | Start a core and connect a client |
+| [`docs/PAIRING.md`](docs/PAIRING.md) | Pairing codes, browser sessions, troubleshooting |
+| [`docs/design.md`](docs/design.md) | Technical design: components, protocol, crypto, modules |
+| [`docs/rfc/`](docs/rfc) + [`schema/`](schema) | Per-RFC protocol contracts and the JSON schema |
+| [`docs/ALPHA.md`](docs/ALPHA.md) | Alpha acceptance evidence and known defects |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) · [`docs/DEPLOYMENT.zh-CN.md`](docs/DEPLOYMENT.zh-CN.md) | Self-hosting and production hardening (English / 中文) |
+| [`docs/release/0.0.2.md`](docs/release/0.0.2.md) | 0.0.2 release scope and open tasks |
+| [`docs/status.md`](docs/status.md) | Batch status and milestones |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Branches, review, and merge rules |
 
-## 分支模型
+## Not in 0.0.2-alpha
 
-```
-debug                 基线分支（只收来自 dev_gingshan 的阶段合入 PR）
-└── dev_gingshan      日常集成分支
-    └── tmp/<主题>     一次改动一条，合入后即删
-```
+These are explicitly deferred, not silently missing:
 
-## 许可
+- **iOS client.** Only Android, Windows desktop, and Web are built.
+- **Memory and M4b self-evolution.** There is no memory module, no `memory` schema, and no core memory subsystem.
+- **mcp-bridge module.** Not built.
+- **Production signing and updates.** The APK is debug-signed, the Windows MSI is unsigned, and there is no update channel.
+- **Upstream `/v1/models` discovery and multiple model modules side by side.** You configure the model name explicitly; cross-module `chat` conflicts need a separate RFC.
+- **Real-model tool-call end-to-end acceptance (T3).** Tool cards and routing exist; the full model-driven loop is not yet accepted.
+- **Admin pages beyond login and nodes.** Setup, audit, and settings are placeholder pages; skills, memory, and topology are not implemented.
 
-**Apache License 2.0** —— 完整条款见 [`LICENSE`](LICENSE)，署名与第三方声明见 [`NOTICE`](NOTICE)。
+The release checklist and the known-defect list are in [`docs/release/0.0.2.md`](docs/release/0.0.2.md) and [`docs/ALPHA.md`](docs/ALPHA.md).
 
-```
-Copyright (c) 2026 Vade contributors
+## Contributing
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+Day-to-day work lands on `dev_gingshan`; `debug` is the baseline branch and only receives stage merges. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the review and merge gates.
 
-    http://www.apache.org/licenses/LICENSE-2.0
+## License
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
-
-### 二次修改与再分发（必须标明原作者）
-
-Apache-2.0 是宽松许可（可商用、可闭源衍生），但**署名不能省**：
-
-- 再分发时必须保留 [`LICENSE`](LICENSE) 与 [`NOTICE`](NOTICE)（§4(c)(d)）；
-- **凡改动过的文件，必须在文件内显著声明「你改过」**（§4(b)）；
-- 不得暗示原作者为你背书（§4(g)），不得使用项目商标（§6）。
-
-一句话：**可以改、可以商用、可以不开源，但不能抹掉原作者、不能把改过的版本说成原版。**
-
-## 第三方组件与许可
-
-下表按 `requirements.txt` 里各包自带的元数据核实（2026-11-15）：
-
-| 组件 | 版本 | 许可 | 用途 |
-|---|---|---|---|
-| uvicorn | 0.54.0 | BSD-3-Clause | ASGI 服务器 |
-| starlette | 1.9.0 | BSD-3-Clause | Web 框架（HTTP / WebSocket 路由） |
-| websockets | 15.0.1 | BSD-3-Clause | WebSocket 实现 |
-| PyYAML | 6.0.3 | MIT | 配置与模块 manifest 解析 |
-| argon2-cffi | 25.1.0 | MIT | 口令 / 密钥派生 |
-
-> **兼容性**：BSD-3-Clause 与 MIT 均与 GPLv3 兼容；上述声明随源码与二进制一同保留。
-> 客户端的第三方组件（Compose、Ktor、Miuix、haze、Tabler Icons、KernelSU 等）见
-> [vade-client README](https://github.com/lshub2010/vade-client#第三方组件与许可)。
-
-## 引用
-
-```bibtex
-@software{vade2026,
-  title     = {Vade: a thin-core, module-first agent runtime},
-  author    = {{Vade contributors}},
-  year      = {2026},
-  version   = {0.0.1-alpha},
-  url       = {https://github.com/lshub2010/Vade}
-}
-```
-
-机器可读元数据见 [`CITATION.cff`](CITATION.cff)。
+**Apache License 2.0.** See [`LICENSE`](LICENSE) for the full text and [`NOTICE`](NOTICE) for attribution and third-party notices. If you modify and redistribute Vade, keep the license and notice files, mark modified files, and do not imply endorsement by the original authors.

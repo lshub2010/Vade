@@ -418,7 +418,16 @@ def _serve(
     install_components(app, strict=strict)
 
     admin_ctx = getattr(app, "admin", None)
-    admin_app = create_admin_app(admin_ctx) if admin_ctx is not None else None
+    # Ship the built admin UI with the core: when the release tree contains
+    # `admin-ui/dist`, mount it so `/admin` is a browser experience rather than
+    # the JSON discovery response. Tests and source checkouts that did not run
+    # `npm run build` keep the old JSON behaviour.
+    _admin_dist = Path(__file__).resolve().parents[2] / "admin-ui" / "dist"
+    admin_app = (
+        create_admin_app(admin_ctx, static_dist=_admin_dist if _admin_dist.is_dir() else None)
+        if admin_ctx is not None
+        else None
+    )
     setup_token_value: str | None = None
     if admin_ctx is not None:
         # D59: uninitialised ⇒ rotate on every start; initialised ⇒ delete any

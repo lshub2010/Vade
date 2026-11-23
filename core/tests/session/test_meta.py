@@ -635,7 +635,8 @@ def test_rpc_schema_and_handlers_agree_on_the_ten_methods():
     # The pin tracks the current C-05 head: 1.3.0 was RFC-0010's append;
     # RFC-0012 (subagent/list|get) owned 1.4.0; RFC-0014 (session/search)
     # owned 1.5.0; RFC-0015 (ui/modules) owned 1.6.0; RFC-0016 (ui/blob.token)
-    # owns 1.7.0. The TEN_METHODS
+    # owned 1.7.0; f15 deliberately does not bump it (no field removed, no
+    # method added). The TEN_METHODS
     # assertions below are the real subject of this test and did not move.
     assert rpc_data["version"] == "1.7.0"
     ui = rpc_data["directions"]["ui_to_core"]

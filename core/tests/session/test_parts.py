@@ -846,14 +846,14 @@ def test_legacy_to_llm_payload_is_byte_identical(tmp_path):
     store.close()
 
 
-def test_legacy_row_appears_in_the_snapshot_as_plain_content(tmp_path):
-    """A pre-parts row is readable from `content` alone, and travels once.
+def test_legacy_row_is_readable_from_content_in_the_snapshot(tmp_path):
+    """A pre-parts row reaches clients through `content`; the text travels once.
 
-    `Message.to_snapshot` drops text-only `parts`: they are exactly the
-    projection of `content`, and sending both is what put a legal session over
-    the 65 519-byte frame cap (f9-audit P0-1). A client that only knows
-    `content` renders the legacy row unchanged; a client that reads `parts`
-    synthesises the same text part it always did.
+    C-05 1.7.0 keeps `parts` declared, but the snapshot sends the text once:
+    a text-only row (including the synthetic part of a legacy row) carries
+    `content` only, and `x-vade.dedup` names the fallback
+    (`[{type:'text',text:content}]`). Nothing is rewritten on disk —
+    `wire_parts()` still synthesises the part in-process.
     """
     path = tmp_path / "sessions.db"
     _legacy_db(path)
@@ -861,6 +861,7 @@ def test_legacy_row_appears_in_the_snapshot_as_plain_content(tmp_path):
     snapshot = log.snapshot(SESSION)
     assert snapshot["messages"][0]["content"] == "旧消息 hello"
     assert "parts" not in snapshot["messages"][0]
+    assert snapshot["x-vade"]["dedup"]["fallback"]["messages[].parts"] == "content"
     assert log.store.load(SESSION).messages[0].wire_parts() == [
         {"type": "text", "text": "旧消息 hello"}]
     log.store.close()

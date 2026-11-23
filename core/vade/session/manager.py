@@ -94,6 +94,41 @@ ATTACH_REPLAY_RESERVE = 8
 #: and the whole reply is replaced by PAYLOAD_TOO_LARGE when it does not.
 SNAPSHOT_ENVELOPE_RESERVE = 2048
 
+#: f15: the snapshot's text travels ONCE. `Message.to_snapshot` elides a
+#: text-only `parts` list (`content` is its exact projection) and
+#: `Turn.to_snapshot` elides `user_text` (it is the `content` of the turn's
+#: user row). C-05 1.7.0 still DECLARES both fields — no RFC-less version bump
+#: and no append block — but a reader must be told the row arrived in the
+#: elided form, so every snapshot carries this marker verbatim. Additive and
+#: always present, like the bounding counters: the shape never changes only
+#: because a session happens to be small.
+SNAPSHOT_DEDUP_PATHS: tuple[str, ...] = ("messages[].parts:text-only", "turns[].user_text")
+
+
+def _dedup_marker() -> dict[str, Any]:
+    """The `x-vade.dedup` block: what was elided and how to rebuild it."""
+    return {
+        "dedup": {
+            "version": 1,
+            "elided": list(SNAPSHOT_DEDUP_PATHS),
+            # Machine-readable fallback chain; the same text is in the
+            # `ui/attach` notes (C-05) and `docs/agents/22-C3-session-loop.md`.
+            "fallback": {
+                "messages[].parts": "content",
+                "turns[].user_text": "user_message_id -> messages[].id; "
+                                     "messages[].turn_id == turn.id when NULL",
+            },
+        },
+    }
+
+
+class _ArgsTooComplex(Exception):
+    """A pending approval's `args` exceeded the bounded-copy limits.
+
+    Not an error for the caller of `snapshot()`: the row is kept whole and
+    counted (`pending_copy_failed`), it is simply never clipped in place.
+    """
+
 
 def _wire_size(obj: Any) -> int:
     """UTF-8 byte count of the exact encoding the transport seals."""
@@ -985,27 +1020,56 @@ class SessionLog:
         `ui/attach` is the only channel that returns history (C-05 has no
         paged-history method), so a snapshot that cannot fit the 65 519-byte
         frame cap makes the session permanently unopenable — not slow, not
-        truncated, unopenable. Three things keep it honest:
+        truncated, unopenable. Four things keep it honest:
 
-        * the text travels once (`Message.to_snapshot` / `Turn.to_snapshot`),
-          instead of `content` + `parts[].text` + `turns[].user_text`;
+        * the text travels once: `Message.to_snapshot` elides a text-only
+          `parts` list (its exact projection is `content`) and
+          `Turn.to_snapshot` elides `user_text` (it is the `content` of the
+          turn's user row). Both elisions are DECLARED on the wire in
+          `x-vade.dedup` with the rebuild fallback, so nothing is silently
+          absent — C-05 1.7.0 still declares both fields, and this is an
+          encoding of the snapshot, not a field removal or a version bump;
         * when that is still too much, the OLDEST rows are dropped and the
           caller is told (`truncated`/`omitted`/`truncated_before_seq`);
         * a single row bigger than the whole budget is clipped, never refused
           (`content_truncated` + per-row `truncated`), and every truncated
-          attach leaves an audit row.
+          attach leaves an audit row;
+        * dropping a BLOCKING dialog is never silent: the recoverable `tasks`
+          block goes first, BEFORE any message/turn row or approval argument is
+          touched, and the frame is re-measured; if approvals/inputs still
+          cannot fit they carry `pending_truncated` + `omitted_approvals`/
+          `omitted_inputs` and force `truncated=true`.
         """
         session = self._require_session(session_id)
         queue = self._queues.get(session_id)
         pending: list[Any] = []
+        #: Rows whose `args` could not be detached from the port. `_clip_one_text`
+        #: must never mutate those: the approval's digest decides what runs, and
+        #: the port owns the live value. They stay in the snapshot WHOLE and are
+        #: counted (`pending_copy_failed`) — keeping a dialog is always better
+        #: than silently losing every dialog because one row was too complex.
+        protected_args: set[int] = set()
+        copy_failed = 0
         if self.approval_port is not None and hasattr(self.approval_port, "pending"):
             try:
-                # Copy: `_bound_snapshot` clips these rows in place when the
-                # frame is over budget, and the port owns the originals.
-                pending = [dict(row) if isinstance(row, Mapping) else row
-                           for row in self.approval_port.pending(session_id)]
+                rows = self.approval_port.pending(session_id)
             except Exception:  # pragma: no cover - approval port is C5a's
-                pending = []
+                rows = []
+                log.warning("pending approvals unavailable while snapshotting",
+                            extra={"code": None, "msg": f"session={session_id}"})
+            # Per-row, not one list comprehension: a single pathological row
+            # must not take the whole blocking-state block down with it (that
+            # was the P0: one RecursionError -> `except` -> pending=[]).
+            for row in rows:
+                try:
+                    copied, args_copied = self._copy_pending_row(row)
+                except Exception:  # pragma: no cover - _copy_pending_row is total
+                    copied, args_copied = row, False
+                if not args_copied and isinstance(copied, Mapping):
+                    protected_args.add(id(copied))
+                if not args_copied:
+                    copy_failed += 1
+                pending.append(copied)
         # RFC-0008 §8.2: a reconnecting client that fell outside the replay
         # window only gets this snapshot, so a pending question MUST be here —
         # otherwise the dialog exists on the phone and not on the desktop.
@@ -1031,6 +1095,11 @@ class SessionLog:
         )
         snapshot: dict[str, Any] = {
             "from_seq": self.store.last_seq(session_id),
+            # f15: `messages[].parts` (text-only rows) and `turns[].user_text`
+            # are elided by `to_snapshot()` — the text travels once. The
+            # marker is additive, always present and machine-readable so no
+            # client has to infer the elided shape from a missing key.
+            "x-vade": _dedup_marker(),
             "session": {
                 "id": session.id,
                 "created_at": session.created_at,
@@ -1049,7 +1118,17 @@ class SessionLog:
             "pending_approvals": pending,
             "pending_inputs": pending_inputs,
             # Additive, always present so the shape does not change only when
-            # a session happens to be large (C-05 `ui/attach`).
+            # a session happens to be large (C-05 `ui/attach`). The `pending_*`
+            # pair is NOT optional padding: an approval blocks its turn until
+            # it is answered, so dropping one has to be visible even when no
+            # message row was lost (`truncated` covers the aggregate).
+            # `pending_truncated` also covers a row kept WHOLE because its args
+            # could not be copied: the dialog survived, but the snapshot could
+            # not be bounded inside it — say so instead of pretending.
+            "pending_truncated": bool(copy_failed),
+            "omitted_approvals": 0,
+            "omitted_inputs": 0,
+            "pending_copy_failed": copy_failed,
             "running_partial": running_partial,
             "truncated": False,
             "omitted": 0,
@@ -1065,7 +1144,8 @@ class SessionLog:
             tasks, truncated = self.tasks.snapshot(session_id)
             snapshot["tasks"] = tasks
             snapshot["tasks_truncated"] = bool(truncated)
-        return self._bound_snapshot(session_id, snapshot)
+            snapshot["omitted_tasks"] = 0
+        return self._bound_snapshot(session_id, snapshot, protected_args=protected_args)
 
     def _reply_bytes(self, session_id: str, snapshot: dict[str, Any]) -> int:
         """Bytes the `ui/attach` reply occupies with this snapshot inside it.
@@ -1080,19 +1160,33 @@ class SessionLog:
             "snapshot": snapshot,
         })
 
-    def _bound_snapshot(self, session_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    def _bound_snapshot(
+        self, session_id: str, snapshot: dict[str, Any], *,
+        protected_args: frozenset[int] | set[int] = frozenset(),
+    ) -> dict[str, Any]:
         """Trim `snapshot` until it fits one frame; never return a refusal.
 
-        Order matters: the recent rows are what a client renders, so the oldest
-        go first; a running turn's partial is the newest text and survives
-        longest; a single message may still be larger than the entire budget
-        (RFC-0006 §8 allows 32 000 code points ≈ 96 KB of CJK), which is the
-        one case where clipping is the only answer.
+        Order matters: the recoverable, non-conversation block (`tasks`) goes
+        FIRST; only then are the oldest conversation rows dropped, the largest
+        text fields clipped, and — last — the blocking dialogs dropped counted.
+        A running turn's partial is the newest text and survives longest; a
+        single message may still be larger than the entire budget (RFC-0006 §8
+        allows 32 000 code points ≈ 96 KB of CJK), which is the one case where
+        clipping is the only answer.
         """
         budget = MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE
         size = self._reply_bytes(session_id, snapshot)
-        if size <= budget:
+        if size <= budget and not snapshot.get("pending_copy_failed"):
             return snapshot
+
+        # ⓪ Optional blocks go BEFORE any conversation row. `tasks` has its own
+        # recovery channel (`task/list`); messages/turns are the conversation
+        # and `pending_approvals[].args` is what the approver must see. Dropping
+        # the task list only after ①②③ let it eat messages and shrink approval
+        # args down to the last 64 characters (f15 review P1-1).
+        if size > budget:
+            self._drop_tasks(snapshot)
+            size = self._reply_bytes(session_id, snapshot)
 
         # ① Messages, oldest first. Subtractive sizes keep this O(n) for a
         # 1 000-row session instead of re-encoding the snapshot per row. The
@@ -1114,24 +1208,22 @@ class SessionLog:
         # refuses once every field is already short, so it cannot spin.
         while True:
             before = self._reply_bytes(session_id, snapshot)
-            if before <= budget or not self._clip_one_text(snapshot):
+            if before <= budget or not self._clip_one_text(snapshot, protected_args):
                 break
             if self._reply_bytes(session_id, snapshot) >= before:
                 break  # no progress: never spin on a floor-sized field
-        # ④ Last resort: optional blocks go before the session does. A client
-        # loses task progress (it can `task/list`) but keeps the conversation
-        # and its cursor — and `truncated` says so.
+        # ④ Last resort: blocking dialogs go before the session does. When they
+        # still do not fit they go — counted, flagged and audited
+        # (`pending_truncated` + `omitted_approvals`/`omitted_inputs`, and
+        # `truncated=true`), never silently.
         if self._reply_bytes(session_id, snapshot) > budget:
-            snapshot["tasks"] = []
-            snapshot["tasks_truncated"] = True
-            snapshot["pending_inputs"] = []
-            snapshot["pending_approvals"] = []
+            self._drop_pending(snapshot)
             while True:
                 before = self._reply_bytes(session_id, snapshot)
-                if before <= budget or not self._clip_one_text(snapshot):
+                if before <= budget or not self._clip_one_text(snapshot, protected_args):
                     break
                 if self._reply_bytes(session_id, snapshot) >= before:
-                    break
+                    break  # no progress: never spin on a floor-sized field
         # ⑤ Absolute floor: no reply the transport will refuse. Reached only by
         # a pathological session (thousands of one-word rows), but "attach is
         # impossible" must not be reachable at all.
@@ -1149,9 +1241,8 @@ class SessionLog:
             snapshot["messages"] = []
             snapshot["omitted_turns"] += len(snapshot["turns"])
             snapshot["turns"] = []
-            snapshot["tasks"] = []
-            snapshot["pending_inputs"] = []
-            snapshot["pending_approvals"] = []
+            self._drop_tasks(snapshot)
+            self._drop_pending(snapshot)
 
         if snapshot["omitted"]:
             kept = snapshot["messages"]
@@ -1160,72 +1251,289 @@ class SessionLog:
                 snapshot["truncated_before_seq"] = first
             else:
                 snapshot["truncated_before_seq"] = int(snapshot["from_seq"]) + (0 if kept else 1)
-        if snapshot["omitted"] or snapshot["omitted_turns"] or snapshot["content_truncated"]:
+        if (snapshot["omitted"] or snapshot["omitted_turns"] or snapshot["content_truncated"]
+                or snapshot["pending_truncated"] or snapshot.get("omitted_tasks")
+                or snapshot.get("pending_copy_failed")):
             snapshot["truncated"] = True
             self._audit_snapshot_truncated(session_id, snapshot)
         return snapshot
 
-    def _clip_one_text(self, snapshot: dict[str, Any]) -> bool:
+    #: Bounds for detaching a pending approval's `args` from the port. The
+    #: clipper walks to the SAME depth (see `_longest_arg_text`), so every row
+    #: that was copied successfully is reachable by `_clip_one_text`: a legal
+    #: request at depth 9–64 used to be copied (hence not `protected`) and then
+    #: unreachable to the clipper, and step ④ dropped the whole dialog
+    #: (f15 review P1-3). The node/char budgets stop a legal-looking but
+    #: enormous Mapping. A value past a bound is NOT dropped by the copy: the
+    #: row is kept whole and counted, and `protected_args` keeps the clipper
+    #: from mutating the live request.
+    _ARGS_COPY_MAX_DEPTH = 64
+    _ARGS_COPY_MAX_NODES = 50_000
+    _ARGS_COPY_MAX_CHARS = 4_000_000
+
+    @classmethod
+    def _bounded_copy(
+        cls, value: Any, depth: int = 0, state: list[int] | None = None,
+    ) -> Any:
+        """Copy a JSON-ish approval argument without `deepcopy`'s recursion limit.
+
+        `copy.deepcopy` blows up at ~900 nested objects — a legal 6 KB `args`
+        the approval port itself minted — and the old caller turned that
+        RecursionError into `pending=[]`: every dialog vanished unflagged
+        (f15 review P0-1). This walker is explicit about its bounds and raises
+        `_ArgsTooComplex` instead of recursing forever.
+        """
+        if state is None:
+            state = [0, 0]
+        state[0] += 1
+        if depth > cls._ARGS_COPY_MAX_DEPTH or state[0] > cls._ARGS_COPY_MAX_NODES:
+            raise _ArgsTooComplex("approval args exceed the copy bound")
+        if isinstance(value, str):
+            state[1] += len(value)
+            if state[1] > cls._ARGS_COPY_MAX_CHARS:
+                raise _ArgsTooComplex("approval args exceed the copy bound")
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            state[1] += len(value)
+            if state[1] > cls._ARGS_COPY_MAX_CHARS:
+                raise _ArgsTooComplex("approval args exceed the copy bound")
+            return value
+        if isinstance(value, Mapping):
+            return {key: cls._bounded_copy(child, depth + 1, state)
+                    for key, child in value.items()}
+        if isinstance(value, (list, tuple)):
+            copied = [cls._bounded_copy(child, depth + 1, state) for child in value]
+            return tuple(copied) if isinstance(value, tuple) else copied
+        return value
+
+    @classmethod
+    def _copy_pending_row(cls, row: Any) -> tuple[Any, bool]:
+        """Detach a pending approval from the port before clipping it.
+
+        `args` is a nested Mapping and the port keeps using it (its digest
+        decides the approval), so clipping the shared value would rewrite the
+        live request. Returns `(row, args_detached)`: when the copy bound is
+        hit the BARE row is returned with `args_detached=False`, and the caller
+        keeps the dialog (never drops it) while protecting `args` from clipping.
+        """
+        if not isinstance(row, Mapping):
+            return row, True
+        copied = dict(row)
+        args = copied.get("args")
+        if isinstance(args, (Mapping, list, tuple)):
+            try:
+                copied["args"] = cls._bounded_copy(args)
+            except Exception:
+                return copied, False
+        return copied, True
+
+    @staticmethod
+    def _drop_tasks(snapshot: dict[str, Any]) -> int:
+        """Drop `tasks` only when the key exists AND holds rows.
+
+        A core without the task component must never grow a `tasks`/
+        `tasks_truncated` pair during bounding — MISSING `tasks` is the
+        documented "this core predates RFC-0007" signal — and an already-empty
+        list has nothing to lose: `tasks_truncated=true` for it would advertise
+        history that never existed.
+
+        Bounding runs this FIRST (before messages/turns/clipping): the task
+        list is recoverable through `task/list`, while a dropped message or a
+        clipped approval argument is not. A bounding drop also sets
+        `tasks_truncated=true` — the same flag `Tasks.snapshot()` uses for
+        "older history exists" — and `omitted_tasks` says how many rows are
+        gone from THIS snapshot.
+        """
+        tasks = snapshot.get("tasks")
+        if not isinstance(tasks, list) or not tasks:
+            return 0
+        dropped = len(tasks)
+        snapshot["tasks"] = []
+        snapshot["tasks_truncated"] = True
+        snapshot["omitted_tasks"] = int(snapshot.get("omitted_tasks") or 0) + dropped
+        return dropped
+
+    @staticmethod
+    def _drop_pending(snapshot: dict[str, Any]) -> tuple[int, int]:
+        """Drop the blocking dialogs, counted and flagged — never silently.
+
+        Returns `(approvals, inputs)` dropped. `pending_truncated` is the
+        signal a client keys "a dialog may be missing; re-query" off: without
+        it a snapshot that lost an approval is byte-for-byte an idle session,
+        and the turn behind it only ends by timeout.
+        """
+        approvals = snapshot.get("pending_approvals") or []
+        inputs = snapshot.get("pending_inputs") or []
+        dropped_approvals = len(approvals) if isinstance(approvals, list) else 0
+        dropped_inputs = len(inputs) if isinstance(inputs, list) else 0
+        if not dropped_approvals and not dropped_inputs:
+            return 0, 0
+        snapshot["pending_approvals"] = []
+        snapshot["pending_inputs"] = []
+        snapshot["pending_truncated"] = True
+        snapshot["omitted_approvals"] = (
+            int(snapshot.get("omitted_approvals") or 0) + dropped_approvals)
+        snapshot["omitted_inputs"] = (
+            int(snapshot.get("omitted_inputs") or 0) + dropped_inputs)
+        return dropped_approvals, dropped_inputs
+
+    @staticmethod
+    def _set_at(container: Any, path: Sequence[Any], value: str) -> None:
+        node = container
+        for step in path[:-1]:
+            node = node[step]
+        node[path[-1]] = value
+
+    @classmethod
+    def _longest_arg_text(
+        cls, value: Any, path: tuple[Any, ...] = (), depth: int = 0,
+    ) -> tuple[tuple[Any, ...], str] | None:
+        """The largest string leaf inside a JSON-ish `args` object.
+
+        `pending_approvals[].args` is an arbitrary tool-argument Mapping, not a
+        flat string field: one legal 32 000-character `fs__write_file.content`
+        used to be invisible to the clipper, blow the frame, and take the whole
+        approval with it in step ④.
+
+        The walk uses the SAME depth bound as `_bounded_copy`. Alignment is the
+        contract: a row whose `args` was detached successfully is by
+        construction within `_ARGS_COPY_MAX_DEPTH`, so every clippable row is
+        reachable. A fixed depth of 8 was NOT aligned — a depth-9 `args` was
+        copied (so not `protected_args`) and still unreachable, and ④ dropped
+        the dialog (f15 review P1-3). Rows the copy could not detach are
+        `protected_args` and skipped by the caller anyway.
+        """
+        if depth > cls._ARGS_COPY_MAX_DEPTH:
+            return None
+        if isinstance(value, str):
+            return path, value
+        if isinstance(value, Mapping):
+            items: Any = value.items()
+        elif isinstance(value, (list, tuple)):
+            items = enumerate(value)
+        else:
+            return None
+        best: tuple[tuple[Any, ...], str] | None = None
+        for key, child in items:
+            found = cls._longest_arg_text(child, path + (key,), depth + 1)
+            if found is not None and (best is None or len(found[1]) > len(best[1])):
+                best = found
+        return best
+
+    def _clip_one_text(
+        self, snapshot: dict[str, Any], protected_args: frozenset[int] | set[int] = frozenset(),
+    ) -> bool:
         """Shorten the largest text field; False when nothing is left to cut.
 
         A completed message keeps its HEAD (it is read top-down); a running
         partial keeps its TAIL, so the deltas that arrive after this snapshot
         still land on the end of that bubble instead of leaving a hole in the
-        middle. Both cases set `truncated` on the row, so a clipped row is never
-        mistakable for a short one.
+        middle. A pending approval's `args` is a nested Mapping — its largest
+        string leaf is clipped too, because one 32 000-character write argument
+        is a legal request that would otherwise cost the whole dialog. Every
+        clipped row is marked (`truncated` / `args_truncated` + omitted counts)
+        so it is never mistakable for a short one. Rows in `protected_args`
+        share their `args` with the approval port (the copy bound was hit), so
+        their args are never touched.
         """
-        candidates: list[tuple[dict[str, Any], str]] = []
+        # (container, path-within-container, original text, row to mark)
+        candidates: list[tuple[Any, tuple[Any, ...], str, dict[str, Any]]] = []
         for message in snapshot.get("messages", ()):
-            if isinstance(message.get("content"), str) and len(message["content"]) > 64:
-                candidates.append((message, "content"))
+            if not isinstance(message, dict):
+                continue
+            parts = message.get("parts")
+            text_parts = [
+                (index, part) for index, part in enumerate(parts)
+                if isinstance(part, dict) and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ] if isinstance(parts, list) else []
+            long_parts = [(index, part) for index, part in text_parts
+                          if len(part["text"]) > 64]
+            if long_parts:
+                # Clip the parts, never the derived `content`: halving
+                # `content` and rebuilding it from untouched parts is a no-op
+                # that used to spin forever.
+                for index, part in long_parts:
+                    candidates.append(
+                        (message, ("parts", index, "text"), part["text"], message))
+            elif not text_parts and isinstance(message.get("content"), str) \
+                    and len(message["content"]) > 64:
+                candidates.append((message, ("content",), message["content"], message))
         running = snapshot.get("running_partial")
         if isinstance(running, dict) and len(str(running.get("text") or "")) > 64:
-            candidates.append((running, "text"))
+            candidates.append((running, ("text",), str(running["text"]), running))
         for block in ("pending_inputs", "pending_approvals"):
             for row in snapshot.get(block) or ():
                 if not isinstance(row, dict):
                     continue
                 for key in ("prompt", "detail", "title", "question", "summary"):
                     if isinstance(row.get(key), str) and len(row[key]) > 256:
-                        candidates.append((row, key))
+                        candidates.append((row, (key,), row[key], row))
+                if block == "pending_approvals" and id(row) in protected_args:
+                    # `args` still belongs to the approval port (copy failed):
+                    # a clip here would rewrite the live request the digest
+                    # decides on. The row itself is kept, counted by
+                    # `pending_copy_failed`.
+                    continue
+                args = row.get("args")
+                if isinstance(args, Mapping):
+                    found = self._longest_arg_text(args)
+                    if found is not None and len(found[1]) > 64:
+                        candidates.append((row, ("args",) + found[0], found[1], row))
         if not candidates:
             return False
-        container, key = max(candidates, key=lambda item: len(item[0][item[1]]))
-        text = container[key]
+        container, path, text, mark = max(candidates, key=lambda item: len(item[2]))
         keep = max(64, len(text) // 2)
-        if container is running:
+        if mark is running:
             # A running partial keeps its tail: the deltas that follow this
             # snapshot append to the end of the bubble, so dropping the tail
             # would leave a hole right where the stream continues.
             container["text"] = text[-keep:]
             container["chars"] = len(container["text"])
+            mark["omitted_chars"] = (
+                int(mark.get("omitted_chars") or 0) + max(0, len(text) - keep))
         else:
-            container[key] = text[:keep]
-            if "parts" in container:
-                # Clip the largest text part, not the derived `content`: with
-                # two 6k-character parts, halving `content` and then rebuilding
-                # it from two 6k parts is a no-op that used to spin forever.
-                text_parts = [
-                    part for part in container["parts"]
-                    if part.get("type") == "text" and isinstance(part.get("text"), str)
-                    and len(part["text"]) > 64
-                ]
-                if text_parts:
-                    largest = max(text_parts, key=lambda part: len(part["text"]))
-                    largest["text"] = largest["text"][: max(64, len(largest["text"]) // 2)]
-                container["content"] = parts_text(container["parts"]) or container[key]
-        container["truncated"] = True
-        container["omitted_chars"] = max(0, len(text) - len(container.get(key) or ""))
+            before_content = len(str(mark.get("content") or ""))
+            self._set_at(container, path, text[:keep])
+            if path[0] == "args":
+                # Keep the dialog able to say WHICH argument was cut; the
+                # execution copy is untouched (pending rows are copies).
+                mark["args_truncated"] = True
+                mark["args_omitted_chars"] = (
+                    int(mark.get("args_omitted_chars") or 0) + len(text) - keep)
+            elif path[0] == "parts":
+                mark["content"] = parts_text(mark["parts"]) or mark.get("content") or ""
+                mark["omitted_chars"] = (
+                    int(mark.get("omitted_chars") or 0)
+                    + max(0, before_content - len(str(mark["content"]))))
+            else:
+                mark["omitted_chars"] = (
+                    int(mark.get("omitted_chars") or 0) + max(0, len(text) - keep))
+        mark["truncated"] = True
         snapshot["content_truncated"] = True
         return True
 
     def _audit_snapshot_truncated(self, session_id: str, snapshot: dict[str, Any]) -> None:
         """A truncated attach is an outcome, not noise: leave a row."""
+        approvals = [row for row in (snapshot.get("pending_approvals") or ())
+                     if isinstance(row, Mapping)]
         detail = {
             "omitted": snapshot["omitted"],
             "omitted_turns": snapshot["omitted_turns"],
             "truncated_before_seq": snapshot["truncated_before_seq"],
             "content_truncated": snapshot["content_truncated"],
+            # A dropped approval blocks its turn: it belongs in the audit row
+            # even when no message/turn row was lost.
+            "pending_truncated": snapshot["pending_truncated"],
+            "omitted_approvals": snapshot["omitted_approvals"],
+            "omitted_inputs": snapshot["omitted_inputs"],
+            "pending_copy_failed": snapshot.get("pending_copy_failed", 0),
+            "omitted_tasks": snapshot.get("omitted_tasks", 0),
+            # Security audit: clipping an approval's args must be visible even
+            # when the row itself survived (`args_truncated` was row-local).
+            "args_truncated": any(row.get("args_truncated") for row in approvals),
+            "args_omitted_chars": sum(
+                int(row.get("args_omitted_chars") or 0) for row in approvals),
             "bytes": self._reply_bytes(session_id, snapshot),
             "budget": MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE,
         }

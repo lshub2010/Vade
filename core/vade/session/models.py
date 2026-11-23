@@ -215,23 +215,26 @@ class Message:
         }
 
     def to_snapshot(self) -> dict[str, Any]:
-        """`ui/attach` shape: the text travels ONCE.
+        """`ui/attach` shape: the C-05 row with the derived text sent ONCE.
 
-        `to_dict()` writes both `content` and the text parts it projects, and
-        `Turn.to_dict()` writes `user_text` a third time — the same bytes three
-        times for a user message. That is invisible to an in-process caller and
-        fatal on the wire: one frame is capped at 65 519 bytes, so a session
-        with ~7 100 CJK characters of user text could never be attached again.
+        `to_dict()` writes both `content` and the text part it projects — the
+        same characters twice — and one frame is capped at 65 519 bytes, so a
+        session with ~7 100 CJK characters of user text could never be
+        attached again (the row was dropped, taking the user bubble with it).
 
-        Text-only `parts` add nothing a client cannot derive from `content`
-        (legacy rows were synthesising exactly that part on read), so they are
-        dropped here. A message with an image/file part keeps `parts` — and
-        `content`, its projection — for clients that render one or the other.
-        `content` is never dropped: every existing client reads it.
+        A text-only `parts` list is exactly `content` (`__post_init__` derives
+        `content` from `parts`, and `wire_parts()` re-synthesises the single
+        text part of a legacy row), so it is elided here. Nothing becomes
+        unreachable: the snapshot declares the elision in `x-vade.dedup`
+        (`manager.snapshot`) and the fallback is "rebuild `[{type:'text',
+        text:content}]` when `parts` is absent" — which is what the shipped
+        client already does. A message with an image/file part keeps `parts`
+        (and its `content` projection) so part ORDER survives.
         """
         data = self.to_dict()
-        if all(part.get("type") == "text" for part in data["parts"]):
-            data.pop("parts")
+        parts = data["parts"]
+        if not parts or all(part.get("type") == "text" for part in parts):
+            data.pop("parts", None)
         return data
 
 
@@ -303,12 +306,16 @@ class Turn:
         }
 
     def to_snapshot(self) -> dict[str, Any]:
-        """`ui/attach` shape: no `user_text`.
+        """`ui/attach` shape: `user_text` is elided — it is a projection.
 
-        It is the projection of the turn's user message (`user_message_id`),
+        `user_text` is the text of the turn's user message (`user_message_id`),
         and `snapshot.messages[]` already carries that row — the third copy of
-        the same bytes (see `Message.to_snapshot`). The field stays on
-        `to_dict()` for in-process callers.
+        the same bytes. C-05 1.7.0 keeps the FIELD declared; the snapshot
+        elides it and says so in `x-vade.dedup`, with the documented fallback:
+        `user_message_id` -> `messages[].id`, and for legacy turns whose
+        `user_message_id` is NULL (the column postdates RFC-0006)
+        `messages[].turn_id == turn.id`. The value stays on `to_dict()` for
+        in-process callers.
         """
         data = self.to_dict()
         data.pop("user_text", None)

@@ -1184,8 +1184,9 @@ def check_subagent_events(events: dict, declared_events: dict, schema_events: se
     )
     check(not elsewhere, f"rpc.json: RFC-0012 methods must not be module-facing: {elsewhere}")
     check(rpc.get("version") in ("1.4.0", "1.5.0", "1.6.0", "1.7.0"),
-          f"rpc.json: version must be 1.4.0 (RFC-0012), 1.5.0 (RFC-0014), 1.6.0 (RFC-0015) "
-          f"or 1.7.0 (RFC-0016, the current head) (got {rpc.get('version')!r})")
+          f"rpc.json: version must be 1.4.0 (RFC-0012), 1.5.0 (RFC-0014), 1.6.0 (RFC-0015) or "
+          f"1.7.0 (RFC-0016, the current head) "
+          f"(got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0012" in str(b.get("doc") or "")), None)
     check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0012")
@@ -1446,7 +1447,8 @@ def check_session_meta(rpc: dict, events: dict) -> None:
         check(not unknown, f"rpc.json {name}: errors not declared in C-04: {unknown}")
     check(rpc.get("version") in ("1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0"),
           f"rpc.json: version must be 1.3.0 (RFC-0010), 1.4.0 (RFC-0012), 1.5.0 (RFC-0014), "
-          f"1.6.0 (RFC-0015) or 1.7.0 (RFC-0016, the current head) (got {rpc.get('version')!r})")
+          f"1.6.0 (RFC-0015) or 1.7.0 (RFC-0016, the current head) "
+          f"(got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0010" in str(b.get("doc") or "")), None)
     check(rblock is not None, "rpc.json: missing the x-vade.appends block for RFC-0010")
@@ -1570,8 +1572,9 @@ def check_session_search(rpc: dict) -> None:
         else:
             check(False, "rpc.json session/search.result.results: must declare the hit-row shape (one object)")
     check(rpc.get("version") in ("1.5.0", "1.6.0", "1.7.0"),
-          f"rpc.json: version must be 1.5.0 (RFC-0014), 1.6.0 (RFC-0015) or "
-          f"1.7.0 (RFC-0016, the current head) after the RFC-0014 append (got {rpc.get('version')!r})")
+          f"rpc.json: version must be 1.5.0 (RFC-0014), 1.6.0 (RFC-0015) or 1.7.0 (RFC-0016, "
+          f"the current head) after the RFC-0014 append "
+          f"(got {rpc.get('version')!r})")
 
     if str(ROOT / "core") not in sys.path:
         sys.path.insert(0, str(ROOT / "core"))
@@ -1675,7 +1678,8 @@ def check_blob_token(rpc: dict) -> None:
               "rpc.json ui/blob.token.errors must be exactly the four reused C-04 codes (no new code)")
 
     check(rpc.get("version") == "1.7.0",
-          f"rpc.json: version must be 1.7.0 (RFC-0016 owns the C-05 head) (got {rpc.get('version')!r})")
+          f"rpc.json: version must be 1.7.0 (RFC-0016 owns the C-05 head; f15 adds no method) "
+          f"(got {rpc.get('version')!r})")
 
     if str(ROOT / "core") not in sys.path:
         sys.path.insert(0, str(ROOT / "core"))
@@ -1716,6 +1720,73 @@ def check_blob_token(rpc: dict) -> None:
               "rpc.json: the RFC-0016 append must be rewrite-free")
         check(block.get("contract") == "C-05" and block.get("owner") == "C2",
               "rpc.json: the RFC-0016 append block must carry contract C-05 / owner C2")
+
+
+def check_snapshot_contract(rpc: dict) -> None:
+    """f15: the bounded snapshot stays INSIDE frozen C-05 1.7.0.
+
+    The first attempt registered a 1.8.0 append block that no RFC owned and
+    that deleted two frozen wire fields (`messages[].parts`,
+    `turns[].user_text`). The review rejected it. The second attempt kept the
+    fields but sent the same text three times, so a 7 100-CJK session lost its
+    user row. The rule that satisfies both is: the CONTRACT keeps every field,
+    the SNAPSHOT sends the text once, and the elision is declared on the wire.
+    This gate keeps that honest:
+
+      1. the top-level version is still 1.7.0 and there is NO f15 append block;
+      2. `ui/attach` notes declare `content`, `parts`, `user_text` and the
+         legacy-turn fallback (`user_message_id` NULL -> `messages[].turn_id`);
+      3. the notes document the `x-vade.dedup` marker — what is elided and the
+         rebuild fallback — and still say no key was renamed or removed;
+      4. the bounding keys are documented as additive, including
+         `pending_copy_failed` (a dialog kept whole, never silently lost).
+
+    Behavioural evidence lives in `core/tests/session/test_attach_bounds.py`
+    (a real `SessionLog` snapshot must omit text-only `parts`/`user_text`, carry
+    the marker, and keep a 7 000-CJK user row). The source pins below are only
+    wiring: a schema/gate that describes a marker the code never emits is the
+    "test green, feature dead" failure this repo keeps re-learning.
+    """
+    check(rpc.get("version") == "1.7.0",
+          f"rpc.json: version must stay 1.7.0 (f15 removes no field and adds no "
+          f"method) (got {rpc.get('version')!r})")
+    blocks = (rpc.get("x-vade") or {}).get("appends") or []
+    f15_blocks = [b for b in blocks if isinstance(b, dict)
+                  and "f15-snapshot-contract" in str(b.get("doc") or "")]
+    check(not f15_blocks,
+          "rpc.json: f15 must not register an append block — a frozen-field change "
+          "needs an RFC, and f15 removes nothing")
+    attach = ((rpc.get("directions") or {}).get("ui_to_core") or {}).get("ui/attach") or {}
+    notes = str(attach.get("notes") or "")
+    for needle in ("`content`", "`parts`", "`user_text`", "`user_message_id`",
+                   "turn_id", "pending_truncated", "pending_copy_failed",
+                   "args_truncated"):
+        check(needle in notes,
+              f"rpc.json ui/attach notes: `{needle}` must be documented")
+    check("no key was renamed or removed" in notes,
+          "rpc.json ui/attach notes: must state that no key was renamed or removed")
+    # The dedup must be DECLARED, not silent: marker name, the elided shape and
+    # the rebuild fallback all have to be in the contract text.
+    for needle in ("x-vade.dedup", "ELIDED", "text travels ONCE",
+                   "text:content", "1.7.0"):
+        check(needle in notes,
+              f"rpc.json ui/attach notes: `{needle}` must be documented (an elided "
+              f"field without a declared marker/fallback is a silent shape change)")
+    check("dropped FIRST" in notes,
+          "rpc.json ui/attach notes: must document that the recoverable `tasks` "
+          "block is dropped before conversation rows")
+
+    models = (CORE / "session" / "models.py").read_text(encoding="utf-8")
+    check('data.pop("parts", None)' in models and 'data.pop("user_text", None)' in models,
+          "core/vade/session/models.py: `to_snapshot()` must elide text-only `parts` "
+          "and `turns[].user_text` (the text travels once)")
+    manager = (CORE / "session" / "manager.py").read_text(encoding="utf-8")
+    check("SNAPSHOT_DEDUP_PATHS" in manager and "x-vade" in manager,
+          "core/vade/session/manager.py: snapshot() must emit the `x-vade.dedup` "
+          "marker for the elisions the contract documents")
+    check("depth > cls._ARGS_COPY_MAX_DEPTH" in manager,
+          "core/vade/session/manager.py: the args clipper must walk to the SAME depth "
+          "bound as `_bounded_copy` (depth 9-64 rows must be clippable, not dropped)")
 
 
 def main() -> int:
@@ -1779,6 +1850,7 @@ def main() -> int:
     check_ui(config, manifest, rpc)
     check_submit_parts(rpc)
     check_http_endpoints(rpc)
+    check_snapshot_contract(rpc)
 
     methods = {
         "module/register", "module/capabilities.update", "module/heartbeat",

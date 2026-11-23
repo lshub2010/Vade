@@ -2,7 +2,7 @@
 
 > **真相口径**：契约列以 `schema/*.json` 的 `x-vade.appends` 为准，**不以 RFC 正文自述为准**；status 以各 RFC frontmatter 为准（无 frontmatter 的以正文「状态」表为准）；实现落点必须在本仓真实存在（由 `tools/check_ledger.py` 校验）；测试数只引用有出处的数字，没有出处写「未记录/未核实」。
 > 重跑自检：`D:/HermesWorkspace/Vade/Vade/.venv/Scripts/python.exe tools/check_ledger.py`（基于本文件末尾 JSON 事实块 + 三份契约文件 + RFC frontmatter 重算比对）。
-> 快照基线：初版 `tmp/w-ledger` @ `320384a`（2026-11-14）；§1 数字随 `s-rfc0015-register`（→1.6.0）与 `s-blob-impl`（→1.7.0）推进，本页最近一次复算于 `tmp/d2-docs`（基于 `dev_gingshan` @ `be16ebe`，2026-11-17）。发现的口径冲突见本文 §4 与 `docs/rfc/LEDGER-RESULT.md`（后者为 2026-11-14 初版快照，条目沿用原文）。
+> 快照基线：初版 `tmp/w-ledger` @ `320384a`（2026-11-14）；§1 数字随 `s-rfc0015-register`（→1.6.0）、`s-blob-impl`（→1.7.0）；f15 保持 1.7.0（不登记契约变更），本页最近一次复算于 `tmp/f15-contract`（2026-11-22）。发现的口径冲突见本文 §4 与 `docs/rfc/LEDGER-RESULT.md`（后者为 2026-11-14 初版快照，条目沿用原文）。
 
 ## 1. 契约真实状态（脚本重算，非引用）
 
@@ -12,12 +12,13 @@
 | C-05 方法数 | ui_to_core **36** / core_to_module **7** / module_to_core **6**，三方向合计 **49** | 同上 |
 | RFC-0015 append 块 | `x-vade.appends` 第 **11** 块（C-05 **1.6.0**，`adds=["ui/modules"]`，`rewrites: none`）。原先的 `x-vade.rfc0015_pending` 占位块已在本棒（`s-rfc0015-register`）转正后删除 | `schema/rpc.json` |
 | RFC-0016 append 块 | `x-vade.appends` 第 **12** 块（C-05 **1.7.0**，`adds=["ui/blob.token"]`，`rewrites: none`）；顶部 version 同批 1.6.0 → 1.7.0，`http_endpoints.auth.device` 注记改为点名铸造方法 | `schema/rpc.json` |
+| f15 bounded snapshot | **无 append 块**：C-05 顶部保持 **1.7.0**、不升版、不删声明字段；正文只传一份——text-only 行的 `parts` 与每个 turn 的 `user_text` 不上 wire，由快照级 `x-vade.dedup`（`{version, elided[], fallback{}}`）显式声明并给回退链（`parts` → `content`；`user_text` → `user_message_id`/`messages[].turn_id`）；`check_ledger` 重算 `appends_rpc=12` | `schema/rpc.json`、`core/vade/session/manager.py` |
 | RFC-0007 events 块 | `x-vade.appends` 第 **9** 块（C-06 **1.1.0**，`adds=["task.started","task.status","task.progress","task.finished"]`，`rewrites: none`）。**补登记**：四个事件与顶层 `task_states` 自 `404c3f3` 起就在 events.json，但当时 `appends` 还是字符串形态、没有任何块；原 `x-vade.append_rfc0007` 兄弟键保留作史料，块版本与 rpc.json 侧 1.1.0 对齐 | `schema/events.json` |
 | C-06 events.json 顶部 version | **2.0.0** | `schema/events.json` |
 | C-06 事件数 | **34**（含 `turn.state` 枚举条目；不含则 33） | 同上 |
 | C-04 错误码 | **34** | `schema/errors.json` |
 | append 登记块 | rpc.json **12** 块 / events.json **9** 块 / manifest.schema.json **3** 块，合计 **24** | 三文件 `x-vade.appends` |
-| 服务端测试 | **1203 passed**（`pytest core/tests -q`，worktree `s-blob-impl`，基线 `7941b93`：1165 + 本棒 38 = 32 `test_rpc_token.py` + 5 `test_revoke_purges_tokens.py` + 1 `test_blob_token_ws.py`；`1203 passed, 9 warnings in 526.67s`）。**当前 HEAD `be16ebe` 只做收集计数**：`pytest core/tests -q --collect-only` → 1383 tests collected（`tmp/d2-docs`，2026-11-17），全量未复跑，故本行不给 HEAD 的 passed 数。历史：**1164 passed**（`shots/s-modules-impl/RESULT.md`、`shots/s-rfc0015-register/RESULT.md`，其中 s-rfc0015 基线实跑口径 **1165**，见该报告 §8）；**1089 passed**（2026-11-14 在 `dev_gingshan` 合入 RFC-0003 Q5 后复跑）。本总账初版记录的 **1065** 是 RFC-0014 落地时、RFC-0003 Q5 未合时的数（出处 `core/vade/session/RESULT-rfc0014.md`） | 本人复跑（1203 除外，出处见左） |
+| 服务端测试 | **1557 passed**（`tmp/f15-contract`，2026-11-22：`PYTHONPATH=core:protocol/core/python pytest core/tests -q` → `1557 passed, 14 warnings in 481.82s (0:08:01)`；按「Rust 大构建禁本地」复用同源预编译 `libvade_protocol.so`，未跑 `cargo build`）。历史：**1203 passed**（`pytest core/tests -q`，worktree `s-blob-impl`，基线 `7941b93`：1165 + 本棒 38 = 32 `test_rpc_token.py` + 5 `test_revoke_purges_tokens.py` + 1 `test_blob_token_ws.py`；`1203 passed, 9 warnings in 526.67s`）。**旧 HEAD `be16ebe` 只做收集计数**：`pytest core/tests -q --collect-only` → 1383 tests collected（`tmp/d2-docs`，2026-11-17）。历史：**1164 passed**（`shots/s-modules-impl/RESULT.md`、`shots/s-rfc0015-register/RESULT.md`，其中 s-rfc0015 基线实跑口径 **1165**，见该报告 §8）；**1089 passed**（2026-11-14 在 `dev_gingshan` 合入 RFC-0003 Q5 后复跑）。本总账初版记录的 **1065** 是 RFC-0014 落地时、RFC-0003 Q5 未合时的数（出处 `core/vade/session/RESULT-rfc0014.md`） | 本人复跑（1203/1383 除外，出处见左） |
 | 契约门禁 | `tools/check_contracts.py` exit 0（`contracts: OK …RFC-0014 session search green, RFC-0016 blob token green…`） | 本人复跑 |
 | docs 门禁 | `docs/check_docs.py` exit 0（12 项，失败 0 项） | 本人复跑 |
 
@@ -85,8 +86,8 @@
 ## 4. 本表已知的口径冲突（详单与证据见 `docs/rfc/LEDGER-RESULT.md`）
 
 1. **RFC-0003～0009 frontmatter `stage` 过时口径已收口**（保留为历史条目）：七份 RFC 曾自称「草稿，未实现」，与 status.md「已合并」及契约登记矛盾。`s-hygiene`（`a9c7dcc`）只改 frontmatter `stage:` 为「已实现并合并」（正文零改动，diff 可验），`docs/rfc/README.md` 七行状态列同批改为「approved（已实现并合并）」；本表各行的「stage 已过时」注记随之改为「已回填」。详见 `docs/rfc/HYGIENE-RESULT.md` §1-4。
-2. 「35 方法」口径：三方向合计 **49**；**36** 才是 ui_to_core 方向数（36 方法 / 34 错误码 / 34 事件三个数撞在一起，口头汇报必错）。`ui/modules`（RFC-0015）自 `s-rfc0015-register` 起**既在** `directions` 里、**也在** `x-vade.appends` 里（第 11 块，C-05 1.6.0，`adds=["ui/modules"]`）；`ui/blob.token`（RFC-0016）在第 12 块（C-05 1.7.0）。
-3. 「events.json 10 条 appends」口径：events.json 实为 **9** 块；**12** 是 rpc.json 的块数（RFC-0016 登记后）；三文件合计 **24** 块。
+2. 「35 方法」口径：三方向合计 **49**；**36** 才是 ui_to_core 方向数（36 方法 / 34 错误码 / 34 事件三个数撞在一起，口头汇报必错）。`ui/modules`（RFC-0015）自 `s-rfc0015-register` 起**既在** `directions` 里、**也在** `x-vade.appends` 里（第 11 块，C-05 1.6.0，`adds=["ui/modules"]`）；`ui/blob.token`（RFC-0016）在第 12 块（C-05 1.7.0）；f15 不登记契约变更：保持 1.7.0，声明字段一个不删；快照正文只传一份，两个派生字段由 `x-vade.dedup` 声明并按回退链重建（无 RFC 不得删冻结字段，也不得悄悄改变形状）。
+3. 「events.json 10 条 appends」口径：events.json 实为 **9** 块；**12** 是 rpc.json 的块数（f15 不登记块）；三文件合计 **24** 块。
 4. append 块级版本 ≠ 契约顶部版本（RFC-0013 块级 1.2.0 / 顶部 1.3.0→1.7.0 共存），引用版本号必须说明是哪一层。
 5. **RFC-0007 的 events 登记缺口已收口**（保留为历史条目）：四个 `task.*` 事件与顶层 `task_states` 自 `404c3f3` 起就在 events.json，但当时 `appends` 还是字符串形态（events.json 顶部 version 仍 **1.0.0**），所以一直没有登记块——append-per-minor 纪律的缺口。`a2-ledger` 补 `x-vade.appends` 第 **9** 块（C-06 **1.1.0**，`adds` = 四事件，`rewrites: none`，块版本与 rpc.json 侧 1.1.0 对齐），并在 `tools/check_contracts.py` 的 `check_task_events` 追加该块断言（缺块 / 版本不是 1.1.0 / `adds` 不是那四个 / `rewrites` 不是 `none` 全部红）；原 `x-vade.append_rfc0007` 兄弟键**保留**作史料。
 6. **601 vs 607 差异已查实**（保留为历史条目）：601 = 分支 `tmp/rfc0007` 顶端 `404c3f3` 的全量（基线 `94f5995`=549 + 本批 52）；607 = 合并点 `67c5c49` 的全量（分叉后 dev 侧经 `32eb6c4` 设备身份接线新增 6 条，549→555，555+52=607）。四点 `pytest --collect-only` 实测（549 / 601 / 555 / 607）见 `docs/rfc/HYGIENE-RESULT.md` §1-3 与 `docs/status.md` rfc0007 行尾备注——非测试增删，两个数字都对，与 rfc0005/rfc0006 同为「分支时 vs 合并后全量」口径。

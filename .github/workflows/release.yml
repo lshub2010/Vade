@@ -148,7 +148,16 @@ jobs:
           path: dist
       - name: Flatten and checksum
         run: |
-          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          # Module artifacts each call their manifest `manifest.json`; prefix it
+          # with the module name so the combined release can hold all five.
+          find dist -mindepth 2 -type f | while IFS= read -r f; do
+            parent="$(basename "$(dirname "$f")")"
+            base="$(basename "$f")"
+            if [ "$base" = "manifest.json" ]; then
+              base="${parent#module-}-manifest.json"
+            fi
+            mv "$f" "dist/$base"
+          done
           find dist -mindepth 1 -type d -empty -delete
           cd dist
           find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum > SHA256SUMS

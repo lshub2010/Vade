@@ -94,6 +94,33 @@ ATTACH_REPLAY_RESERVE = 8
 #: and the whole reply is replaced by PAYLOAD_TOO_LARGE when it does not.
 SNAPSHOT_ENVELOPE_RESERVE = 2048
 
+#: f15: the snapshot's text travels ONCE. `Message.to_snapshot` elides a
+#: text-only `parts` list (`content` is its exact projection) and
+#: `Turn.to_snapshot` elides `user_text` (it is the `content` of the turn's
+#: user row). C-05 1.7.0 still DECLARES both fields — no RFC-less version bump
+#: and no append block — but a reader must be told the row arrived in the
+#: elided form, so every snapshot carries this marker verbatim. Additive and
+#: always present, like the bounding counters: the shape never changes only
+#: because a session happens to be small.
+SNAPSHOT_DEDUP_PATHS: tuple[str, ...] = ("messages[].parts:text-only", "turns[].user_text")
+
+
+def _dedup_marker() -> dict[str, Any]:
+    """The `x-vade.dedup` block: what was elided and how to rebuild it."""
+    return {
+        "dedup": {
+            "version": 1,
+            "elided": list(SNAPSHOT_DEDUP_PATHS),
+            # Machine-readable fallback chain; the same text is in the
+            # `ui/attach` notes (C-05) and `docs/agents/22-C3-session-loop.md`.
+            "fallback": {
+                "messages[].parts": "content",
+                "turns[].user_text": "user_message_id -> messages[].id; "
+                                     "messages[].turn_id == turn.id when NULL",
+            },
+        },
+    }
+
 
 class _ArgsTooComplex(Exception):
     """A pending approval's `args` exceeded the bounded-copy limits.
@@ -993,10 +1020,15 @@ class SessionLog:
         `ui/attach` is the only channel that returns history (C-05 has no
         paged-history method), so a snapshot that cannot fit the 65 519-byte
         frame cap makes the session permanently unopenable — not slow, not
-        truncated, unopenable. Three things keep it honest:
+        truncated, unopenable. Four things keep it honest:
 
-        * the text travels once (`Message.to_snapshot` / `Turn.to_snapshot`),
-          instead of `content` + `parts[].text` + `turns[].user_text`;
+        * the text travels once: `Message.to_snapshot` elides a text-only
+          `parts` list (its exact projection is `content`) and
+          `Turn.to_snapshot` elides `user_text` (it is the `content` of the
+          turn's user row). Both elisions are DECLARED on the wire in
+          `x-vade.dedup` with the rebuild fallback, so nothing is silently
+          absent — C-05 1.7.0 still declares both fields, and this is an
+          encoding of the snapshot, not a field removal or a version bump;
         * when that is still too much, the OLDEST rows are dropped and the
           caller is told (`truncated`/`omitted`/`truncated_before_seq`);
         * a single row bigger than the whole budget is clipped, never refused
@@ -1063,6 +1095,11 @@ class SessionLog:
         )
         snapshot: dict[str, Any] = {
             "from_seq": self.store.last_seq(session_id),
+            # f15: `messages[].parts` (text-only rows) and `turns[].user_text`
+            # are elided by `to_snapshot()` — the text travels once. The
+            # marker is additive, always present and machine-readable so no
+            # client has to infer the elided shape from a missing key.
+            "x-vade": _dedup_marker(),
             "session": {
                 "id": session.id,
                 "created_at": session.created_at,
@@ -1222,11 +1259,14 @@ class SessionLog:
         return snapshot
 
     #: Bounds for detaching a pending approval's `args` from the port. The
-    #: clipper never looks deeper than 8, so 64 is generous for real requests
-    #: while staying far below both the recursive-copy and JSON limits; the
-    #: node/char budgets stop a legal-looking but enormous Mapping. A value
-    #: past the bound is NOT dropped: the row is kept whole and counted, and
-    #: `protected_args` keeps the clipper from mutating the live request.
+    #: clipper walks to the SAME depth (see `_longest_arg_text`), so every row
+    #: that was copied successfully is reachable by `_clip_one_text`: a legal
+    #: request at depth 9–64 used to be copied (hence not `protected`) and then
+    #: unreachable to the clipper, and step ④ dropped the whole dialog
+    #: (f15 review P1-3). The node/char budgets stop a legal-looking but
+    #: enormous Mapping. A value past a bound is NOT dropped by the copy: the
+    #: row is kept whole and counted, and `protected_args` keeps the clipper
+    #: from mutating the live request.
     _ARGS_COPY_MAX_DEPTH = 64
     _ARGS_COPY_MAX_NODES = 50_000
     _ARGS_COPY_MAX_CHARS = 4_000_000
@@ -1353,11 +1393,17 @@ class SessionLog:
         `pending_approvals[].args` is an arbitrary tool-argument Mapping, not a
         flat string field: one legal 32 000-character `fs__write_file.content`
         used to be invisible to the clipper, blow the frame, and take the whole
-        approval with it in step ④. Depth is bounded so bounding a pathological
-        value cannot become its own stack overflow; past the bound the block is
-        still counted by `_drop_pending`.
+        approval with it in step ④.
+
+        The walk uses the SAME depth bound as `_bounded_copy`. Alignment is the
+        contract: a row whose `args` was detached successfully is by
+        construction within `_ARGS_COPY_MAX_DEPTH`, so every clippable row is
+        reachable. A fixed depth of 8 was NOT aligned — a depth-9 `args` was
+        copied (so not `protected_args`) and still unreachable, and ④ dropped
+        the dialog (f15 review P1-3). Rows the copy could not detach are
+        `protected_args` and skipped by the caller anyway.
         """
-        if depth > 8:
+        if depth > cls._ARGS_COPY_MAX_DEPTH:
             return None
         if isinstance(value, str):
             return path, value

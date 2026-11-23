@@ -215,16 +215,27 @@ class Message:
         }
 
     def to_snapshot(self) -> dict[str, Any]:
-        """`ui/attach` shape: the full C-05 row, text fields included.
+        """`ui/attach` shape: the C-05 row with the derived text sent ONCE.
 
-        C-05 1.7.0 is frozen and the snapshot's wire shape is part of it: a
-        client may read `content`, `parts[].text` or (on a turn) `user_text`.
-        Dropping the derived copies was a wire-shape change that no RFC owned,
-        so the snapshot keeps all three. Bounding still fits one frame — it
-        drops the oldest rows and clips a single oversized row — it just does
-        not get to redefine a frozen field set (f15 review P1-2).
+        `to_dict()` writes both `content` and the text part it projects — the
+        same characters twice — and one frame is capped at 65 519 bytes, so a
+        session with ~7 100 CJK characters of user text could never be
+        attached again (the row was dropped, taking the user bubble with it).
+
+        A text-only `parts` list is exactly `content` (`__post_init__` derives
+        `content` from `parts`, and `wire_parts()` re-synthesises the single
+        text part of a legacy row), so it is elided here. Nothing becomes
+        unreachable: the snapshot declares the elision in `x-vade.dedup`
+        (`manager.snapshot`) and the fallback is "rebuild `[{type:'text',
+        text:content}]` when `parts` is absent" — which is what the shipped
+        client already does. A message with an image/file part keeps `parts`
+        (and its `content` projection) so part ORDER survives.
         """
-        return self.to_dict()
+        data = self.to_dict()
+        parts = data["parts"]
+        if not parts or all(part.get("type") == "text" for part in parts):
+            data.pop("parts", None)
+        return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,16 +306,20 @@ class Turn:
         }
 
     def to_snapshot(self) -> dict[str, Any]:
-        """`ui/attach` shape: same fields as `to_dict()`, `user_text` included.
+        """`ui/attach` shape: `user_text` is elided — it is a projection.
 
-        C-05 1.7.0 is frozen: `turns[].user_text` is a field clients read, and
-        removing it without an RFC was not a legal change. It stays. A client
-        that resolves the turn's user message by id still has to handle legacy
-        turns whose `user_message_id` is NULL (the column postdates RFC-0006):
-        the fallback is `messages[].turn_id == turn.id`, documented in the
-        `ui/attach` notes.
+        `user_text` is the text of the turn's user message (`user_message_id`),
+        and `snapshot.messages[]` already carries that row — the third copy of
+        the same bytes. C-05 1.7.0 keeps the FIELD declared; the snapshot
+        elides it and says so in `x-vade.dedup`, with the documented fallback:
+        `user_message_id` -> `messages[].id`, and for legacy turns whose
+        `user_message_id` is NULL (the column postdates RFC-0006)
+        `messages[].turn_id == turn.id`. The value stays on `to_dict()` for
+        in-process callers.
         """
-        return self.to_dict()
+        data = self.to_dict()
+        data.pop("user_text", None)
+        return data
 
 
 @dataclass(frozen=True, slots=True)

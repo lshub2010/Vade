@@ -15,6 +15,11 @@ caller believes it has the whole session and the server silently says less:
         streamed lived only in `turn.delta` events, and `turn.completed`
         carries no body — that answer stayed half-rendered forever.
 
+f15 fix3: the retry that kept all three copies (legal under C-05) paid with
+the user row at ~7 100 CJK; the snapshot now sends the text once and declares
+the elision in `x-vade.dedup`, so the fields stay in the contract and the row
+stays in the tree.
+
 Every test drives the real `SessionLog` + real `SQLiteStore`; the size checks
 use `Connection._encode_json`, the same encoder `_send_result` measures with.
 """
@@ -342,14 +347,15 @@ def test_two_text_parts_plus_an_image_do_not_spin_the_clipper(tmp_path):
     asyncio.run(scenario())
 
 
-def test_the_snapshot_keeps_parts_and_user_text(tmp_path):
-    """C-05 1.7.0 is frozen: no wire field is dropped from a snapshot.
+def test_the_snapshot_sends_the_text_once(tmp_path):
+    """The snapshot is deduped, and the elision is DECLARED on the wire.
 
-    An earlier f15 revision removed text-only `parts` and `turns[].user_text`
-    from `ui/attach` and called the removal an append; no RFC owned it. The
-    snapshot keeps the full row, and the legacy fallback for turns is still
-    part of the contract: `user_message_id` -> `messages[]`, and when that
-    column is NULL (rows written before RFC-0006) `messages[].turn_id`.
+    C-05 1.7.0 keeps `content`, `parts` and `user_text` declared, but sending
+    all three cost a whole frame: a ~7 100-CJK user turn lost its own message
+    row (f15 fix2 review P1-1). The snapshot sends the text once — text-only
+    `parts` and `turns[].user_text` are elided — and `x-vade.dedup` names
+    exactly what is gone plus how to rebuild it, so no client has to infer the
+    shape from a missing key. A row with an image part keeps `parts`.
     """
     async def scenario():
         log = _log(tmp_path)
@@ -360,14 +366,61 @@ def test_the_snapshot_keeps_parts_and_user_text(tmp_path):
         snapshot = log.snapshot(session.id)
         user = next(m for m in snapshot["messages"] if m["role"] == "user")
         assert user["content"] == "hello"
-        assert user["parts"] == [{"type": "text", "text": "hello"}]
+        assert "parts" not in user, "text-only parts are the projection of content"
         [turn] = snapshot["turns"]
-        assert turn["user_text"] == "hello"
-        # The fallback chain clients rely on: the turn's user row is findable
-        # by id, and also by `turn_id` when `user_message_id` is NULL.
+        assert "user_text" not in turn, "user_text is the projection of messages[]"
+        # The declared fallback still resolves the user row both ways.
         assert user["id"] == turn["user_message_id"] or turn["user_message_id"] is None
         assert next(m for m in snapshot["messages"]
                     if m.get("turn_id") == turn["id"])["content"] == "hello"
+        # The marker is additive, always present, and names both elisions.
+        dedup = snapshot["x-vade"]["dedup"]
+        assert dedup["version"] == 1
+        assert dedup["elided"] == ["messages[].parts:text-only", "turns[].user_text"]
+        assert dedup["fallback"]["messages[].parts"] == "content"
+        assert "turn_id" in dedup["fallback"]["turns[].user_text"]
+        # In-process shapes keep the fields: the elision is snapshot-only.
+        stored = log.store.load(session.id)
+        assert stored.messages[0].to_dict()["parts"] == [{"type": "text", "text": "hello"}]
+        assert stored.turns[0].to_dict()["user_text"] == "hello"
+        # A row with an image part keeps its ordered `parts` (order is data).
+        mixed = Message(
+            id="m-img", session_id=session.id, role="user", content="hi",
+            parts=({"type": "text", "text": "hi"},
+                   {"type": "image", "file_id": "f1", "mime": "image/png"}),
+        )
+        assert [p["type"] for p in mixed.to_snapshot()["parts"]] == ["text", "image"]
+        await log.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_7100_cjk_user_turn_keeps_its_message_row(tmp_path):
+    """The row that used to be lost was the user's own text.
+
+    De-duplicated text is not a micro-optimisation: `content` + `parts[].text`
+    + `turns[].user_text` made a 7 100-CJK turn ~64 KB on its own, the reply
+    went over the frame, and step ① dropped the USER message (`omitted=1`) —
+    the tree lost its bubble and only `turns[].user_text` still had the words.
+    With the text sent once the same session fits whole.
+    """
+    async def scenario():
+        log = _log(tmp_path)
+        session = log.create_session()
+        text = "汉" * 7_100
+        await log.submit(session.id, [{"type": "text", "text": text}], "c1")
+        await log.wait_idle(session.id)
+
+        snapshot = log.snapshot(session.id)
+        assert snapshot["omitted"] == 0, "the user row must survive"
+        assert snapshot["omitted_turns"] == 0
+        assert snapshot["truncated"] is False
+        assert snapshot["content_truncated"] is False
+        user = next(m for m in snapshot["messages"] if m["role"] == "user")
+        assert user["content"] == text, "the whole 7 100-CJK body is still there"
+        assert _reply_size(session.id, {
+            "from_seq": snapshot["from_seq"], "snapshot": snapshot,
+        }, reply_id="a" * 36) <= MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE
         await log.close()
 
     asyncio.run(scenario())
@@ -663,6 +716,59 @@ def test_a_deeply_nested_approval_is_kept_and_counted_not_cleared(tmp_path):
     asyncio.run(scenario())
 
 
+def test_a_depth_9_argument_is_clipped_not_dropped(tmp_path):
+    """Depth 9-64 is LEGAL: the copy accepts it, so the clipper must reach it.
+
+    `_bounded_copy` allows 64 levels while `_longest_arg_text` used to stop at
+    8. A depth-9 `args` was therefore copied (so it was NOT in
+    `protected_args` — nobody protected it) and still invisible to
+    `_clip_one_text`; step ④ then dropped the whole dialog. 21 500 CJK
+    characters (~64.5 KB) fit the frame after ONE halving. The two bounds are
+    now the same constant, so a legal nested request is clipped
+    (`args_truncated`) instead of costing the dialog.
+    """
+    async def scenario():
+        log = _log(tmp_path)
+        session = log.create_session()
+        manager = ApprovalManager(timeout_s=30.0, engine=PolicyEngine(), audit=None)
+        log.approval_port = PolicyAdapter(manager)
+        huge = "字" * 21_500
+        pending = await _open_approval(
+            manager, session.id, "turn-nested",
+            {"file": {"path": "/tmp/nested.txt", "content": _deep_value(9, huge)}})
+
+        snapshot = log.snapshot(session.id)
+
+        rows = snapshot["pending_approvals"]
+        assert len(rows) == 1, "clippable, so never dropped"
+        row = rows[0]
+        assert row["request_id"] == pending.request_id
+        depth, leaf = 0, row["args"]["file"]["content"]
+        while isinstance(leaf, dict):
+            leaf = leaf["n"]
+            depth += 1
+        assert depth == 9
+        assert len(leaf) < len(huge), "the clipper reached the depth-9 leaf"
+        assert leaf == huge[:len(leaf)]
+        assert row["args_truncated"] is True
+        assert row["args_omitted_chars"] == len(huge) - len(leaf)
+        assert snapshot["pending_copy_failed"] == 0
+        assert snapshot["omitted_approvals"] == 0
+        assert snapshot["pending_truncated"] is False
+        assert _reply_size(session.id, {
+            "from_seq": snapshot["from_seq"], "snapshot": snapshot,
+        }, reply_id="a" * 36) <= MAX_REPLY_BYTES - SNAPSHOT_ENVELOPE_RESERVE
+        # The approval port still holds the full, unclipped request.
+        live = {r["request_id"]: r for r in manager.pending_requests()}
+        live_leaf = live[pending.request_id]["args"]["file"]["content"]
+        while isinstance(live_leaf, dict):
+            live_leaf = live_leaf["n"]
+        assert live_leaf == huge
+        await log.close()
+
+    asyncio.run(scenario())
+
+
 def test_a_huge_task_list_does_not_eat_the_conversation(tmp_path):
     """P1-1: tasks go before MESSAGES, not just before pending dialogs.
 
@@ -867,14 +973,16 @@ def test_rpc_json_keeps_the_snapshot_contract_compliant():
     """C-05 1.7.0: f15 adds no method, removes no field, registers no append.
 
     The rejected revision bumped the frozen contract to 1.8.0 with `adds=[]`
-    and a free-text "removal" that no RFC owned. The wire now keeps `parts`
-    and `user_text`; the bounding keys are additive notes; `check_contracts`
-    enforces the same facts.
+    and a free-text "removal" that no RFC owned; the fix2 retry then kept the
+    full three-copy row and lost the user message at 7 100 CJK. The legal
+    combination is: the CONTRACT keeps every field, the SNAPSHOT sends the
+    text once, and `x-vade.dedup` declares the elision + the rebuild fallback.
+    `check_contracts` enforces the same facts.
     """
     from pathlib import Path
 
-    rpc = json.loads(
-        (Path(__file__).resolve().parents[3] / "schema" / "rpc.json").read_text(encoding="utf-8"))
+    root = Path(__file__).resolve().parents[3]
+    rpc = json.loads((root / "schema" / "rpc.json").read_text(encoding="utf-8"))
     assert rpc["version"] == "1.7.0"
     assert not [
         block for block in rpc["x-vade"]["appends"]
@@ -882,12 +990,22 @@ def test_rpc_json_keeps_the_snapshot_contract_compliant():
     ], "f15 must not register a non-RFC append block"
 
     notes = rpc["directions"]["ui_to_core"]["ui/attach"]["notes"]
-    for needle in ("`content`", "`parts`", "`user_text`", "`user_message_id`", "turn_id"):
+    for needle in ("`content`", "`parts`", "`user_text`", "`user_message_id`",
+                   "turn_id", "x-vade.dedup", "ELIDED", "text travels ONCE",
+                   "text:content", "1.7.0"):
         assert needle in notes, f"ui/attach notes do not document {needle}"
     assert "no key was renamed or removed" in notes
-    assert "no longer sent" not in notes and "omits `user_text`" not in notes
     for key in ("pending_truncated", "omitted_approvals", "omitted_inputs",
                 "omitted_tasks", "args_truncated", "pending_copy_failed",
                 "running_partial", "content_truncated"):
         assert key in notes, f"ui/attach notes do not document {key}"
     assert "dropped FIRST" in notes
+
+    # Wiring pins: the notes describe a marker the code must actually emit,
+    # and the two depth bounds must be the same constant.
+    models = (root / "core" / "vade" / "session" / "models.py").read_text(encoding="utf-8")
+    assert 'data.pop("parts", None)' in models
+    assert 'data.pop("user_text", None)' in models
+    manager = (root / "core" / "vade" / "session" / "manager.py").read_text(encoding="utf-8")
+    assert "SNAPSHOT_DEDUP_PATHS" in manager and '"x-vade": _dedup_marker()' in manager
+    assert "depth > cls._ARGS_COPY_MAX_DEPTH" in manager

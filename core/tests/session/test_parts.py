@@ -846,20 +846,22 @@ def test_legacy_to_llm_payload_is_byte_identical(tmp_path):
     store.close()
 
 
-def test_legacy_row_appears_in_the_snapshot_with_a_synthetic_part(tmp_path):
-    """A pre-parts row is readable from `content` AND from a synthetic part.
+def test_legacy_row_is_readable_from_content_in_the_snapshot(tmp_path):
+    """A pre-parts row reaches clients through `content`; the text travels once.
 
-    C-05 1.7.0 keeps `parts` on every message: a client that renders only
-    `parts` must still see the legacy row. `Message.to_snapshot` therefore
-    keeps the single `text` part synthesised from `content` (nothing is
-    rewritten on disk), instead of removing it.
+    C-05 1.7.0 keeps `parts` declared, but the snapshot sends the text once:
+    a text-only row (including the synthetic part of a legacy row) carries
+    `content` only, and `x-vade.dedup` names the fallback
+    (`[{type:'text',text:content}]`). Nothing is rewritten on disk —
+    `wire_parts()` still synthesises the part in-process.
     """
     path = tmp_path / "sessions.db"
     _legacy_db(path)
     log = SessionLog(SQLiteStore(path), replay=ReplayBuffer())
     snapshot = log.snapshot(SESSION)
     assert snapshot["messages"][0]["content"] == "旧消息 hello"
-    assert snapshot["messages"][0]["parts"] == [{"type": "text", "text": "旧消息 hello"}]
+    assert "parts" not in snapshot["messages"][0]
+    assert snapshot["x-vade"]["dedup"]["fallback"]["messages[].parts"] == "content"
     assert log.store.load(SESSION).messages[0].wire_parts() == [
         {"type": "text", "text": "旧消息 hello"}]
     log.store.close()

@@ -1727,15 +1727,25 @@ def check_snapshot_contract(rpc: dict) -> None:
 
     The first attempt registered a 1.8.0 append block that no RFC owned and
     that deleted two frozen wire fields (`messages[].parts`,
-    `turns[].user_text`). The review rejected it; this gate keeps the retry
-    honest:
+    `turns[].user_text`). The review rejected it. The second attempt kept the
+    fields but sent the same text three times, so a 7 100-CJK session lost its
+    user row. The rule that satisfies both is: the CONTRACT keeps every field,
+    the SNAPSHOT sends the text once, and the elision is declared on the wire.
+    This gate keeps that honest:
+
       1. the top-level version is still 1.7.0 and there is NO f15 append block;
-      2. `ui/attach` notes still declare `content` AND `parts` on every message
-         and `user_text` on every turn (no field was removed);
-      3. the legacy-turn fallback (`user_message_id` NULL ->
-         `messages[].turn_id`) is spelled out;
+      2. `ui/attach` notes declare `content`, `parts`, `user_text` and the
+         legacy-turn fallback (`user_message_id` NULL -> `messages[].turn_id`);
+      3. the notes document the `x-vade.dedup` marker — what is elided and the
+         rebuild fallback — and still say no key was renamed or removed;
       4. the bounding keys are documented as additive, including
          `pending_copy_failed` (a dialog kept whole, never silently lost).
+
+    Behavioural evidence lives in `core/tests/session/test_attach_bounds.py`
+    (a real `SessionLog` snapshot must omit text-only `parts`/`user_text`, carry
+    the marker, and keep a 7 000-CJK user row). The source pins below are only
+    wiring: a schema/gate that describes a marker the code never emits is the
+    "test green, feature dead" failure this repo keeps re-learning.
     """
     check(rpc.get("version") == "1.7.0",
           f"rpc.json: version must stay 1.7.0 (f15 removes no field and adds no "
@@ -1755,12 +1765,28 @@ def check_snapshot_contract(rpc: dict) -> None:
               f"rpc.json ui/attach notes: `{needle}` must be documented")
     check("no key was renamed or removed" in notes,
           "rpc.json ui/attach notes: must state that no key was renamed or removed")
-    check("no longer sent" not in notes and "omits `user_text`" not in notes,
-          "rpc.json ui/attach notes: still claims a field is no longer sent "
-          "(C-05 1.7.0 keeps `parts` and `user_text`)")
+    # The dedup must be DECLARED, not silent: marker name, the elided shape and
+    # the rebuild fallback all have to be in the contract text.
+    for needle in ("x-vade.dedup", "ELIDED", "text travels ONCE",
+                   "text:content", "1.7.0"):
+        check(needle in notes,
+              f"rpc.json ui/attach notes: `{needle}` must be documented (an elided "
+              f"field without a declared marker/fallback is a silent shape change)")
     check("dropped FIRST" in notes,
           "rpc.json ui/attach notes: must document that the recoverable `tasks` "
           "block is dropped before conversation rows")
+
+    models = (CORE / "session" / "models.py").read_text(encoding="utf-8")
+    check('data.pop("parts", None)' in models and 'data.pop("user_text", None)' in models,
+          "core/vade/session/models.py: `to_snapshot()` must elide text-only `parts` "
+          "and `turns[].user_text` (the text travels once)")
+    manager = (CORE / "session" / "manager.py").read_text(encoding="utf-8")
+    check("SNAPSHOT_DEDUP_PATHS" in manager and "x-vade" in manager,
+          "core/vade/session/manager.py: snapshot() must emit the `x-vade.dedup` "
+          "marker for the elisions the contract documents")
+    check("depth > cls._ARGS_COPY_MAX_DEPTH" in manager,
+          "core/vade/session/manager.py: the args clipper must walk to the SAME depth "
+          "bound as `_bounded_copy` (depth 9-64 rows must be clippable, not dropped)")
 
 
 def main() -> int:

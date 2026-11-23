@@ -98,7 +98,28 @@ UI_SESSIONS_FILE_VERSION = 1
 UI_SESSION_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("POST", "/ui/session"),
     ("DELETE", "/ui/session"),
+    # CORS preflight. A browser page on an allowlisted origin sends
+    # `content-type: application/json` (and the opt-in token header), both of
+    # which trigger a preflight; without an answer `fetch` never issues the
+    # POST and first-run pairing is unreachable from any page not served by
+    # this exact listener. Preflights carry no credentials and are answered
+    # only for an origin the same gate would accept.
+    ("OPTIONS", "/ui/session"),
 })
+
+#: Opt-in request header for the browser token channel. The value is `1`.
+#:
+#: Why opt-in: `session_token` is the same secret as `__Host-ac_ui`, and the
+#: cookie is `HttpOnly` on purpose — handing the value to page JavaScript
+#: removes that protection for the page's whole lifetime (an XSS can then
+#: exfiltrate a credential that outlives the tab). A client that can read
+#: `Set-Cookie` must not get it; only a browser that explicitly says it cannot
+#: (wasm) and is on an allowlisted Origin does.
+UI_SESSION_TOKEN_HEADER = "x-vade-session-token"
+
+#: Request headers a `/ui/session` preflight may ask for.
+UI_SESSION_ALLOWED_HEADERS = "content-type, x-vade-session-token, x-vade-csrf"
+
 
 #: Live connections by connection_id. CoreApp registers here by default so
 #: governance hooks (`App._close_connection`) see the same objects.
@@ -576,9 +597,12 @@ class CoreApp:
             if method == "DELETE":
                 await self._ui_unpair(scope, send, headers)
                 return
+            if method == "OPTIONS":
+                await self._ui_session_preflight(send, headers)
+                return
             await self._json(
                 send, 405, {"code": "INVALID_ARGUMENT", "message": "method not allowed"},
-                extra={"Allow": "POST, DELETE"},
+                extra={"Allow": "POST, DELETE, OPTIONS"},
             )
             return
 
@@ -600,7 +624,7 @@ class CoreApp:
 
     async def _ui_session(self, scope: Mapping[str, Any], receive: Callable[[], Awaitable[dict[str, Any]]], send: Callable[[dict[str, Any]], Awaitable[None]], headers: Mapping[str, str]) -> None:
         origin = headers.get("origin")
-        cors = self._cors_headers(origin)
+        cors = self._cors_headers(origin, headers.get("host", ""))
         if origin and cors is None:
             await self._json(send, 403, {"code": "ORIGIN_MISMATCH", "message": "origin not allowed"})
             return
@@ -653,8 +677,52 @@ class CoreApp:
         # in `x-vade-csrf`); it is useless without the session cookie.
         csrf_cookie = f"__Host-ac_csrf={csrf}; Path=/; Secure; SameSite=Lax; Max-Age={max_age}"
         extra = {"Set-Cookie": [cookie, csrf_cookie]}
-        await self._json(send, 200, {"device_id": device_id}, cors, extra)
+        body_out: dict[str, Any] = {"device_id": device_id}
+        # Browser token channel (T5/D8). A wasm page cannot read `Set-Cookie`,
+        # so the only credential it can learn from this response is one this
+        # body carries. Three conditions, all required:
+        #   * the caller opted in by name (`x-vade-session-token: 1`), so a
+        #     curl/JVM/Android client that can read the cookie never gets a
+        #     JS-readable copy of it;
+        #   * an `Origin` was sent — i.e. this is a page, not a native client;
+        #   * that Origin passed the same gate `DELETE` and `/ws` use.
+        # The value is byte-identical to the cookie, so it is the same row and
+        # the same revoke path (`DELETE /ui/session` kills it). It is never
+        # logged: this function has no log statement, and the audit sink only
+        # ever sees `device_id`.
+        if origin and headers.get(UI_SESSION_TOKEN_HEADER, "") == "1":
+            body_out["session_token"] = token
+        await self._json(send, 200, body_out, cors, extra)
         _ = record
+
+    async def _ui_session_preflight(self, send: Callable[[dict[str, Any]], Awaitable[None]], headers: Mapping[str, str]) -> None:
+        """CORS preflight for `POST/DELETE /ui/session`.
+
+        A page on an allowlisted origin cannot even send the mint request
+        without this: `content-type: application/json` and the opt-in token
+        header are both non-simple, so the browser asks first and a 405 here
+        aborts the fetch. The answer is the same allowlist decision the POST
+        makes (`_cors_headers`), returns no body and no credentials, and
+        never reflects a wildcard.
+        """
+        origin = headers.get("origin")
+        if not origin:
+            # Not a browser preflight. Keep the generic method answer so a
+            # probe learns nothing this path did not already say.
+            await self._json(
+                send, 405, {"code": "INVALID_ARGUMENT", "message": "method not allowed"},
+                extra={"Allow": "POST, DELETE, OPTIONS"},
+            )
+            return
+        cors = self._cors_headers(origin, headers.get("host", ""))
+        if cors is None:
+            await self._json(send, 403, {"code": "ORIGIN_MISMATCH", "message": "origin not allowed"})
+            return
+        await self._no_content(send, cors, extra={
+            "Access-Control-Allow-Methods": "POST, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": UI_SESSION_ALLOWED_HEADERS,
+            "Access-Control-Max-Age": "600",
+        })
 
     async def _ui_unpair(self, scope: Mapping[str, Any], send: Callable[[dict[str, Any]], Awaitable[None]], headers: Mapping[str, str]) -> None:
         """`DELETE /ui/session`: revoke exactly the session that presents its cookie.
@@ -676,7 +744,7 @@ class CoreApp:
         is `401` and must not touch any other session.
         """
         origin = headers.get("origin")
-        cors = self._cors_headers(origin)
+        cors = self._cors_headers(origin, headers.get("host", ""))
         if origin and cors is None:
             await self._json(send, 403, {"code": "ORIGIN_MISMATCH", "message": "origin not allowed"})
             return
@@ -759,12 +827,22 @@ class CoreApp:
             return {"Retry-After": str(int(exc.data["retry_after"]))}
         return {}
 
-    def _cors_headers(self, origin: str | None) -> dict[str, str] | None:
+    def _cors_headers(self, origin: str | None, host: str = "") -> dict[str, str] | None:
+        """CORS answer for `origin`, or `None` when the origin is refused.
+
+        Same decision as the `/ws` upgrade (`_origin_allowed`), deliberately:
+        a page that may hold a socket must also be able to mint and revoke the
+        session that socket proves. With no `[server].ui_origins` configured,
+        a page served by this listener (Origin netloc == Host) is accepted —
+        that is the zero-config page-shell deployment, and `_origin_allowed`
+        already treats it as same-origin. A configured allowlist stays
+        exact-match only.
+        """
         if not origin:
             return {}
-        if origin in self._ui_origins:
-            return {"Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true", "Vary": "Origin"}
-        return None
+        if not self._origin_allowed(origin, host):
+            return None
+        return {"Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true", "Vary": "Origin"}
 
     def _client_ip(self, scope: Mapping[str, Any], headers: Mapping[str, str]) -> str | None:
         if self._trust_forwarded_for and "x-forwarded-for" in headers:

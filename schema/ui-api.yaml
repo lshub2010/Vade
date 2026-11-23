@@ -30,6 +30,20 @@ info:
     `{code, message}`，`code` 取自 `schema/errors.json`。
 paths:
   /ui/session:
+    options:
+      tags: [session]
+      summary: CORS preflight（浏览器配对前必经）
+      description: |
+        `content-type: application/json` 与 `x-vade-session-token` 都是非简单头，
+        浏览器会先发 `OPTIONS`。这里用与 `POST`/`DELETE` 完全相同的 origin 闸门回答：
+        允许列表精确匹配；未配置 `[server].ui_origins` 时，Origin 的 netloc 必须等于
+        Host（页面由本 listener 提供）。无 Origin 的预检探测按普通方法错误拒绝。
+        响应无 body、无凭据；`Access-Control-Allow-Headers` 列出
+        `content-type, x-vade-session-token, x-vade-csrf`。
+      responses:
+        "204": {description: 允许（无 body）}
+        "403": {$ref: "#/components/responses/OriginMismatch"}
+        "405": {$ref: "#/components/responses/MethodNotAllowed"}
     post:
       tags: [session]
       summary: 用配对码换浏览器会话 cookie
@@ -37,6 +51,19 @@ paths:
         码必须是一次性 `purpose=browser` 的配对码（`core/vade/identity/pairing.py`）。
         成功返回 `200` 并设置 `__Host-ac_ui`（`Secure; HttpOnly; SameSite=Strict;
         Path=/`，不带 `Domain`）与可被页面读取的 `__Host-ac_csrf`（double-submit 用）。
+
+        ## 浏览器 token 通道（wasm）
+        浏览器 `fetch` 读不到 `Set-Cookie`（forbidden response header）。只想让
+        **页面**拿到这张凭据的客户端在请求里加 `x-vade-session-token: 1`；满足以下
+        三条时响应体额外带 `session_token`（与 cookie 同值、同一 session 行，可用
+        `DELETE /ui/session` 吊销）：
+        1. 请求显式带该头且值为 `1`；
+        2. 请求带 `Origin`（原生客户端不带，它们能读 `Set-Cookie`，不需要这份拷贝）；
+        3. 该 `Origin` 通过同一 origin 闸门。
+
+        这是对 `HttpOnly` 的一次**显式、按请求**的放宽：拿到它的同源脚本可以带走
+        一个活到 30 天的凭据，所以客户端**不得**把它写进 `localStorage`/磁盘，
+        只在进程内存里用到会话结束。
       requestBody:
         required: true
         content:
@@ -67,6 +94,11 @@ paths:
                   device_id:
                     type: string
                     description: 本次会话的标签（ui-…）
+                  session_token:
+                    type: string
+                    description: |
+                      仅当请求带 `x-vade-session-token: 1` 且 Origin 通过闸门时出现。
+                      与 `__Host-ac_ui` 同值；不得落盘/进日志，吊销走 `DELETE /ui/session`。
                 required: [device_id]
                 additionalProperties: false
         "400": {$ref: "#/components/responses/CodeInvalid"}

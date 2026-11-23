@@ -135,6 +135,38 @@ VADE_PAIR_CODE='青松-AAAAAA' \
 ⚠️ **不带这四个变量直接 `gradle :composeApp:run`，你看到的是假数据 + 「未连接 core」横幅。**
 那是**默认的 fixtures 路径**，不代表 core 有问题；要真连接必须带上面的环境变量。
 
+### 浏览器（wasm）首次配对
+
+浏览器 `fetch` 读不到 `Set-Cookie`（它是 forbidden response header），所以 wasm 版走
+**body token 通道**：`KtorTransportFactory` 在 `POST /ui/session` 上带
+`x-vade-session-token: 1`，core 在满足下面三条时把**同一个** `__Host-ac_ui` 放进响应体：
+
+1. 请求显式带 `x-vade-session-token: 1`；
+2. 请求带 `Origin`（原生客户端不带，它们能读 `Set-Cookie`，不需要这份拷贝）；
+3. 该 `Origin` 与本 listener 同源，或在 `[server].ui_origins` 里。
+
+拿到 token 后浏览器仍然用 `__Host-ac_ui` cookie 认证 `/ws`（token 只是让 JS 知道这次
+会话存在）；旧 core 不回 token 时，客户端退回「浏览器托管 cookie」模式 —— 只要**页面与
+core 同源**，cookie 由浏览器自己保存并发送，`/ws` 升级成功即配对成功。
+
+部署方式：
+
+- **推荐：反向代理**把静态站点与 core 放在同一个 scheme/host/port 下。零额外配置：
+  `ui_origins` 留空时，Origin 的 netloc 等于 Host 即放行（与 `/ws` 同一条规则），
+  fetch 的默认 `credentials: same-origin` 也会把 `__Host-ac_ui` 存进浏览器并随
+  `/ws` 升级发送。**本仓的 wasm 构建今天只验证这一种部署。**
+- 页面与 core **同 host 不同端口**（例如 `127.0.0.1:8080` → `127.0.0.1:8443`）属于
+  跨源：`SameSite=Strict` 的 cookie 仍在同一个 site 内可用，但 fetch 默认不发送/保存
+  跨源 cookie，页面壳必须自己用 `credentials: "include"` 发请求（Ktor WASM 引擎需要
+  `engine { configureRequest { credentials = RequestCredentials.INCLUDE } }`，这是
+  页面壳的职责，不在本仓的配对链路里）。core 侧已经就绪：把页面 Origin 加进
+  `[server].ui_origins`，`OPTIONS /ui/session` 会回答预检。
+- **跨站页面（不同 host）不行**：`SameSite=Strict` 的 cookie 不会被带上。那种失败在
+  配对卡上归为「浏览器没能保存这次配对」，不会误报成「码错」—— 码其实已经被消费，
+  需要重新取一个。
+- token 只许留在页面进程内存：`localStorage` / `sessionStorage` 一律不写（等同把 30 天
+  有效的 UI 凭据交给同源的任何脚本）。刷新后浏览器仍带着 cookie，但应用会重新出配对卡。
+
 ### 脚本/手工调接口
 
 等价的手工路径是先换 cookie 再升级 `/ws`：

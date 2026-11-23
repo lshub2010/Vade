@@ -10,7 +10,7 @@
 - 服务端测试：**1557 passed**（f15 worktree `tmp/f15-contract`，2026-11-22：`PYTHONPATH=core:protocol/core/python pytest core/tests -q` → `1557 passed, 14 warnings in 481.82s`；未本机构建 Rust，复用同源预编译 `libvade_protocol.so`）。历史口径：**1203 passed**（`shots/s-blob-impl/RESULT.md`，基线 `7941b93`）；**1383 collected**（旧 HEAD `be16ebe` 仅收集计数）；1165（`s-rfc0015-register`）、1089（2026-11-14）。
 - 契约门禁：`tools/check_contracts.py` → exit 0（含 `RFC-0016 blob token green`；出处 `docs/rfc/LEDGER.md` §1、`shots/s-blob-impl/RESULT.md`）。
 - docs 门禁：`docs/check_docs.py` → exit 0（12 项，失败 0 项；本 worktree 2026-11-22 复跑）。
-- 契约登记全部在案：RFC-0001～0009 各有 `x-vade.appends` 块；RFC-0015 第 **11** 块（C-05 1.6.0）、RFC-0016 第 **12** 块（C-05 1.7.0）；f15 不登记 append 块（保持 C-05 1.7.0，`parts`/`user_text` 保留）；RFC-0007 的 4 个 `task.*` 事件补登记为 events.json 第 **9** 块（C-06 1.1.0，追溯登记，随块保留原 `x-vade.append_rfc0007` 作史料）。
+- 契约登记全部在案：RFC-0001～0009 各有 `x-vade.appends` 块；RFC-0015 第 **11** 块（C-05 1.6.0）、RFC-0016 第 **12** 块（C-05 1.7.0）；f15 不登记 append 块（保持 C-05 1.7.0，声明字段一个不删；快照正文只传一份——text-only `parts` 与 `turns[].user_text` 不上 wire，由 `x-vade.dedup` 声明 + `content`/`messages[]` 回退）；RFC-0007 的 4 个 `task.*` 事件补登记为 events.json 第 **9** 块（C-06 1.1.0，追溯登记，随块保留原 `x-vade.append_rfc0007` 作史料）。
 - RFC-0001～0009：已批准（frontmatter `status: approved`；0001/0002 为正文状态表）且已实现合并；frontmatter `stage` 已由 `s-hygiene`（`a9c7dcc`）回填为「已实现并合并」，`docs/rfc/README.md` 状态列同批同步（见 `docs/rfc/HYGIENE-RESULT.md` §1-4）。
 - RFC-0010 / 0012 / 0013 / 0014 / 0015 / 0016：core 侧已实现（各自 `core/vade/*/RESULT-rfc*.md`；契约块 1.3.0 / 1.4.0 / 1.2.0 / 1.5.0 / 1.6.0 / 1.7.0 均在案）；f15 不登记契约块：保持 1.7.0，snapshot 计数键只写进 `ui/attach.notes`（additive，无字段删除）。
 - RFC-0004 数据面 `/ui/blob` 六路由 + content parts 定型（`core/vade/blob/http.py`、`core/vade/session/parts.py`；RESULT-parts.md 539 passed）。

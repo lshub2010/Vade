@@ -149,6 +149,33 @@ def acceptance_truth(rfc_path: Path) -> tuple[int, int]:
     return len(rows), checked
 
 
+def check_section_one_appends(aggregate: dict) -> None:
+    """The §1 prose row must agree with the recomputed block counts.
+
+    `check_ledger` used to compare only the trailing JSON facts block and the
+    per-RFC rows, so §1 kept a stale "rpc.json 13 块 / 合计 25" through three
+    green runs while §3/§4 said 12/24 (f15 review P1-2). A prose table that no
+    gate reads is exactly where drift survives.
+    """
+    text = LEDGER.read_text(encoding="utf-8")
+    line = next((ln for ln in text.splitlines() if ln.startswith("| append 登记块 |")), None)
+    check(line is not None, "LEDGER.md §1: the `append 登记块` row is missing")
+    if line is None:
+        return
+    seen = re.findall(r"\*\*(\d+)\*\*", line)
+    check(len(seen) == 4, f"LEDGER.md §1 append row must carry four bold counts: {line!r}")
+    if len(seen) != 4:
+        return
+    expected = [
+        aggregate["appends_rpc"],
+        aggregate["appends_events"],
+        aggregate["appends_manifest"],
+        aggregate["appends_rpc"] + aggregate["appends_events"] + aggregate["appends_manifest"],
+    ]
+    check([int(value) for value in seen] == expected,
+          f"LEDGER.md §1 append counts {seen} != contracts {expected}")
+
+
 def main() -> int:
     if not LEDGER.exists():
         print("ledger: FAIL (docs/rfc/LEDGER.md missing)")
@@ -175,6 +202,7 @@ def main() -> int:
           "aggregate: rpc_methods_total != sum(rpc_methods_by_direction) inside the LEDGER itself")
     check(claimed.get("events_total_incl_turn_state") == claimed.get("events_total_excl_turn_state", -99) + 1,
           "aggregate: events_total_incl_turn_state != events_total_excl_turn_state + 1 inside the LEDGER itself")
+    check_section_one_appends(aggregate)
 
     # -- 2/3/4. per-RFC rows --------------------------------------------------
     rfcs_facts = facts.get("rfcs") or {}

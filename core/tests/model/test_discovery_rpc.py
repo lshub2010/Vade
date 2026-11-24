@@ -250,3 +250,38 @@ def test_discover_is_registered_and_read_only_viewers_may_refresh(tmp_path, monk
     assert isinstance(result, dict)
     assert result["cached"] is False
     assert upstream.calls == 1
+
+
+def test_discovery_never_changes_the_configured_default(tmp_path, monkeypatch):
+    """Refreshing the list is a read; it must not silently re-route turns.
+
+    With equal priority the resolver's last tie-breaker is lexical id, so an
+    upstream id like `claude-*` would win over the configured `gpt-*`.
+    """
+    upstream = FakeUpstream(["claude-3-haiku", "gpt-4o-mini", "zzz-70b"])
+    _patch_upstream(monkeypatch, upstream)
+    _, rpc, resolver = _rpc(tmp_path, _builtin_cfg())
+
+    before = resolver.resolve(None).model_id
+    assert before == "builtin/gpt-4o-mini"
+
+    result = _discover(rpc, FakeConnection())
+
+    assert result["revision"] > 0
+    assert resolver.resolve(None).model_id == before
+
+
+def test_failed_refresh_arms_the_cooldown(tmp_path, monkeypatch):
+    upstream = FakeUpstream([], error=RuntimeError("503 Service Unavailable"))
+    _patch_upstream(monkeypatch, upstream)
+    _, rpc, _ = _rpc(tmp_path, _builtin_cfg())
+
+    first = _discover(rpc, FakeConnection())
+    assert isinstance(first, RpcError)
+    assert upstream.calls == 1
+
+    # A second click inside the cooldown must not hit the upstream again.
+    second = _discover(rpc, FakeConnection())
+    assert isinstance(second, dict)
+    assert second["cached"] is True
+    assert upstream.calls == 1

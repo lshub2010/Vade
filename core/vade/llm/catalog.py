@@ -383,11 +383,14 @@ class ModelResolver:
                 base_url=str(self.config.get("llm.base_url", "")),
                 model=str(self.config.get("llm.model", "") or "gpt-4o-mini"),
                 api_key_env=str(self.config.get("llm.api_key_env", "") or "VADE_LLM_API_KEY"),
-                timeout_s=float(self.config.get("llm.timeout_s", 120) or 120),
+                timeout_s=min(float(self.config.get("llm.timeout_s", 120) or 120), 10.0),
             )
             try:
                 ids = await provider.list_models()
             except Exception as exc:  # noqa: BLE001 - keep the last good list, report the cause
+                # Arm the cooldown on failure too: the refresh button is most
+                # likely to be hammered exactly when the upstream is down.
+                self._last_discovery_at = now
                 self._last_discovery_error = f"{type(exc).__name__}: {exc}"[:300]
                 raise
             self._last_discovery_error = None
@@ -397,7 +400,12 @@ class ModelResolver:
                     provider=BUILTIN,
                     model=model_id,
                     display_name=model_id,
-                    priority=0,
+                    # A refresh must never silently change the default: the
+                    # configured `builtin/<llm.model>` entry stays ahead of
+                    # every discovered one. With equal priority, selection
+                    # falls back to lexical id and picks e.g. `claude-*`
+                    # merely because it sorts before `gpt-*`.
+                    priority=-1,
                     available=True,
                 )
                 for model_id in ids
@@ -409,8 +417,12 @@ class ModelResolver:
             return self.catalog()
 
     def _in_cooldown(self, now: float | None = None) -> bool:
-        """True when a refresh would reuse the cache instead of the upstream."""
-        return self._discovery_generation > 0 and (
+        """True when a refresh would reuse the cache instead of the upstream.
+
+        The timestamp is armed by failures too, so a down gateway cannot be
+        hammered by repeated refresh clicks.
+        """
+        return self._last_discovery_at > 0 and (
             (time.monotonic() if now is None else now) - self._last_discovery_at
         ) < self.DISCOVERY_COOLDOWN_S
 

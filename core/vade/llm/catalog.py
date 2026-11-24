@@ -10,14 +10,24 @@ Two responsibilities, both read-only:
   manifest.priority** (§5.2) and reports which layer won (`source`), because a
   UI that has to re-derive that is a second source of truth.
 
+It also owns the optional upstream discovery cache (0.0.3 `model/discover`):
+`discover()` asks the builtin's `/models` and `catalog()` appends what it
+found. The cache is replaced only on success, so a failed probe keeps the last
+good list instead of blanking the picker.
+
 `revision` is the registry's monotonic counter: the list is a pure function of
 the registry snapshot and the static `[llm]` config, so every mutation that can
-change it bumps the counter and no TTL cache is needed (§4.4).
+change it bumps the counter and no TTL cache is needed (§4.4). Discovery bumps
+it too (a successful refresh is a mutation), even when the upstream adds no new
+id — a revision that could fall back would strand `model/list?if_revision`.
 """
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from .capabilities import ModelSpec, normalise_capabilities
@@ -126,6 +136,11 @@ class ModelCatalog:
 
     def to_wire(self) -> list[dict[str, Any]]:
         return [entry.to_wire() for entry in self.entries]
+
+
+def _utc_now() -> str:
+    """Second-resolution ISO-8601 UTC, the `discovered_at` spelling (§2)."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _mode_of(config: Any) -> str:
@@ -307,12 +322,116 @@ def _merge_entries(a: ModelEntry, b: ModelEntry) -> ModelEntry:
 class ModelResolver:
     """Selection order §5.2, with the layer that won kept explicit."""
 
+    #: Explicit refresh calls closer than this reuse the last answer instead of
+    #: hitting the upstream again. A UI "refresh" button should not be a way to
+    #: turn one core into a request amplifier against the LLM gateway.
+    DISCOVERY_COOLDOWN_S = 2.0
+
     def __init__(self, config: Any, registry: Any | None = None) -> None:
         self.config = config
         self.registry = registry
+        self._discovered: tuple[ModelEntry, ...] = ()
+        self._discovered_revision = 0
+        self._last_discovery_at = 0.0
+        self._discovered_at: str | None = None
+        self._discovery_generation = 0
+        self._discovery_lock = asyncio.Lock()
+        self._last_discovery_error: str | None = None
 
     def catalog(self) -> ModelCatalog:
-        return build_catalog(self.config, self.registry)
+        base = build_catalog(self.config, self.registry)
+        if not self._discovery_generation or base.mode not in _BUILTIN_MODES:
+            return base
+        configured = {entry.id for entry in base.entries}
+        extra = tuple(entry for entry in self._discovered if entry.id not in configured)
+        # The revision is bumped even when every discovered id is already
+        # configured (or the upstream returned none): `model/discover` promises
+        # "a successful refresh moves `revision`", and keying the merge on
+        # `extra` instead of on "did a discovery ever succeed" would make the
+        # counter fall back to `base.revision` — i.e. go BACKWARDS.
+        return ModelCatalog(
+            entries=base.entries + extra,
+            revision=base.revision + self._discovered_revision,
+            mode=base.mode,
+        )
+
+    # ------------------------------------------------------------------ discovery
+    def can_discover(self) -> bool:
+        """Only the builtin HTTP path has a `/models` endpoint we own."""
+        return (
+            str(self.config.get("llm.provider", "") or "").strip().lower() in _BUILTIN_MODES
+            and bool(str(self.config.get("llm.base_url", "") or "").strip())
+        )
+
+    async def discover(self) -> ModelCatalog:
+        """Ask the configured upstream for `/models` and merge the ids.
+
+        The cache is process-local and replaced only on success: a timed-out or
+        401 upstream keeps the last good list visible instead of blanking the
+        picker. Nothing is inferred about capabilities — every discovered entry
+        keeps `None` for context window / modalities / tool support.
+        """
+        if not self.can_discover():
+            raise RuntimeError("model discovery needs a builtin provider with llm.base_url")
+        async with self._discovery_lock:
+            now = time.monotonic()
+            if self._in_cooldown(now):
+                return self.catalog()
+            from .openai_compat import OpenAICompatProvider
+
+            provider = OpenAICompatProvider(
+                base_url=str(self.config.get("llm.base_url", "")),
+                model=str(self.config.get("llm.model", "") or "gpt-4o-mini"),
+                api_key_env=str(self.config.get("llm.api_key_env", "") or "VADE_LLM_API_KEY"),
+                timeout_s=float(self.config.get("llm.timeout_s", 120) or 120),
+            )
+            try:
+                ids = await provider.list_models()
+            except Exception as exc:  # noqa: BLE001 - keep the last good list, report the cause
+                self._last_discovery_error = f"{type(exc).__name__}: {exc}"[:300]
+                raise
+            self._last_discovery_error = None
+            self._discovered = tuple(
+                ModelEntry(
+                    id=f"{BUILTIN}/{model_id}",
+                    provider=BUILTIN,
+                    model=model_id,
+                    display_name=model_id,
+                    priority=0,
+                    available=True,
+                )
+                for model_id in ids
+            )
+            self._discovered_revision += 1
+            self._discovery_generation += 1
+            self._last_discovery_at = now
+            self._discovered_at = _utc_now()
+            return self.catalog()
+
+    def _in_cooldown(self, now: float | None = None) -> bool:
+        """True when a refresh would reuse the cache instead of the upstream."""
+        return self._discovery_generation > 0 and (
+            (time.monotonic() if now is None else now) - self._last_discovery_at
+        ) < self.DISCOVERY_COOLDOWN_S
+
+    @property
+    def discovery_generation(self) -> int:
+        """How many times the cache was actually REPLACED (successes only).
+
+        `model/discover` compares it before/after the call to report `cached`:
+        a wait behind the lock that then finds the cache fresh is still a cache
+        hit, and only this counter can tell the two apart.
+        """
+        return self._discovery_generation
+
+    @property
+    def discovered_at(self) -> str | None:
+        """ISO-8601 UTC of the last SUCCESSFUL discovery, or None."""
+        return self._discovered_at
+
+    @property
+    def last_discovery_error(self) -> str | None:
+        return self._last_discovery_error
 
     # ------------------------------------------------------------------ resolve
     def resolve(self, session_model_id: str | None, catalog: ModelCatalog | None = None) -> Selection:

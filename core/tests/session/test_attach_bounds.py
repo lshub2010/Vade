@@ -970,20 +970,21 @@ def test_both_pending_blocks_are_counted_when_dropped(tmp_path):
 
 
 def test_rpc_json_keeps_the_snapshot_contract_compliant():
-    """C-05 1.7.0: f15 adds no method, removes no field, registers no append.
+    """f15 adds no method, removes no field, registers no append.
 
     The rejected revision bumped the frozen contract to 1.8.0 with `adds=[]`
     and a free-text "removal" that no RFC owned; the fix2 retry then kept the
     full three-copy row and lost the user message at 7 100 CJK. The legal
     combination is: the CONTRACT keeps every field, the SNAPSHOT sends the
     text once, and `x-vade.dedup` declares the elision + the rebuild fallback.
-    `check_contracts` enforces the same facts.
+    `check_contracts` enforces the same facts. The 1.8.0 in the file today is
+    0.0.3's `model/discover` append — a method, not a field removal.
     """
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[3]
     rpc = json.loads((root / "schema" / "rpc.json").read_text(encoding="utf-8"))
-    assert rpc["version"] == "1.7.0"
+    assert rpc["version"] == "1.8.0"
     assert not [
         block for block in rpc["x-vade"]["appends"]
         if "f15-snapshot-contract" in str(block.get("doc") or "")

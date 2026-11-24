@@ -128,6 +128,10 @@ class SessionRPC:
             "approval/decide": self.approval_decide,
             # RFC-0005 (C-05 append): read-only model surface + usage views.
             "model/list": self.model_list,
+            # 0.0.3 (C-05 1.8.0): upstream `/models` discovery for the builtin
+            # provider. Read-only for the caller: it refreshes a process-local
+            # cache, so a read-only viewer may look at the real list too.
+            "model/discover": self.model_discover,
             "session/model.get": self.session_model_get,
             "session/model.set": self.session_model_set,
             "session/usage.get": self.session_usage_get,
@@ -379,6 +383,51 @@ class SessionRPC:
             "models": catalog.to_wire(),
             "default": {"model_id": default.model_id, "source": default.source,
                         "resolved": default.resolved},
+        }
+
+    async def model_discover(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        """0.0.3 / C-05 1.8.0: refresh the builtin upstream's model list.
+
+        Only the builtin HTTP path has a `/models` endpoint core owns. A module
+        model declares its own list (`model/list` already shows it), and `mock`
+        has no upstream at all, so both answer `UNAVAILABLE` instead of probing
+        something core does not own — the declared error set has no
+        `READ_ONLY_SESSION` because this refreshes a process-local cache, not
+        durable state.
+
+        A failed refresh answers `UNAVAILABLE` and KEEPS the last good list:
+        blanking the picker on a 401/503 would read as "the upstream has no
+        models", the exact misreading `OpenAICompatProvider.list_models()`
+        refuses to produce. `cached` says whether this call actually reached
+        the upstream or was answered from the 2 s cooldown; either way
+        `revision` is the catalog the client should re-pull.
+        """
+        resolver = getattr(self.log, "models", None)
+        discover = getattr(resolver, "discover", None)
+        if resolver is None or not callable(discover):
+            raise VadeError("UNAVAILABLE", "the model catalog is not wired")
+        can_discover = getattr(resolver, "can_discover", None)
+        if callable(can_discover) and not can_discover():
+            raise VadeError(
+                "UNAVAILABLE",
+                "the configured model provider declares its own list; core does not probe it",
+                data={"reason": "not_discoverable"},
+            )
+        before = int(getattr(resolver, "discovery_generation", 0) or 0)
+        pending: Any = discover()
+        try:
+            catalog = await pending
+        except Exception as exc:  # noqa: BLE001 - the cause belongs in the error frame
+            raise VadeError(
+                "UNAVAILABLE",
+                f"upstream model discovery failed: {type(exc).__name__}: {exc}"[:300],
+                data={"reason": "upstream_error"},
+            ) from None
+        return {
+            "revision": catalog.revision,
+            "models": catalog.to_wire(),
+            "discovered_at": getattr(resolver, "discovered_at", None),
+            "cached": int(getattr(resolver, "discovery_generation", 0) or 0) == before,
         }
 
     async def session_model_get(self, connection: Any, params: Mapping[str, Any]) -> dict[str, Any]:

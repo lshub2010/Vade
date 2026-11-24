@@ -8,17 +8,18 @@
 
 | 项 | 值 | 出处 |
 |---|---|---|
-| C-05 rpc.json 顶部 version | **1.7.0** | `schema/rpc.json` |
-| C-05 方法数 | ui_to_core **36** / core_to_module **7** / module_to_core **6**，三方向合计 **49** | 同上 |
+| C-05 rpc.json 顶部 version | **1.8.0** | `schema/rpc.json` |
+| C-05 方法数 | ui_to_core **37** / core_to_module **7** / module_to_core **6**，三方向合计 **50** | 同上 |
 | RFC-0015 append 块 | `x-vade.appends` 第 **11** 块（C-05 **1.6.0**，`adds=["ui/modules"]`，`rewrites: none`）。原先的 `x-vade.rfc0015_pending` 占位块已在本棒（`s-rfc0015-register`）转正后删除 | `schema/rpc.json` |
 | RFC-0016 append 块 | `x-vade.appends` 第 **12** 块（C-05 **1.7.0**，`adds=["ui/blob.token"]`，`rewrites: none`）；顶部 version 同批 1.6.0 → 1.7.0，`http_endpoints.auth.device` 注记改为点名铸造方法 | `schema/rpc.json` |
-| f15 bounded snapshot | **无 append 块**：C-05 顶部保持 **1.7.0**、不升版、不删声明字段；正文只传一份——text-only 行的 `parts` 与每个 turn 的 `user_text` 不上 wire，由快照级 `x-vade.dedup`（`{version, elided[], fallback{}}`）显式声明并给回退链（`parts` → `content`；`user_text` → `user_message_id`/`messages[].turn_id`）；`check_ledger` 重算 `appends_rpc=12` | `schema/rpc.json`、`core/vade/session/manager.py` |
+| f15 bounded snapshot | **无 append 块**：f15 自身不升版、不删声明字段（顶部现 **1.8.0** 是 0.0.3 `model/discover` 的 append，与 f15 无关）；正文只传一份——text-only 行的 `parts` 与每个 turn 的 `user_text` 不上 wire，由快照级 `x-vade.dedup`（`{version, elided[], fallback{}}`）显式声明并给回退链（`parts` → `content`；`user_text` → `user_message_id`/`messages[].turn_id`）；`check_ledger` 重算 `appends_rpc`（现 13，f15 自身不占块） | `schema/rpc.json`、`core/vade/session/manager.py` |
+| 0.0.3 model/discover append 块 | `x-vade.appends` 第 **13** 块（C-05 **1.8.0**，`adds=["model/discover"]`，`rewrites: none`）。无 RFC 承载——0.0.3 的发现工作由设计记录 `docs/release/0.0.3-discovery.md` 跟踪，故 §2 主表没有对应行（`check_ledger` 的 per-RFC `adds` 重算不受影响） | `schema/rpc.json` |
 | RFC-0007 events 块 | `x-vade.appends` 第 **9** 块（C-06 **1.1.0**，`adds=["task.started","task.status","task.progress","task.finished"]`，`rewrites: none`）。**补登记**：四个事件与顶层 `task_states` 自 `404c3f3` 起就在 events.json，但当时 `appends` 还是字符串形态、没有任何块；原 `x-vade.append_rfc0007` 兄弟键保留作史料，块版本与 rpc.json 侧 1.1.0 对齐 | `schema/events.json` |
 | C-06 events.json 顶部 version | **2.0.0** | `schema/events.json` |
 | C-06 事件数 | **34**（含 `turn.state` 枚举条目；不含则 33） | 同上 |
 | C-04 错误码 | **34** | `schema/errors.json` |
-| append 登记块 | rpc.json **12** 块 / events.json **9** 块 / manifest.schema.json **3** 块，合计 **24** | 三文件 `x-vade.appends` |
-| 服务端测试 | **1557 passed**（`tmp/f15-contract`，2026-11-22：`PYTHONPATH=core:protocol/core/python pytest core/tests -q` → `1557 passed, 14 warnings in 481.82s (0:08:01)`；按「Rust 大构建禁本地」复用同源预编译 `libvade_protocol.so`，未跑 `cargo build`）。历史：**1203 passed**（`pytest core/tests -q`，worktree `s-blob-impl`，基线 `7941b93`：1165 + 本棒 38 = 32 `test_rpc_token.py` + 5 `test_revoke_purges_tokens.py` + 1 `test_blob_token_ws.py`；`1203 passed, 9 warnings in 526.67s`）。**旧 HEAD `be16ebe` 只做收集计数**：`pytest core/tests -q --collect-only` → 1383 tests collected（`tmp/d2-docs`，2026-11-17）。历史：**1164 passed**（`shots/s-modules-impl/RESULT.md`、`shots/s-rfc0015-register/RESULT.md`，其中 s-rfc0015 基线实跑口径 **1165**，见该报告 §8）；**1089 passed**（2026-11-14 在 `dev_gingshan` 合入 RFC-0003 Q5 后复跑）。本总账初版记录的 **1065** 是 RFC-0014 落地时、RFC-0003 Q5 未合时的数（出处 `core/vade/session/RESULT-rfc0014.md`） | 本人复跑（1203/1383 除外，出处见左） |
+| append 登记块 | rpc.json **13** 块 / events.json **9** 块 / manifest.schema.json **3** 块，合计 **25** | 三文件 `x-vade.appends` |
+| 服务端测试 | **1557 passed**（`tmp/f15-contract`，2026-11-22：`PYTHONPATH=core:protocol/core/python pytest core/tests -q` → `1557 passed, 14 warnings in 481.82s (0:08:01)`；按「Rust 大构建禁本地」复用同源预编译 `libvade_protocol.so`，未跑 `cargo build`）。历史：**1203 passed**（`pytest core/tests -q`，worktree `s-blob-impl`，基线 `7941b93`：1165 + 本棒 38 = 32 `test_rpc_token.py` + 5 `test_revoke_purges_tokens.py` + 1 `test_blob_token_ws.py`；`1203 passed, 9 warnings in 526.67s`）。**旧 HEAD `be16ebe` 只做收集计数**：`pytest core/tests -q --collect-only` → 1383 tests collected（`tmp/d2-docs`，2026-11-17）。历史：**1164 passed**（`shots/s-modules-impl/RESULT.md`、`shots/s-rfc0015-register/RESULT.md`，其中 s-rfc0015 基线实跑口径 **1165**，见该报告 §8）；**1089 passed**（2026-11-14 在 `dev_gingshan` 合入 RFC-0003 Q5 后复跑）。本总账初版记录的 **1065** 是 RFC-0014 落地时、RFC-0003 Q5 未合时的数（出处 `core/vade/session/RESULT-rfc0014.md`）。0.0.3 `model/discover` 本棒全量复跑：`PYTHONPATH=core:protocol/core/python .venv/bin/python -m pytest core/tests -q` → **1577 passed, 9 warnings in 353.52s (0:05:53)**（含新增 `core/tests/model/test_discovery_rpc.py` 8 例；单跑 `core/tests/model` 69 passed） | 本人复跑（1203/1383 除外，出处见左） |
 | 契约门禁 | `tools/check_contracts.py` exit 0（`contracts: OK …RFC-0014 session search green, RFC-0016 blob token green…`） | 本人复跑 |
 | docs 门禁 | `docs/check_docs.py` exit 0（12 项，失败 0 项） | 本人复跑 |
 
@@ -51,14 +52,14 @@
 ```json
 {
   "aggregate": {
-    "rpc_version": "1.7.0",
-    "rpc_methods_by_direction": {"module_to_core": 6, "core_to_module": 7, "ui_to_core": 36},
-    "rpc_methods_total": 49,
+    "rpc_version": "1.8.0",
+    "rpc_methods_by_direction": {"module_to_core": 6, "core_to_module": 7, "ui_to_core": 37},
+    "rpc_methods_total": 50,
     "events_version": "2.0.0",
     "events_total_incl_turn_state": 34,
     "events_total_excl_turn_state": 33,
     "error_codes": 34,
-    "appends_rpc": 12,
+    "appends_rpc": 13,
     "appends_events": 9,
     "appends_manifest": 3
   },
@@ -86,12 +87,13 @@
 ## 4. 本表已知的口径冲突（详单与证据见 `docs/rfc/LEDGER-RESULT.md`）
 
 1. **RFC-0003～0009 frontmatter `stage` 过时口径已收口**（保留为历史条目）：七份 RFC 曾自称「草稿，未实现」，与 status.md「已合并」及契约登记矛盾。`s-hygiene`（`a9c7dcc`）只改 frontmatter `stage:` 为「已实现并合并」（正文零改动，diff 可验），`docs/rfc/README.md` 七行状态列同批改为「approved（已实现并合并）」；本表各行的「stage 已过时」注记随之改为「已回填」。详见 `docs/rfc/HYGIENE-RESULT.md` §1-4。
-2. 「35 方法」口径：三方向合计 **49**；**36** 才是 ui_to_core 方向数（36 方法 / 34 错误码 / 34 事件三个数撞在一起，口头汇报必错）。`ui/modules`（RFC-0015）自 `s-rfc0015-register` 起**既在** `directions` 里、**也在** `x-vade.appends` 里（第 11 块，C-05 1.6.0，`adds=["ui/modules"]`）；`ui/blob.token`（RFC-0016）在第 12 块（C-05 1.7.0）；f15 不登记契约变更：保持 1.7.0，声明字段一个不删；快照正文只传一份，两个派生字段由 `x-vade.dedup` 声明并按回退链重建（无 RFC 不得删冻结字段，也不得悄悄改变形状）。
-3. 「events.json 10 条 appends」口径：events.json 实为 **9** 块；**12** 是 rpc.json 的块数（f15 不登记块）；三文件合计 **24** 块。
-4. append 块级版本 ≠ 契约顶部版本（RFC-0013 块级 1.2.0 / 顶部 1.3.0→1.7.0 共存），引用版本号必须说明是哪一层。
+2. 「35 方法」口径：三方向合计 **50**；**37** 才是 ui_to_core 方向数（37 方法 / 34 错误码 / 34 事件三个数撞在一起，口头汇报必错）。`ui/modules`（RFC-0015）自 `s-rfc0015-register` 起**既在** `directions` 里、**也在** `x-vade.appends` 里（第 11 块，C-05 1.6.0，`adds=["ui/modules"]`）；`ui/blob.token`（RFC-0016）在第 12 块（C-05 1.7.0）；`model/discover`（0.0.3）在第 13 块（C-05 1.8.0，无 RFC 承载）；f15 不登记契约变更：自身不升版，声明字段一个不删；快照正文只传一份，两个派生字段由 `x-vade.dedup` 声明并按回退链重建（无 RFC 不得删冻结字段，也不得悄悄改变形状）。
+3. 「events.json 10 条 appends」口径：events.json 实为 **9** 块；**13** 是 rpc.json 的块数（f15 不登记块）；三文件合计 **25** 块。
+4. append 块级版本 ≠ 契约顶部版本（RFC-0013 块级 1.2.0 / 顶部 1.3.0→1.8.0 共存），引用版本号必须说明是哪一层。
 5. **RFC-0007 的 events 登记缺口已收口**（保留为历史条目）：四个 `task.*` 事件与顶层 `task_states` 自 `404c3f3` 起就在 events.json，但当时 `appends` 还是字符串形态（events.json 顶部 version 仍 **1.0.0**），所以一直没有登记块——append-per-minor 纪律的缺口。`a2-ledger` 补 `x-vade.appends` 第 **9** 块（C-06 **1.1.0**，`adds` = 四事件，`rewrites: none`，块版本与 rpc.json 侧 1.1.0 对齐），并在 `tools/check_contracts.py` 的 `check_task_events` 追加该块断言（缺块 / 版本不是 1.1.0 / `adds` 不是那四个 / `rewrites` 不是 `none` 全部红）；原 `x-vade.append_rfc0007` 兄弟键**保留**作史料。
 6. **601 vs 607 差异已查实**（保留为历史条目）：601 = 分支 `tmp/rfc0007` 顶端 `404c3f3` 的全量（基线 `94f5995`=549 + 本批 52）；607 = 合并点 `67c5c49` 的全量（分叉后 dev 侧经 `32eb6c4` 设备身份接线新增 6 条，549→555，555+52=607）。四点 `pytest --collect-only` 实测（549 / 601 / 555 / 607）见 `docs/rfc/HYGIENE-RESULT.md` §1-3 与 `docs/status.md` rfc0007 行尾备注——非测试增删，两个数字都对，与 rfc0005/rfc0006 同为「分支时 vs 合并后全量」口径。
-7. **append 块 `contract` 键口径已修**（保留为历史条目）：`s-hygiene`（`a9c7dcc`）给 rpc.json 的 RFC-0009 块补 `"contract": "C-05"`（与同数组其余块一致），并把 manifest.schema.json 的 RFC-0005 块 `contract` 由 `"RFC-0005"` 改为 `"C-03"`（`capabilities.models` 由 C-03 的 `Manifest` 承接）。现状：rpc.json 12 块、events.json 9 块、manifest 3 块的 `contract` 键全部齐备且写契约号。**门禁不承重**：`tools/check_ledger.py` 不校验该键，改前改后均 OK——核对依据是 `docs/rfc/HYGIENE-RESULT.md` §1-1/§1-2 的 diff。附带订正：C-18 无 `x-vade.appends` 数组（`[ui]` 4 键是叶子级元数据），旧句「C-18 append 块缺 contract」不成立。
+7. **append 块 `contract` 键口径已修**（保留为历史条目）：`s-hygiene`（`a9c7dcc`）给 rpc.json 的 RFC-0009 块补 `"contract": "C-05"`（与同数组其余块一致），并把 manifest.schema.json 的 RFC-0005 块 `contract` 由 `"RFC-0005"` 改为 `"C-03"`（`capabilities.models` 由 C-03 的 `Manifest` 承接）。现状：rpc.json 13 块、events.json 9 块、manifest 3 块的 `contract` 键全部齐备且写契约号。**门禁不承重**：`tools/check_ledger.py` 不校验该键，改前改后均 OK——核对依据是 `docs/rfc/HYGIENE-RESULT.md` §1-1/§1-2 的 diff。附带订正：C-18 无 `x-vade.appends` 数组（`[ui]` 4 键是叶子级元数据），旧句「C-18 append 块缺 contract」不成立。
 8. RFC-0011 唯一实现证据在客户端仓（vade-client `d667442`），本仓不可验证。
 9. **「声明先于实现」已收口**（保留为历史条目）：RFC-0015 的 `ui/modules` 曾在 `s-modules-rfc` 只写进 `directions.ui_to_core`、登记块放在 `x-vade.rfc0015_pending`——因为 append 在总账里等于声明「已实现」（`tools/check_ledger.py:203-205` 硬要求 `impl_state=已实现` 且 impl 路径必须存在）。`s-rfc0015-register` 把三件事同批做完：① pending 块转进 `appends` 末尾（第 11 块，块版本 1.6.0，既有 10 块未动）；② 顶部 version 1.5.0→1.6.0；③ `tools/check_contracts.py` 三处版本钉**追加** 1.6.0（1.3.0/1.4.0/1.5.0 原样保留；临时改 1.7.0 实测仍 FAIL，见 `shots/s-rfc0015-register/RESULT.md` §5）。另加 `core/tests` 里三处「顶部版本」断言同步（既有惯例：RFC-0014 的 6b568b9 同样只改版本号与相邻注释）。
 10. **RFC-0016 同批走完「登记 + 实现」**（`s-blob-impl`，2026-11-15）：第 12 块登记与 core 实现同批落地，故本表不再出现「声明先于实现」窗口。三处版本钉**只追加** 1.7.0（1.3.0–1.6.0 原样保留），并新增 `check_blob_token()`（方法形状 / endpoints 与 `http_endpoints` 别名比对 / `TOKEN_TTL_*` 常量 / handler 注册 / auth.device 点名方法 / append 块）；门禁咬合实测：顶部临时改 1.8.0、删 `endpoints.fetch`、改 `expires_at` 键名、`errors` 换 `UNAVAILABLE`、`params` 加 `device_id`、append 块版本改 1.6.0 —— 六种变异全部 FAIL，还原后 OK（`shots/s-blob-impl/RESULT.md`）。`core/tests` 三处「顶部版本」断言 1.6.0→1.7.0（同 §4-9 惯例）。
+11. **0.0.3 `model/discover` 是第一个无 RFC 承载的 append 块**：它由版本设计记录 `docs/release/0.0.3-discovery.md` 跟踪，块 `doc` 直指该文件，因此 `check_ledger` 的 per-RFC `adds` 重算把它当作「不属于任何 RFC」（无 `RFC-\d{4}` 可归属），§2 主表没有对应行——这是登记口径的刻意例外，不是漏登记。门禁侧新增 `tools/check_contracts.py:check_model_discover()`（params 恰为 `{}` / result 四键 / errors 恰为两枚复用码 / handler 注册 / `discover()`+`can_discover()` / 冷却常量 2 s / 块版本 1.8.0），并把三处版本钉的元组**追加** 1.8.0、两处「当前 head」精确钉由 1.7.0 改为 1.8.0；`core/tests` 四处「顶部版本」断言同步（同 §4-9 惯例）。行为测试在 `core/tests/model/test_discovery_rpc.py`（成功 / 不支持的模式 / 上游失败保留旧列表 / 冷却）。

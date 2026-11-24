@@ -1,6 +1,6 @@
 {
   "id": "C-05",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "status": "frozen",
   "frozen_at": "2026-11-14",
   "owner": "C2",
@@ -181,6 +181,20 @@
           "no new error code (C-04 stays 34), no new event (C-06 stays 34), no new config key (C-18 untouched), no new table (blob_tokens already exists); the six http_endpoints routes are unchanged — this method only finally writes rows into blob_tokens (§8)"
         ],
         "rewrites": "none. One ui_to_core method appended (RFC-0004 §4.5 finally registered); C-05 version 1.6.0 -> 1.7.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one, 1.6.0 one, 1.7.0 one). http_endpoints.auth.device renamed the minting method (note-level string, no route/structure change). C-06 untouched (no event), C-04 untouched (34 codes), C-03/C-18 untouched. Recorded in docs/rfc/LEDGER.md; evidence in shots/s-blob-impl/RESULT.md."
+      },
+      {
+        "contract": "C-05",
+        "version": "1.8.0",
+        "owner": "C2",
+        "doc": "docs/release/0.0.3-discovery.md",
+        "adds": ["model/discover"],
+        "notes": [
+          "one ui_to_core method appended: model/discover asks the builtin upstream's `GET {base_url}/models` and appends each id to `model/list` as `builtin/<upstream-id>`; `display_name` is the upstream id and every capability field stays `null` — nothing is inferred from a model name",
+          "UNAVAILABLE covers both 'this mode has no list core may probe' (module/mock, `data.reason=not_discoverable`) and 'the upstream call failed' (`data.reason=upstream_error`); a failure KEEPS the last good catalog, so a 401/503 never blanks the picker",
+          "the cache is process-local and replaced only on success; a 2 s cooldown answers `cached=true` without touching the upstream, so a UI refresh button cannot turn one core into a request amplifier",
+          "no new error code (C-04 stays 34), no new event (C-06 stays 34), no new config key (C-18 untouched); `llm.base_url` already exists. A core that predates it answers C-04 NOT_FOUND with an `unknown method` message (JSON-RPC -32601 is the standard form) and the client hides the refresh control"
+        ],
+        "rewrites": "none. One ui_to_core method appended (0.0.3 model discovery); C-05 version 1.7.0 -> 1.8.0 per the append-per-minor discipline (1.1.0 four methods, 1.2.0 three, 1.3.0 ten, 1.4.0 two, 1.5.0 one, 1.6.0 one, 1.7.0 one, 1.8.0 one). No existing method, error code, direction or field changed. Recorded in docs/rfc/LEDGER.md; design record docs/release/0.0.3-discovery.md."
       }
     ],
     "rfc0005_append": {
@@ -703,6 +717,12 @@
         "result": {"revision": "int", "not_modified": "bool", "models": "[model]|null", "default": {"model_id": "string|null", "source": "session|global|priority|none", "resolved": "bool"}},
         "errors": ["UNAVAILABLE"],
         "notes": "RFC-0005 append (v1.0.0 -> 1.1.0). Read-only, no side effects, no reverse RPC to modules. `if_revision == revision` returns {revision, not_modified:true, models:null} and the client keeps its cache — a client MUST NOT clear capability badges on `not_modified`. `models` is empty (never 404) when the current mode can route to nothing. Entry: {id, provider, display_name, input_modalities|null, max_image_bytes|null, max_image_px|null, max_images_per_turn|null, context_window|null, supports_tools|null, priority, available}; `null` is UNKNOWN and is never interchangeable with false/[] (no inference from the model name). Offline entries stay with available:false. A core without this method answers C-04 NOT_FOUND with an `unknown method` message and the UI degrades to a read-only badge (FR-8.46), never to an empty list; JSON-RPC -32601 is the standard form for an unregistered method and clients should recognize both."
+      },
+      "model/discover": {
+        "params": {},
+        "result": {"revision": "int", "models": "[model]", "discovered_at": "string", "cached": "bool"},
+        "errors": ["UNAVAILABLE", "INTERNAL"],
+        "notes": "0.0.3 discovery (C-05 1.8.0). Asks the builtin upstream `GET {base_url}/models` and appends every returned id to `model/list` as `builtin/<upstream-id>` (`display_name` = the upstream id; capability fields stay `null` — nothing is inferred from a model name). Discoverable only when `llm.provider` is `builtin`/`openai`/`openai_compatible` AND `llm.base_url` is non-empty; any other mode answers UNAVAILABLE (`data.reason=\"not_discoverable\"`) because a module declares its own list and core does not probe it. The cache is process-local and replaced ONLY on success: a failed/timed-out/gated upstream answers UNAVAILABLE (`data.reason=\"upstream_error\"`, message carries the cause) and KEEPS the last good list — the client must show the failure and must NOT clear its picker, because an empty list would read as 'the upstream has no models'. `cached=true` means this call was answered from the 2 s cooldown instead of the upstream (a refresh button is not a request amplifier). A successful discovery bumps `revision`; the client re-pulls `model/list` (or uses `if_revision`) to pick up the new entries, and those entries are selectable through `session/model.set` like any other. `params` is exactly `{}` on purpose: the catalog is a process-level fact, never a caller-supplied session. Read-only viewers may call it (no READ_ONLY_SESSION: it refreshes an in-memory cache, not durable state). A core without this method answers C-04 NOT_FOUND with an `unknown method` message (JSON-RPC -32601 is the standard form for an unregistered method, which clients should recognize); the client then hides/grays the refresh control."
       },
       "session/model.get": {
         "params": {"session_id": "string"},

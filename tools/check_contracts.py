@@ -58,6 +58,13 @@ Checks (each one has broken at least once in review):
      HTTP surface the dispatcher serves — `POST /ui/session` and
      `DELETE /ui/session` — and the revoke operation keeps its `204`/`401`
      contract.
+ 16. 0.0.3 discovery: `model/discover` is declared (C-05 1.8.0) with
+     `params` exactly `{}`, the four result keys the design record names, and
+     exactly the two reused C-04 codes (`UNAVAILABLE`, `INTERNAL`); it is
+     registered in `SessionRPC.handlers()`, `ModelResolver.discover()`/
+     `can_discover()` exist, `DISCOVERY_COOLDOWN_S` is the 2 s the contract
+     states, and the append block carries `adds=["model/discover"]` /
+     `rewrites: none` / 1.8.0 / `docs/release/0.0.3-discovery.md`.
 
 Run:  python3 tools/check_contracts.py      (exit 0 = green)
 """
@@ -260,6 +267,16 @@ USAGE_BUDGET_REQUIRED = {"scope", "state", "used", "limit", "ratio", "degraded"}
 #: third direction would break the `for direction in directions.values()`
 #: consumers this file already relies on, so the direction is pinned too.
 MODEL_METHODS = {"model/list", "session/model.get", "session/model.set", "session/usage.get"}
+
+#: 0.0.3 discovery: the one ui_to_core method appended under C-05 1.8.0.
+#: `params` is empty on purpose — the catalog is a process-level fact, never
+#: scoped by a caller-supplied session — and the error set is exactly the two
+#: REUSED codes, so a new code would fail here before it reaches C-04.
+MODEL_DISCOVER_METHOD = "model/discover"
+MODEL_DISCOVER_RESULT = {"revision", "models", "discovered_at", "cached"}
+MODEL_DISCOVER_ERRORS = {"UNAVAILABLE", "INTERNAL"}
+MODEL_DISCOVER_COOLDOWN_S = 2.0
+MODEL_DISCOVER_DOC = "docs/release/0.0.3-discovery.md"
 
 #: RFC-0005 §4.3: a manifest must not become a second model directory.
 MAX_MANIFEST_MODELS = 16
@@ -717,6 +734,88 @@ def check_model_methods(rpc: dict) -> None:
             check(field in entry, f"rpc.json {name}: missing {field}")
         unknown = sorted(set(entry.get("errors") or []) - codes)
         check(not unknown, f"rpc.json {name}: errors not declared in C-04: {unknown}")
+
+
+def check_model_discover(rpc: dict) -> None:
+    """0.0.3: `model/discover` is declared (C-05 1.8.0), shaped, and wired.
+
+    Three failures a review cannot see by reading:
+
+    * a schema entry with no handler answers NOT_FOUND on a real socket;
+    * a `params` object that quietly grows a `session_id` would let a caller
+      scope a process-level fact — the catalog is not per session;
+    * the cooldown constant IS the contract's amplifier guard (2 s), and a
+      drift silently turns a refresh button into an upstream flood.
+
+    Runtime behaviour — success, unsupported mode, upstream failure keeping the
+    last list, cooldown — lives in `core/tests/model/test_discovery_rpc.py`.
+    """
+    directions = rpc.get("directions") or {}
+    ui_to_core = directions.get("ui_to_core") or {}
+    entry = ui_to_core.get(MODEL_DISCOVER_METHOD)
+    check(entry is not None,
+          f"rpc.json: {MODEL_DISCOVER_METHOD} is missing from ui_to_core (0.0.3 discovery)")
+    elsewhere = sorted(
+        {MODEL_DISCOVER_METHOD}
+        & (set(directions.get("module_to_core") or {}) | set(directions.get("core_to_module") or {}))
+    )
+    check(not elsewhere, f"rpc.json: {MODEL_DISCOVER_METHOD} must not be module-facing: {elsewhere}")
+    if isinstance(entry, dict):
+        for field in ("params", "result", "errors", "notes"):
+            check(field in entry, f"rpc.json {MODEL_DISCOVER_METHOD}: missing {field}")
+        check(set(entry.get("params") or {}) == set(),
+              "rpc.json model/discover.params must be exactly {} (the catalog is "
+              "process-level; no session_id may appear)")
+        check(set(entry.get("result") or {}) == MODEL_DISCOVER_RESULT,
+              f"rpc.json model/discover.result must be exactly "
+              f"{sorted(MODEL_DISCOVER_RESULT)}")
+        codes = set(load("errors.json").get("codes") or {})
+        unknown = sorted(set(entry.get("errors") or []) - codes)
+        check(not unknown, f"rpc.json {MODEL_DISCOVER_METHOD}: errors not declared in C-04: {unknown}")
+        check(set(entry.get("errors") or []) == MODEL_DISCOVER_ERRORS,
+              "rpc.json model/discover.errors must be exactly {UNAVAILABLE, INTERNAL} "
+              "(no new code)")
+    check(rpc.get("version") == "1.8.0",
+          f"rpc.json: version must be 1.8.0 after the model/discover append "
+          f"(got {rpc.get('version')!r})")
+
+    if str(ROOT / "core") not in sys.path:
+        sys.path.insert(0, str(ROOT / "core"))
+    try:
+        from vade.llm.catalog import ModelResolver
+        from vade.session.rpc import SessionRPC
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        FAILURES.append(f"core/vade: cannot import for the model/discover checks "
+                        f"({type(exc).__name__}: {exc})")
+        return
+    check(MODEL_DISCOVER_METHOD in SessionRPC(None).handlers(),
+          "SessionRPC.handlers(): model/discover is not registered (0.0.3 discovery)")
+    check(callable(getattr(ModelResolver, "discover", None)),
+          "ModelResolver.discover() is missing; the method would answer NOT_FOUND")
+    check(callable(getattr(ModelResolver, "can_discover", None)),
+          "ModelResolver.can_discover() is missing; a module/mock mode would be probed")
+    check(ModelResolver.DISCOVERY_COOLDOWN_S == MODEL_DISCOVER_COOLDOWN_S,
+          f"ModelResolver.DISCOVERY_COOLDOWN_S drifted from the contract: "
+          f"{ModelResolver.DISCOVERY_COOLDOWN_S!r} != {MODEL_DISCOVER_COOLDOWN_S!r}")
+    check((ROOT / MODEL_DISCOVER_DOC).exists(),
+          f"{MODEL_DISCOVER_DOC}: the append block's design record is missing")
+
+    blocks = (rpc.get("x-vade") or {}).get("appends") or []
+    block = next((b for b in blocks if isinstance(b, dict)
+                  and MODEL_DISCOVER_METHOD in (b.get("adds") or [])), None)
+    check(block is not None,
+          "rpc.json: missing the x-vade.appends block for model/discover")
+    if block is not None:
+        check(block.get("version") == "1.8.0",
+              "rpc.json: the model/discover append block must carry version 1.8.0")
+        check(set(block.get("adds") or []) == {MODEL_DISCOVER_METHOD},
+              "rpc.json: the model/discover append block must add exactly model/discover")
+        check("none" in str(block.get("rewrites") or ""),
+              "rpc.json: the model/discover append must be rewrite-free")
+        check(block.get("contract") == "C-05" and block.get("owner") == "C2",
+              "rpc.json: the model/discover append block must carry contract C-05 / owner C2")
+        check(MODEL_DISCOVER_DOC in str(block.get("doc") or ""),
+              f"rpc.json: the model/discover append block must point at {MODEL_DISCOVER_DOC}")
 
 
 def check_usage_budget_event(events: dict) -> None:
@@ -1183,9 +1282,9 @@ def check_subagent_events(events: dict, declared_events: dict, schema_events: se
         & (set(directions.get("module_to_core") or {}) | set(directions.get("core_to_module") or {}))
     )
     check(not elsewhere, f"rpc.json: RFC-0012 methods must not be module-facing: {elsewhere}")
-    check(rpc.get("version") in ("1.4.0", "1.5.0", "1.6.0", "1.7.0"),
-          f"rpc.json: version must be 1.4.0 (RFC-0012), 1.5.0 (RFC-0014), 1.6.0 (RFC-0015) or "
-          f"1.7.0 (RFC-0016, the current head) "
+    check(rpc.get("version") in ("1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0"),
+          f"rpc.json: version must be 1.4.0 (RFC-0012), 1.5.0 (RFC-0014), 1.6.0 (RFC-0015), "
+          f"1.7.0 (RFC-0016) or 1.8.0 (0.0.3 model/discover, the current head) "
           f"(got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0012" in str(b.get("doc") or "")), None)
@@ -1445,9 +1544,9 @@ def check_session_meta(rpc: dict, events: dict) -> None:
             check(field in entry, f"rpc.json {name}: missing {field}")
         unknown = sorted(set(entry.get("errors") or []) - codes)
         check(not unknown, f"rpc.json {name}: errors not declared in C-04: {unknown}")
-    check(rpc.get("version") in ("1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0"),
+    check(rpc.get("version") in ("1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0"),
           f"rpc.json: version must be 1.3.0 (RFC-0010), 1.4.0 (RFC-0012), 1.5.0 (RFC-0014), "
-          f"1.6.0 (RFC-0015) or 1.7.0 (RFC-0016, the current head) "
+          f"1.6.0 (RFC-0015), 1.7.0 (RFC-0016) or 1.8.0 (0.0.3 model/discover, the current head) "
           f"(got {rpc.get('version')!r})")
     rpc_appends = (rpc.get("x-vade") or {}).get("appends") or []
     rblock = next((b for b in rpc_appends if "RFC-0010" in str(b.get("doc") or "")), None)
@@ -1571,9 +1670,9 @@ def check_session_search(rpc: dict) -> None:
                   f"rpc.json session/search hit-row shape drifted: {sorted(set(rows[0]) ^ SESSION_SEARCH_HIT_KEYS)}")
         else:
             check(False, "rpc.json session/search.result.results: must declare the hit-row shape (one object)")
-    check(rpc.get("version") in ("1.5.0", "1.6.0", "1.7.0"),
-          f"rpc.json: version must be 1.5.0 (RFC-0014), 1.6.0 (RFC-0015) or 1.7.0 (RFC-0016, "
-          f"the current head) after the RFC-0014 append "
+    check(rpc.get("version") in ("1.5.0", "1.6.0", "1.7.0", "1.8.0"),
+          f"rpc.json: version must be 1.5.0 (RFC-0014), 1.6.0 (RFC-0015), 1.7.0 (RFC-0016) or "
+          f"1.8.0 (0.0.3 model/discover, the current head) after the RFC-0014 append "
           f"(got {rpc.get('version')!r})")
 
     if str(ROOT / "core") not in sys.path:
@@ -1677,9 +1776,9 @@ def check_blob_token(rpc: dict) -> None:
         check(set(entry.get("errors") or []) == BLOB_TOKEN_ERRORS,
               "rpc.json ui/blob.token.errors must be exactly the four reused C-04 codes (no new code)")
 
-    check(rpc.get("version") == "1.7.0",
-          f"rpc.json: version must be 1.7.0 (RFC-0016 owns the C-05 head; f15 adds no method) "
-          f"(got {rpc.get('version')!r})")
+    check(rpc.get("version") == "1.8.0",
+          f"rpc.json: version must be 1.8.0 (0.0.3 model/discover owns the C-05 head; "
+          f"the RFC-0016 append block itself stays 1.7.0) (got {rpc.get('version')!r})")
 
     if str(ROOT / "core") not in sys.path:
         sys.path.insert(0, str(ROOT / "core"))
@@ -1723,7 +1822,7 @@ def check_blob_token(rpc: dict) -> None:
 
 
 def check_snapshot_contract(rpc: dict) -> None:
-    """f15: the bounded snapshot stays INSIDE frozen C-05 1.7.0.
+    """f15: the bounded snapshot stays INSIDE the frozen C-05 fields.
 
     The first attempt registered a 1.8.0 append block that no RFC owned and
     that deleted two frozen wire fields (`messages[].parts`,
@@ -1733,7 +1832,9 @@ def check_snapshot_contract(rpc: dict) -> None:
     the SNAPSHOT sends the text once, and the elision is declared on the wire.
     This gate keeps that honest:
 
-      1. the top-level version is still 1.7.0 and there is NO f15 append block;
+      1. there is NO f15 append block, and f15 owns no top-level bump — the
+         head is 1.8.0 because 0.0.3's `model/discover` appended a method,
+         which is exactly what the earlier rejected attempt could not claim;
       2. `ui/attach` notes declare `content`, `parts`, `user_text` and the
          legacy-turn fallback (`user_message_id` NULL -> `messages[].turn_id`);
       3. the notes document the `x-vade.dedup` marker — what is elided and the
@@ -1747,9 +1848,10 @@ def check_snapshot_contract(rpc: dict) -> None:
     wiring: a schema/gate that describes a marker the code never emits is the
     "test green, feature dead" failure this repo keeps re-learning.
     """
-    check(rpc.get("version") == "1.7.0",
-          f"rpc.json: version must stay 1.7.0 (f15 removes no field and adds no "
-          f"method) (got {rpc.get('version')!r})")
+    check(rpc.get("version") == "1.8.0",
+          f"rpc.json: version must be 1.8.0 (the 0.0.3 model/discover append is the "
+          f"C-05 head; f15 removes no field, adds no method and registers no block) "
+          f"(got {rpc.get('version')!r})")
     blocks = (rpc.get("x-vade") or {}).get("appends") or []
     f15_blocks = [b for b in blocks if isinstance(b, dict)
                   and "f15-snapshot-contract" in str(b.get("doc") or "")]
@@ -1870,6 +1972,7 @@ def main() -> int:
         declared |= set(direction)
     check(methods <= declared, f"rpc.json missing methods: {sorted(methods - declared)}")
     check_model_methods(rpc)
+    check_model_discover(rpc)
     check(errors.get("codes", {}).get("MANIFEST_INVALID", {}).get("http") == 400, "MANIFEST_INVALID http must be 400")
 
     # ---------------------------------------------------------------- C-06 events
@@ -1960,6 +2063,7 @@ def main() -> int:
     print("contracts: OK (C-03/C-04/C-05/C-06/C-18 frozen, 34 error codes, config metadata complete, "
           "RFC-0005 append green, RFC-0007 task family green, RFC-0010 session metadata green, "
           "RFC-0012 subagent family green, RFC-0014 session search green, RFC-0016 blob token green, "
+          "0.0.3 model discovery green, "
           "RFC-0003 layers green, event gate green)")
     return 0
 

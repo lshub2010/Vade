@@ -4,13 +4,13 @@
 
 This guide is for operators running the Vade core (`python -m vade`) on a Linux
 server. Every command, path, key name and default below was checked against the
-code on `dev_gingshan` for the `0.0.2-alpha` release; nothing here is invented
+code on `dev_gingshan` for the `0.0.3-alpha` release; nothing here is invented
 CLI surface. Where a feature is declared but not wired up, the text says so
 explicitly instead of describing an intended behaviour.
 
 | Item | Value |
 |---|---|
-| Release layout | `vade-core-0.0.2-alpha-linux-{x86_64,aarch64}.tar.gz` |
+| Release layout | `vade-core-0.0.3-alpha-linux-{x86_64,aarch64}.tar.gz` |
 | Python | 3.11+ (CI and this guide use 3.12) |
 | Rust | 1.85+ — **only** if you rebuild `libvade_protocol.so`; the release ships it |
 | Init system | systemd (samples in `deploy/systemd/`) |
@@ -85,7 +85,7 @@ cp target/release/libvade_protocol.so python/
 ### 3.1 Download and verify
 
 ```bash
-VADE_VERSION=0.0.2-alpha
+VADE_VERSION=0.0.3-alpha
 ARCH=x86_64                     # or aarch64
 BASE="https://github.com/lshub2010/Vade/releases/download/v${VADE_VERSION}"
 
@@ -812,7 +812,7 @@ build.
 
 `/healthz` is unauthenticated and deliberately returns no config, fingerprints
 or module list. `version` is the build constant (`CORE_VERSION = "0.1.0"`), not
-the release tag — do not use it to detect `0.0.2-alpha`.
+the release tag — do not use it to detect `0.0.3-alpha`.
 
 `policy_mode` is `allow_all` only when `[dev].allow_all = true`; production
 must leave it `false` (the default).
@@ -880,7 +880,7 @@ The release is relocatable and self-contained; `data_dir` is the only thing
 that must survive.
 
 ```bash
-VADE_VERSION=0.0.2-alpha
+VADE_VERSION=0.0.3-alpha
 ARCH=x86_64
 BASE="https://github.com/lshub2010/Vade/releases/download/v${VADE_VERSION}"
 

@@ -10,10 +10,12 @@ Two responsibilities, both read-only:
   manifest.priority** (§5.2) and reports which layer won (`source`), because a
   UI that has to re-derive that is a second source of truth.
 
-It also owns the optional upstream discovery cache (0.0.3 `model/discover`):
-`discover()` asks the builtin's `/models` and `catalog()` appends what it
-found. The cache is replaced only on success, so a failed probe keeps the last
-good list instead of blanking the picker.
+It also owns the optional upstream discovery cache (0.0.3 `model/discover`,
+persisted in 0.0.4): `discover()` asks the builtin's `/models` and `catalog()`
+appends what it found. The cache is replaced only on success, so a failed
+probe keeps the last good list instead of blanking the picker. The last good
+list is written to `data_dir/models_discovered.json` (0600) and hydrated on
+startup; it is a derived, non-authoritative cache, not user data.
 
 `revision` is the registry's monotonic counter: the list is a pure function of
 the registry snapshot and the static `[llm]` config, so every mutation that can
@@ -25,6 +27,7 @@ id — a revision that could fall back would strand `model/list?if_revision`.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -54,7 +57,7 @@ logger = logging.getLogger(__name__)
 #: Process-local cache on disk: survives a core restart so a selected
 #: `builtin/<upstream-id>` remains selectable until the next refresh. The
 #: data dir is already 0700; the file itself is written 0600.
-_DISCOVERY_CACHE_VERSION = 1
+_DISCOVERY_CACHE_VERSION = 2
 _DISCOVERY_CACHE_NAME = "models_discovered.json"
 
 
@@ -331,6 +334,13 @@ def _merge_entries(a: ModelEntry, b: ModelEntry) -> ModelEntry:
     )
 
 
+def _endpoint_fingerprint(config: Any) -> str:
+    """Stable digest of the upstream identity; never persist the URL itself."""
+    provider = str(config.get("llm.provider", "") or "").strip().lower()
+    base_url = str(config.get("llm.base_url", "") or "").strip().rstrip("/")
+    return hashlib.sha256(f"{provider}\x00{base_url}".encode("utf-8")).hexdigest()
+
+
 class ModelResolver:
     """Selection order §5.2, with the layer that won kept explicit."""
 
@@ -343,6 +353,7 @@ class ModelResolver:
         self.config = config
         self.registry = registry
         self._cache_path = Path(data_dir) / _DISCOVERY_CACHE_NAME if data_dir is not None else None
+        self._cache_endpoint = _endpoint_fingerprint(config)
         self._discovered: tuple[ModelEntry, ...] = ()
         self._discovered_revision = 0
         self._last_discovery_at = 0.0
@@ -368,6 +379,10 @@ class ModelResolver:
             logger.warning("ignoring unreadable model discovery cache: %s", exc)
             return
         if not isinstance(payload, dict) or payload.get("version") != _DISCOVERY_CACHE_VERSION:
+            logger.info("ignoring model discovery cache with an unknown version")
+            return
+        if payload.get("endpoint_sha256") != self._cache_endpoint:
+            logger.info("ignoring model discovery cache for a different upstream endpoint")
             return
         raw_ids = payload.get("ids")
         if not isinstance(raw_ids, list):
@@ -409,6 +424,7 @@ class ModelResolver:
             return
         payload = {
             "version": _DISCOVERY_CACHE_VERSION,
+            "endpoint_sha256": self._cache_endpoint,
             "discovered_at": self._discovered_at,
             "ids": [entry.model for entry in self._discovered],
         }
@@ -419,6 +435,8 @@ class ModelResolver:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
                 fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, path)
             os.chmod(path, 0o600)
         except Exception as exc:  # noqa: BLE001 - cache persistence is best effort
@@ -456,9 +474,9 @@ class ModelResolver:
     async def discover(self) -> ModelCatalog:
         """Ask the configured upstream for `/models` and merge the ids.
 
-        The cache is process-local and replaced only on success: a timed-out or
-        401 upstream keeps the last good list visible instead of blanking the
-        picker. Nothing is inferred about capabilities — every discovered entry
+        The cache is persisted to `data_dir/models_discovered.json` (0600) and
+        replaced only on success: a timed-out or 401 upstream keeps the last
+        good list visible instead of blanking the picker. Nothing is inferred about capabilities — every discovered entry
         keeps `None` for context window / modalities / tool support.
         """
         if not self.can_discover():

@@ -325,3 +325,21 @@ def test_corrupt_cache_is_ignored_at_startup(tmp_path):
     resolver = ModelResolver(_builtin_cfg(), None, data_dir=tmp_path)
     assert resolver.catalog().get("builtin/qwen2.5-vl-72b") is None
     assert resolver.discovered_at is None
+
+
+def test_cache_is_scoped_to_the_upstream_endpoint(tmp_path, monkeypatch):
+    upstream = FakeUpstream(["old-gateway-model"])
+    _patch_upstream(monkeypatch, upstream)
+    _, rpc, _ = _rpc(tmp_path, _builtin_cfg(), data_dir=tmp_path)
+    _discover(rpc, FakeConnection())
+
+    moved = ModelResolver(_builtin_cfg(**{"llm.base_url": "http://other-llm.test/v1"}), None, data_dir=tmp_path)
+    assert moved.catalog().get("builtin/old-gateway-model") is None
+    assert moved.resolve("builtin/old-gateway-model").resolved is False
+
+
+def test_production_builder_passes_the_data_dir_to_the_resolver(tmp_path):
+    from vade.session import _build_model_resolver
+
+    resolver = _build_model_resolver(_builtin_cfg(), None, tmp_path)
+    assert resolver._cache_path == tmp_path / "models_discovered.json"

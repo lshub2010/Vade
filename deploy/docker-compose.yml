@@ -22,9 +22,9 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       args:
-        VADE_VERSION: "0.0.3-alpha"
+        VADE_VERSION: "0.0.4-alpha"
         VADE_ARCH: "x86_64"          # or aarch64
-    image: vade-core:0.0.3-alpha
+    image: vade-core:0.0.4-alpha
     container_name: vade-core
     restart: unless-stopped
     user: "10001:10001"

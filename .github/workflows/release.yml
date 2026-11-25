@@ -10,11 +10,11 @@ name: Release 0.0.3
 on:
   push:
     tags:
-      - "v0.0.3-alpha"
+      - "v0.0.4-alpha"
   workflow_dispatch:
     inputs:
       tag:
-        description: "existing tag, e.g. v0.0.3-alpha"
+        description: "existing tag, e.g. v0.0.4-alpha"
         required: true
         type: string
 
@@ -165,7 +165,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: Vade 0.0.3-alpha
+          name: Vade 0.0.4-alpha
           prerelease: true
           body_path: docs/release/0.0.3-notes.md
           generate_release_notes: false

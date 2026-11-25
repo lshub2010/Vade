@@ -30,6 +30,10 @@ __all__ = ["SessionRPC", "ConnectionSink", "WRITE_METHODS", "CSRF_PARAM"]
 #: create a session when `session_id` is null, and that branch carries its own
 #: gate (`_require_writable`) — refusing attach outright would lock an
 #: explicitly read-only viewer out of the history it is allowed to watch.
+#: `model/discover` is also absent on purpose: it writes only a derived,
+#: non-authoritative cache (`models_discovered.json`) so a selected upstream id
+#: survives restart; it is bounded by the 2 s cooldown and does not change the
+#: user's session/model data, so read-only viewers may refresh it.
 WRITE_METHODS: frozenset[str] = frozenset({
     "ui/submit",
     "ui/interrupt",
@@ -129,7 +133,7 @@ class SessionRPC:
             # RFC-0005 (C-05 append): read-only model surface + usage views.
             "model/list": self.model_list,
             # 0.0.3 (C-05 1.8.0): upstream `/models` discovery for the builtin
-            # provider. Read-only for the caller: it refreshes a process-local
+            # provider. Read-only for the caller: it refreshes a derived, persisted
             # cache, so a read-only viewer may look at the real list too.
             "model/discover": self.model_discover,
             "session/model.get": self.session_model_get,
@@ -392,10 +396,13 @@ class SessionRPC:
         model declares its own list (`model/list` already shows it), and `mock`
         has no upstream at all, so both answer `UNAVAILABLE` instead of probing
         something core does not own — the declared error set has no
-        `READ_ONLY_SESSION` because this refreshes a process-local cache, not
-        durable state.
+        `READ_ONLY_SESSION` because this refreshes a bounded, derived cache
+        (persisted only so a restart does not strand a selected id), not
+        authoritative user state.
 
-        A failed refresh answers `UNAVAILABLE` and KEEPS the last good list:
+        The last good list is persisted under `core.data_dir` (0600) and
+        hydrated on the next start; the cache is derived, not authoritative
+        user data. A failed refresh answers `UNAVAILABLE` and KEEPS the last good list:
         blanking the picker on a 401/503 would read as "the upstream has no
         models", the exact misreading `OpenAICompatProvider.list_models()`
         refuses to produce. `cached` says whether this call actually reached

@@ -1,7 +1,7 @@
 # deploy — production samples
 
 Copy-and-edit samples for running the Vade core. They match the code on
-`dev_gingshan` for `0.0.3-alpha`; the reasoning behind every value is in
+`dev_gingshan` for `0.0.4-alpha`; the reasoning behind every value is in
 [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md) (中文：[`docs/DEPLOYMENT.zh-CN.md`](../docs/DEPLOYMENT.zh-CN.md)).
 `schema/config.schema.json` remains the authority for config keys.
 
@@ -19,7 +19,7 @@ Copy-and-edit samples for running the Vade core. They match the code on
 
 ```bash
 # 1) install the release (docs/DEPLOYMENT.md §3) to
-#    /opt/vade/releases/vade-core-0.0.3-alpha-linux-x86_64 + /opt/vade/current
+#    /opt/vade/releases/vade-core-0.0.4-alpha-linux-x86_64 + /opt/vade/current
 
 sudo install -d -m 0750 -o root -g vade /etc/vade
 sudo install -d -m 0700 -o vade -g vade /var/lib/vade

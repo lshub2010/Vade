@@ -54,7 +54,7 @@ _SOURCES = ("session", "global", "priority", "none")
 
 logger = logging.getLogger(__name__)
 
-#: Process-local cache on disk: survives a core restart so a selected
+#: Persistent derived cache on disk: survives a core restart so a selected
 #: `builtin/<upstream-id>` remains selectable until the next refresh. The
 #: data dir is already 0700; the file itself is written 0600.
 _DISCOVERY_CACHE_VERSION = 2

@@ -199,7 +199,7 @@ def install(app: Any) -> Any:
     registry = getattr(app, "registry", None)
     # RFC-0005: the catalog/resolver are read-only views over the registry +
     # `[llm]`; the queue asks the resolver at dequeue (§5.3), never at submit.
-    resolver = _build_model_resolver(cfg, registry)
+    resolver = _build_model_resolver(cfg, registry, data_dir)
     log.set_model_resolver(resolver)
     log.set_usage_accounting(_build_usage(cfg, store, log, data_dir))
     approval = _LazyApproval(app)
@@ -301,10 +301,10 @@ def install(app: Any) -> Any:
     return app
 
 
-def _build_model_resolver(cfg: Any, registry: Any) -> Any:
+def _build_model_resolver(cfg: Any, registry: Any, data_dir: Path) -> Any:
     from ..llm.catalog import ModelResolver
 
-    return ModelResolver(cfg, registry)
+    return ModelResolver(cfg, registry, data_dir=data_dir)
 
 
 def _build_usage(cfg: Any, store: Any, log: Any, data_dir: Path) -> Any:

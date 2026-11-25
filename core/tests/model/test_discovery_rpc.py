@@ -77,9 +77,9 @@ def _builtin_cfg(**overrides):
     )
 
 
-def _rpc(tmp_path, cfg):
+def _rpc(tmp_path, cfg, data_dir=None):
     log = SessionLog(SQLiteStore(tmp_path / "sessions.db"), replay=ReplayBuffer(maxlen=100))
-    resolver = ModelResolver(cfg, None)
+    resolver = ModelResolver(cfg, None, data_dir=data_dir)
     log.set_model_resolver(resolver)
     return log, SessionRPC(log), resolver
 
@@ -285,3 +285,43 @@ def test_failed_refresh_arms_the_cooldown(tmp_path, monkeypatch):
     assert isinstance(second, dict)
     assert second["cached"] is True
     assert upstream.calls == 1
+
+
+def test_discovery_survives_a_core_restart(tmp_path, monkeypatch):
+    """The selected upstream id must remain resolvable after the process restarts."""
+    upstream = FakeUpstream(["qwen2.5-vl-72b", "llama-3.3-70b"])
+    _patch_upstream(monkeypatch, upstream)
+    _, rpc, _ = _rpc(tmp_path, _builtin_cfg(), data_dir=tmp_path)
+
+    result = _discover(rpc, FakeConnection())
+    assert isinstance(result, dict)
+
+    cache = tmp_path / "models_discovered.json"
+    assert cache.is_file()
+    assert (cache.stat().st_mode & 0o777) == 0o600
+
+    restarted = ModelResolver(_builtin_cfg(), None, data_dir=tmp_path)
+    assert restarted.catalog().get("builtin/qwen2.5-vl-72b") is not None
+    assert restarted.discovered_at == result["discovered_at"]
+    assert restarted.resolve("builtin/qwen2.5-vl-72b").resolved is True
+
+
+def test_a_failed_refresh_does_not_overwrite_the_persisted_list(tmp_path, monkeypatch):
+    upstream = FakeUpstream(["keep-me"])
+    _patch_upstream(monkeypatch, upstream)
+    _, rpc, resolver = _rpc(tmp_path, _builtin_cfg(), data_dir=tmp_path)
+    _discover(rpc, FakeConnection())
+    before = (tmp_path / "models_discovered.json").read_text()
+
+    resolver._last_discovery_at -= 10  # step past the 2 s refresh cooldown
+    upstream.error = RuntimeError("503 Service Unavailable")
+    failed = _discover(rpc, FakeConnection())
+    assert isinstance(failed, RpcError)
+    assert (tmp_path / "models_discovered.json").read_text() == before
+
+
+def test_corrupt_cache_is_ignored_at_startup(tmp_path):
+    (tmp_path / "models_discovered.json").write_text("{not json", encoding="utf-8")
+    resolver = ModelResolver(_builtin_cfg(), None, data_dir=tmp_path)
+    assert resolver.catalog().get("builtin/qwen2.5-vl-72b") is None
+    assert resolver.discovered_at is None

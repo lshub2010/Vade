@@ -25,9 +25,13 @@ id — a revision that could fall back would strand `model/list?if_revision`.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping
 
 from .capabilities import ModelSpec, normalise_capabilities
@@ -44,6 +48,14 @@ MODEL_TOOL = "chat"
 _BUILTIN_MODES = {"", "builtin", "openai", "openai_compatible"}
 
 _SOURCES = ("session", "global", "priority", "none")
+
+logger = logging.getLogger(__name__)
+
+#: Process-local cache on disk: survives a core restart so a selected
+#: `builtin/<upstream-id>` remains selectable until the next refresh. The
+#: data dir is already 0700; the file itself is written 0600.
+_DISCOVERY_CACHE_VERSION = 1
+_DISCOVERY_CACHE_NAME = "models_discovered.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,9 +339,10 @@ class ModelResolver:
     #: turn one core into a request amplifier against the LLM gateway.
     DISCOVERY_COOLDOWN_S = 2.0
 
-    def __init__(self, config: Any, registry: Any | None = None) -> None:
+    def __init__(self, config: Any, registry: Any | None = None, data_dir: str | Path | None = None) -> None:
         self.config = config
         self.registry = registry
+        self._cache_path = Path(data_dir) / _DISCOVERY_CACHE_NAME if data_dir is not None else None
         self._discovered: tuple[ModelEntry, ...] = ()
         self._discovered_revision = 0
         self._last_discovery_at = 0.0
@@ -337,10 +350,87 @@ class ModelResolver:
         self._discovery_generation = 0
         self._discovery_lock = asyncio.Lock()
         self._last_discovery_error: str | None = None
+        self._load_discovered()
+
+    def _load_discovered(self) -> None:
+        """Hydrate the last successful discovery from the data dir.
+
+        Best-effort: a corrupt or unreadable cache must not stop the core from
+        starting. The configured model remains the default (priority 0); the
+        loaded rows keep priority -1 so a refresh never changes that default.
+        """
+        path = self._cache_path
+        if path is None or not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 - startup must survive a bad cache
+            logger.warning("ignoring unreadable model discovery cache: %s", exc)
+            return
+        if not isinstance(payload, dict) or payload.get("version") != _DISCOVERY_CACHE_VERSION:
+            return
+        raw_ids = payload.get("ids")
+        if not isinstance(raw_ids, list):
+            return
+        ids: list[str] = []
+        for raw in raw_ids:
+            if isinstance(raw, str) and raw.strip() and raw.strip() not in ids:
+                ids.append(raw.strip())
+        self._discovered = self._entries_for(ids)
+        self._discovered_revision = 1
+        self._discovery_generation = 1
+        discovered_at = payload.get("discovered_at")
+        self._discovered_at = discovered_at if isinstance(discovered_at, str) else None
+
+    @staticmethod
+    def _entries_for(ids: list[str]) -> tuple[ModelEntry, ...]:
+        return tuple(
+            ModelEntry(
+                id=f"{BUILTIN}/{model_id}",
+                provider=BUILTIN,
+                model=model_id,
+                display_name=model_id,
+                # A refresh must never silently change the default: the
+                # configured `builtin/<llm.model>` entry stays ahead of every
+                # discovered one. With equal priority, selection falls back to
+                # lexical id and picks e.g. `claude-*` merely because it sorts
+                # before `gpt-*`.
+                priority=-1,
+                available=True,
+            )
+            for model_id in ids
+        )
+
+    def _persist_discovered(self) -> None:
+        """Atomically write the last good list; discovery is still a success if
+        the write fails, but the restart gap then remains (logged, not silent)."""
+        path = self._cache_path
+        if path is None:
+            return
+        payload = {
+            "version": _DISCOVERY_CACHE_VERSION,
+            "discovered_at": self._discovered_at,
+            "ids": [entry.model for entry in self._discovered],
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
+                fh.write("\n")
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+        except Exception as exc:  # noqa: BLE001 - cache persistence is best effort
+            logger.warning("could not persist model discovery cache: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def catalog(self) -> ModelCatalog:
         base = build_catalog(self.config, self.registry)
-        if not self._discovery_generation or base.mode not in _BUILTIN_MODES:
+        if not self._discovery_generation or not self.can_discover():
             return base
         configured = {entry.id for entry in base.entries}
         extra = tuple(entry for entry in self._discovered if entry.id not in configured)
@@ -394,26 +484,12 @@ class ModelResolver:
                 self._last_discovery_error = f"{type(exc).__name__}: {exc}"[:300]
                 raise
             self._last_discovery_error = None
-            self._discovered = tuple(
-                ModelEntry(
-                    id=f"{BUILTIN}/{model_id}",
-                    provider=BUILTIN,
-                    model=model_id,
-                    display_name=model_id,
-                    # A refresh must never silently change the default: the
-                    # configured `builtin/<llm.model>` entry stays ahead of
-                    # every discovered one. With equal priority, selection
-                    # falls back to lexical id and picks e.g. `claude-*`
-                    # merely because it sorts before `gpt-*`.
-                    priority=-1,
-                    available=True,
-                )
-                for model_id in ids
-            )
+            self._discovered = self._entries_for(ids)
             self._discovered_revision += 1
             self._discovery_generation += 1
             self._last_discovery_at = now
             self._discovered_at = _utc_now()
+            self._persist_discovered()
             return self.catalog()
 
     def _in_cooldown(self, now: float | None = None) -> bool:

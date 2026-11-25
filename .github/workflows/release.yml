@@ -1,6 +1,6 @@
-name: Release 0.0.3
+name: Release 0.0.4
 
-# One release page with every 0.0.3 artifact:
+# One release page with every 0.0.4 artifact:
 #   core tarballs (x86_64 + aarch64), module wheels, and the client assets
 #   already published by lshub2010/vade-client for the same tag.
 #

@@ -25,7 +25,7 @@ Vade is an agent runtime built around one rule: **the core must not know what a 
 | | |
 |---|---|
 | Release | `v0.0.4-alpha` (pre-release) |
-| Contract | rpc `1.7.0` — 49 methods in 3 directions · events `2.0.0` — 34 events · 34 error codes |
+| Contract | rpc `1.8.0` — 50 methods in 3 directions · events `2.0.0` — 34 events · 34 error codes |
 | Verification | [`docs/ALPHA.md`](docs/ALPHA.md) — evidence per alpha criterion and the known-defect list |
 
 ## Why?

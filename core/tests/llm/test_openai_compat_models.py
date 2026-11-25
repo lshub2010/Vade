@@ -61,7 +61,7 @@ def test_list_models_omits_authorization_without_a_key(monkeypatch):
     assert seen["auth"] is None
 
 
-def test_list_models_raises_on_http_error_instead_of_returning_empty():
+def test_list_models_raises_on_http_error_without_leaking_the_url():
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, json={"error": "down"})
 
@@ -75,7 +75,9 @@ def test_list_models_raises_on_http_error_instead_of_returning_empty():
 
     try:
         asyncio.run(scenario())
-    except httpx.HTTPStatusError as exc:
-        assert exc.response.status_code == 503
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "503" in message
+        assert "llm.test" not in message, "the request URL must not be echoed"
     else:
         raise AssertionError("a 503 must not be reported as an empty model list")

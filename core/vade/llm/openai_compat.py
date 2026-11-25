@@ -95,7 +95,10 @@ class OpenAICompatProvider:
 
         async with httpx.AsyncClient(timeout=self.timeout_s, transport=self._transport) as client:
             response = await client.get(f"{self.base_url}/models", headers=self._headers())
-            response.raise_for_status()
+            if response.status_code >= 400:
+                # Never echo the request URL: `base_url` may carry userinfo or a
+                # query token, and this message reaches the browser/QQ UI.
+                raise RuntimeError(f"LLM /models returned HTTP {response.status_code}")
             payload = response.json()
         rows = payload.get("data") if isinstance(payload, dict) else payload
         if not isinstance(rows, list):

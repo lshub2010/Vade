@@ -9,7 +9,7 @@ The core does four jobs: **connect, route, run the turn loop, and manage keys an
 > The name is Latin *vade* ("go"), as in *vade mecum*, "go with me". The Chinese name 偕行 comes from the Book of Songs: 「与子偕行」, "walk together with you".
 
 > [!WARNING]
-> **Alpha software (`0.0.4-alpha`).** The protocol, data formats, and UI behavior can change without notice. Do not make it the only copy of anything you cannot afford to lose. If you self-host it or run it in production, follow the [deployment guide](docs/DEPLOYMENT.md), harden it for your environment, and accept the risk. The project is AI-assisted: the code has automated tests and human review, but style, comments, and edge-case coverage are not uniform. Audit and harden it before using it for anything critical.
+> **Alpha software (`0.0.5-alpha`).** The protocol, data formats, and UI behavior can change without notice. Do not make it the only copy of anything you cannot afford to lose. If you self-host it or run it in production, follow the [deployment guide](docs/DEPLOYMENT.md), harden it for your environment, and accept the risk. The project is AI-assisted: the code has automated tests and human review, but style, comments, and edge-case coverage are not uniform. Audit and harden it before using it for anything critical.
 
 > **Deploying Vade?** Read the [deployment guide](docs/DEPLOYMENT.md) (English) or the [中文部署教程](docs/DEPLOYMENT.zh-CN.md) before exposing it. They cover self-hosting and the production hardening checklist.
 
@@ -24,7 +24,7 @@ Vade is an agent runtime built around one rule: **the core must not know what a 
 
 | | |
 |---|---|
-| Release | `v0.0.4-alpha` (pre-release) |
+| Release | `v0.0.5-alpha` (pre-release) |
 | Contract | rpc `1.8.0` — 50 methods in 3 directions · events `2.0.0` — 34 events · 34 error codes |
 | Verification | [`docs/ALPHA.md`](docs/ALPHA.md) — evidence per alpha criterion and the known-defect list |
 
@@ -67,41 +67,41 @@ The trade-off is operational: you run and supervise more than one process, and a
 - **Modules are processes, not plugins.** A module starts its own process, connects to the core, and declares its capabilities and pages. The reference implementation is the echo module in its own repository.
 - **`schema/` wins.** When code and contract disagree, the contract is the bug report.
 
-## What is in 0.0.4-alpha
+## What is in 0.0.5-alpha
 
 | Area | What is there |
 |---|---|
 | Core | WebSocket data plane on `:8443`; Noise handshakes for devices and modules, cookie sessions for browsers; module registry and routing; FIFO turn queue with `queue_pos` and interrupt; event stream with `seq` and replay; SQLite sessions and attach snapshots; inline approvals; append-only audit; usage budgets |
-| Models | Built-in OpenAI-compatible adapter (`/v1/chat/completions`), optional `model/discover` upstream `/models` refresh (last good list persisted across restarts), `provider = "module"` for model modules, and a `mock` provider for offline UI work |
+| Models | Built-in OpenAI-compatible adapter (`/v1/chat/completions`), optional `model/discover` upstream `/models` refresh (last good list persisted across restarts; retry re-sends discovery), `provider = "module"` for model modules, and a `mock` provider for offline UI work |
 | Clients | Android, Windows desktop, and Web (wasm); fixtures by default, real core when explicitly enabled; chat send / stream / interrupt, session and group management, inline approvals, module pages |
 | Admin | Admin listener on `:8444` with a React UI. Login and node governance are implemented; setup, audit, and settings pages are still placeholders |
 | Modules | Five separate module repositories: echo (reference), fs, shell, web, model — each with its own CI and tests |
 
 ## Download
 
-All `0.0.4-alpha` artifacts use the tag `v0.0.4-alpha`.
+All `0.0.5-alpha` artifacts use the tag `v0.0.5-alpha`.
 
 | Component | Artifact | Where |
 |---|---|---|
-| Core (Linux) | `vade-core-0.0.4-alpha-linux-x86_64.tar.gz` and `...-aarch64.tar.gz`, with SHA-256 checksums | [Vade `v0.0.4-alpha`](https://github.com/lshub2010/Vade/releases/tag/v0.0.4-alpha) |
+| Core (Linux) | `vade-core-0.0.5-alpha-linux-x86_64.tar.gz` and `...-aarch64.tar.gz`, with SHA-256 checksums | [Vade `v0.0.5-alpha`](https://github.com/lshub2010/Vade/releases/tag/v0.0.5-alpha) |
 | Clients | Debug-signed APK; Windows MSI and portable zip; Web (wasm) zip | [vade-client releases](https://github.com/lshub2010/vade-client/releases) |
 | Modules | `py3-none-any` wheel plus `manifest.json` for each module | Each module repository's Releases page (links below) |
 
 The core archive contains the `core` package, the Python protocol binding (`libvade_protocol.so`), `schema/`, the Python SDK, the built admin UI, `install.sh`, and the license files. Python dependencies are not vendored: `install.sh` creates a virtualenv and installs `requirements.txt`.
 
-The core archive is Linux-only (`x86_64`, `aarch64`). On Windows or macOS, run from source. The Android APK is debug-signed and the Windows artifacts are unsigned — see [Not in 0.0.4-alpha](#not-in-004-alpha).
+The core archive is Linux-only (`x86_64`, `aarch64`). On Windows or macOS, run from source. The Android APK is debug-signed and the Windows artifacts are unsigned — see [Not in 0.0.5-alpha](#not-in-005-alpha).
 
 ## Install from the release package (Linux)
 
 ```bash
 ARCH=x86_64   # or aarch64
-BASE=https://github.com/lshub2010/Vade/releases/download/v0.0.4-alpha
+BASE=https://github.com/lshub2010/Vade/releases/download/v0.0.5-alpha
 
-curl -LO "$BASE/vade-core-0.0.4-alpha-linux-$ARCH.tar.gz"
-sha256sum "vade-core-0.0.4-alpha-linux-$ARCH.tar.gz"   # compare with the checksum on the release page
+curl -LO "$BASE/vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"
+sha256sum "vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"   # compare with the checksum on the release page
 
-tar xzf "vade-core-0.0.4-alpha-linux-$ARCH.tar.gz"
-cd "vade-core-0.0.4-alpha-linux-$ARCH"
+tar xzf "vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"
+cd "vade-core-0.0.5-alpha-linux-$ARCH"
 ./install.sh
 ```
 
@@ -201,7 +201,7 @@ To write a module, start with the Python SDK in [`sdk/python`](sdk/python), the 
 | [`docs/status.md`](docs/status.md) | Batch status and milestones |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Branches, review, and merge rules |
 
-## Not in 0.0.4-alpha
+## Not in 0.0.5-alpha
 
 These are explicitly deferred, not silently missing:
 

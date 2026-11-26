@@ -3,13 +3,13 @@
 [English](DEPLOYMENT.md) | **简体中文**
 
 本文面向在 Linux 服务器上运行 Vade core（`python -m vade`）的运维人员。文中
-每一条命令、路径、键名与默认值都对照过 `dev_gingshan` 上 `0.0.4-alpha` 的代码；
+每一条命令、路径、键名与默认值都对照过 `dev_gingshan` 上 `0.0.5-alpha` 的代码；
 没有凭空发明的 CLI 参数。凡是“schema 里有、这一版没接线”的东西，正文会直接
 写明，而不是描述一个“应该如此”的行为。
 
 | 项 | 值 |
 |---|---|
-| 发布包 | `vade-core-0.0.4-alpha-linux-{x86_64,aarch64}.tar.gz` |
+| 发布包 | `vade-core-0.0.5-alpha-linux-{x86_64,aarch64}.tar.gz` |
 | Python | 3.11+（CI 与本文实测均为 3.12） |
 | Rust | 1.85+ —— **仅**在需要自行重编 `libvade_protocol.so` 时；发布包已带 |
 | init | systemd（样例见 `deploy/systemd/`） |
@@ -26,7 +26,7 @@
    `__Host-ac_ui=…; Secure`。明文 HTTP 下真实浏览器会直接丢弃，所以生产环境
    必须在某处有 TLS（反代或 core 自身），除非你只在 `http://127.0.0.1` 上用。
 
-> 版本说明：本文按 `0.0.4-alpha` 的代码写成，键名与默认值以
+> 版本说明：本文按 `0.0.5-alpha` 的代码写成，键名与默认值以
 > `schema/config.schema.json` 为准；升级后若 schema 有增删，以新版本的
 > schema 与实际代码为准。
 
@@ -84,7 +84,7 @@ cp target/release/libvade_protocol.so python/
 ### 3.1 下载与校验
 
 ```bash
-VADE_VERSION=0.0.4-alpha
+VADE_VERSION=0.0.5-alpha
 ARCH=x86_64                     # 或 aarch64
 BASE="https://github.com/lshub2010/Vade/releases/download/v${VADE_VERSION}"
 
@@ -774,7 +774,7 @@ ssh -N -L 8444:127.0.0.1:8444 ops@vade.example.com
 
 `/healthz` 不需要鉴权，也刻意不返回配置、指纹或模块清单。`version` 是编译期
 常量（`CORE_VERSION = "0.1.0"`），不是发布 tag —— 别拿它判断
-`0.0.4-alpha`。
+`0.0.5-alpha`。
 
 `policy_mode` 只有在 `[dev].allow_all = true` 时才是 `allow_all`；生产必须
 保持默认的 `false`。
@@ -838,7 +838,7 @@ curl -fsS http://127.0.0.1:8443/healthz
 发布包是可重定位的自包含目录，唯一必须活下来的是 `data_dir`。
 
 ```bash
-VADE_VERSION=0.0.4-alpha
+VADE_VERSION=0.0.5-alpha
 ARCH=x86_64
 BASE="https://github.com/lshub2010/Vade/releases/download/v${VADE_VERSION}"
 

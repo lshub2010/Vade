@@ -9,7 +9,7 @@
 > 名字取自拉丁语 `vade`（走），`vade mecum` 意为「与我同行」；中文名取自《诗经》「与子偕行」。
 
 > [!WARNING]
-> **当前是 alpha（`0.0.4-alpha`）。** 协议、数据格式和界面行为都可能随时变化。不建议用它承载不可恢复的数据。自托管或生产化部署请按[中文部署教程](docs/DEPLOYMENT.zh-CN.md)加固，并自担风险。项目由 AI 辅助开发：代码经过自动化测试和人工审查，但风格、注释和边界覆盖并不整齐；用于关键场景前，请自行审计、加固并补测试。
+> **当前是 alpha（`0.0.5-alpha`）。** 协议、数据格式和界面行为都可能随时变化。不建议用它承载不可恢复的数据。自托管或生产化部署请按[中文部署教程](docs/DEPLOYMENT.zh-CN.md)加固，并自担风险。项目由 AI 辅助开发：代码经过自动化测试和人工审查，但风格、注释和边界覆盖并不整齐；用于关键场景前，请自行审计、加固并补测试。
 
 > **要部署 Vade？** 对外暴露前先读[中文部署教程](docs/DEPLOYMENT.zh-CN.md)或 [English deployment guide](docs/DEPLOYMENT.md)，按里面的自托管与生产化加固步骤走。
 
@@ -24,7 +24,7 @@ Vade 只有一条硬规矩：**内核不许知道某个模型、某个工具、�
 
 | | |
 |---|---|
-| 版本 | `v0.0.4-alpha`（pre-release） |
+| 版本 | `v0.0.5-alpha`（pre-release） |
 | 契约 | rpc `1.8.0`，三方向 50 个方法；events `2.0.0`，34 个事件；34 个错误码 |
 | 验证 | [`docs/ALPHA.md`](docs/ALPHA.md) —— 每条 alpha 验收句都有证据，已知缺陷单列 |
 
@@ -66,41 +66,41 @@ Vade 反过来：
 - **模块是进程，不是插件。** 模块自己起进程、连内核、声明能力和页面。参考实现是独立仓里的 echo 模块。
 - **代码和契约打架时，契约赢。** `schema/` 不是文档，是运行时的校验依据。
 
-## 0.0.4-alpha 的现状
+## 0.0.5-alpha 的现状
 
 | 层面 | 现状 |
 |---|---|
 | 内核 | 数据面 WebSocket `:8443`；设备/模块走 Noise 握手，浏览器走 cookie 会话；模块注册表与路由；FIFO 回合队列，带 `queue_pos` 和中断；事件流带 `seq` 与重放；SQLite 会话与 attach 快照；会话内审批；只追加审计；用量预算 |
-| 模型 | 内置 OpenAI 兼容适配器（`/v1/chat/completions`）；`model/discover` 可拉取上游 `/models`，最后一次成功列表会跨重启保留；`provider = "module"` 可把模型放进独立模块；`mock` 可离线跑通回合 |
+| 模型 | 内置 OpenAI 兼容适配器（`/v1/chat/completions`）；`model/discover` 可拉取上游 `/models`，最后一次成功列表会跨重启保留，发现失败可重试重新探测；`provider = "module"` 可把模型放进独立模块；`mock` 可离线跑通回合 |
 | 客户端 | Android、Windows 桌面、Web（wasm）；默认走假数据，显式开启后连真内核；发送/流式/中断、会话与分组管理、内联审批、模块页面 |
 | 管理面 | `:8444` 上的管理监听与 React 前端。登录和节点治理已实现；setup、audit、settings 仍是占位页 |
 | 模块 | 五个独立仓：echo（参考实现）、fs、shell、web、model；各有自己的 CI 和测试 |
 
 ## 下载
 
-`0.0.4-alpha` 的产物统一使用 `v0.0.4-alpha` 这个 tag。
+`0.0.5-alpha` 的产物统一使用 `v0.0.5-alpha` 这个 tag。
 
 | 组件 | 产物 | 在哪 |
 |---|---|---|
-| 内核（Linux） | `vade-core-0.0.4-alpha-linux-x86_64.tar.gz`、`...-aarch64.tar.gz`，附 SHA-256 校验和 | [Vade `v0.0.4-alpha`](https://github.com/lshub2010/Vade/releases/tag/v0.0.4-alpha) |
+| 内核（Linux） | `vade-core-0.0.5-alpha-linux-x86_64.tar.gz`、`...-aarch64.tar.gz`，附 SHA-256 校验和 | [Vade `v0.0.5-alpha`](https://github.com/lshub2010/Vade/releases/tag/v0.0.5-alpha) |
 | 客户端 | debug 签名 APK；Windows MSI 与免安装 zip；Web（wasm）zip | [vade-client releases](https://github.com/lshub2010/vade-client/releases) |
 | 模块 | 每个模块一个 `py3-none-any` wheel + `manifest.json` | 各模块仓的 Releases 页（见下表链接） |
 
 内核压缩包里带 `core` 包、Python 协议绑定（`libvade_protocol.so`）、`schema/`、Python SDK、构建好的管理前端、`install.sh` 和许可文件。Python 依赖没有随包塞入：`install.sh` 会建虚拟环境并安装 `requirements.txt`。
 
-内核包只有 Linux（`x86_64`、`aarch64`）。Windows 和 macOS 请从源码跑。Android APK 是 debug 签名，Windows 产物未签名 —— 详见[「0.0.4-alpha 明确没做」](#004-alpha-明确没做)。
+内核包只有 Linux（`x86_64`、`aarch64`）。Windows 和 macOS 请从源码跑。Android APK 是 debug 签名，Windows 产物未签名 —— 详见[「0.0.5-alpha 明确没做」](#005-alpha-明确没做)。
 
 ## 从发布包安装（Linux）
 
 ```bash
 ARCH=x86_64   # 或 aarch64
-BASE=https://github.com/lshub2010/Vade/releases/download/v0.0.4-alpha
+BASE=https://github.com/lshub2010/Vade/releases/download/v0.0.5-alpha
 
-curl -LO "$BASE/vade-core-0.0.4-alpha-linux-$ARCH.tar.gz"
-sha256sum "vade-core-0.0.4-alpha-linux-$ARCH.tar.gz"   # 与发布页上的校验和比对
+curl -LO "$BASE/vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"
+sha256sum "vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"   # 与发布页上的校验和比对
 
-tar xzf "vade-core-0.0.4-alpha-linux-$ARCH.tar.gz"
-cd "vade-core-0.0.4-alpha-linux-$ARCH"
+tar xzf "vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"
+cd "vade-core-0.0.5-alpha-linux-$ARCH"
 ./install.sh
 ```
 
@@ -200,7 +200,7 @@ api_key_env = "VADE_LLM_API_KEY"
 | [`docs/status.md`](docs/status.md) | 批次状态与里程碑 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 分支、审查与合并规则 |
 
-## 0.0.4-alpha 明确没做
+## 0.0.5-alpha 明确没做
 
 这些是明确延期，不是悄悄缺省：
 

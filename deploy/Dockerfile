@@ -4,8 +4,8 @@
 # release tarball. Pin VADE_VERSION and verify the checksum in CI if you
 # rebuild; the Dockerfile below installs the tarball as-is.
 #
-#   docker build -f deploy/Dockerfile -t vade-core:0.0.4-alpha \
-#     --build-arg VADE_VERSION=0.0.4-alpha \
+#   docker build -f deploy/Dockerfile -t vade-core:0.0.5-alpha \
+#     --build-arg VADE_VERSION=0.0.5-alpha \
 #     --build-arg VADE_ARCH=x86_64 .
 #
 # Build context is the repository root only so the ARGs resolve; no repo files
@@ -14,7 +14,7 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
-ARG VADE_VERSION=0.0.4-alpha
+ARG VADE_VERSION=0.0.5-alpha
 ARG VADE_ARCH=x86_64
 ARG VADE_BASE_URL=https://github.com/lshub2010/Vade/releases/download/v${VADE_VERSION}
 

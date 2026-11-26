@@ -343,3 +343,27 @@ def test_production_builder_passes_the_data_dir_to_the_resolver(tmp_path):
 
     resolver = _build_model_resolver(_builtin_cfg(), None, tmp_path)
     assert resolver._cache_path == tmp_path / "models_discovered.json"
+
+
+def test_production_install_wires_the_persisted_cache_path(tmp_path):
+    """The builder test above is not enough: `session.install()` must call it with data_dir."""
+    from vade.app import App, install_components
+    from vade.config import load_config
+
+    cfg = load_config(cli={
+        "core.data_dir": str(tmp_path),
+        "llm.provider": "openai_compatible",
+        "llm.base_url": "http://llm.test/v1",
+        "llm.model": "gpt-4o-mini",
+    })
+
+    async def scenario() -> None:
+        app = App(cfg)
+        await app.startup()
+        install_components(app, strict=False)
+        try:
+            assert app.models._cache_path == tmp_path / "models_discovered.json"
+        finally:
+            await app.shutdown()
+
+    asyncio.run(scenario())

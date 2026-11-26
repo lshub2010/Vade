@@ -386,6 +386,7 @@ class ModelResolver:
             return
         raw_ids = payload.get("ids")
         if not isinstance(raw_ids, list):
+            logger.info("ignoring model discovery cache with a non-list ids field")
             return
         ids: list[str] = []
         for raw in raw_ids:
@@ -428,7 +429,9 @@ class ModelResolver:
             "discovered_at": self._discovered_at,
             "ids": [entry.model for entry in self._discovered],
         }
-        tmp = path.with_name(path.name + ".tmp")
+        # Per-process temp name: two cores sharing a restored data_dir must not
+        # truncate each other's half-written file.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -439,6 +442,14 @@ class ModelResolver:
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
             os.chmod(path, 0o600)
+            try:
+                dir_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
         except Exception as exc:  # noqa: BLE001 - cache persistence is best effort
             logger.warning("could not persist model discovery cache: %s", exc)
             try:

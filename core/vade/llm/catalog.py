@@ -31,6 +31,7 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -429,12 +430,13 @@ class ModelResolver:
             "discovered_at": self._discovered_at,
             "ids": [entry.model for entry in self._discovered],
         }
-        # Per-process temp name: two cores sharing a restored data_dir must not
-        # truncate each other's half-written file.
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        # A unique temp name, not just pid: two resolvers in one process (or
+        # containers sharing a data_dir) must not truncate each other's file.
+        tmp: Path | None = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+            tmp = Path(tmp_name)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
                 fh.write("\n")
@@ -452,10 +454,11 @@ class ModelResolver:
                 pass
         except Exception as exc:  # noqa: BLE001 - cache persistence is best effort
             logger.warning("could not persist model discovery cache: %s", exc)
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def catalog(self) -> ModelCatalog:
         base = build_catalog(self.config, self.registry)

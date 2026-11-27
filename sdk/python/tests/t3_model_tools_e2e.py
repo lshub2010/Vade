@@ -4,7 +4,7 @@ Not collected by pytest (the filename does not start with ``test_``): it needs
 the Rust binding, uvicorn, a free port and two module checkouts. Run it
 explicitly:
 
-    /root/HermesWorkspace/Vade/.venv/bin/python sdk/python/tests/t3_model_tools_e2e.py
+    python sdk/python/tests/t3_model_tools_e2e.py
 
 What it proves, in order:
 
@@ -92,7 +92,6 @@ def _binding_dir(work: Path) -> Path:
             candidates.extend(sorted(base.glob("*/protocol/core/python/libvade_protocol.so")))
         except OSError:
             pass
-    candidates.append(Path("/root/HermesWorkspace/Vade/protocol/core/python/libvade_protocol.so"))
 
     for candidate in candidates:
         if candidate.is_file():
@@ -322,8 +321,9 @@ async def main() -> int:
     from vade.transport.server import CoreApp
     from vade_sdk.transport import fingerprint_of, load_or_create_key
 
-    model_dir = Path(os.environ.get("VADE_MODEL_DIR", "/root/HermesWorkspace/Vade-module-model"))
-    echo_dir = Path(os.environ.get("VADE_ECHO_DIR", "/root/HermesWorkspace/Vade-module-echo"))
+    workspace = REPO.parent if (REPO.parent / "Vade-module-model").is_dir() else REPO.parent.parent
+    model_dir = Path(os.environ.get("VADE_MODEL_DIR", workspace / "Vade-module-model"))
+    echo_dir = Path(os.environ.get("VADE_ECHO_DIR", workspace / "Vade-module-echo"))
     if not (model_dir / "src" / "model_module").is_dir():
         raise SystemExit(f"model module not found at {model_dir}; set VADE_MODEL_DIR")
     if not (echo_dir / "src" / "echo_module").is_dir():

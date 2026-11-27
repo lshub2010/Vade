@@ -105,3 +105,23 @@ def test_llm_model_module_still_pins_selection_and_routing():
     assert router.calls[0]["tool_id"] == f"{ALPHA}/chat", (
         "priority must not override an explicit llm.model_module pin"
     )
+
+
+def test_the_provider_channel_is_not_a_tool_the_model_can_call():
+    """`chat` reaches core through the router, never through the tool table.
+
+    Regression: `build_snapshot` published every manifest tool, so a model
+    module's `chat` appeared as `alpha__chat` in the prompt — the model could
+    call its own provider (FR-2.7 forbids module/core reverse calls), and with
+    several model modules online it got one such callable per module.
+    """
+    from vade.loop.tools import build_snapshot
+
+    registry = _two_modules()
+    snapshot = build_snapshot(registry)
+    assert snapshot.names() == ()
+    # ...while the router still reaches each module's namespaced chat.
+    assert [record.manifest.module_id for record in registry.snapshot()] != []
+    assert all(
+        record.manifest.tool("chat") is not None for record in registry.snapshot()
+    )

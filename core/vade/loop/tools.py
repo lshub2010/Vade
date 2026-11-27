@@ -22,6 +22,14 @@ __all__ = ["ToolEntry", "ToolSnapshot", "build_snapshot", "resolve_hot", "normal
 
 HOT_MAX_DEFAULT = 12
 
+#: Tools that are a *provider channel*, not a capability for the model. M6's
+#: `chat` is how `ModuleLLMProvider` reaches a model module; exposing it in the
+#: tool table let the model call its own provider recursively (and, with
+#: several model modules online, handed it one callable per module). The router
+#: still addresses `<module_id>/chat` — it reads the registry, not this
+#: snapshot — so hiding it here costs nothing.
+PROVIDER_TOOLS = frozenset({"chat"})
+
 
 def normalize_tool_key(name: str) -> str:
     """`mcp-bridge__s_kb_recall`, `mcp_bridge/s_kb_recall` and `MCP-BRIDGE__S_KB_RECALL`
@@ -167,6 +175,10 @@ def build_snapshot(registry: Any) -> ToolSnapshot:
         if health in ("offline", "rejected"):
             continue
         for spec in record.manifest.tools:
+            if spec.name in PROVIDER_TOOLS:
+                # A model module's `chat` is the provider channel; it must not
+                # become a tool the model can call (§FR-2.7 no reverse calls).
+                continue
             key = (record.module_id, spec.name)
             pairs.append(key)
             slot = merged.setdefault(key, {

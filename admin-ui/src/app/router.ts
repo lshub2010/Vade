@@ -2,9 +2,19 @@
 
 import { useEffect, useState } from 'react';
 
-// 已注册：`/nodes`、`/topology`、`/skills`、`/audit`、`/settings`、`/setup`、`/login`；
-// `/memory` 归后续批次。`/topology` 的实现在 `src/canvas/`（C5b 所有），这里只登记路由。
-export const ROUTES = ['/nodes', '/topology', '/skills', '/audit', '/settings', '/setup', '/login'] as const;
+// 已注册：`/nodes`、`/topology`、`/skills`、`/memory`、`/audit`、`/settings`、`/setup`、`/login`；
+// `/memory` 的列表 / 详情 / 晋升 / 归档 / 恢复在 `src/pages/MemoryPage.tsx`（只读会话不渲染写按钮）；
+// `/topology` 的实现在 `src/canvas/`（C5b 所有），这里只登记路由。
+export const ROUTES = [
+  '/nodes',
+  '/topology',
+  '/skills',
+  '/memory',
+  '/audit',
+  '/settings',
+  '/setup',
+  '/login',
+] as const;
 
 export type RoutePath = (typeof ROUTES)[number];
 

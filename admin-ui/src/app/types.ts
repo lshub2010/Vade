@@ -300,3 +300,50 @@ export interface SkillDetail extends SkillSummary {
   pending_revision: number | null;
   history: SkillHistoryEntry[];
 }
+
+// ---------------------------------------------------------------- memory
+
+export type MemoryLayer = 'session' | 'global';
+
+/** `staging` 待确认、`active` 参与召回、`archived` 手动归档、`superseded` 被新版本替换。 */
+export type MemoryStatus = 'staging' | 'active' | 'archived' | 'superseded';
+
+/**
+ * `GET /admin/api/memory` 的一行（schema#MemoryItem）。
+ *
+ * 契约只开放条目正文与指针，**不含** `user_text` / `assistant_text`：
+ * 记忆是从对话里抽出来的摘要，页面不请求原始对话，也不猜。
+ * `text` 是模型生成的文本，按纯文本渲染，不解析成 HTML/Markdown。
+ */
+export interface MemoryItem {
+  id: string;
+  text?: string;
+  layer: MemoryLayer | string;
+  namespace: string;
+  status: MemoryStatus | string;
+  session_id?: string | null;
+  turn_id?: string | null;
+  /** epoch 秒（不是毫秒）。 */
+  created_at: number;
+  /** epoch 秒；`null` = 不过期（全局层通常为 null）。 */
+  expires_at?: number | null;
+  hit_count?: number;
+  /** 本条替换掉的旧条目 id；`GET /{id}` 才保证有链。 */
+  supersedes?: string[];
+}
+
+export interface MemoryListResponse {
+  items: MemoryItem[];
+  /** 没有更多页时为 null；页面用它决定是否渲染「加载更多」。 */
+  next_cursor: string | null;
+}
+
+/** `GET /admin/api/memory/stats`：配额与计数，不含任何正文。 */
+export interface MemoryStats {
+  global_count: number;
+  global_limit: number;
+  staging_count: number;
+  archived_count: number;
+  /** epoch 秒；空库时为 null。 */
+  oldest_at: number | null;
+}

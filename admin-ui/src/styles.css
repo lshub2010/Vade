@@ -2627,6 +2627,180 @@ a:hover {
   font-size: 13px;
 }
 
+/* ------------------------------------------------------------------ 记忆 */
+
+.memory-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.memory-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #101623;
+}
+
+.memory-stat-label {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.memory-stat-value {
+  font-family: var(--mono);
+  font-size: 20px;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.memory-stat-value .muted {
+  font-size: 13px;
+}
+
+.memory-stat-hint {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.memory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.memory-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #121926;
+}
+
+.memory-item-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+}
+
+.memory-item-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.memory-item-time {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* 正文是模型生成的纯文本：保留换行，不做任何 HTML 解析。 */
+.memory-item-text,
+.memory-full-text {
+  margin: 0;
+  color: #d7e0ef;
+  font-size: 14px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.memory-item-text {
+  max-height: 6.2em;
+  overflow: hidden;
+}
+
+.memory-item-text .muted {
+  margin-left: 4px;
+  font-size: 12px;
+}
+
+.memory-item-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.memory-id {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.memory-item-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.memory-chain {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.memory-chain-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #0c121d;
+  font-size: 12.5px;
+}
+
+.memory-chain-text {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* 窄屏：配额两列，条目操作按钮占满一行（主场景是手机 WebView）。 */
+@media (max-width: 767px) {
+  .memory-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .memory-item-foot {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .memory-item-actions {
+    margin-left: 0;
+  }
+
+  .memory-item-actions .Button {
+    flex: 1 1 auto;
+    min-height: 40px;
+  }
+
+  .memory-stats .memory-stat-value {
+    font-size: 18px;
+  }
+}
+
 /* ------------------------------------------------------------------ 断点 */
 
 /* 中等宽度：元信息三列，节点卡片两列（卡片 380px 起才够读地址）。 */

@@ -1011,7 +1011,7 @@ paths:
     get:
       tags: [governance]
       summary: 记忆分页（只返回条目，不含原始对话）
-      x-vade-implemented: false
+      x-vade-implemented: true
       description: 必须经 C3 的 `MemoryPort.admin_list`；禁止 `import memory_module` 或直连 `memory.db`。
       parameters:
         - {name: layer, in: query, schema: {type: string, enum: [session, global]}}
@@ -1039,7 +1039,7 @@ paths:
     get:
       tags: [governance]
       summary: 记忆配额
-      x-vade-implemented: false
+      x-vade-implemented: true
       responses:
         "200":
           description: 统计
@@ -1058,7 +1058,7 @@ paths:
     get:
       tags: [governance]
       summary: 记忆详情（含 supersedes 链）
-      x-vade-implemented: false
+      x-vade-implemented: true
       parameters:
         - $ref: "#/components/parameters/Id"
       responses:
@@ -1082,7 +1082,7 @@ paths:
     post:
       tags: [governance]
       summary: staging → active（写审计）
-      x-vade-implemented: false
+      x-vade-implemented: true
       parameters:
         - $ref: "#/components/parameters/Id"
       responses:
@@ -1096,7 +1096,7 @@ paths:
     post:
       tags: [governance]
       summary: 归档（必填理由，可恢复，写审计）
-      x-vade-implemented: false
+      x-vade-implemented: true
       parameters:
         - $ref: "#/components/parameters/Id"
       requestBody:
@@ -1119,7 +1119,7 @@ paths:
     post:
       tags: [governance]
       summary: archived → active（写审计）
-      x-vade-implemented: false
+      x-vade-implemented: true
       parameters:
         - $ref: "#/components/parameters/Id"
       responses:

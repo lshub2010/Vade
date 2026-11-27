@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.0.5-alpha"
+__version__ = "0.1.0-beta"
 PROTOCOL = "vade/v1"
 
 __all__ = ["__version__", "PROTOCOL"]

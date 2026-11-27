@@ -9,7 +9,7 @@
 > 名字取自拉丁语 `vade`（走），`vade mecum` 意为「与我同行」；中文名取自《诗经》「与子偕行」。
 
 > [!WARNING]
-> **当前是 alpha（`0.0.5-alpha`）。** 协议、数据格式和界面行为都可能随时变化。不建议用它承载不可恢复的数据。自托管或生产化部署请按[中文部署教程](docs/DEPLOYMENT.zh-CN.md)加固，并自担风险。项目由 AI 辅助开发：代码经过自动化测试和人工审查，但风格、注释和边界覆盖并不整齐；用于关键场景前，请自行审计、加固并补测试。
+> **当前是 Beta（`0.1.0-beta`）。** 协议与数据格式在本版本冻结，但界面行为仍可能变化。不建议用它承载不可恢复的数据。自托管或生产化部署请按[中文部署教程](docs/DEPLOYMENT.zh-CN.md)加固，并自担风险。项目由 AI 辅助开发：代码经过自动化测试和人工审查，但风格、注释和边界覆盖并不整齐；用于关键场景前，请自行审计、加固并补测试。
 
 > **要部署 Vade？** 对外暴露前先读[中文部署教程](docs/DEPLOYMENT.zh-CN.md)或 [English deployment guide](docs/DEPLOYMENT.md)，按里面的自托管与生产化加固步骤走。
 
@@ -17,16 +17,16 @@
 
 Vade 只有一条硬规矩：**内核不许知道某个模型、某个工具、某个客户端叫什么。**
 
-- 内核负责建连接、认身份、校验模块 manifest、转发 RPC、跑回合循环、落会话与事件、处理审批、写审计。到此为止。
-- 工具、模型、界面页面都由**模块**提供。模块是独立进程，自己连上来，声明自己能做什么。
+- 内核负责建连接、认身份、校验模块 manifest、转发 RPC、跑回合循环、落会话与事件、处理审批、写审计、注入会话记忆。到此为止。
+- 工具、模型、记忆、界面页面都由**模块**提供。模块是独立进程，自己连上来，声明自己能做什么。
 - 客户端不特殊：Android、桌面、Web 说的是 `ui/*` 契约，和其他模块说的 `module/*` 是同一套协议的不同方向。
 - `schema/` 是唯一真相。服务端和所有客户端按同一份 JSON 契约校验；线协议用 Rust 实现，对 Python 暴露绑定。
 
 | | |
 |---|---|
-| 版本 | `v0.0.5-alpha`（pre-release） |
+| 版本 | `v0.1.0-beta`（pre-release） |
 | 契约 | rpc `1.8.0`，三方向 50 个方法；events `2.0.0`，34 个事件；34 个错误码 |
-| 验证 | [`docs/ALPHA.md`](docs/ALPHA.md) —— 每条 alpha 验收句都有证据，已知缺陷单列 |
+| 验证 | [`docs/ALPHA.md`](docs/ALPHA.md) —— 每条验收句都有证据，已知缺口单列 |
 
 ## 为什么这么做
 
@@ -39,17 +39,30 @@ Vade 反过来：
 - **客户端可替换。** 内核只暴露会话和事件；任何实现 `ui/*` 契约的客户端都能接入，多个客户端可以同时看同一个会话。
 - **模型是后端，不是架构。** 可以用内置的 OpenAI 兼容适配器，也可以把模型挪进独立模块。
 
-代价在运维：你要多跑几个进程并看住它们，alpha 阶段的打包也还很朴素。
+代价在运维：你要多跑几个进程并看住它们，打包也还很朴素。
+
+## 0.1.0-beta 新增
+
+Beta 补上了 0.0.5 留下的运行时缺口。
+
+| 方面 | 落地内容 |
+|---|---|
+| **记忆（M4a）** | 真正的记忆模块：会话/全局两层、内容哈希去重、supersedes 链、评分与淘汰、会话 7 天 TTL、重启后仍可召回；`remember` / `recall` / `forget` 三个工具；私有 `memory/*` RPC。内核持有 `MemoryPort` 适配器，并在每轮注入会话层。 |
+| **记忆治理** | 六个 `/admin/api/memory*` 路由替换 501 占位：分页筛选、详情（含 supersedes 链）、配额统计、晋升、归档（必填理由）、恢复。写操作审计、读操作不审计，且没有编辑正文的端点。管理面新增 `/memory` 页面（浏览器会话只读）。 |
+| **自进化（M4b）** | 五个确定性触发器：`turn_end` 规则抽取、`turn_review` 骨架复盘、`session_close` 总结、`consolidate`、`skill_evolve`。提案只落在 `skills/pending/`，未经人工批准绝不进入 prompt。默认关闭。 |
+| **MCP 桥（M5）** | 支持 stdio 与 HTTP 上游、工具名加前缀、未知 risk 一律按 `high`、动态 `capabilities.update`（失败保留旧表）、2 MB 结果上限、凭据脱敏、拆实例隔离。 |
+| **多模型模块并存** | 多个模型模块可同时在线（FR-6.3）；`manifest.priority` 决定默认，`llm.model_module` 可固定。模型通道 `chat` 不再作为工具暴露给模型。 |
+| **SDK** | 私有 RPC（`on_rpc`）、事件投递（`on_event`）、带外调用上下文（`current_call_context`）——记忆链路需要、旧传输层丢掉的三个钩子。 |
 
 ## 架构
 
 ```text
       Android · Windows 桌面 · Web                    模块
-             （ui/* RPC）                echo · fs · shell · web · model
+             （ui/* RPC）  echo · fs · shell · web · model · memory · mcp-bridge
                  │                                       │（module/* RPC）
                  └──────────────►  内核  ◄───────────────┘
                              连接 · 路由 · 回合循环
-                             密钥 · 审计 · SQLite 存储
+                             密钥 · 审计 · SQLite 存储 · 记忆端口
 
         数据面 :8443                          管理面 :8444
 
@@ -62,58 +75,35 @@ Vade 反过来：
   modules/     只有索引 —— 每个模块都在自己的仓里
 ```
 
-- **内核里没有模型、工具、记忆的逻辑。** 它只知道怎么把一次回合路由给「注册了这项能力」的模块。
+- **内核里没有模型、工具、记忆存储的逻辑。** 它把一次回合路由给「注册了这项能力」的模块，访问记忆只经过 `MemoryPort`。
 - **模块是进程，不是插件。** 模块自己起进程、连内核、声明能力和页面。参考实现是独立仓里的 echo 模块。
 - **代码和契约打架时，契约赢。** `schema/` 不是文档，是运行时的校验依据。
 
-## 0.0.5-alpha 的现状
-
-| 层面 | 现状 |
-|---|---|
-| 内核 | 数据面 WebSocket `:8443`；设备/模块走 Noise 握手，浏览器走 cookie 会话；模块注册表与路由；FIFO 回合队列，带 `queue_pos` 和中断；事件流带 `seq` 与重放；SQLite 会话与 attach 快照；会话内审批；只追加审计；用量预算 |
-| 模型 | 内置 OpenAI 兼容适配器（`/v1/chat/completions`）；`model/discover` 可拉取上游 `/models`，最后一次成功列表会跨重启保留，发现失败可重试重新探测；`provider = "module"` 可把模型放进独立模块；`mock` 可离线跑通回合 |
-| 客户端 | Android、Windows 桌面、Web（wasm）；默认走假数据，显式开启后连真内核；发送/流式/中断、会话与分组管理、内联审批、模块页面 |
-| 管理面 | `:8444` 上的管理监听与 React 前端。登录和节点治理已实现；setup、audit、settings 仍是占位页 |
-| 模块 | 五个独立仓：echo（参考实现）、fs、shell、web、model；各有自己的 CI 和测试 |
-
-## 0.0.5-alpha 之后的当前开发（未发布）
-
-`dev_gingshan` 包含 0.0.5 发布之后合并的改动；在下次发布前，`v0.0.5-alpha` 的产物不包含这些内容。
-
-| 方面 | 现状 |
-|---|---|
-| 模型发现 | 上游 `/v1/models` 返回空列表时按发现失败处理，最后一次成功列表与缓存保留，客户端可重试 |
-| 会话 | 桌面端到端覆盖「杀进程/重启 → 重连 → 快照重放」（`RealCoreRestartSnapshotE2ETest`） |
-| 工具 | 真 core + 真 model 模块 + echo：同一条 assistant 消息返回四个 `tool_calls`；客户端工具卡与审批卡按 canonical 的模块/工具身份绑定 |
-| 队列 | `ui/queue.cancel` 可取消尚未开始的排队回合；真核 e2e 证明第二回合从未发出 `turn.started` 或 `turn.delta` |
-
-这些是开发证据，不是一次新发布。具体测试名与剩余缺口见 [`docs/ALPHA.md`](docs/ALPHA.md)。
-
 ## 下载
 
-`0.0.5-alpha` 的产物统一使用 `v0.0.5-alpha` 这个 tag。
+`0.1.0-beta` 的产物统一使用 `v0.1.0-beta` 这个 tag。
 
 | 组件 | 产物 | 在哪 |
 |---|---|---|
-| 内核（Linux） | `vade-core-0.0.5-alpha-linux-x86_64.tar.gz`、`...-aarch64.tar.gz`，附 SHA-256 校验和 | [Vade `v0.0.5-alpha`](https://github.com/lshub2010/Vade/releases/tag/v0.0.5-alpha) |
+| 内核（Linux） | `vade-core-0.1.0-beta-linux-x86_64.tar.gz`、`...-aarch64.tar.gz`，附 SHA-256 校验和 | [Vade `v0.1.0-beta`](https://github.com/lshub2010/Vade/releases/tag/v0.1.0-beta) |
 | 客户端 | debug 签名 APK；Windows MSI 与免安装 zip；Web（wasm）zip | [vade-client releases](https://github.com/lshub2010/vade-client/releases) |
 | 模块 | 每个模块一个 `py3-none-any` wheel + `manifest.json` | 各模块仓的 Releases 页（见下表链接） |
 
 内核压缩包里带 `core` 包、Python 协议绑定（`libvade_protocol.so`）、`schema/`、Python SDK、构建好的管理前端、`install.sh` 和许可文件。Python 依赖没有随包塞入：`install.sh` 会建虚拟环境并安装 `requirements.txt`。
 
-内核包只有 Linux（`x86_64`、`aarch64`）。Windows 和 macOS 请从源码跑。Android APK 是 debug 签名，Windows 产物未签名 —— 详见[「0.0.5-alpha 明确没做」](#005-alpha-明确没做)。
+内核包只有 Linux（`x86_64`、`aarch64`）。Windows 和 macOS 请从源码跑。Android APK 是 debug 签名，Windows 产物未签名 —— 详见[「0.1.0-beta 明确没做」](#0100-beta-明确没做)。
 
 ## 从发布包安装（Linux）
 
 ```bash
 ARCH=x86_64   # 或 aarch64
-BASE=https://github.com/lshub2010/Vade/releases/download/v0.0.5-alpha
+BASE=https://github.com/lshub2010/Vade/releases/download/v0.1.0-beta
 
-curl -LO "$BASE/vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"
-sha256sum "vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"   # 与发布页上的校验和比对
+curl -LO "$BASE/vade-core-0.1.0-beta-linux-$ARCH.tar.gz"
+sha256sum "vade-core-0.1.0-beta-linux-$ARCH.tar.gz"   # 与发布页上的校验和比对
 
-tar xzf "vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"
-cd "vade-core-0.0.5-alpha-linux-$ARCH"
+tar xzf "vade-core-0.1.0-beta-linux-$ARCH.tar.gz"
+cd "vade-core-0.1.0-beta-linux-$ARCH"
 ./install.sh
 ```
 
@@ -182,7 +172,40 @@ api_key_env = "VADE_LLM_API_KEY"
 
 内核会在 `base_url` 后面拼 `/chat/completions`，所以 `/v1` 要留在地址里。密钥只从 `api_key_env` 指定的环境变量读，不写进配置文件，也不进日志。模型在客户端里显示为 `builtin/<model>`。
 
-`provider = "mock"` 可以不起网络就跑回合；`provider = "module"` 把对话交给模型模块（见 [`docs/rfc/RFC-0005-model-capabilities-usage.md`](docs/rfc/RFC-0005-model-capabilities-usage.md)）。
+`provider = "mock"` 可以不起网络就跑回合；`provider = "module"` 把对话交给模型模块。多个模型模块同时在线时，`llm.model_module` 可固定一个，否则取 `manifest.priority` 最高的。
+
+## 记忆
+
+记忆模块和其他能力一样，是独立进程。它用自己的 SQLite 文件，不碰内核数据库。
+
+```bash
+git clone https://github.com/lshub2010/Vade-module-memory.git
+cd Vade-module-memory
+python3 -m venv .venv && .venv/bin/pip install -e ".[core]"
+VADE_DATA_DIR=./data .venv/bin/python -m memory_module --core wss://127.0.0.1:8443 --pair-code "<配对码>"
+```
+
+内核会拿它做三件事：
+
+- `memory/read_session` 作为会话层注入每轮（有预算，不是整段转录）；
+- `remember`、`recall`、`forget` 变成普通工具，风险按 manifest（`forget` 是 `high`）；
+- 管理面提供列表 / 详情 / 统计 / 晋升 / 归档 / 恢复。
+
+自进化（M4b）**默认关闭**。在记忆模块上设 `MEMORY_EVOLVE_ENABLED=1` 才会启用；确定性的规则层与 `consolidate` 会运行，依赖 LLM 的 `turn_review` / `session_close` / `skill_evolve` 还需要给模块注入模型调用。触发器契约见 [`docs/agents/46-M4b-evolve.md`](docs/agents/46-M4b-evolve.md)。
+
+## MCP 桥
+
+它把 MCP 服务器的工具变成 Vade 工具，而内核不需要知道 MCP 是什么。
+
+```bash
+git clone https://github.com/lshub2010/Vade-module-mcp-bridge.git
+cd Vade-module-mcp-bridge
+python3 -m venv .venv && .venv/bin/pip install -e ".[core]"
+cp config.example.toml config.toml     # 改：上游 command/url + 凭据的环境变量名
+.venv/bin/python -m mcp_bridge --core wss://127.0.0.1:8443 --pair-code "<配对码>"
+```
+
+上游没声明风险的工具一律按 `high` 走审批。上游凭据只从环境变量读，错误和日志里会脱敏。
 
 ## 模块
 
@@ -195,8 +218,12 @@ api_key_env = "VADE_LLM_API_KEY"
 | shell | 执行命令，限制 cwd、超时和输出截断 | [vade-module-shell](https://github.com/lshub2010/vade-module-shell) |
 | web | 带 SSRF 防护的 `fetch` / `head` | [vade-module-web](https://github.com/lshub2010/vade-module-web) |
 | model | OpenAI 兼容的模型提供方（`chat`） | [vade-module-model](https://github.com/lshub2010/vade-module-model) |
+| memory | 两层记忆、去重、TTL、召回、管理 RPC、M4b 自进化 | [Vade-module-memory](https://github.com/lshub2010/Vade-module-memory) |
+| mcp-bridge | 把 stdio/HTTP MCP 服务器桥接成 Vade 工具 | [Vade-module-mcp-bridge](https://github.com/lshub2010/Vade-module-mcp-bridge) |
 
 要写模块，从 [`sdk/python`](sdk/python) 的 Python SDK、[`docs/design.md`](docs/design.md) §15.1 的目录约定、[`schema/manifest.schema.json`](schema/manifest.schema.json) 的 manifest 契约入手。模块连上内核、注册 manifest，然后处理内核转发过来的调用。
+
+SDK 的可选钩子是给非工具能力用的：`ModuleApp.on_rpc(method, handler)` 注册私有 RPC（如 `memory/read_session`），`ModuleApp.on_event(handler)` 接收 `events/deliver`，`current_call_context()` 读取内核注入的 `session_id`。它们都是可选的，普通工具模块不需要。
 
 ## 文档
 
@@ -207,25 +234,24 @@ api_key_env = "VADE_LLM_API_KEY"
 | [`docs/PAIRING.md`](docs/PAIRING.md) | 配对码、浏览器会话、连不上时怎么查 |
 | [`docs/design.md`](docs/design.md) | 技术方案：组件、协议、加密、模块 |
 | [`docs/rfc/`](docs/rfc) + [`schema/`](schema) | 逐条 RFC 契约与 JSON schema |
-| [`docs/ALPHA.md`](docs/ALPHA.md) | alpha 验收证据与已知缺陷 |
+| [`docs/ALPHA.md`](docs/ALPHA.md) | 验收证据与已知缺口 |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) · [`docs/DEPLOYMENT.zh-CN.md`](docs/DEPLOYMENT.zh-CN.md) | 自托管与生产化加固（English / 中文） |
-| [`docs/release/0.0.5.md`](docs/release/0.0.5.md) | 0.0.5 发布范围与待办 |
+| [`docs/release/0.1.0-beta.md`](docs/release/0.1.0-beta.md) | Beta 范围、产物与已知缺口 |
 | [`docs/status.md`](docs/status.md) | 批次状态与里程碑 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 分支、审查与合并规则 |
 
-## 0.0.5-alpha 明确没做
+## 0.1.0-beta 明确没做
 
 这些是明确延期，不是悄悄缺省：
 
 - **iOS 客户端。** 只构建 Android、Windows 桌面和 Web。
-- **记忆与 M4b 自演化。** 没有 memory 模块，没有 memory schema，内核里也没有记忆子系统。
-- **mcp-bridge 模块。** 没建。
 - **生产签名与更新通道。** APK 是 debug 签名，Windows MSI 未签名，也没有更新检查。
-- **多模型模块并存。** 上游 `/v1/models` 自动发现已经实现；多个模型模块同时提供 `chat` 时的选择与冲突消解仍要单独出 RFC。
-- **T3 完整验收不在 0.0.5 发布物里。** 发布物只有工具卡与路由，没有完整的模型驱动链路。当前开发树已合并 core 的四工具循环和客户端工具卡/审批卡绑定；但客户端真模块 e2e 在缺少模块源码时会被 CI 跳过，所以 T3 仍不能算完整验收。
-- **登录和节点以外的管理页。** setup、audit、settings 是占位页；skills、memory、topology 还没实现。
+- **接托管模型的自进化。** M4b 的规则层与 `consolidate` 可用；依赖 LLM 的 `turn_review` / `session_close` / `skill_evolve` 仍需给模块注入模型调用，当前发布物未配置。
+- **T3 完整验收。** core 的四工具路由与客户端工具卡/审批卡绑定已合并；但客户端真模块 e2e 在缺少模块源码时会被 CI 跳过，所以仍不能算完整验收。
+- **集群 / K8s 部署与模块市场。** 只有单机 SQLite。
+- **IME、AGSL、Web 配对真机验证。** 桌面 CI 证明不了，按未验证对待。
 
-发布清单和已知缺陷分别见 [`docs/release/0.0.5.md`](docs/release/0.0.5.md) 和 [`docs/ALPHA.md`](docs/ALPHA.md)。
+发布清单和已知缺口分别见 [`docs/release/0.1.0-beta.md`](docs/release/0.1.0-beta.md) 和 [`docs/ALPHA.md`](docs/ALPHA.md)。
 
 ## 参与开发
 

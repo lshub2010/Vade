@@ -9,7 +9,7 @@ The core does four jobs: **connect, route, run the turn loop, and manage keys an
 > The name is Latin *vade* ("go"), as in *vade mecum*, "go with me". The Chinese name 偕行 comes from the Book of Songs: 「与子偕行」, "walk together with you".
 
 > [!WARNING]
-> **Alpha software (`0.0.5-alpha`).** The protocol, data formats, and UI behavior can change without notice. Do not make it the only copy of anything you cannot afford to lose. If you self-host it or run it in production, follow the [deployment guide](docs/DEPLOYMENT.md), harden it for your environment, and accept the risk. The project is AI-assisted: the code has automated tests and human review, but style, comments, and edge-case coverage are not uniform. Audit and harden it before using it for anything critical.
+> **Beta software (`0.1.0-beta`).** The protocol and data formats are frozen for this release, but UI behavior can still change. Do not make it the only copy of anything you cannot afford to lose. If you self-host it or run it in production, follow the [deployment guide](docs/DEPLOYMENT.md), harden it for your environment, and accept the risk. The project is AI-assisted: the code has automated tests and human review, but style, comments, and edge-case coverage are not uniform. Audit and harden it before using it for anything critical.
 
 > **Deploying Vade?** Read the [deployment guide](docs/DEPLOYMENT.md) (English) or the [中文部署教程](docs/DEPLOYMENT.zh-CN.md) before exposing it. They cover self-hosting and the production hardening checklist.
 
@@ -17,16 +17,16 @@ The core does four jobs: **connect, route, run the turn loop, and manage keys an
 
 Vade is an agent runtime built around one rule: **the core must not know what a model, a tool, or a client is.**
 
-- The core opens connections, authenticates peers, validates module manifests, routes RPC, runs the turn loop, persists sessions and events, asks for approvals, and writes audit records. That is all.
-- Tools, model providers, and UI pages are contributed by **modules** — independent processes that connect to the core and declare what they provide.
+- The core opens connections, authenticates peers, validates module manifests, routes RPC, runs the turn loop, persists sessions and events, asks for approvals, writes audit records, and injects session memory. That is all.
+- Tools, model providers, memory, and UI pages are contributed by **modules** — independent processes that connect to the core and declare what they provide.
 - A client is not special: Android, desktop, and Web clients speak the same `ui/*` contract as any other module speaks `module/*`.
 - `schema/` is the source of truth. The server and every client validate against the same JSON contract; the wire protocol is implemented in Rust and exposed to Python.
 
 | | |
 |---|---|
-| Release | `v0.0.5-alpha` (pre-release) |
+| Release | `v0.1.0-beta` (pre-release) |
 | Contract | rpc `1.8.0` — 50 methods in 3 directions · events `2.0.0` — 34 events · 34 error codes |
-| Verification | [`docs/ALPHA.md`](docs/ALPHA.md) — evidence per alpha criterion and the known-defect list |
+| Verification | [`docs/ALPHA.md`](docs/ALPHA.md) — evidence per criterion and the known-gap list |
 
 ## Why?
 
@@ -39,17 +39,30 @@ Vade inverts that:
 - **Clients are replaceable.** The core exposes sessions and events; any client that implements the `ui/*` contract can attach, and several clients can watch the same session.
 - **The model is a backend, not the architecture.** Use the built-in OpenAI-compatible adapter, or move the model into its own module.
 
-The trade-off is operational: you run and supervise more than one process, and alpha packaging is still basic.
+The trade-off is operational: you run and supervise more than one process, and packaging is still basic.
+
+## What is new in 0.1.0-beta
+
+Beta closes the runtime gaps that 0.0.5 left open.
+
+| Area | What landed |
+|---|---|
+| **Memory (M4a)** | A real memory module with two layers (session/global), content-hash dedupe, supersedes chains, scoring and eviction, 7-day session TTL, restart-stable recall, `remember`/`recall`/`forget` tools, and private `memory/*` RPCs. The core owns a `MemoryPort` adapter and injects the session layer into every turn. |
+| **Memory governance** | Six `/admin/api/memory*` routes replace the 501 placeholders: list with filters and cursor, detail with the supersedes chain, stats, promote, archive (reason required), restore. Writes are audited; reads are not; no endpoint edits memory text. A `/memory` page in the admin UI drives the same contract (browser sessions stay read-only). |
+| **Self-evolution (M4b)** | Five deterministic triggers — `turn_end` rules, `turn_review` over skeletons, `session_close` summary, `consolidate`, `skill_evolve`. Proposals land in `skills/pending/` and are never injected until a human approves them. Disabled by default. |
+| **MCP bridge (M5)** | stdio and HTTP MCP upstreams, prefixed tools, unknown risk treated as `high`, dynamic `capabilities.update` that keeps the old table on failure, 2 MB result cap, credential redaction, split-instance isolation. |
+| **Multiple model modules** | Several model modules can be online at once (FR-6.3); `manifest.priority` picks the default and `llm.model_module` pins one. The provider channel (`chat`) is not exposed as a tool the model can call. |
+| **SDK** | Private RPC (`on_rpc`), event delivery (`on_event`), and out-of-band call context (`current_call_context`) — the three hooks memory needs and the old transport dropped. |
 
 ## Architecture
 
 ```text
       Android · Windows desktop · Web                 modules
-             (ui/* RPC)                    echo · fs · shell · web · model
+             (ui/* RPC)     echo · fs · shell · web · model · memory · mcp-bridge
                  │                                       │ (module/* RPC)
                  └──────────────►  core  ◄───────────────┘
                              connect · route · turn loop
-                             keys · audit · SQLite store
+                             keys · audit · SQLite store · memory port
 
        data plane :8443                         admin plane :8444
 
@@ -63,58 +76,35 @@ The trade-off is operational: you run and supervise more than one process, and a
   modules/     index only — every module lives in its own repository
 ```
 
-- **core** contains no model, tool, or memory logic. It knows how to route a turn to whichever module registered the required capability.
+- **core** contains no model, tool, or memory storage logic. It routes a turn to whichever module registered the required capability, and it reaches memory only through `MemoryPort`.
 - **Modules are processes, not plugins.** A module starts its own process, connects to the core, and declares its capabilities and pages. The reference implementation is the echo module in its own repository.
 - **`schema/` wins.** When code and contract disagree, the contract is the bug report.
 
-## What is in 0.0.5-alpha
-
-| Area | What is there |
-|---|---|
-| Core | WebSocket data plane on `:8443`; Noise handshakes for devices and modules, cookie sessions for browsers; module registry and routing; FIFO turn queue with `queue_pos` and interrupt; event stream with `seq` and replay; SQLite sessions and attach snapshots; inline approvals; append-only audit; usage budgets |
-| Models | Built-in OpenAI-compatible adapter (`/v1/chat/completions`), optional `model/discover` upstream `/models` refresh (last good list persisted across restarts; retry re-sends discovery), `provider = "module"` for model modules, and a `mock` provider for offline UI work |
-| Clients | Android, Windows desktop, and Web (wasm); fixtures by default, real core when explicitly enabled; chat send / stream / interrupt, session and group management, inline approvals, module pages |
-| Admin | Admin listener on `:8444` with a React UI. Login and node governance are implemented; setup, audit, and settings pages are still placeholders |
-| Modules | Five separate module repositories: echo (reference), fs, shell, web, model — each with its own CI and tests |
-
-## Current development (post-0.0.5-alpha)
-
-`dev_gingshan` contains work merged after the 0.0.5 release. The `v0.0.5-alpha` artifacts do not include it until the next release.
-
-| Area | Status |
-|---|---|
-| Model discovery | An empty upstream `/v1/models` response is treated as a failed refresh; the last good list and cache survive, and discovery can be retried from the client. |
-| Sessions | A desktop end-to-end test covers kill/restart → reconnect → snapshot replay (`RealCoreRestartSnapshotE2ETest`). |
-| Tools | The core runs a real core + real model module + echo loop where one assistant message contains four tool calls (`echo__echo`, `echo__add`, `echo__sleep`, `echo__boom`). Client tool cards bind approval cards to canonical `module/tool` IDs. |
-| Queue | `ui/queue.cancel` cancels a queued turn before it starts; a real-core e2e proves the second turn never emits `turn.started` or `turn.delta`. |
-
-This is development evidence, not a new release. Exact test names and remaining gaps are in [`docs/ALPHA.md`](docs/ALPHA.md).
-
 ## Download
 
-All `0.0.5-alpha` artifacts use the tag `v0.0.5-alpha`.
+All `0.1.0-beta` artifacts use the tag `v0.1.0-beta`.
 
 | Component | Artifact | Where |
 |---|---|---|
-| Core (Linux) | `vade-core-0.0.5-alpha-linux-x86_64.tar.gz` and `...-aarch64.tar.gz`, with SHA-256 checksums | [Vade `v0.0.5-alpha`](https://github.com/lshub2010/Vade/releases/tag/v0.0.5-alpha) |
+| Core (Linux) | `vade-core-0.1.0-beta-linux-x86_64.tar.gz` and `...-aarch64.tar.gz`, with SHA-256 checksums | [Vade `v0.1.0-beta`](https://github.com/lshub2010/Vade/releases/tag/v0.1.0-beta) |
 | Clients | Debug-signed APK; Windows MSI and portable zip; Web (wasm) zip | [vade-client releases](https://github.com/lshub2010/vade-client/releases) |
 | Modules | `py3-none-any` wheel plus `manifest.json` for each module | Each module repository's Releases page (links below) |
 
 The core archive contains the `core` package, the Python protocol binding (`libvade_protocol.so`), `schema/`, the Python SDK, the built admin UI, `install.sh`, and the license files. Python dependencies are not vendored: `install.sh` creates a virtualenv and installs `requirements.txt`.
 
-The core archive is Linux-only (`x86_64`, `aarch64`). On Windows or macOS, run from source. The Android APK is debug-signed and the Windows artifacts are unsigned — see [Not in 0.0.5-alpha](#not-in-005-alpha).
+The core archive is Linux-only (`x86_64`, `aarch64`). On Windows or macOS, run from source. The Android APK is debug-signed and the Windows artifacts are unsigned — see [Not in 0.1.0-beta](#not-in-0100-beta).
 
 ## Install from the release package (Linux)
 
 ```bash
 ARCH=x86_64   # or aarch64
-BASE=https://github.com/lshub2010/Vade/releases/download/v0.0.5-alpha
+BASE=https://github.com/lshub2010/Vade/releases/download/v0.1.0-beta
 
-curl -LO "$BASE/vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"
-sha256sum "vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"   # compare with the checksum on the release page
+curl -LO "$BASE/vade-core-0.1.0-beta-linux-$ARCH.tar.gz"
+sha256sum "vade-core-0.1.0-beta-linux-$ARCH.tar.gz"   # compare with the checksum on the release page
 
-tar xzf "vade-core-0.0.5-alpha-linux-$ARCH.tar.gz"
-cd "vade-core-0.0.5-alpha-linux-$ARCH"
+tar xzf "vade-core-0.1.0-beta-linux-$ARCH.tar.gz"
+cd "vade-core-0.1.0-beta-linux-$ARCH"
 ./install.sh
 ```
 
@@ -183,7 +173,40 @@ api_key_env = "VADE_LLM_API_KEY"
 
 The core appends `/chat/completions` to `base_url`, so keep the `/v1` suffix. The key is read only from the environment variable named by `api_key_env`; it is never written to the config file or the logs. The model then appears in the client as `builtin/<model>`.
 
-Set `provider = "mock"` to run a turn loop without a network call, or `provider = "module"` to serve chat from a model module (see [`docs/rfc/RFC-0005-model-capabilities-usage.md`](docs/rfc/RFC-0005-model-capabilities-usage.md)).
+Set `provider = "mock"` to run a turn loop without a network call, or `provider = "module"` to serve chat from a model module. With several model modules online, `llm.model_module` pins one; otherwise the highest `manifest.priority` wins.
+
+## Memory
+
+The memory module is a separate process, like every other capability. It keeps its own SQLite file and never touches core's database.
+
+```bash
+git clone https://github.com/lshub2010/Vade-module-memory.git
+cd Vade-module-memory
+python3 -m venv .venv && .venv/bin/pip install -e ".[core]"
+VADE_DATA_DIR=./data .venv/bin/python -m memory_module --core wss://127.0.0.1:8443 --pair-code "<code>"
+```
+
+What the core does with it:
+
+- `memory/read_session` is injected into each turn as the session layer (budgeted, never the whole transcript);
+- `remember`, `recall`, and `forget` become ordinary tools with their declared risk (`forget` is `high`);
+- the admin plane exposes list / detail / stats / promote / archive / restore.
+
+Self-evolution (M4b) is **disabled by default**. Enable it with `MEMORY_EVOLVE_ENABLED=1` on the memory module; the deterministic rule layer and `consolidate` then run. The LLM-backed `turn_review` / `session_close` / `skill_evolve` paths need a model callable wired into the module. See [`docs/agents/46-M4b-evolve.md`](docs/agents/46-M4b-evolve.md) for the trigger contract.
+
+## MCP bridge
+
+The bridge turns an MCP server's tools into Vade tools without teaching the core about MCP.
+
+```bash
+git clone https://github.com/lshub2010/Vade-module-mcp-bridge.git
+cd Vade-module-mcp-bridge
+python3 -m venv .venv && .venv/bin/pip install -e ".[core]"
+cp config.example.toml config.toml     # edit: upstream command/url + env credential NAME
+.venv/bin/python -m mcp_bridge --core wss://127.0.0.1:8443 --pair-code "<code>"
+```
+
+A tool whose upstream risk is unknown is treated as `high`, so it goes through approval. Upstream credentials are read from environment variables and are redacted from errors and logs.
 
 ## Modules
 
@@ -196,8 +219,12 @@ Modules are not in this repository; [`modules/README.md`](modules/README.md) is 
 | shell | Command execution with a cwd allow-list, timeout, and output truncation | [vade-module-shell](https://github.com/lshub2010/vade-module-shell) |
 | web | `fetch` / `head` with SSRF protection | [vade-module-web](https://github.com/lshub2010/vade-module-web) |
 | model | OpenAI-compatible model provider (`chat`) | [vade-module-model](https://github.com/lshub2010/vade-module-model) |
+| memory | Two-layer memory, dedupe, TTL, recall, admin RPC, M4b evolution | [Vade-module-memory](https://github.com/lshub2010/Vade-module-memory) |
+| mcp-bridge | Bridges stdio/HTTP MCP servers into Vade tools | [Vade-module-mcp-bridge](https://github.com/lshub2010/Vade-module-mcp-bridge) |
 
 To write a module, start with the Python SDK in [`sdk/python`](sdk/python), the directory conventions in [`docs/design.md`](docs/design.md) §15.1, and the manifest contract in [`schema/manifest.schema.json`](schema/manifest.schema.json). A module connects to the core, registers its manifest, and then serves the calls the core routes to it.
+
+The SDK's optional hooks are what non-tool capabilities use: `ModuleApp.on_rpc(method, handler)` for private RPCs (for example `memory/read_session`), `ModuleApp.on_event(handler)` for `events/deliver`, and `current_call_context()` for the core-injected `session_id`. They are opt-in; a plain tool module does not need them.
 
 ## Documentation
 
@@ -208,25 +235,24 @@ To write a module, start with the Python SDK in [`sdk/python`](sdk/python), the 
 | [`docs/PAIRING.md`](docs/PAIRING.md) | Pairing codes, browser sessions, troubleshooting |
 | [`docs/design.md`](docs/design.md) | Technical design: components, protocol, crypto, modules |
 | [`docs/rfc/`](docs/rfc) + [`schema/`](schema) | Per-RFC protocol contracts and the JSON schema |
-| [`docs/ALPHA.md`](docs/ALPHA.md) | Alpha acceptance evidence and known defects |
+| [`docs/ALPHA.md`](docs/ALPHA.md) | Acceptance evidence and known gaps |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) · [`docs/DEPLOYMENT.zh-CN.md`](docs/DEPLOYMENT.zh-CN.md) | Self-hosting and production hardening (English / 中文) |
-| [`docs/release/0.0.5.md`](docs/release/0.0.5.md) | 0.0.5 release scope and open tasks |
+| [`docs/release/0.1.0-beta.md`](docs/release/0.1.0-beta.md) | Beta scope, artifacts, and known gaps |
 | [`docs/status.md`](docs/status.md) | Batch status and milestones |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Branches, review, and merge rules |
 
-## Not in 0.0.5-alpha
+## Not in 0.1.0-beta
 
 These are explicitly deferred, not silently missing:
 
 - **iOS client.** Only Android, Windows desktop, and Web are built.
-- **Memory and M4b self-evolution.** There is no memory module, no `memory` schema, and no core memory subsystem.
-- **mcp-bridge module.** Not built.
 - **Production signing and updates.** The APK is debug-signed, the Windows MSI is unsigned, and there is no update channel.
-- **Multiple model modules side by side.** Upstream `/v1/models` discovery is implemented; choosing between several model modules and resolving cross-module `chat` conflicts still needs a separate RFC.
-- **Full T3 acceptance in the 0.0.5 release.** The release has tool cards and routing, but not the complete model-driven loop. In the current development tree the core four-tool loop and client tool-card/approval binding are merged; the client real-module e2e is skipped in CI when module sources are absent, so T3 is still not fully accepted.
-- **Admin pages beyond login and nodes.** Setup, audit, and settings are placeholder pages; skills, memory, and topology are not implemented.
+- **Self-evolution with a hosted model.** M4b's rules and `consolidate` work; the LLM-backed `turn_review` / `session_close` / `skill_evolve` paths still need a model callable that the shipped module does not configure.
+- **Full T3 acceptance.** Core four-tool routing and client tool-card/approval binding are merged. The client real-module e2e is skipped in CI when module sources are absent, so this is still not a full acceptance.
+- **Cluster / K8s deployment and a module marketplace.** Single-host SQLite only.
+- **True-device verification for IME, AGSL, and Web pairing.** Desktop CI cannot prove those; treat them as unverified.
 
-The release checklist and the known-defect list are in [`docs/release/0.0.5.md`](docs/release/0.0.5.md) and [`docs/ALPHA.md`](docs/ALPHA.md).
+The release checklist and known gaps are in [`docs/release/0.1.0-beta.md`](docs/release/0.1.0-beta.md) and [`docs/ALPHA.md`](docs/ALPHA.md).
 
 ## Contributing
 

@@ -1,4 +1,4 @@
-"""T3 core-half e2e: a REAL model module drives a REAL echo tool call.
+"""T3 core-half e2e: a REAL model module drives FOUR REAL echo tools in one step.
 
 Not collected by pytest (the filename does not start with ``test_``): it needs
 the Rust binding, uvicorn, a free port and two module checkouts. Run it
@@ -17,15 +17,19 @@ What it proves, in order:
      starts with ``[llm] provider = "module"`` and no builtin fallback;
   2. the real ``com.example.model`` module registers and serves ``chat``
      against a stdlib ``http.server`` fake OpenAI-compatible upstream;
-  3. the upstream answers the first request with a ``tool_calls`` entry whose
-     name is the echo tool from core's frozen snapshot (``echo__echo``);
-  4. core routes that call to the real ``com.example.echo`` module over Noise,
-     gets ``{"text", "len"}`` back, and sends it to the model as a ``tool``
-     message (the second upstream request);
+  3. the upstream answers the first request with FOUR ``tool_calls`` in ONE
+     assistant message, each name resolved from core's frozen snapshot by
+     suffix (``echo__echo`` / ``echo__add`` / ``echo__sleep`` / ``echo__boom``)
+     — never hard-coded names core did not advertise;
+  4. core runs all four against the real ``com.example.echo`` module over
+     Noise, one by one: ``echo`` / ``add`` / ``sleep`` succeed and ``boom``
+     returns a structured ``INTERNAL`` failure. A failed tool does not fail the
+     turn — core sends all four results back as ``tool`` messages;
   5. the upstream's second answer is the final assistant text and the turn
-     completes;
-  6. the durable event stream is ordered
-     ``turn.tool_call`` -> ``turn.tool_result`` -> ``turn.completed``.
+     completes with ``state == "completed"``;
+  6. the durable event stream holds four ``turn.tool_call`` and four
+     ``turn.tool_result`` events, every call precedes its own result, all four
+     results precede ``turn.completed``, and every ``tool_call_id`` matches.
 
 Every module key is whitelisted out of band (same honest stand-in for pairing
 as ``sdk/python/tests/e2e_real_core.py`` documents).
@@ -53,10 +57,22 @@ REPO = Path(__file__).resolve().parents[3]
 
 HOST = "127.0.0.1"
 ECHO_TEXT = "hello-from-t3"
-FINAL_TEXT = "T3-FINAL: the echo tool returned hello-from-t3"
+BOOM_MESSAGE = "t3-boom"
+FINAL_TEXT = "T3-FINAL: echo, add and sleep ran; boom failed with INTERNAL as designed"
 
 MODEL_MODULE_ID = "com.example.model"
 ECHO_MODULE_ID = "com.example.echo"
+
+#: (tool suffix, tool_call id, arguments, expected outcome) in the order the
+#: upstream returns them. The actual names come from what core advertised.
+CALL_SPECS: tuple[tuple[str, str, dict[str, Any]], ...] = (
+    ("echo", "call_t3_echo_1", {"text": ECHO_TEXT}),
+    ("add", "call_t3_echo_2", {"a": 2, "b": 3}),
+    ("sleep", "call_t3_echo_3", {"ms": 1}),
+    ("boom", "call_t3_echo_4", {"message": BOOM_MESSAGE}),
+)
+
+TOOL_SUFFIXES = tuple(suffix for suffix, _, _ in CALL_SPECS)
 
 
 def _banner(text: str) -> None:
@@ -118,7 +134,7 @@ class UpstreamState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.requests: list[dict[str, Any]] = []
-        self.echo_tool: str | None = None
+        self.tools: dict[str, str] = {}
         self.problem: str | None = None
 
     def record(self, body: dict[str, Any]) -> int:
@@ -126,17 +142,17 @@ class UpstreamState:
             self.requests.append(body)
             return len(self.requests)
 
-    def set_echo_tool(self, name: str) -> None:
+    def set_tools(self, mapping: dict[str, str]) -> None:
         with self.lock:
-            self.echo_tool = name
+            self.tools = dict(mapping)
 
     def fail(self, problem: str) -> None:
         with self.lock:
             self.problem = problem
 
-    def snapshot(self) -> tuple[list[dict[str, Any]], str | None, str | None]:
+    def snapshot(self) -> tuple[list[dict[str, Any]], dict[str, str], str | None]:
         with self.lock:
-            return list(self.requests), self.echo_tool, self.problem
+            return list(self.requests), dict(self.tools), self.problem
 
 
 class FakeOpenAIHandler(BaseHTTPRequestHandler):
@@ -174,7 +190,8 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
         tool_messages = [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
 
         if tool_messages:
-            # Second round: core has executed the tool and sent the result back.
+            # Second round: core has executed all four tools and sent the
+            # results back. Answer with the final assistant text.
             self._send(200, {
                 "id": "chatcmpl-t3-2",
                 "object": "chat.completion",
@@ -188,24 +205,41 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # First round: pick the echo tool core advertised and call it.
+        # First round: resolve the four tools from what core advertised, by
+        # suffix — hard-coding `echo__echo` would pass even if core's snapshot
+        # advertised a different module id.
         names = []
         for spec in body.get("tools") or []:
             function = (spec or {}).get("function") or {}
             name = function.get("name")
             if isinstance(name, str) and name:
                 names.append(name)
-        echo_names = [name for name in names if name.endswith("__echo")]
-        if not echo_names:
-            self.state.fail(f"no echo tool was advertised; tools={names!r}")
-            self._send(400, {"error": {"type": "t3_no_echo_tool", "message": f"tools={names}"}})
-            return
-        if len(echo_names) > 1:
-            self.state.fail(f"ambiguous echo tools: {echo_names!r}")
-            self._send(400, {"error": {"type": "t3_ambiguous_echo", "message": f"tools={names}"}})
-            return
-        echo_name = echo_names[0]
-        self.state.set_echo_tool(echo_name)
+        chosen: dict[str, str] = {}
+        for suffix in TOOL_SUFFIXES:
+            matches = [name for name in names if name.endswith("__" + suffix)]
+            if len(matches) != 1:
+                problem = (
+                    f"expected exactly one advertised tool ending in '__{suffix}', "
+                    f"got {matches!r}; tools={names!r}"
+                )
+                self.state.fail(problem)
+                self._send(400, {"error": {"type": "t3_tool_mismatch", "message": problem}})
+                return
+            chosen[suffix] = matches[0]
+        self.state.set_tools(chosen)
+
+        # Four tool_calls in ONE assistant message, ids in declaration order.
+        tool_calls = [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": chosen[suffix],
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
+            }
+            for suffix, call_id, args in CALL_SPECS
+        ]
         self._send(200, {
             "id": "chatcmpl-t3-1",
             "object": "chat.completion",
@@ -215,14 +249,7 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
                 "message": {
                     "role": "assistant",
                     "content": None,
-                    "tool_calls": [{
-                        "id": "call_t3_echo_1",
-                        "type": "function",
-                        "function": {
-                            "name": echo_name,
-                            "arguments": json.dumps({"text": ECHO_TEXT}, ensure_ascii=False),
-                        },
-                    }],
+                    "tool_calls": tool_calls,
                 },
                 "finish_reason": "tool_calls",
             }],
@@ -283,6 +310,16 @@ def _stop(proc: subprocess.Popen | None) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
+
+
+def _json_or_none(text: Any) -> Any:
+    """Parse a tool message's content, returning None when it is not JSON."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
 
 
 async def main() -> int:
@@ -455,21 +492,23 @@ async def main() -> int:
             f"tools={[s.name for s in records[MODEL_MODULE_ID].manifest.tools] if MODEL_MODULE_ID in records else None}",
         )
         check(
-            "echo module serves echo",
-            ECHO_MODULE_ID in records,
+            "echo module serves echo/add/sleep/boom",
+            ECHO_MODULE_ID in records
+            and {s.name for s in records[ECHO_MODULE_ID].manifest.tools} >= {"echo", "add", "sleep", "boom"},
             f"tools={[s.name for s in records[ECHO_MODULE_ID].manifest.tools] if ECHO_MODULE_ID in records else None}",
         )
         if set(records) != set(expected):
             return 1
 
-        # 2. one real turn: submit -> model tool_call -> echo -> model -> done
-        _banner("turn: model calls echo")
+        # 2. one real turn: submit -> model returns FOUR tool_calls -> echo
+        #    module runs all four -> model -> done
+        _banner("turn: model calls echo/add/sleep/boom in one step")
         session = app.session.create_session()
         sink = CollectSink()
         await app.session.attach(session.id, None, sink)
         await app.session.submit(
             session.id,
-            [{"type": "text", "text": "Please echo the phrase hello-from-t3."}],
+            [{"type": "text", "text": "Run echo, add, sleep and boom, then summarise."}],
             "t3-msg-1",
         )
         try:
@@ -491,36 +530,105 @@ async def main() -> int:
             for index, event in enumerate(events)
             if event.type in ("turn.tool_call", "turn.tool_result", "turn.completed")
         ]
-        print("[info] event timeline:", [(i, t) for i, t, _ in timeline], flush=True)
+        print("[info] event timeline:", [(i, t, p.get("call_id")) for i, t, p in timeline], flush=True)
         types = [event_type for _, event_type, _ in timeline]
+        call_positions = {
+            str(payload.get("call_id")): index
+            for index, event_type, payload in timeline if event_type == "turn.tool_call"
+        }
+        result_positions = {
+            str(payload.get("call_id")): index
+            for index, event_type, payload in timeline if event_type == "turn.tool_result"
+        }
+        completed_positions = [index for index, event_type, _ in timeline if event_type == "turn.completed"]
+        expected_ids = [call_id for _, call_id, _ in CALL_SPECS]
+        completed_index = completed_positions[0] if completed_positions else None
+
+        check("four turn.tool_call events", len(call_positions) == 4,
+              f"count={len(call_positions)} types={types}")
+        check("four turn.tool_result events", len(result_positions) == 4,
+              f"count={len(result_positions)} types={types}")
+        check("exactly one turn.completed", len(completed_positions) == 1,
+              f"count={len(completed_positions)}")
         check(
-            "event order tool_call -> tool_result -> turn.completed",
-            types == ["turn.tool_call", "turn.tool_result", "turn.completed"],
-            f"types={types}",
+            "tool_call ids are call_t3_echo_1..4",
+            sorted(call_positions) == sorted(expected_ids),
+            f"call_ids={sorted(call_positions)}",
+        )
+        check(
+            "every tool_call precedes its own tool_result",
+            set(call_positions) == set(result_positions)
+            and all(call_positions[call_id] < result_positions[call_id] for call_id in expected_ids
+                    if call_id in call_positions and call_id in result_positions),
+            f"calls={call_positions} results={result_positions}",
+        )
+        check(
+            "all four tool_results precede turn.completed",
+            completed_index is not None
+            and len(result_positions) == 4
+            and all(position < completed_index for position in result_positions.values()),
+            f"results={sorted(result_positions.values())} completed={completed_index}",
         )
 
-        tool_calls = [payload for _, event_type, payload in timeline if event_type == "turn.tool_call"]
-        tool_results = [payload for _, event_type, payload in timeline if event_type == "turn.tool_result"]
+        calls_by_id = {
+            str(payload.get("call_id")): payload
+            for _, event_type, payload in timeline if event_type == "turn.tool_call"
+        }
+        results_by_id = {
+            str(payload.get("call_id")): payload
+            for _, event_type, payload in timeline if event_type == "turn.tool_result"
+        }
         completed = [payload for _, event_type, payload in timeline if event_type == "turn.completed"]
 
-        requests, echo_tool, problem = upstream_state.snapshot()
+        requests, advertised, problem = upstream_state.snapshot()
         check("upstream saw exactly two requests", len(requests) == 2, f"count={len(requests)}")
-        check("upstream found one advertised echo tool", problem is None and bool(echo_tool),
-              f"echo_tool={echo_tool!r} problem={problem!r}")
-        if echo_tool is None:
-            echo_tool = "echo__echo"
-
         check(
-            "tool_call names the echo tool",
-            bool(tool_calls) and tool_calls[0].get("tool") == echo_tool,
-            f"tool={tool_calls[0].get('tool') if tool_calls else None} expected={echo_tool}",
+            "upstream resolved all four advertised tools by suffix",
+            problem is None and set(advertised) == set(TOOL_SUFFIXES),
+            f"tools={advertised} problem={problem!r}",
+        )
+        expected_names = [advertised.get(suffix) for suffix, _, _ in CALL_SPECS]
+        actual_names = [
+            calls_by_id[call_id].get("tool") if call_id in calls_by_id else None
+            for _, call_id, _ in CALL_SPECS
+        ]
+        check(
+            "four tool_calls name the advertised echo tools",
+            all(name for name in expected_names) and actual_names == expected_names,
+            f"tools={actual_names} expected={expected_names}",
+        )
+
+        def result_ok(call_id: str) -> bool | None:
+            payload = results_by_id.get(call_id)
+            return None if payload is None else payload.get("ok")
+
+        def result_summary(call_id: str) -> str:
+            payload = results_by_id.get(call_id)
+            return "" if payload is None else str(payload.get("summary", ""))
+
+        echo_id, add_id, sleep_id, boom_id = expected_ids
+        check(
+            "echo result is ok and carries the echo payload",
+            result_ok(echo_id) is True and ECHO_TEXT in result_summary(echo_id),
+            f"ok={result_ok(echo_id)} summary={result_summary(echo_id)!r}",
         )
         check(
-            "tool_result is ok and carries the echo payload",
-            bool(tool_results) and tool_results[0].get("ok") is True
-            and ECHO_TEXT in str(tool_results[0].get("summary", "")),
-            f"ok={tool_results[0].get('ok') if tool_results else None} "
-            f"summary={tool_results[0].get('summary') if tool_results else None!r}",
+            "add result is ok and sums 2 + 3",
+            result_ok(add_id) is True and '"sum": 5' in result_summary(add_id),
+            f"ok={result_ok(add_id)} summary={result_summary(add_id)!r}",
+        )
+        check(
+            "sleep result is ok and reports the slept duration",
+            result_ok(sleep_id) is True and "slept_ms" in result_summary(sleep_id),
+            f"ok={result_ok(sleep_id)} summary={result_summary(sleep_id)!r}",
+        )
+        check(
+            "boom is a structured INTERNAL failure, not a turn failure",
+            result_ok(boom_id) is False
+            and results_by_id.get(boom_id, {}).get("code") == "INTERNAL"
+            and BOOM_MESSAGE in result_summary(boom_id),
+            f"ok={result_ok(boom_id)} code={results_by_id.get(boom_id, {}).get('code')!r} "
+            f"summary={result_summary(boom_id)!r}",
         )
         check(
             "turn completed",
@@ -528,7 +636,7 @@ async def main() -> int:
             f"state={completed[0].get('state') if completed else None}",
         )
 
-        # 3. the tool result really travelled back to the model upstream
+        # 3. all four tool results really travelled back to the model upstream
         if len(requests) >= 2:
             first, second = requests[0], requests[1]
             first_tools = [
@@ -536,8 +644,8 @@ async def main() -> int:
                 for spec in (first.get("tools") or [])
             ]
             check(
-                "first request advertised echo + model tools",
-                echo_tool in first_tools and "model__chat" in first_tools,
+                "first request advertised the four echo tools + model chat",
+                all(name in first_tools for name in expected_names if name) and "model__chat" in first_tools,
                 f"tools={first_tools}",
             )
             second_tool_messages = [
@@ -545,43 +653,93 @@ async def main() -> int:
                 if isinstance(m, dict) and m.get("role") == "tool"
             ]
             check(
-                "second request carries the current tool result",
-                len(second_tool_messages) == 1
-                and second_tool_messages[0].get("tool_call_id") == "call_t3_echo_1"
-                and ECHO_TEXT in str(second_tool_messages[0].get("content", "")),
+                "second request carries exactly four tool messages",
+                len(second_tool_messages) == 4,
                 f"tool_messages={second_tool_messages}",
+            )
+            by_call_id = {
+                str(m.get("tool_call_id")): m for m in second_tool_messages
+                if isinstance(m, dict)
+            }
+            check(
+                "tool messages cover all four tool_call ids",
+                set(by_call_id) == set(expected_ids),
+                f"ids={sorted(by_call_id)} expected={expected_ids}",
+            )
+            echo_payload = _json_or_none(by_call_id.get(echo_id, {}).get("content"))
+            add_payload = _json_or_none(by_call_id.get(add_id, {}).get("content"))
+            sleep_payload = _json_or_none(by_call_id.get(sleep_id, {}).get("content"))
+            boom_payload = _json_or_none(by_call_id.get(boom_id, {}).get("content"))
+            check(
+                "echo result reached the model intact",
+                isinstance(echo_payload, dict)
+                and echo_payload.get("text") == ECHO_TEXT
+                and echo_payload.get("len") == len(ECHO_TEXT),
+                f"content={by_call_id.get(echo_id, {}).get('content')!r}",
+            )
+            check(
+                "add result reached the model intact",
+                isinstance(add_payload, dict) and add_payload.get("sum") == 5,
+                f"content={by_call_id.get(add_id, {}).get('content')!r}",
+            )
+            check(
+                "sleep result reached the model intact",
+                isinstance(sleep_payload, dict) and sleep_payload.get("slept_ms") == 1,
+                f"content={by_call_id.get(sleep_id, {}).get('content')!r}",
+            )
+            check(
+                "boom failure reached the model as a structured error",
+                isinstance(boom_payload, dict)
+                and boom_payload.get("ok") is False
+                and (boom_payload.get("error") or {}).get("code") == "INTERNAL"
+                and (boom_payload.get("error") or {}).get("message") == BOOM_MESSAGE,
+                f"content={by_call_id.get(boom_id, {}).get('content')!r}",
             )
             assistant_calls = [
                 m for m in (second.get("messages") or [])
                 if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
             ]
+            carried = assistant_calls[-1].get("tool_calls") if assistant_calls else []
             check(
-                "second request carries the assistant tool_call",
-                bool(assistant_calls)
-                and assistant_calls[-1]["tool_calls"][0]["function"]["name"] == echo_tool,
-                f"assistant_calls={assistant_calls}",
+                "second request carries all four assistant tool_calls",
+                len(carried) == 4
+                and [c.get("id") for c in carried] == expected_ids
+                and [((c.get("function") or {}).get("name")) for c in carried] == expected_names,
+                f"assistant_calls={carried}",
             )
         else:
-            check("second request carries the current tool result", False, "only one request")
+            check("second request carries the four tool results", False, "only one request")
 
         # 4. transcript + final answer
         messages = app.session_store.load(session.id).messages
         roles = [message.role for message in messages]
         check(
-            "transcript is user/assistant/tool/assistant",
-            roles == ["user", "assistant", "tool", "assistant"],
+            "transcript is user/assistant/tool x4/assistant",
+            roles == ["user", "assistant", "tool", "tool", "tool", "tool", "assistant"],
             f"roles={roles}",
+        )
+        tool_message_ids = [
+            str(message.tool_call_id) for message in messages if message.role == "tool"
+        ]
+        check(
+            "transcript tool messages keep the four tool_call ids",
+            tool_message_ids == expected_ids,
+            f"ids={tool_message_ids}",
         )
         final_message = messages[-1] if messages else None
         check(
             "final assistant answer is the upstream's second reply",
-            final_message is not None and FINAL_TEXT in str(final_message.content),
+            final_message is not None
+            and final_message.role == "assistant"
+            and FINAL_TEXT in str(final_message.content),
             f"content={getattr(final_message, 'content', None)!r}",
         )
+        sink_types = sink.types()
         check(
-            "live sink saw the tool events too",
-            "turn.tool_call" in sink.types() and "turn.tool_result" in sink.types(),
-            f"sink_types={sink.types()}",
+            "live sink saw all four tool_calls and tool_results",
+            sink_types.count("turn.tool_call") == 4 and sink_types.count("turn.tool_result") == 4,
+            f"tool_call={sink_types.count('turn.tool_call')} "
+            f"tool_result={sink_types.count('turn.tool_result')} sink_types={sink_types}",
         )
     finally:
         _stop(model_proc)

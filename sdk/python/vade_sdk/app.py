@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import copy
 import functools
 import inspect
@@ -45,6 +46,18 @@ PAGE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 PAGE_REQUIRED_KEYS = ("id", "title", "version", "schema")
 
 _RESULT_TYPES = (dict, list, str, int, float, bool, type(None))
+
+#: Per-call core context (`params["ctx"]`). Modules can read it without the SDK
+#: injecting core-specific tool arguments, and sync tools keep it because the
+#: executor runnable copies the context before entering the worker thread.
+_CALL_CONTEXT: contextvars.ContextVar[Mapping[str, Any]] = contextvars.ContextVar(
+    "vade_call_context", default={}
+)
+
+
+def current_call_context() -> Mapping[str, Any]:
+    """The context core attached to the current tool call, or `{}`."""
+    return _CALL_CONTEXT.get()
 
 
 class ModuleApp:
@@ -141,6 +154,55 @@ class ModuleApp:
         self._semaphore: asyncio.Semaphore | None = None
         self._exit_code = 0
         self._stopped: asyncio.Event | None = None
+        #: Optional private RPC surface. Core calls these by method name; they
+        #: are not tools and never appear in the manifest. A module author must
+        #: register only handlers it owns (for example `memory/admin_list`).
+        self._rpc_handlers: dict[str, Callable[[Mapping[str, Any]], Any]] = {}
+        #: Optional event subscriber callback for `events/deliver`. The default
+        #: behavior remains an acknowledgement; a module that declares
+        #: subscriptions can opt in without changing the transport.
+        self._event_handler: Callable[[str, Any], Any] | None = None
+
+    # ---------------------------------------------------------- private RPC
+    def on_rpc(self, method: str, handler: Callable[[Mapping[str, Any]], Any]) -> "ModuleApp":
+        """Register a non-tool RPC handler (for example `memory/read_session`).
+
+        The handler receives the params object and may be sync or async. It is
+        deliberately separate from `add_tool`: private RPCs are never exposed
+        to the model and must not appear in the capability table.
+        """
+        if not isinstance(method, str) or not method.strip():
+            raise ValueError("RPC method must be a non-empty string")
+        if not callable(handler):
+            raise TypeError(f"handler for {method!r} must be callable")
+        self._rpc_handlers[method] = handler
+        return self
+
+    async def dispatch_rpc(self, method: str, params: Any = None) -> Any:
+        """Dispatch one private RPC or raise `ToolError(NOT_FOUND)`."""
+        handler = self._rpc_handlers.get(method)
+        if handler is None:
+            raise ToolError("NOT_FOUND", f"module {self.module_id!r} has no private RPC {method!r}")
+        payload = params if isinstance(params, Mapping) else {}
+        result = handler(payload)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    def on_event(self, handler: Callable[[str, Any], Any]) -> "ModuleApp":
+        """Register an `events/deliver` handler; may be sync or async."""
+        if not callable(handler):
+            raise TypeError("event handler must be callable")
+        self._event_handler = handler
+        return self
+
+    async def dispatch_event(self, topic: str, payload: Any = None) -> Any:
+        if self._event_handler is None:
+            return {"ok": True}
+        result = self._event_handler(topic, payload)
+        if inspect.isawaitable(result):
+            result = await result
+        return result if result is not None else {"ok": True}
 
     # ------------------------------------------------------------------ tools
     def add_tool(self, spec: ToolSpec) -> "ModuleApp":
@@ -274,8 +336,19 @@ class ModuleApp:
         return problems
 
     # ------------------------------------------------------------------ dispatch
-    async def call_tool(self, name: str, args: Mapping[str, Any] | None, *, call_id: str = "") -> dict[str, Any]:
+    async def call_tool(
+        self,
+        name: str,
+        args: Mapping[str, Any] | None,
+        *,
+        call_id: str = "",
+        context: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Execute one tool and return the C-05 tool_result envelope.
+
+        `context` is core's out-of-band `params["ctx"]`. It is exposed through
+        `current_call_context()` rather than injected into the tool's JSON
+        arguments, preserving each tool's declared schema.
 
         Never raises: every failure becomes `{"ok": false, "error": {...}}` so a
         buggy tool cannot take the connection down.
@@ -294,6 +367,7 @@ class ModuleApp:
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self.max_concurrency)
         self._inflight += 1
+        token = _CALL_CONTEXT.set(dict(context or {}))
         try:
             async with self._semaphore:
                 result = await self._execute(spec, payload, call_id)
@@ -313,6 +387,7 @@ class ModuleApp:
             )
             return _error_envelope("INTERNAL", f"{type(exc).__name__} in tool {name!r}", started)
         finally:
+            _CALL_CONTEXT.reset(token)
             self._inflight -= 1
             self._tasks.pop(call_id, None)
             self._cancelled.discard(call_id)
@@ -326,8 +401,10 @@ class ModuleApp:
             task: asyncio.Future[Any] = asyncio.ensure_future(spec.fn(**args))
         else:
             # A sync tool runs in a worker thread: one blocking tool must not
-            # stall heartbeats or every other in-flight call.
-            task = loop.run_in_executor(None, functools.partial(spec.fn, **args))
+            # stall heartbeats or every other in-flight call. Copy the context
+            # so `current_call_context()` survives the thread hop.
+            ctx = contextvars.copy_context()
+            task = loop.run_in_executor(None, ctx.run, functools.partial(spec.fn, **args))
         if call_id:
             self._tasks[call_id] = task
         try:

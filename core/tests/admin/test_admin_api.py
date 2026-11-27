@@ -471,20 +471,16 @@ def test_config_rejects_unknown_keys_and_dangerous_changes_need_confirm(ctx, app
     asyncio.run(scenario())
 
 
-def test_unimplemented_feature_endpoints_answer_501_not_404(ctx, app):
-    """C5b's memory routes are in the schema but not built in this batch.
+def test_memory_routes_are_wired_and_degrade_without_a_port(ctx, app):
+    """A core without the memory component answers UNSUPPORTED, not an empty page.
 
-    Every shape the schema declares — including nested actions — must answer 501
-    `UNSUPPORTED`. A 404 reads as a broken build or a typo'd URL and leaves the
-    UI unable to say "not in this build"; a 501 can be labelled. Skills were in
-    this list until `admin/skills.py` landed; their coverage lives in
-    `test_skills.py`.
+    The blanket 501 placeholders were replaced by `admin/memory.py`; the real
+    handler coverage lives in `test_memory.py`. Two things stay here: a missing
+    component must still be a labelled 501 (never a fake empty list), and the
+    action routes are POST-only, so `GET`/`PATCH` are 405 — matching the C-08
+    declaration that there is no edit endpoint.
     """
-    paths = (
-        "/admin/api/memory", "/admin/api/memory/stats", "/admin/api/memory/m1",
-        "/admin/api/memory/m1/promote", "/admin/api/memory/m1/archive",
-        "/admin/api/memory/m1/restore",
-    )
+    paths = ("/admin/api/memory", "/admin/api/memory/stats", "/admin/api/memory/m1")
 
     async def scenario():
         client = client_for(app)
@@ -496,5 +492,11 @@ def test_unimplemented_feature_endpoints_answer_501_not_404(ctx, app):
             response = await client.get(path, headers=bearer(token))
             assert response.status_code == 501, (path, response.status_code, response.text)
             assert response.json()["code"] == "UNSUPPORTED", path
+        for path in ("/admin/api/memory/m1/promote", "/admin/api/memory/m1/archive",
+                     "/admin/api/memory/m1/restore"):
+            response = await client.get(path, headers=bearer(token))
+            assert response.status_code == 405, (path, response.status_code, response.text)
+        patch = await client.patch("/admin/api/memory/m1", json={}, headers=bearer(token))
+        assert patch.status_code == 405, patch.text
 
     asyncio.run(scenario())

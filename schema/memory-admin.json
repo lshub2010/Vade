@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vade.local/schema/memory-admin.json",
+  "title": "Vade memory admin private RPCs (C-16)",
+  "description": "Frozen contract C-16. The six `memory/admin_*` core->module RPCs the admin plane uses to browse and govern memory, plus `MemoryQuery` and the view types they return. None of these are tools: they are absent from the manifest tool table and therefore invisible to the model (FR-9.44). The module performs no authorization; core's admin guard is the only gate. `memory/admin_list` returns memory text and pointers, never raw conversation (no `user_text` / `assistant_text`). There is deliberately no `memory/admin_update`: to change an entry, archive the old one and remember a new one, keeping the supersedes chain.",
+  "x-vade": {
+    "contract": "C-16",
+    "version": "1.0.0",
+    "frozen": "2026-11-27",
+    "owner": "M4a",
+    "doc": "docs/agents/43-M4-memory.md",
+    "consumers": ["C3", "C5a"],
+    "not_in_tool_table": true,
+    "direction": "core->module",
+    "transport": "one JSON-RPC request per method over the live module connection (the same caller the router uses); no manifest tool entry exists",
+    "concurrency": "exclusive — memory is one capability one instance (D13); a second registering instance must be refused by core",
+    "rpcs": {
+      "memory/read_session": {
+        "params": {"$ref": "#/$defs/ReadSessionQuery"},
+        "result": {"$ref": "#/$defs/ReadSessionResult"},
+        "errors": ["INVALID_ARGUMENT", "UNAVAILABLE", "TIMEOUT"],
+        "note": "The prompt-injection path (C3 MemoryPort.read_session). Returns only the current session's rows, already ordered by importance x recency and cut to session_inject_char_limit."
+      },
+      "memory/admin_list": {
+        "params": {"$ref": "#/$defs/MemoryQuery"},
+        "result": {"$ref": "#/$defs/AdminListResult"},
+        "errors": ["INVALID_ARGUMENT", "UNAVAILABLE", "TIMEOUT"],
+        "note": "`q` is a SQLite LIKE over text and tags; it is NOT vector search, because a paged admin query must be stable and must not recompute embeddings per page."
+      },
+      "memory/admin_get": {
+        "params": {"type": "object", "additionalProperties": false, "required": ["id"], "properties": {"id": {"$ref": "#/$defs/Id"}}},
+        "result": {"$ref": "#/$defs/AdminGetResult"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "UNAVAILABLE", "TIMEOUT"],
+        "note": "Detail plus the supersedes chain (before and after), so the UI can render the lineage without a second call."
+      },
+      "memory/admin_promote": {
+        "params": {"$ref": "#/$defs/PromoteQuery"},
+        "result": {"$ref": "#/$defs/OkResult"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "UNAVAILABLE", "TIMEOUT"],
+        "note": "staging -> active; the module writes promoted_by=\"admin:<name>\" from `by`."
+      },
+      "memory/admin_archive": {
+        "params": {"$ref": "#/$defs/ArchiveQuery"},
+        "result": {"$ref": "#/$defs/OkResult"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "UNAVAILABLE", "TIMEOUT"],
+        "note": "Soft archive, reversible. A reason is mandatory; core writes the audit row."
+      },
+      "memory/admin_restore": {
+        "params": {"$ref": "#/$defs/RestoreQuery"},
+        "result": {"$ref": "#/$defs/OkResult"},
+        "errors": ["NOT_FOUND", "INVALID_ARGUMENT", "UNAVAILABLE", "TIMEOUT"],
+        "note": "archived -> active. core writes the audit row."
+      },
+      "memory/admin_stats": {
+        "params": {"type": "object", "additionalProperties": false, "properties": {}},
+        "result": {"$ref": "#/$defs/StatsResult"},
+        "errors": ["UNAVAILABLE", "TIMEOUT"],
+        "note": "Quota counters for the config page; read-only."
+      }
+    }
+  },
+  "$defs": {
+    "Id": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "Layer": {"type": "string", "enum": ["session", "global"]},
+    "Status": {"type": "string", "enum": ["staging", "active", "archived", "superseded"]},
+    "ReadSessionQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id"],
+      "properties": {
+        "session_id": {"$ref": "#/$defs/Id"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+      }
+    },
+    "ReadSessionItem": {
+      "type": "object",
+      "required": ["id", "text"],
+      "properties": {
+        "id": {"$ref": "#/$defs/Id"},
+        "text": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "created_at": {"type": "integer"}
+      }
+    },
+    "ReadSessionResult": {
+      "type": "object",
+      "required": ["items"],
+      "properties": {
+        "items": {"type": "array", "items": {"$ref": "#/$defs/ReadSessionItem"}}
+      }
+    },
+    "MemoryQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "`from` / `to` are inclusive unix-second bounds on created_at. `cursor` is opaque and must be echoed back verbatim.",
+      "properties": {
+        "layer": {"$ref": "#/$defs/Layer"},
+        "namespace": {"type": "string", "pattern": "^[a-z0-9][a-z0-9:_-]{0,63}$"},
+        "status": {"$ref": "#/$defs/Status"},
+        "from": {"type": "number"},
+        "to": {"type": "number"},
+        "q": {"type": "string", "maxLength": 200},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+        "cursor": {"type": ["string", "null"]}
+      }
+    },
+    "MemoryItem": {
+      "type": "object",
+      "description": "Only the entry text and pointers; no raw conversation. `tags` is a decoded convenience the C-12 row already carries.",
+      "required": ["id", "layer", "namespace", "status", "text", "created_at"],
+      "properties": {
+        "id": {"$ref": "#/$defs/Id"},
+        "layer": {"$ref": "#/$defs/Layer"},
+        "namespace": {"type": "string"},
+        "status": {"$ref": "#/$defs/Status"},
+        "text": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "session_id": {"type": ["string", "null"]},
+        "turn_id": {"type": ["string", "null"]},
+        "created_at": {"type": "number"},
+        "expires_at": {"type": ["number", "null"]},
+        "hit_count": {"type": "integer", "minimum": 0},
+        "supersedes": {"type": "array", "items": {"$ref": "#/$defs/Id"}}
+      }
+    },
+    "ChainEntry": {
+      "type": "object",
+      "required": ["id", "status", "created_at"],
+      "properties": {
+        "id": {"$ref": "#/$defs/Id"},
+        "status": {"$ref": "#/$defs/Status"},
+        "created_at": {"type": "number"}
+      }
+    },
+    "AdminListResult": {
+      "type": "object",
+      "required": ["items", "next_cursor"],
+      "properties": {
+        "items": {"type": "array", "items": {"$ref": "#/$defs/MemoryItem"}},
+        "next_cursor": {"type": ["string", "null"]}
+      }
+    },
+    "AdminGetResult": {
+      "allOf": [{"$ref": "#/$defs/MemoryItem"}],
+      "properties": {
+        "chain": {"type": "array", "items": {"$ref": "#/$defs/ChainEntry"}}
+      },
+      "required": ["chain"]
+    },
+    "PromoteQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "by"],
+      "properties": {
+        "id": {"$ref": "#/$defs/Id"},
+        "by": {"type": "string", "minLength": 1, "maxLength": 128}
+      }
+    },
+    "ArchiveQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "reason", "by"],
+      "properties": {
+        "id": {"$ref": "#/$defs/Id"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+        "by": {"type": "string", "minLength": 1, "maxLength": 128}
+      }
+    },
+    "RestoreQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "by"],
+      "properties": {
+        "id": {"$ref": "#/$defs/Id"},
+        "by": {"type": "string", "minLength": 1, "maxLength": 128}
+      }
+    },
+    "OkResult": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "ok": {"type": "boolean"},
+        "id": {"$ref": "#/$defs/Id"},
+        "audit_id": {"type": ["string", "null"]}
+      }
+    },
+    "StatsResult": {
+      "type": "object",
+      "required": ["global_count", "global_limit", "staging_count", "archived_count", "oldest_at"],
+      "properties": {
+        "global_count": {"type": "integer", "minimum": 0},
+        "global_limit": {"type": "integer", "minimum": 0},
+        "staging_count": {"type": "integer", "minimum": 0},
+        "archived_count": {"type": "integer", "minimum": 0},
+        "oldest_at": {"type": ["number", "null"]}
+      }
+    }
+  }
+}

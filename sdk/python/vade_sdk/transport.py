@@ -459,7 +459,8 @@ class Client:
             call_id = str(params.get("call_id") or "")
             tool = str(params.get("tool") or "")
             args = params.get("args") or {}
-            envelope = await self.app.call_tool(tool, args, call_id=call_id)
+            context = params.get("ctx") if isinstance(params.get("ctx"), Mapping) else {}
+            envelope = await self.app.call_tool(tool, args, call_id=call_id, context=context)
             envelope.pop("truncated", None)
             if request_id is not None:
                 await self._reply(request_id, envelope)
@@ -482,11 +483,33 @@ class Client:
                 await self._reply_error(request_id, "NOT_FOUND", f"module {self.app.module_id} declares no prompts")
             return
         if method == "events/deliver":
+            topic = str(params.get("topic") or "")
+            payload = params.get("payload")
+            try:
+                result = await self.app.dispatch_event(topic, payload)
+            except Exception as exc:  # a subscriber bug must not kill the socket
+                code = str(getattr(exc, "code", "INTERNAL"))
+                detail = str(getattr(exc, "message", str(exc)))[:300]
+                if request_id is not None:
+                    await self._reply_error(request_id, code, detail)
+                return
             if request_id is not None:
-                await self._reply(request_id, {"ok": True})
+                await self._reply(request_id, result if isinstance(result, Mapping) else {"ok": True})
+            return
+        # Private RPCs (memory/read_session, memory/admin_*, ...) are not tools
+        # and never appear in the manifest. They are dispatched only when the
+        # module explicitly registered a handler; otherwise this stays a clear
+        # NOT_FOUND rather than a silent success.
+        try:
+            result = await self.app.dispatch_rpc(method, params)
+        except Exception as exc:
+            code = str(getattr(exc, "code", "NOT_FOUND"))
+            detail = str(getattr(exc, "message", str(exc)))[:300]
+            if request_id is not None:
+                await self._reply_error(request_id, code, detail)
             return
         if request_id is not None:
-            await self._reply_error(request_id, "NOT_FOUND", f"unknown method {method!r}")
+            await self._reply(request_id, result if isinstance(result, Mapping) else {"result": result})
 
     async def _drain_and_stop(self, grace_ms: int) -> None:
         deadline = time.monotonic() + max(0, grace_ms) / 1000.0

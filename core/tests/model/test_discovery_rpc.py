@@ -233,6 +233,67 @@ def test_success_that_adds_no_new_id_still_moves_the_revision(tmp_path, monkeypa
     assert upstream.calls == 2
 
 
+def test_empty_upstream_list_is_a_failed_refresh_not_an_empty_catalog(tmp_path, monkeypatch):
+    """A `200` with `data: []` must not blank the picker or the persisted cache.
+
+    A shrinking-but-non-empty list is a success (the test above); an EMPTY one
+    is not evidence of anything — gateways answer it while booting, or when the
+    key is scoped to no model. Treating it as a refresh would replace the last
+    good list with nothing, the exact misreading a 401/503 already refuses.
+    `OpenAICompatProvider.list_models()` still returns `[]` for that body
+    (`core/tests/llm/test_openai_compat_models.py` pins it), so the guard sits
+    in the resolver, where the last good list and its cache live.
+    """
+    upstream = FakeUpstream(["gpt-4o-mini", "qwen2.5-vl-72b", "llama-3.3-70b"])
+    _patch_upstream(monkeypatch, upstream)
+    _, rpc, resolver = _rpc(tmp_path, _builtin_cfg(), data_dir=tmp_path)
+    conn = FakeConnection()
+
+    first = _discover(rpc, conn)
+    assert isinstance(first, dict)
+    good_ids = [entry.id for entry in resolver.catalog().entries]
+    good_revision = resolver.catalog().revision
+    good_at = resolver.discovered_at
+    cache = tmp_path / "models_discovered.json"
+    cache_bytes = cache.read_bytes()
+    assert "builtin/llama-3.3-70b" in good_ids
+
+    resolver._last_discovery_at -= 10  # step past the 2 s refresh cooldown
+    upstream.ids = []  # HTTP 200 with {"data": []}
+
+    failed = _discover(rpc, conn)
+
+    assert isinstance(failed, RpcError)
+    assert failed.code == "UNAVAILABLE"
+    assert failed.data == {"reason": "upstream_error"}
+    assert "empty" in failed.message
+    assert "llm.test" not in failed.message, "the base_url must not be echoed"
+    assert upstream.calls == 2
+
+    # Nothing the last success wrote may move: ids, revision, timestamp, file.
+    after = resolver.catalog()
+    assert [entry.id for entry in after.entries] == good_ids
+    assert after.revision == good_revision
+    assert resolver.discovered_at == good_at
+    assert resolver.discovery_generation == 1
+    assert cache.read_bytes() == cache_bytes
+
+    listed = asyncio.run(rpc.dispatch(conn, "model/list", {}))
+    assert [item["id"] for item in listed["models"]] == good_ids
+
+    # Same failure path as a 503: cause recorded, cooldown armed.
+    assert resolver.last_discovery_error is not None
+    assert "empty" in resolver.last_discovery_error
+    assert resolver._in_cooldown() is True
+
+    # A second click inside the cooldown answers from the last good list.
+    second = _discover(rpc, conn)
+    assert isinstance(second, dict)
+    assert second["cached"] is True
+    assert [row["id"] for row in second["models"]] == good_ids
+    assert upstream.calls == 2, "the cooldown must answer without probing again"
+
+
 def test_discover_is_registered_and_read_only_viewers_may_refresh(tmp_path, monkeypatch):
     # Registration + the read-only decision are both contract facts: the method
     # declares no READ_ONLY_SESSION, so it must not be a WRITE_METHODS verb.

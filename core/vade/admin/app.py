@@ -52,6 +52,7 @@ from .auth import (
 )
 from .devices import DeviceStore
 from .identity import CoreIdentity, load_or_create
+from .memory import build_routes as memory_routes
 from .setup import SetupService
 from .skills import build_routes as skill_routes
 from .stream import EventStream
@@ -260,6 +261,11 @@ class AdminContext:
     #: because `admin` installs BEFORE `skill` (alphabetical), so it does not
     #: exist yet when this context is built.
     skills: Any = None
+    #: C3's `MemoryPort` adapter (`app.memory_port`, installed by `vade.memory`).
+    #: Resolved again in `bind_ports` for the same alphabetical reason
+    #: (`admin` < `memory`). `None` means the component is absent, which the
+    #: memory routes answer with UNSUPPORTED/501, never a fake empty list.
+    memory: Any = None
     #: The trust table (`vade.identity.whitelist.Whitelist`). Revoking a node
     #: must unbind it HERE as well as in the registry, because the registry's
     #: `_revoked` set is process memory: whitelist.json is what survives a
@@ -327,6 +333,7 @@ class AdminContext:
             pairing=getattr(app, "pairing", None),
             whitelist=getattr(app, "whitelist", None),
             skills=getattr(app, "skill_loader", None),
+            memory=getattr(app, "memory_port", None),
             app_config=getattr(app, "config", None),
             version=config.version,
             e2e_enabled=config.e2e_enabled,
@@ -358,6 +365,8 @@ class AdminContext:
             self.pairing = getattr(source, "pairing", None)
         if self.skills is None:
             self.skills = getattr(source, "skill_loader", None)
+        if self.memory is None:
+            self.memory = getattr(source, "memory_port", None)
 
     def __post_init__(self) -> None:
         self.sessions.set_device_checker(self.devices.is_active)
@@ -1607,11 +1616,7 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         ctx._layout = {"rev": int(ctx._layout.get("rev", 0)) + 1, "nodes": nodes}
         return JSONResponse(ctx._layout)
 
-    # ------------------------------------------------------------------ not yet
-    async def unsupported(request: Request) -> Response:
-        guard(request)
-        raise VadeError("UNSUPPORTED", f"{request.url.path} is not implemented in this batch")
-
+    # ------------------------------------------------------------------ health
     async def health(request: Request) -> Response:
         if _loopback(request):
             return JSONResponse({
@@ -1706,16 +1711,11 @@ def create_admin_app(ctx: AdminContext, *, static_dist: Path | str | None = None
         Route("/login", login_page, methods=["GET"]),
         Route("/", login_page, methods=["GET"]),
     ])
-    # Memory is C5b. It is declared in `schema/admin-api.yaml` already, so
-    # answer `UNSUPPORTED` (501) — not `NOT_FOUND` — for every shape the schema
-    # defines, including nested actions that would otherwise miss the `{id}`
-    # routes. A UI can then label the feature "not in this build".
-    for path in (
-        "/admin/api/memory", "/admin/api/memory/stats", "/admin/api/memory/{id}",
-        "/admin/api/memory/{id}/promote", "/admin/api/memory/{id}/archive",
-        "/admin/api/memory/{id}/restore",
-    ):
-        routes.append(Route(path, unsupported, methods=["GET", "POST", "PATCH", "DELETE", "PUT"]))
+    # Memory is C5b's management surface over C3's `MemoryPort`; the adapter
+    # forwards to the module's `memory/admin_*` private RPCs (C-16). It sits
+    # here rather than in a 501 block so every schema shape resolves to a
+    # handler; a missing component still answers UNSUPPORTED from `_port`.
+    routes.extend(memory_routes(ctx, guard, _json))
 
     starlette_app = Starlette(routes=routes)
     # The SPA's JS/CSS live under `/assets`; serving only `index.html` gives an

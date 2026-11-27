@@ -7,6 +7,9 @@ Invariants:
     `capabilities.update` can never leave a half-applied tool table.
   * `module_id/tool` is globally unique AND the bare tool name is globally
     unique (design §2.3): the later registrant loses, never the earlier one.
+    The one exception is the model-discovery tool `chat`: FR-6.3 requires
+    several model modules to be registered at once, and each is addressed by
+    `module_id/chat`, so that name alone carries no cross-module identity.
 """
 
 from __future__ import annotations
@@ -23,6 +26,13 @@ from ..errors import VadeError
 __all__ = ["Registry", "NodeRecord", "ToolBinding", "Registration", "MAX_TOOLS_GLOBAL"]
 
 _RISK_RANK = {"low": 0, "medium": 1, "high": 2}
+
+#: Tool names exempt from the bare-name uniqueness rule. `chat` is M6's single
+#: discovery tool, so every model module declares it by definition (FR-6.3
+#: allows several model modules online at once); the router addresses it as
+#: `<module_id>/chat`, so it is already namespaced and cannot be ambiguous.
+#: Every other bare tool name stays globally unique.
+_NAMESPACE_SCOPED_TOOLS = frozenset({"chat"})
 
 #: Tools whose effective risk can never be lowered below `high`, whatever the
 #: manifest or [policy.tool_risk] says (design §7.9.1).
@@ -252,7 +262,9 @@ class Registry:
 
         Pooled instances each get their own entry (three instances -> three
         bindings for the same tool), so the router can pick the least-inflight
-        one. A tool name held by a DIFFERENT module is a conflict. Disabled
+        one. A tool name held by a DIFFERENT module is a conflict, except for
+        `_NAMESPACE_SCOPED_TOOLS` (`chat`), where several model modules must
+        coexist (FR-6.3) and routing is always `<module_id>/chat`. Disabled
         instances contribute nothing: `set_enabled(False)` must stop routing
         without touching the other instances of the same module.
         """
@@ -272,12 +284,13 @@ class Registry:
                 )
 
         for pos, spec in enumerate(manifest.tools):
-            foreign = {b.module_id for b in index.values() if b.spec.name == spec.name} - {manifest.module_id}
-            if foreign:
-                raise VadeError(
-                    "TOOL_CONFLICT",
-                    f"/capabilities/tools/{pos}/name: tool {spec.name!r} already held by {sorted(foreign)[0]}",
-                )
+            if spec.name not in _NAMESPACE_SCOPED_TOOLS:
+                foreign = {b.module_id for b in index.values() if b.spec.name == spec.name} - {manifest.module_id}
+                if foreign:
+                    raise VadeError(
+                        "TOOL_CONFLICT",
+                        f"/capabilities/tools/{pos}/name: tool {spec.name!r} already held by {sorted(foreign)[0]}",
+                    )
             index[f"{manifest.module_id}/{spec.name}@{manifest.instance_id}"] = ToolBinding(
                 tool_id=f"{manifest.module_id}/{spec.name}",
                 module_id=manifest.module_id,

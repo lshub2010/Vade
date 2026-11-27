@@ -53,7 +53,7 @@ Vade 反过来：
 
         数据面 :8443                          管理面 :8444
 
-  schema/      契约 —— rpc 1.7.0（三方向 49 个方法）、
+  schema/      契约 —— rpc 1.8.0（三方向 50 个方法）、
                events 2.0.0（34 个事件）、34 个错误码
   protocol/    Rust 线协议：Noise IK/XXpsk3 + ChaCha20-Poly1305，
                并给出内核使用的 Python 绑定
@@ -75,6 +75,19 @@ Vade 反过来：
 | 客户端 | Android、Windows 桌面、Web（wasm）；默认走假数据，显式开启后连真内核；发送/流式/中断、会话与分组管理、内联审批、模块页面 |
 | 管理面 | `:8444` 上的管理监听与 React 前端。登录和节点治理已实现；setup、audit、settings 仍是占位页 |
 | 模块 | 五个独立仓：echo（参考实现）、fs、shell、web、model；各有自己的 CI 和测试 |
+
+## 0.0.5-alpha 之后的当前开发（未发布）
+
+`dev_gingshan` 包含 0.0.5 发布之后合并的改动；在下次发布前，`v0.0.5-alpha` 的产物不包含这些内容。
+
+| 方面 | 现状 |
+|---|---|
+| 模型发现 | 上游 `/v1/models` 返回空列表时按发现失败处理，最后一次成功列表与缓存保留，客户端可重试 |
+| 会话 | 桌面端到端覆盖「杀进程/重启 → 重连 → 快照重放」（`RealCoreRestartSnapshotE2ETest`） |
+| 工具 | 真 core + 真 model 模块 + echo：同一条 assistant 消息返回四个 `tool_calls`；客户端工具卡与审批卡按 canonical 的模块/工具身份绑定 |
+| 队列 | `ui/queue.cancel` 可取消尚未开始的排队回合；真核 e2e 证明第二回合从未发出 `turn.started` 或 `turn.delta` |
+
+这些是开发证据，不是一次新发布。具体测试名与剩余缺口见 [`docs/ALPHA.md`](docs/ALPHA.md)。
 
 ## 下载
 
@@ -196,7 +209,7 @@ api_key_env = "VADE_LLM_API_KEY"
 | [`docs/rfc/`](docs/rfc) + [`schema/`](schema) | 逐条 RFC 契约与 JSON schema |
 | [`docs/ALPHA.md`](docs/ALPHA.md) | alpha 验收证据与已知缺陷 |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) · [`docs/DEPLOYMENT.zh-CN.md`](docs/DEPLOYMENT.zh-CN.md) | 自托管与生产化加固（English / 中文） |
-| [`docs/release/0.0.2.md`](docs/release/0.0.2.md) | 0.0.2 发布范围与待办 |
+| [`docs/release/0.0.5.md`](docs/release/0.0.5.md) | 0.0.5 发布范围与待办 |
 | [`docs/status.md`](docs/status.md) | 批次状态与里程碑 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 分支、审查与合并规则 |
 
@@ -208,11 +221,11 @@ api_key_env = "VADE_LLM_API_KEY"
 - **记忆与 M4b 自演化。** 没有 memory 模块，没有 memory schema，内核里也没有记忆子系统。
 - **mcp-bridge 模块。** 没建。
 - **生产签名与更新通道。** APK 是 debug 签名，Windows MSI 未签名，也没有更新检查。
-- **上游 `/v1/models` 自动发现、多模型模块并存。** 模型名要手工配；跨模块 `chat` 冲突要单独出 RFC。
-- **真模型驱动的工具调用端到端验收（T3）。** 工具卡和路由已经有了，模型自主调用工具的完整链路还没验收。
+- **多模型模块并存。** 上游 `/v1/models` 自动发现已经实现；多个模型模块同时提供 `chat` 时的选择与冲突消解仍要单独出 RFC。
+- **T3 完整验收不在 0.0.5 发布物里。** 发布物只有工具卡与路由，没有完整的模型驱动链路。当前开发树已合并 core 的四工具循环和客户端工具卡/审批卡绑定；但客户端真模块 e2e 在缺少模块源码时会被 CI 跳过，所以 T3 仍不能算完整验收。
 - **登录和节点以外的管理页。** setup、audit、settings 是占位页；skills、memory、topology 还没实现。
 
-发布清单和已知缺陷分别见 [`docs/release/0.0.2.md`](docs/release/0.0.2.md) 和 [`docs/ALPHA.md`](docs/ALPHA.md)。
+发布清单和已知缺陷分别见 [`docs/release/0.0.5.md`](docs/release/0.0.5.md) 和 [`docs/ALPHA.md`](docs/ALPHA.md)。
 
 ## 参与开发
 

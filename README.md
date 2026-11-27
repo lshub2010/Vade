@@ -53,7 +53,7 @@ The trade-off is operational: you run and supervise more than one process, and a
 
        data plane :8443                         admin plane :8444
 
-  schema/      the contract — rpc 1.7.0 (49 methods / 3 directions),
+  schema/      the contract — rpc 1.8.0 (50 methods / 3 directions),
                events 2.0.0 (34 events), 34 error codes
   protocol/    Rust wire protocol: Noise IK/XXpsk3 + ChaCha20-Poly1305,
                with the Python binding used by the core
@@ -76,6 +76,19 @@ The trade-off is operational: you run and supervise more than one process, and a
 | Clients | Android, Windows desktop, and Web (wasm); fixtures by default, real core when explicitly enabled; chat send / stream / interrupt, session and group management, inline approvals, module pages |
 | Admin | Admin listener on `:8444` with a React UI. Login and node governance are implemented; setup, audit, and settings pages are still placeholders |
 | Modules | Five separate module repositories: echo (reference), fs, shell, web, model — each with its own CI and tests |
+
+## Current development (post-0.0.5-alpha)
+
+`dev_gingshan` contains work merged after the 0.0.5 release. The `v0.0.5-alpha` artifacts do not include it until the next release.
+
+| Area | Status |
+|---|---|
+| Model discovery | An empty upstream `/v1/models` response is treated as a failed refresh; the last good list and cache survive, and discovery can be retried from the client. |
+| Sessions | A desktop end-to-end test covers kill/restart → reconnect → snapshot replay (`RealCoreRestartSnapshotE2ETest`). |
+| Tools | The core runs a real core + real model module + echo loop where one assistant message contains four tool calls (`echo__echo`, `echo__add`, `echo__sleep`, `echo__boom`). Client tool cards bind approval cards to canonical `module/tool` IDs. |
+| Queue | `ui/queue.cancel` cancels a queued turn before it starts; a real-core e2e proves the second turn never emits `turn.started` or `turn.delta`. |
+
+This is development evidence, not a new release. Exact test names and remaining gaps are in [`docs/ALPHA.md`](docs/ALPHA.md).
 
 ## Download
 
@@ -197,7 +210,7 @@ To write a module, start with the Python SDK in [`sdk/python`](sdk/python), the 
 | [`docs/rfc/`](docs/rfc) + [`schema/`](schema) | Per-RFC protocol contracts and the JSON schema |
 | [`docs/ALPHA.md`](docs/ALPHA.md) | Alpha acceptance evidence and known defects |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) · [`docs/DEPLOYMENT.zh-CN.md`](docs/DEPLOYMENT.zh-CN.md) | Self-hosting and production hardening (English / 中文) |
-| [`docs/release/0.0.2.md`](docs/release/0.0.2.md) | 0.0.2 release scope and open tasks |
+| [`docs/release/0.0.5.md`](docs/release/0.0.5.md) | 0.0.5 release scope and open tasks |
 | [`docs/status.md`](docs/status.md) | Batch status and milestones |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Branches, review, and merge rules |
 
@@ -209,11 +222,11 @@ These are explicitly deferred, not silently missing:
 - **Memory and M4b self-evolution.** There is no memory module, no `memory` schema, and no core memory subsystem.
 - **mcp-bridge module.** Not built.
 - **Production signing and updates.** The APK is debug-signed, the Windows MSI is unsigned, and there is no update channel.
-- **Upstream `/v1/models` discovery and multiple model modules side by side.** You configure the model name explicitly; cross-module `chat` conflicts need a separate RFC.
-- **Real-model tool-call end-to-end acceptance (T3).** Tool cards and routing exist; the full model-driven loop is not yet accepted.
+- **Multiple model modules side by side.** Upstream `/v1/models` discovery is implemented; choosing between several model modules and resolving cross-module `chat` conflicts still needs a separate RFC.
+- **Full T3 acceptance in the 0.0.5 release.** The release has tool cards and routing, but not the complete model-driven loop. In the current development tree the core four-tool loop and client tool-card/approval binding are merged; the client real-module e2e is skipped in CI when module sources are absent, so T3 is still not fully accepted.
 - **Admin pages beyond login and nodes.** Setup, audit, and settings are placeholder pages; skills, memory, and topology are not implemented.
 
-The release checklist and the known-defect list are in [`docs/release/0.0.2.md`](docs/release/0.0.2.md) and [`docs/ALPHA.md`](docs/ALPHA.md).
+The release checklist and the known-defect list are in [`docs/release/0.0.5.md`](docs/release/0.0.5.md) and [`docs/ALPHA.md`](docs/ALPHA.md).
 
 ## Contributing
 

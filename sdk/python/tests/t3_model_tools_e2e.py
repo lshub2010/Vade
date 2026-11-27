@@ -6,6 +6,11 @@ explicitly:
 
     python sdk/python/tests/t3_model_tools_e2e.py
 
+It needs an exact binding: build ``protocol/core/python/libvade_protocol.so``
+in this checkout, or set ``VADE_PROTOCOL_SO`` (and optionally
+``VADE_PROTOCOL_PY``) to the file you mean to test. It never borrows another
+worktree's build silently.
+
 What it proves, in order:
 
   1. a real core (`App.startup()` + `install_components()` + uvicorn + Noise IK)
@@ -29,6 +34,7 @@ as ``sdk/python/tests/e2e_real_core.py`` documents).
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
 import shutil
@@ -82,29 +88,27 @@ def _binding_dir(work: Path) -> Path:
     if (source / "libvade_protocol.so").is_file():
         return source
 
-    candidates: list[Path] = []
     env_so = os.environ.get("VADE_PROTOCOL_SO")
-    if env_so:
-        candidates.append(Path(env_so))
-    candidates.append(source / "libvade_protocol.so")
-    for base in (REPO.parent, REPO.parent.parent):
-        try:
-            candidates.extend(sorted(base.glob("*/protocol/core/python/libvade_protocol.so")))
-        except OSError:
-            pass
+    if not env_so:
+        raise SystemExit(
+            "no libvade_protocol.so in this worktree. Build it, or set "
+            "VADE_PROTOCOL_SO to the exact .so you mean to test with "
+            "(VADE_PROTOCOL_PY points at a directory holding both files). "
+            "Refusing to borrow a sibling worktree's binding silently."
+        )
+    candidate = Path(env_so)
+    if not candidate.is_file():
+        raise SystemExit(f"VADE_PROTOCOL_SO does not exist: {candidate}")
 
-    for candidate in candidates:
-        if candidate.is_file():
-            target = work / "binding"
-            target.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source / "vade_protocol.py", target / "vade_protocol.py")
-            shutil.copy2(candidate, target / "libvade_protocol.so")
-            print(f"[info] binding .so: {candidate}", flush=True)
-            return target
-    raise SystemExit(
-        "no libvade_protocol.so found; set VADE_PROTOCOL_PY (dir with both files) "
-        "or VADE_PROTOCOL_SO (path to the .so)"
-    )
+    target = work / "binding"
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / "vade_protocol.py", target / "vade_protocol.py")
+    try:
+        (target / "libvade_protocol.so").symlink_to(candidate)
+    except OSError:
+        shutil.copy2(candidate, target / "libvade_protocol.so")
+    print(f"[info] binding .so: {candidate}", flush=True)
+    return target
 
 
 # -------------------------------------------------------------------- upstream
@@ -283,6 +287,10 @@ def _stop(proc: subprocess.Popen | None) -> None:
 
 async def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="vade-t3-"))
+    if os.environ.get("VADE_KEEP_WORK") != "1":
+        # The inner finally only runs after setup succeeds; an early SystemExit
+        # (missing .so/module) must not leave 76 MB behind either.
+        atexit.register(shutil.rmtree, work, True)
     data = work / "core-data"
     data.mkdir(parents=True)
     binding = _binding_dir(work)
@@ -597,6 +605,9 @@ async def main() -> int:
             print(f"[warn] session.close: {exc}", flush=True)
         await app.shutdown()
         print(f"\n[info] work dir: {work}", flush=True)
+        if os.environ.get("VADE_KEEP_WORK") != "1":
+            shutil.rmtree(work, ignore_errors=True)
+            print("[info] work dir removed (VADE_KEEP_WORK=1 keeps it)", flush=True)
 
     _banner("result")
     if failures:

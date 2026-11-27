@@ -57,6 +57,11 @@ class App:
         self.tool_failure_hooks: list[Any] = []
         self.on_session_end: list[Any] = []
         self.approval_port: Any = None
+        #: C3's `MemoryPort` adapter (`vade.memory`). Optional: a core without a
+        #: registered memory module keeps it as an adapter that answers
+        #: `NOT_FOUND`, and `_LazyMemory` turns that into an empty prompt
+        #: section rather than a failed turn.
+        self.memory_port: Any = None
         self.started = False
 
     # ------------------------------------------------------------------ lifecycle

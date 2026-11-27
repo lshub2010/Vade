@@ -14,11 +14,11 @@ meaning of an existing field is not.
 
 from __future__ import annotations
 
-from .app import ModuleApp, run
+from .app import ModuleApp, current_call_context, run
 from .errors import ToolError
 from .spec import ToolSpec
 
-__all__ = ["ModuleApp", "ToolSpec", "ToolError", "run"]
+__all__ = ["ModuleApp", "ToolSpec", "ToolError", "run", "current_call_context"]
 
 #: SDK version. Modules pin `vade-sdk==0.1.*`; a breaking change needs 0.2.
 __version__ = "0.1.0"

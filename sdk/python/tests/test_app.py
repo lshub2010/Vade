@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from vade_sdk import ModuleApp, ToolSpec
+from vade_sdk import ModuleApp, ToolSpec, current_call_context
 from vade_sdk.errors import ToolError
 
 
@@ -138,6 +138,59 @@ async def test_draining_refuses_new_calls():
     app.begin_drain(100)
     envelope = await app.call_tool("echo", {"text": "hi"})
     assert envelope["error"]["code"] == "MODULE_DRAINING"
+
+
+async def test_tool_context_reaches_sync_and_async_tools_and_is_reset():
+    app = ModuleApp("com.example.context", "1.0.0")
+
+    def sync_tool() -> dict:
+        return {"session_id": current_call_context().get("session_id")}
+
+    async def async_tool() -> dict:
+        return {"session_id": current_call_context().get("session_id")}
+
+    app.add_tool(ToolSpec(name="sync", fn=sync_tool, description="sync"))
+    app.add_tool(ToolSpec(name="async", fn=async_tool, description="async"))
+
+    sync_envelope = await app.call_tool("sync", {}, context={"session_id": "s-1"})
+    async_envelope = await app.call_tool("async", {}, context={"session_id": "s-2"})
+    assert sync_envelope["result"] == {"session_id": "s-1"}
+    assert async_envelope["result"] == {"session_id": "s-2"}
+    assert current_call_context() == {}
+
+
+async def test_private_rpc_handlers_are_not_tools_and_dispatch_sync_or_async():
+    app = ModuleApp("com.example.rpc", "1.0.0")
+    app.on_rpc("memory/admin_stats", lambda params: {"ok": True, "params": dict(params)})
+
+    async def read_session(params):
+        return {"items": [], "session_id": params.get("session_id")}
+
+    app.on_rpc("memory/read_session", read_session)
+    assert await app.dispatch_rpc("memory/admin_stats", {"x": 1}) == {
+        "ok": True,
+        "params": {"x": 1},
+    }
+    assert await app.dispatch_rpc("memory/read_session", {"session_id": "s"}) == {
+        "items": [],
+        "session_id": "s",
+    }
+    assert app.tool_names == ()
+    with pytest.raises(ToolError) as excinfo:
+        await app.dispatch_rpc("memory/unknown", {})
+    assert excinfo.value.code == "NOT_FOUND"
+
+
+async def test_event_handler_receives_topic_and_payload():
+    app = ModuleApp("com.example.events", "1.0.0")
+    seen = []
+
+    async def on_event(topic, payload):
+        seen.append((topic, payload))
+
+    app.on_event(on_event)
+    assert await app.dispatch_event("session.turn", {"turn_id": "t"}) == {"ok": True}
+    assert seen == [("session.turn", {"turn_id": "t"})]
 
 
 class _RefusingTransport:

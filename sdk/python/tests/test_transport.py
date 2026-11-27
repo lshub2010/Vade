@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from vade_sdk.transport import HEADER_LEN, TransportError, _frame, _peek, fingerprint_of, load_or_create_key
+from vade_sdk.transport import Client, HEADER_LEN, TransportError, _frame, _peek, fingerprint_of, load_or_create_key
 
 
 def test_key_file_is_created_0600_and_never_overwritten(tmp_path):
@@ -69,3 +69,48 @@ def test_encrypted_frame_with_counter_zero_is_rejected():
     header[12:20] = (0).to_bytes(8, "big")
     with pytest.raises(TransportError, match="counter 0"):
         _peek(bytes(header))
+
+
+async def test_transport_passes_ctx_and_dispatches_private_rpc():
+    replies = []
+    errors = []
+    seen = {}
+
+    class FakeApp:
+        module_id = "com.example.private"
+
+        async def call_tool(self, tool, args, *, call_id="", context=None):
+            seen["tool"] = (tool, args, call_id, context)
+            return {"ok": True, "result": {"tool": tool}}
+
+        async def dispatch_rpc(self, method, params):
+            if method == "memory/admin_stats":
+                return {"global_count": 0}
+            raise RuntimeError("missing code")
+
+    client = object.__new__(Client)
+    client.app = FakeApp()
+
+    async def reply(request_id, result):
+        replies.append((request_id, result))
+
+    async def reply_error(request_id, code, message):
+        errors.append((request_id, code, message))
+
+    client._reply = reply
+    client._reply_error = reply_error
+    await client._handle_request(
+        {
+            "id": 1,
+            "method": "tools/call",
+            "params": {"tool": "remember", "args": {"text": "x"}, "call_id": "c", "ctx": {"session_id": "s-1"}},
+        }
+    )
+    assert seen["tool"] == ("remember", {"text": "x"}, "c", {"session_id": "s-1"})
+    assert replies[-1] == (1, {"ok": True, "result": {"tool": "remember"}})
+
+    await client._handle_request({"id": 2, "method": "memory/admin_stats", "params": {}})
+    assert replies[-1] == (2, {"global_count": 0})
+
+    await client._handle_request({"id": 3, "method": "memory/unknown", "params": {}})
+    assert errors[-1][0:2] == (3, "NOT_FOUND")

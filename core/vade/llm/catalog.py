@@ -13,9 +13,13 @@ Two responsibilities, both read-only:
 It also owns the optional upstream discovery cache (0.0.3 `model/discover`,
 persisted in 0.0.4): `discover()` asks the builtin's `/models` and `catalog()`
 appends what it found. The cache is replaced only on success, so a failed
-probe keeps the last good list instead of blanking the picker. The last good
-list is written to `data_dir/models_discovered.json` (0600) and hydrated on
-startup; it is a derived, non-authoritative cache, not user data.
+probe keeps the last good list instead of blanking the picker. A `200` whose
+`data` yields no usable id counts as a failed probe too: an empty answer
+cannot be told apart from a gateway that is still booting or a key scoped to
+no model, and blanking the picker is the exact misreading a 401/503 already
+refuses to produce. The last good list is written to
+`data_dir/models_discovered.json` (0600) and hydrated on startup; it is a
+derived, non-authoritative cache, not user data.
 
 `revision` is the registry's monotonic counter: the list is a pure function of
 the registry snapshot and the static `[llm]` config, so every mutation that can
@@ -490,7 +494,10 @@ class ModelResolver:
 
         The cache is persisted to `data_dir/models_discovered.json` (0600) and
         replaced only on success: a timed-out or 401 upstream keeps the last
-        good list visible instead of blanking the picker. Nothing is inferred about capabilities — every discovered entry
+        good list visible instead of blanking the picker. A `200` with no usable
+        id is treated the same way — an empty answer is not evidence that the
+        upstream has no models, only that this probe told us nothing. Nothing is
+        inferred about capabilities — every discovered entry
         keeps `None` for context window / modalities / tool support.
         """
         if not self.can_discover():
@@ -509,6 +516,15 @@ class ModelResolver:
             )
             try:
                 ids = await provider.list_models()
+                if not ids:
+                    # A healthy 200 carrying `data: []` (or rows without a
+                    # usable id) says nothing about the real catalog. Treat it
+                    # as a failed probe: replacing the last good list here
+                    # would empty the picker and overwrite the persisted cache
+                    # with nothing. `list_models()` keeps returning `[]` for
+                    # that body; the refusal belongs where the last good list
+                    # lives. The message never echoes `base_url`/key.
+                    raise RuntimeError("LLM /models returned an empty model list")
             except Exception as exc:  # noqa: BLE001 - keep the last good list, report the cause
                 # Arm the cooldown on failure too: the refresh button is most
                 # likely to be hammered exactly when the upstream is down.

@@ -7,6 +7,7 @@ import { Shell } from './Shell';
 import { LoginPage } from '../pages/LoginPage';
 import { NodesPage } from '../pages/NodesPage';
 import { SkillsPage } from '../pages/SkillsPage';
+import { MemoryPage } from '../pages/MemoryPage';
 import { AuditPage } from '../pages/AuditPage';
 import { SetupPage } from '../pages/SetupPage';
 import { SettingsPage } from '../pages/SettingsPage';
@@ -48,6 +49,8 @@ function pageFor(path: string): ReactNode {
       );
     case '/skills':
       return <SkillsPage />;
+    case '/memory':
+      return <MemoryPage />;
     case '/audit':
       return <AuditPage />;
     case '/settings':
@@ -61,6 +64,7 @@ const TITLES: Record<string, string> = {
   '/nodes': '节点',
   '/topology': '拓扑',
   '/skills': '技能',
+  '/memory': '记忆',
   '/audit': '审计',
   '/settings': '设置',
   '/setup': '首次配置',

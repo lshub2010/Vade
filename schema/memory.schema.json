@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vade.local/schema/memory.schema.json",
+  "title": "Vade memory records (C-12)",
+  "description": "Frozen contract C-12. The shapes stored by the `memory` module: `memories` (MemoryRecord), `staging` (StagingRecord) and `archive` (ArchiveRecord), plus the enums both M4b and C5a must share. This file describes rows, not a wire format: `embedding` never leaves the module and is opaque here on purpose. `status` is derived, not a column: active = a live memory row, superseded = `superseded_by IS NOT NULL`, archived = a row copied into `archive`, staging = a `staging` row.",
+  "x-vade": {
+    "contract": "C-12",
+    "version": "1.0.0",
+    "frozen": "2026-11-27",
+    "owner": "M4a",
+    "doc": "docs/agents/43-M4-memory.md",
+    "consumers": ["M4b", "C3d", "C5a"],
+    "tables": {
+      "memories": "CREATE TABLE memories(id, layer, namespace, session_id, text, tags, content_hash, embedding, importance, confidence, source, kind, evidence, verified_at, supersedes, superseded_by, hit_count, last_hit_at, created_at, expires_at, deleted_at); UNIQUE(layer, session_id, namespace, content_hash)",
+      "staging": "CREATE TABLE staging(id, text, namespace, kind, evidence, content_hash, seen_sessions, embedding, confidence, created_at); UNIQUE(kind, namespace, content_hash)",
+      "archive": "CREATE TABLE archive(id, payload, archived_at, reason)",
+      "meta": "CREATE TABLE meta(k, v) — embedding_model, dim",
+      "consolidate_run": "CREATE TABLE consolidate_run(run_id, last_run, kind, stats) — owned by M4a, read/written by M4b through store.py"
+    },
+    "enums": {
+      "layer": ["session", "global"],
+      "source": ["user", "evolve", "import"],
+      "kind": ["fact", "preference", "lesson"],
+      "status": ["staging", "active", "archived", "superseded"]
+    },
+    "namespace_pattern": "^[a-z0-9][a-z0-9:_-]{0,63}$",
+    "namespace_default": "user:default",
+    "limits": {
+      "text_max_chars": 8192,
+      "tags_max_items": 16,
+      "tag_max_chars": 32,
+      "importance_min": 1,
+      "importance_max": 5,
+      "confidence_min": 0,
+      "confidence_max": 1,
+      "global_capacity": 5000,
+      "session_capacity": 200,
+      "session_inject_char_limit": 4200,
+      "recall_k_max": 20,
+      "recall_token_limit": 800,
+      "ttl_days": 7
+    },
+    "invariants": [
+      "session_id is NOT NULL DEFAULT '' — never NULL: SQLite treats NULLs as distinct, which would disable dedup on the global layer",
+      "session layer: namespace = '', session_id = <ULID>, expires_at = now + 7d",
+      "global layer: namespace = <namespace>, session_id = '', expires_at = null",
+      "UNIQUE includes session_id so two sessions writing the same text get two rows",
+      "a lesson row requires evidence; verified_at null means unverified",
+      "forget is a soft delete (deleted_at + archive(reason='forget')); TTL expiry is the only physical DELETE",
+      "quota eviction writes archive(reason='quota'); superseded rows have a negative score and are evicted first"
+    ]
+  },
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "ULID, Crockford base32. Memory ids and session ids share this shape."
+    },
+    "Layer": {
+      "type": "string",
+      "enum": ["session", "global"]
+    },
+    "Source": {
+      "type": "string",
+      "enum": ["user", "evolve", "import"],
+      "description": "Who wrote the row: an explicit tool call (`user`, importance 5), the evolver (`evolve`), or an import (`import`)."
+    },
+    "Kind": {
+      "type": "string",
+      "enum": ["fact", "preference", "lesson"],
+      "default": "fact"
+    },
+    "Status": {
+      "type": "string",
+      "enum": ["staging", "active", "archived", "superseded"],
+      "description": "Derived class the admin surface exposes; `staging` only ever describes a StagingRecord."
+    },
+    "MemoryStatus": {
+      "type": "string",
+      "enum": ["active", "archived", "superseded"]
+    },
+    "Evidence": {
+      "type": "object",
+      "description": "Required for kind=lesson. `result_digest` is a digest of the tool result, never the raw text.",
+      "additionalProperties": false,
+      "required": ["turn_id", "tool", "result_digest", "claim"],
+      "properties": {
+        "turn_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "tool": {"type": "string", "minLength": 1, "maxLength": 128},
+        "result_digest": {"type": "string", "minLength": 1, "maxLength": 256},
+        "claim": {"type": "string", "minLength": 1, "maxLength": 1024}
+      }
+    },
+    "MemoryRecord": {
+      "type": "object",
+      "title": "memories row",
+      "description": "One live memory. `status`, `tags` and `evidence` are decoded views of the stored columns.",
+      "required": [
+        "id", "layer", "namespace", "session_id", "text", "tags", "content_hash",
+        "importance", "confidence", "source", "kind", "created_at"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/Ulid"},
+        "layer": {"$ref": "#/$defs/Layer"},
+        "namespace": {
+          "type": "string",
+          "description": "Global layer: the partition (`user:default`, `agent:x`, `project:y`). Session layer: always the empty string.",
+          "pattern": "^$|^[a-z0-9][a-z0-9:_-]{0,63}$"
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Session layer: the ULID core injected. Global layer: always the empty string (never null).",
+          "pattern": "^$|^[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "text": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "tags": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {"type": "string", "minLength": 1, "maxLength": 32}
+        },
+        "content_hash": {
+          "type": "string",
+          "description": "sha256(layer + '\\0' + session_id + '\\0' + namespace + '\\0' + normalized_text); normalized_text is strip() + whitespace folding only.",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "embedding": {
+          "type": "string",
+          "description": "Opaque module-internal BLOB (numpy.float32.tobytes(), `memory.embedding_dim` floats). Never serialised by `memory/admin_*`."
+        },
+        "importance": {"type": "number", "minimum": 1, "maximum": 5, "description": "Explicit remember = 5."},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "source": {"$ref": "#/$defs/Source"},
+        "kind": {"$ref": "#/$defs/Kind"},
+        "evidence": {
+          "description": "Required when kind=lesson; null means the column is NULL.",
+          "anyOf": [{"$ref": "#/$defs/Evidence"}, {"type": "null"}]
+        },
+        "verified_at": {
+          "type": ["integer", "null"],
+          "description": "Unix seconds of the second verification; null = unverified."
+        },
+        "supersedes": {
+          "type": ["string", "null"],
+          "description": "The id this row replaces (new -> old)."
+        },
+        "superseded_by": {
+          "type": ["string", "null"],
+          "description": "The id that replaced this row; non-null means soft-invalid and score-negative."
+        },
+        "hit_count": {"type": "integer", "minimum": 0, "default": 0},
+        "last_hit_at": {"type": ["integer", "null"]},
+        "created_at": {"type": "integer", "description": "Unix seconds."},
+        "expires_at": {
+          "type": ["integer", "null"],
+          "description": "Session-layer TTL; null on the global layer."
+        },
+        "deleted_at": {
+          "type": ["integer", "null"],
+          "description": "Soft delete (forget). Physically purged 7 days later on startup."
+        },
+        "status": {"$ref": "#/$defs/MemoryStatus"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "lesson"}}, "required": ["kind"]},
+          "then": {"required": ["evidence"], "properties": {"evidence": {"$ref": "#/$defs/Evidence"}}}
+        }
+      ]
+    },
+    "StagingRecord": {
+      "type": "object",
+      "title": "staging row",
+      "description": "An unpromoted candidate written by the evolver; consolidate consumes it. Never visible to the model until promoted.",
+      "required": ["id", "text", "namespace", "kind", "content_hash", "seen_sessions", "created_at"],
+      "properties": {
+        "id": {"$ref": "#/$defs/Ulid"},
+        "text": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "namespace": {"type": "string", "pattern": "^[a-z0-9][a-z0-9:_-]{0,63}$"},
+        "kind": {"$ref": "#/$defs/Kind"},
+        "evidence": {"anyOf": [{"$ref": "#/$defs/Evidence"}, {"type": "null"}]},
+        "content_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "seen_sessions": {
+          "type": "array",
+          "description": "JSON list of session ids that produced this candidate.",
+          "items": {"$ref": "#/$defs/Ulid"}
+        },
+        "embedding": {
+          "type": ["string", "null"],
+          "description": "Computed at staging_put so consolidate can cluster; null means only string matching is possible."
+        },
+        "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "created_at": {"type": "integer"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "lesson"}}, "required": ["kind"]},
+          "then": {"required": ["evidence"], "properties": {"evidence": {"$ref": "#/$defs/Evidence"}}}
+        }
+      ]
+    },
+    "ArchiveRecord": {
+      "type": "object",
+      "title": "archive row",
+      "description": "The landing place for evicted and forgotten rows. Recoverable by definition; only `forget`/TTL physically DELETE, and TTL never archives.",
+      "required": ["id", "payload", "archived_at"],
+      "properties": {
+        "id": {"$ref": "#/$defs/Ulid"},
+        "payload": {
+          "type": "object",
+          "description": "The serialised MemoryRecord as it was archived."
+        },
+        "archived_at": {"type": "integer"},
+        "reason": {
+          "type": ["string", "null"],
+          "description": "Free text. The module writes `quota` (eviction), `forget` (soft delete) and `admin` (C5a archive RPC)."
+        }
+      }
+    }
+  }
+}

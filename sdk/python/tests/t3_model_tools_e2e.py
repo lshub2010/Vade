@@ -96,7 +96,7 @@ def _binding_dir(work: Path) -> Path:
             "(VADE_PROTOCOL_PY points at a directory holding both files). "
             "Refusing to borrow a sibling worktree's binding silently."
         )
-    candidate = Path(env_so)
+    candidate = Path(env_so).expanduser().resolve()
     if not candidate.is_file():
         raise SystemExit(f"VADE_PROTOCOL_SO does not exist: {candidate}")
 
@@ -604,10 +604,11 @@ async def main() -> int:
         except (VadeError, RuntimeError, OSError) as exc:  # cleanup must not mask the real failure
             print(f"[warn] session.close: {exc}", flush=True)
         await app.shutdown()
-        print(f"\n[info] work dir: {work}", flush=True)
-        if os.environ.get("VADE_KEEP_WORK") != "1":
+        if os.environ.get("VADE_KEEP_WORK") == "1":
+            print(f"\n[info] work dir kept: {work}", flush=True)
+        else:
             shutil.rmtree(work, ignore_errors=True)
-            print("[info] work dir removed (VADE_KEEP_WORK=1 keeps it)", flush=True)
+            print("\n[info] work dir removed (VADE_KEEP_WORK=1 keeps it)", flush=True)
 
     _banner("result")
     if failures:

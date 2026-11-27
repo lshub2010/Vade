@@ -208,7 +208,12 @@ class LoopEngine:
             snapshot = snapshot.with_core(self._core_entries())
         # Built-ins (`ask_user`, RFC-0008 §14) need no module: a turn with an
         # empty module snapshot can still ask the user a question.
-        if self.router is None or (not snapshot and not self.builtins):
+        #
+        # The gate is "no routable capability at all", not "the tool table is
+        # empty": a core whose only module is a model module has an empty table
+        # by design (its `chat` is the provider channel, not a tool) and must
+        # still be able to chat. `registry.snapshot()` is the honest source.
+        if self.router is None or (not snapshot and not self.builtins and not self._has_live_module()):
             text = "No capabilities are available: no module is online, so I cannot run tools."
             await self._turn_emit(
                 turn, "turn.delta",
@@ -534,6 +539,27 @@ class LoopEngine:
         )
 
     # ------------------------------------------------------------------ helpers
+    def _has_live_module(self) -> bool:
+        """Is any module online, regardless of whether it contributes a tool?
+
+        A model module's only declared capability is the provider channel
+        `chat`, which never enters the tool table. Gating the "no capabilities"
+        notice on the table alone therefore silenced a chat-only core.
+        """
+        registry = getattr(self.router, "_registry", None) or getattr(self, "registry", None)
+        snapshot = getattr(registry, "snapshot", None)
+        if not callable(snapshot):
+            return False
+        for record in snapshot():
+            if not getattr(record, "enabled", False) or getattr(record, "manifest", None) is None:
+                continue
+            if getattr(record, "connection_id", None) is None:
+                continue
+            health = getattr(getattr(record, "health", None), "value", str(getattr(record, "health", "")))
+            if health not in ("offline", "rejected"):
+                return True
+        return False
+
     def _core_entries(self) -> tuple[ToolEntry, ...]:
         """ToolEntry projections of the core-native tools (§4.2.4). The loop
         never names them: the specs live in `loop.coretools`."""

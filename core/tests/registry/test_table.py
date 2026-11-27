@@ -36,6 +36,33 @@ def manifest(instance="fs-01", module="com.example.fs", concurrency="exclusive",
     )
 
 
+def multi_tool_manifest(module, instance, tools, *, concurrency="exclusive", max_concurrency=1):
+    """A manifest carrying several tools, for mixed model/tool modules."""
+    return validate_manifest(
+        {
+            "module_id": module,
+            "instance_id": instance,
+            "version": "1.0.0",
+            "protocol": "vade/v1",
+            "concurrency": concurrency,
+            "capabilities": {
+                "tools": [
+                    {
+                        "name": name,
+                        "description": f"{name} does something",
+                        "input_schema": {"type": "object", "properties": {}},
+                        "risk": "low",
+                        "idempotent": True,
+                        "timeout_ms": 1000,
+                    }
+                    for name in tools
+                ]
+            },
+            "limits": {"max_concurrency": max_concurrency, "max_payload": 65519},
+        }
+    )
+
+
 def test_first_registration_is_accepted():
     reg = Registry()
     result = reg.register(manifest(), fingerprint="a" * 16, connection_id="c1")
@@ -157,3 +184,74 @@ def test_unregistered_capabilities_update_is_not_found():
     with pytest.raises(VadeError) as excinfo:
         reg.update_capabilities(manifest(), fingerprint="a" * 16)
     assert excinfo.value.code == "NOT_FOUND"
+
+
+# ---------------------------------------------------------------- model modules
+# FR-6.3: several model modules must be registered at the same time. Every one
+# of them declares the single discovery tool `chat`, so the bare-name rule may
+# not turn that into TOOL_CONFLICT; routing is always `<module_id>/chat`.
+
+
+def test_two_model_modules_can_both_expose_chat():
+    reg = Registry()
+    reg.register(manifest(module="com.example.model-a", instance="a-1", tool="chat", concurrency="pooled", max_concurrency=4),
+                 fingerprint="a" * 16, connection_id="c1")
+    reg.register(manifest(module="com.example.model-b", instance="b-1", tool="chat", concurrency="pooled", max_concurrency=4),
+                 fingerprint="b" * 16, connection_id="c2")
+
+    assert len(reg.snapshot()) == 2
+    bindings = reg.bindings_for("chat")
+    assert {b.tool_id for b in bindings} == {"com.example.model-a/chat", "com.example.model-b/chat"}
+    assert {b.module_id for b in bindings} == {"com.example.model-a", "com.example.model-b"}
+    # Namespaced ids are distinct, so the global budget counts two tools.
+    assert reg.tool_count() == 2
+    assert reg.get("com.example.model-a", "a-1") is not None
+    assert reg.get("com.example.model-b", "b-1") is not None
+
+
+def test_chat_coexistence_does_not_exempt_a_modules_other_tools():
+    """Only `chat` is namespaced; a model module's other names stay unique."""
+    reg = Registry()
+    reg.register(multi_tool_manifest("com.example.model-a", "a-1", ("chat", "read_file")),
+                 fingerprint="a" * 16, connection_id="c1")
+    reg.register(manifest(module="com.example.model-b", instance="b-1", tool="chat",
+                          concurrency="pooled", max_concurrency=4),
+                 fingerprint="b" * 16, connection_id="c2")
+
+    with pytest.raises(VadeError) as excinfo:
+        reg.register(multi_tool_manifest("com.example.model-b", "b-2", ("chat", "read_file"),
+                                         concurrency="pooled", max_concurrency=4),
+                     fingerprint="b" * 16, connection_id="c3")
+    err = excinfo.value
+    assert err.code == "TOOL_CONFLICT"
+    assert "/capabilities/tools/1/name" in err.message, "the collision is read_file, not chat"
+    assert "read_file" in err.message
+
+    # The failed registration never half-applied: both model modules stay.
+    read_file = reg.resolve_tool("read_file")
+    assert read_file is not None and read_file.module_id == "com.example.model-a"
+    assert {b.module_id for b in reg.bindings_for("chat")} == {
+        "com.example.model-a", "com.example.model-b"}
+    assert reg.get("com.example.model-b", "b-2") is None
+
+
+def test_pooled_chat_instances_keep_the_lease_rules():
+    """Same tool, same module: one tool id, one binding per instance, cap enforced."""
+    reg = Registry()
+    for i in range(2):
+        reg.register(
+            manifest(module="com.example.model", instance=f"m-{i}", tool="chat",
+                     concurrency="pooled", max_concurrency=2),
+            fingerprint="a" * 16, connection_id=f"c{i}",
+        )
+    assert len(reg.bindings_for("chat")) == 2
+    assert reg.tool_count() == 1, "two instances of one module are still one tool_id"
+
+    with pytest.raises(VadeError) as excinfo:
+        reg.register(
+            manifest(module="com.example.model", instance="m-2", tool="chat",
+                     concurrency="pooled", max_concurrency=2),
+            fingerprint="a" * 16, connection_id="c2",
+        )
+    assert excinfo.value.code == "TOOL_CONFLICT"
+    assert "max_concurrency=2" in excinfo.value.message

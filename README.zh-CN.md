@@ -182,8 +182,10 @@ api_key_env = "VADE_LLM_API_KEY"
 git clone https://github.com/lshub2010/Vade-module-memory.git
 cd Vade-module-memory
 python3 -m venv .venv && .venv/bin/pip install -e ".[core]"
-VADE_DATA_DIR=./data .venv/bin/python -m memory_module --core wss://127.0.0.1:8443 --pair-code "<配对码>"
+CORE_PUBLIC_KEY=<内核的 64 位 hex 公钥> VADE_DATA_DIR=./data .venv/bin/python -m memory_module --core ws://127.0.0.1:8443
 ```
+
+> **模块授权：** SDK 目前不支持模块配对码。先在内核停止时把模块公钥写进 `<data_dir>/identity/whitelist.json`（见[部署教程](docs/DEPLOYMENT.zh-CN.md) §9.3），再用 `--core` 启动模块。`--pair-code` 会按设计返回 `UNSUPPORTED`。`CORE_PUBLIC_KEY` 是内核的 64 位 hex 公钥，不填就无法固定对端。
 
 内核会拿它做三件事：
 
@@ -202,8 +204,10 @@ git clone https://github.com/lshub2010/Vade-module-mcp-bridge.git
 cd Vade-module-mcp-bridge
 python3 -m venv .venv && .venv/bin/pip install -e ".[core]"
 cp config.example.toml config.toml     # 改：上游 command/url + 凭据的环境变量名
-.venv/bin/python -m mcp_bridge --core wss://127.0.0.1:8443 --pair-code "<配对码>"
+CORE_PUBLIC_KEY=<内核的 64 位 hex 公钥> VADE_DATA_DIR=./data .venv/bin/python -m mcp_bridge --core ws://127.0.0.1:8443
 ```
+
+> **模块授权：** SDK 目前不支持模块配对码。先在内核停止时把模块公钥写进 `<data_dir>/identity/whitelist.json`（见[部署教程](docs/DEPLOYMENT.zh-CN.md) §9.3），再用 `--core` 启动模块。`--pair-code` 会按设计返回 `UNSUPPORTED`。`CORE_PUBLIC_KEY` 是内核的 64 位 hex 公钥，不填就无法固定对端。
 
 上游没声明风险的工具一律按 `high` 走审批。上游凭据只从环境变量读，错误和日志里会脱敏。
 

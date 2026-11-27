@@ -183,8 +183,10 @@ The memory module is a separate process, like every other capability. It keeps i
 git clone https://github.com/lshub2010/Vade-module-memory.git
 cd Vade-module-memory
 python3 -m venv .venv && .venv/bin/pip install -e ".[core]"
-VADE_DATA_DIR=./data .venv/bin/python -m memory_module --core wss://127.0.0.1:8443 --pair-code "<code>"
+CORE_PUBLIC_KEY=<64 hex from the core> VADE_DATA_DIR=./data .venv/bin/python -m memory_module --core ws://127.0.0.1:8443
 ```
+
+> **Module authorisation:** the SDK has no module pairing code yet. Add the module's public key to `<data_dir>/identity/whitelist.json` while the core is stopped (see the [deployment guide](docs/DEPLOYMENT.md) §9.3), then start the module with `--core`. `--pair-code` fails with `UNSUPPORTED` by design. `CORE_PUBLIC_KEY` is the core's 64-hex public key — without it the handshake cannot pin the core.
 
 What the core does with it:
 
@@ -203,8 +205,10 @@ git clone https://github.com/lshub2010/Vade-module-mcp-bridge.git
 cd Vade-module-mcp-bridge
 python3 -m venv .venv && .venv/bin/pip install -e ".[core]"
 cp config.example.toml config.toml     # edit: upstream command/url + env credential NAME
-.venv/bin/python -m mcp_bridge --core wss://127.0.0.1:8443 --pair-code "<code>"
+CORE_PUBLIC_KEY=<64 hex from the core> VADE_DATA_DIR=./data .venv/bin/python -m mcp_bridge --core ws://127.0.0.1:8443
 ```
+
+> **Module authorisation:** the SDK has no module pairing code yet. Add the module's public key to `<data_dir>/identity/whitelist.json` while the core is stopped (see the [deployment guide](docs/DEPLOYMENT.md) §9.3), then start the module with `--core`. `--pair-code` fails with `UNSUPPORTED` by design. `CORE_PUBLIC_KEY` is the core's 64-hex public key — without it the handshake cannot pin the core.
 
 A tool whose upstream risk is unknown is treated as `high`, so it goes through approval. Upstream credentials are read from environment variables and are redacted from errors and logs.
 

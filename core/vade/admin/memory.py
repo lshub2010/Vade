@@ -37,7 +37,7 @@ LAYERS = ("session", "global")
 STATUSES = ("staging", "active", "archived", "superseded")
 #: Must match the module's `reason[:200]`; a longer value here would be audited
 #: at 300 chars while the stored archive row silently kept 200.
-_MAX_TEXT = 200
+_MAX_TEXT = 300
 
 
 # ------------------------------------------------------------------ helpers
@@ -72,9 +72,17 @@ def _number(value: str | None, name: str) -> int | None:
     if value in (None, ""):
         return None
     try:
-        return int(float(value))
+        number = float(value)
     except (TypeError, ValueError):
         raise VadeError("INVALID_ARGUMENT", f"{name} must be a number") from None
+    if number != number or number in (float("inf"), float("-inf")):
+        # `?from=inf` / `1e400` survive float() and blow up as OverflowError in
+        # int(); that used to surface as a 500 instead of the contract's 400.
+        raise VadeError("INVALID_ARGUMENT", f"{name} must be a finite number")
+    try:
+        return int(number)
+    except (OverflowError, ValueError):
+        raise VadeError("INVALID_ARGUMENT", f"{name} must be a finite number") from None
 
 
 def _limit(value: Any) -> int:
@@ -101,7 +109,12 @@ def _one(value: Any, name: str, allowed: tuple[str, ...]) -> str | None:
 def _text(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise VadeError("INVALID_ARGUMENT", f"{name} is required")
-    return value.strip()[:_MAX_TEXT]
+    text = value.strip()
+    if len(text) > _MAX_TEXT:
+        # C-16 caps the field; silently truncating would audit one reason and
+        # store another (the module's own slice is the same length).
+        raise VadeError("INVALID_ARGUMENT", f"{name} must be at most {_MAX_TEXT} characters")
+    return text
 
 
 def _view(item: Any) -> dict[str, Any]:

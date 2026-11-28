@@ -511,12 +511,16 @@ class Client:
                 await self._reply_error(request_id, code, detail)
             return
         if request_id is not None:
-            if result is None:
-                # A handler that forgot to return must not look like an empty
-                # page: core would render "0 items" and hide the bug.
-                await self._reply_error(request_id, "INTERNAL", "private RPC returned no result")
+            if not isinstance(result, Mapping):
+                # A handler that returns None/list/str must not look like an
+                # empty page: core reads top-level `items` and would render
+                # "0 memories" while the bug stays invisible.
+                await self._reply_error(
+                    request_id, "INTERNAL",
+                    f"private RPC must return an object, got {type(result).__name__}",
+                )
             else:
-                await self._reply(request_id, result if isinstance(result, Mapping) else {"result": result})
+                await self._reply(request_id, result)
 
     async def _drain_and_stop(self, grace_ms: int) -> None:
         deadline = time.monotonic() + max(0, grace_ms) / 1000.0

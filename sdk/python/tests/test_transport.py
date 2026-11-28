@@ -149,5 +149,31 @@ async def test_private_rpc_handler_bug_is_internal_and_never_a_fake_success():
 
     await client._handle_request({"id": 2, "method": "memory/empty", "params": {}})
     assert errors[-1][0:2] == (2, "INTERNAL")
-    assert "no result" in errors[-1][2]
+    assert "object" in errors[-1][2]
     assert replies == []
+
+
+async def test_private_rpc_non_mapping_result_is_an_error():
+    """A list/str return must not be wrapped into a fake empty page."""
+    errors = []
+
+    class FakeApp:
+        module_id = "com.example.badshape"
+
+        async def dispatch_rpc(self, method, params):
+            return []
+
+    client = object.__new__(Client)
+    client.app = FakeApp()
+
+    async def reply(request_id, result):  # pragma: no cover - must not run
+        raise AssertionError("must not reply with a non-mapping result")
+
+    async def reply_error(request_id, code, message):
+        errors.append((request_id, code, message))
+
+    client._reply = reply
+    client._reply_error = reply_error
+    await client._handle_request({"id": 3, "method": "memory/list", "params": {}})
+    assert errors[-1][0:2] == (3, "INTERNAL")
+    assert "object" in errors[-1][2]

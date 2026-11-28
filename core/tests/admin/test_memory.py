@@ -322,3 +322,25 @@ def test_time_filters_reject_non_finite_and_out_of_range_values(env):
             assert response.json()["code"] == "INVALID_ARGUMENT", raw
 
     asyncio.run(scenario())
+
+
+def test_time_filters_accept_the_exact_int64_boundaries(env):
+    """float() rounds 2**63-1 up to 2**63; integer literals must parse as int."""
+    ctx, port, app = env
+
+    async def scenario():
+        token = await _device_token(app, ctx)
+        client = client_for(app)
+        for raw in (str(2**63 - 1), str(-(2**63))):
+            response = await client.get(
+                f"/admin/api/memory?from={raw}", headers=bearer(token)
+            )
+            assert response.status_code == 200, (raw, response.text)
+            assert port.list_queries[-1]["from"] == int(raw)
+        too_big = await client.get(
+            f"/admin/api/memory?from={2**63}", headers=bearer(token)
+        )
+        assert too_big.status_code == 400
+        assert too_big.json()["code"] == "INVALID_ARGUMENT"
+
+    asyncio.run(scenario())

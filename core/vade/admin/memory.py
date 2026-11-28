@@ -19,6 +19,8 @@ there is no edit RPC. Changing an entry means archive + remember (C-16 note).
 
 from __future__ import annotations
 
+import re
+
 from typing import Any, Callable, Mapping
 
 from starlette.requests import Request
@@ -37,6 +39,9 @@ LAYERS = ("session", "global")
 STATUSES = ("staging", "active", "archived", "superseded")
 #: C-16 `reason` maxLength; the module stores the same 300 characters.
 _MAX_TEXT = 300
+_INTEGER = re.compile(r"[+-]?\d+")
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63
 
 
 # ------------------------------------------------------------------ helpers
@@ -70,15 +75,23 @@ def _number(value: str | None, name: str) -> int | None:
     """
     if value in (None, ""):
         return None
+    text = str(value).strip()
+    if _INTEGER.fullmatch(text):
+        # Parse integer literals as int: float() rounds 2**63-1 up to 2**63,
+        # which used to reject a perfectly valid int64 boundary value.
+        number = int(text)
+        if not _INT64_MIN <= number < _INT64_MAX:
+            raise VadeError("INVALID_ARGUMENT", f"{name} is out of range")
+        return number
     try:
-        number = float(value)
+        number = float(text)
     except (TypeError, ValueError):
         raise VadeError("INVALID_ARGUMENT", f"{name} must be a number") from None
     if number != number or number in (float("inf"), float("-inf")):
         # `?from=inf` / `1e400` survive float() and blow up as OverflowError in
         # int(); that used to surface as a 500 instead of the contract's 400.
         raise VadeError("INVALID_ARGUMENT", f"{name} must be a finite number")
-    if not -(2**63) <= number < 2**63:
+    if not _INT64_MIN <= number < _INT64_MAX:
         # SQLite INTEGER is signed 64-bit; a larger "finite" number reached the
         # module and blew up as OverflowError/INTERNAL (HTTP 500) instead of 400.
         raise VadeError("INVALID_ARGUMENT", f"{name} is out of range")

@@ -2,9 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [dev_gingshan, debug]
+    branches: [dev_gingshan, debug, main]
   pull_request:
-    branches: [dev_gingshan, debug]
+    branches: [dev_gingshan, debug, main]
   workflow_dispatch:
 
 concurrency:

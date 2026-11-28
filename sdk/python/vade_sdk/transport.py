@@ -285,6 +285,10 @@ def _peek(wire: bytes) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- client
 class Client:
+    #: A wedged private RPC (memory/admin_*, memory/read_session) must not hold
+    #: a slot forever; the handler is module code and may block on its own lock.
+    rpc_timeout = 30.0
+
     def __init__(self, app, url: str, ws, noise: NoiseChannel) -> None:
         self.app = app
         self.url = url
@@ -501,7 +505,16 @@ class Client:
         # module explicitly registered a handler; otherwise this stays a clear
         # NOT_FOUND rather than a silent success.
         try:
-            result = await self.app.dispatch_rpc(method, params)
+            result = await asyncio.wait_for(
+                self.app.dispatch_rpc(method, params), timeout=self.rpc_timeout
+            )
+        except asyncio.TimeoutError:
+            if request_id is not None:
+                await self._reply_error(
+                    request_id, "TIMEOUT",
+                    f"{method} timed out after {self.rpc_timeout}s",
+                )
+            return
         except Exception as exc:
             # A handler bug is INTERNAL, not NOT_FOUND: conflating them made a
             # crashed memory query look like "this method does not exist".

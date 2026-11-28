@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from vade.llm.catalog import build_catalog
 from vade.llm.module import ModuleLLMProvider
 from vade.router.dispatch import ToolCallResult
@@ -125,3 +127,99 @@ def test_the_provider_channel_is_not_a_tool_the_model_can_call():
     assert all(
         record.manifest.tool("chat") is not None for record in registry.snapshot()
     )
+
+
+def test_with_core_never_adds_the_same_llm_name_twice():
+    """A duplicated core entry used to reach the provider as two schemas."""
+    from vade.loop.tools import ToolEntry, ToolSnapshot
+
+    def entry(name: str) -> ToolEntry:
+        return ToolEntry(
+            llm_name=name, tool_id=f"core/{name}", module_id="core", description="",
+            input_schema={}, risk="low", timeout_ms=1000, idempotent=True,
+        )
+
+    merged = ToolSnapshot().with_core([entry("kb_search"), entry("kb_search")])
+    assert merged.names() == ("kb_search",)
+
+
+def test_a_llm_name_collision_across_modules_is_rejected_not_shadowed():
+    """The prefix map should make this impossible; if it ever does not, say so."""
+    from types import SimpleNamespace
+
+    from vade.errors import VadeError
+    from vade.loop.tools import build_snapshot
+
+    def record(module_id: str, tools: list[str]):
+        manifest = SimpleNamespace(
+            tools=[
+                SimpleNamespace(name=name, description=name, input_schema={}, risk="low",
+                                timeout_ms=1000, idempotent=True)
+                for name in tools
+            ],
+            injects=[],
+        )
+        return SimpleNamespace(
+            module_id=module_id, instance_id="i-1", connection_id="c-1",
+            manifest=manifest, enabled=True, health=SimpleNamespace(value="online"),
+            node_id=f"{module_id}#i-1",
+        )
+
+    class Registry:
+        def snapshot(self):
+            # `a.b` and `a-b` normalise to the same prefix (`a_b`), so the map
+            # gives the second one `a_b2`; the guard must not fire here.
+            return (record("com.example.a.b", ["go"]), record("com.example.a-b", ["go"]))
+
+        def bindings_for(self, name):
+            return ()
+
+    names = build_snapshot(Registry()).names()
+    # `com.example.a.b` -> prefix `b`, `com.example.a-b` -> prefix `a_b`; the
+    # point is that the two differ, not which one won.
+    assert names == ("a_b__go", "b__go")
+
+    class Colliding(Registry):
+        def snapshot(self):
+            return (record("com.example.dup", ["x", "y"]),)
+
+    # Same module, two tools: prefixes are per module, so no collision either.
+    assert build_snapshot(Colliding()).names() == ("dup__x", "dup__y")
+
+    class Broken(Registry):
+        def snapshot(self):
+            return (record("com.example.one", ["same"]), record("com.example.one", ["same"]))
+
+    # Two instances of one module are one entry per tool, not a collision.
+    assert build_snapshot(Broken()).names() == ("one__same",)
+
+    from vade.loop.tools import ToolNameMap
+
+    class Duplicate(Registry):
+        def snapshot(self):
+            return (record("com.example.p", ["t"]), record("com.example.q", ["t"]))
+
+    class FixedMap(ToolNameMap):
+        pass
+
+    # Force the pathological case: a name map that returns one name for two ids.
+    original = ToolNameMap.build.__func__
+
+    def broken_build(cls, pairs):
+        pairs = list(pairs)
+        mapping = original(cls, pairs)
+        forward = {tool_id: "same__name" for tool_id in mapping.forward}
+        return ToolNameMap(
+            forward=type(mapping.forward)(forward),
+            backward=type(mapping.backward)({"same__name": next(iter(forward))}),
+            prefixes=mapping.prefixes,
+        )
+
+    ToolNameMap.build = classmethod(broken_build)
+    try:
+        with pytest.raises(VadeError) as caught:
+            build_snapshot(Duplicate())
+        assert caught.value.code == "MANIFEST_INVALID"
+        assert "same__name" in caught.value.message
+    finally:
+        ToolNameMap.build = classmethod(original)

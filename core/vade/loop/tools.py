@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
+from ..errors import VadeError
 from ..router.names import ToolNameMap
 
 __all__ = ["ToolEntry", "ToolSnapshot", "build_snapshot", "resolve_hot", "normalize_tool_key", "HOT_MAX_DEFAULT"]
@@ -102,11 +103,20 @@ class ToolSnapshot:
         """Graft core-native entries (RFC-0003 §4.2.4). A name the snapshot
         already carries is never shadowed; the merged table stays name-sorted.
         """
-        add = tuple(e for e in (extra or ()) if self.get(e.llm_name) is None)
+        add: list[ToolEntry] = []
+        taken = {e.llm_name for e in self.entries}
+        for entry in extra or ():
+            # `extra` itself may repeat a name (two built-ins registered under
+            # one label); the second copy used to reach the provider as a
+            # duplicate schema, which is a 400 for the whole turn.
+            if entry.llm_name in taken:
+                continue
+            taken.add(entry.llm_name)
+            add.append(entry)
         if not add:
             return self
         return ToolSnapshot(
-            entries=tuple(sorted(self.entries + add, key=lambda e: e.llm_name)),
+            entries=tuple(sorted(self.entries + tuple(add), key=lambda e: e.llm_name)),
             name_map=self.name_map,
         )
 
@@ -200,9 +210,24 @@ def build_snapshot(registry: Any) -> ToolSnapshot:
                         slot["risk"] = binding.effective_risk
     name_map = ToolNameMap.build(pairs)
     entries = []
+    seen_names: dict[str, str] = {}
     for (module_id, tool), slot in sorted(merged.items()):
+        llm_name = name_map.llm_name(f"{module_id}/{tool}") or f"tool__{tool}"
+        previous = seen_names.get(llm_name)
+        if previous is not None:
+            # The prefix map already disambiguates `fs`/`fs2`, so a collision
+            # here means the fallback name (or a module whose tail normalises
+            # to the same prefix) produced one llm name for two tools. Sending
+            # both to a provider is a 400 at best and a silently wrong call at
+            # worst, so fail at snapshot time with both ids named.
+            raise VadeError(
+                "MANIFEST_INVALID",
+                f"two tools map to the same LLM name {llm_name!r}: "
+                f"{previous!r} and {slot['tool_id']!r}",
+            )
+        seen_names[llm_name] = slot["tool_id"]
         entries.append(ToolEntry(
-            llm_name=name_map.llm_name(f"{module_id}/{tool}") or f"tool__{tool}",
+            llm_name=llm_name,
             tool_id=slot["tool_id"], module_id=module_id, description=slot["description"],
             input_schema=slot["input_schema"], risk=slot["risk"], timeout_ms=slot["timeout_ms"],
             idempotent=slot["idempotent"], injects=slot["injects"],

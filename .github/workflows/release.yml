@@ -1,6 +1,6 @@
-name: Release 0.0.4
+name: Release
 
-# One release page with every 0.0.4 artifact:
+# One release page with every Beta artifact:
 #   core tarballs (x86_64 + aarch64), module wheels, and the client assets
 #   already published by lshub2010/vade-client for the same tag.
 #
@@ -10,11 +10,11 @@ name: Release 0.0.4
 on:
   push:
     tags:
-      - "v0.0.5-alpha"
+      - "v0.1.0-beta"
   workflow_dispatch:
     inputs:
       tag:
-        description: "existing tag, e.g. v0.0.5-alpha"
+        description: "existing tag, e.g. v0.1.0-beta"
         required: true
         type: string
 
@@ -165,9 +165,9 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: Vade 0.0.5-alpha
+          name: Vade 0.1.0-beta
           prerelease: true
-          body_path: docs/release/0.0.5-notes.md
+          body_path: docs/release/0.1.0-beta-notes.md
           generate_release_notes: false
           fail_on_unmatched_files: true
           files: dist/*

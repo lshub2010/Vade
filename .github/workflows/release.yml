@@ -95,7 +95,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [echo, fs, shell, web, model]
+        module: [echo, fs, shell, web, model, memory, mcp-bridge]
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -149,7 +149,7 @@ jobs:
       - name: Flatten and checksum
         run: |
           # Module artifacts each call their manifest `manifest.json`; prefix it
-          # with the module name so the combined release can hold all five.
+          # with the module name so the combined release can hold all seven.
           find dist -mindepth 2 -type f | while IFS= read -r f; do
             parent="$(basename "$(dirname "$f")")"
             base="$(basename "$f")"

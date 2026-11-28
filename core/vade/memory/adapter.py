@@ -9,8 +9,10 @@ both are load-bearing:
   router only routes `module/tool` pairs declared in a manifest, so calling them
   goes through the same `ModuleCaller` but not through `Router.call` — that is
   why this adapter selects the registered memory node itself.
-* Absence is `NOT_FOUND`, not an empty result. A page that shows "no memories"
-  when the module is missing is indistinguishable from data loss (22-C3 §四).
+* Absence is `UNSUPPORTED` (HTTP 501), not `NOT_FOUND` and never an empty
+  result. A page that shows "no memories" when the module is missing is
+  indistinguishable from data loss (22-C3 §四); `NOT_FOUND` would be read as
+  "this entry is gone" by the admin UI.
 
 Selection uses the module-id convention the canvas already uses
 (`capability_kinds` in `admin/views.py`): a node whose `module_id` contains

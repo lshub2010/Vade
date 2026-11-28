@@ -353,10 +353,17 @@ def test_second_instance_cannot_take_the_data_directory(tmp_path):
     # And across real processes, which is what systemd/docker actually do.
     fd = acquire_instance_lock(tmp_path)
     try:
+        # The child must import the SAME `vade` package this test is running.
+        # `Path.cwd()` is the repo root, where `vade` does not live (it is under
+        # `core/`), so derive the parent from the imported module instead of
+        # guessing a directory — that keeps the test correct from any cwd.
+        import vade as _vade_pkg
+
+        _pkg_parent = str(Path(_vade_pkg.__file__).resolve().parents[1])
         script = (
             "import sys\n"
             "from pathlib import Path\n"
-            f"sys.path.insert(0, {str(Path.cwd())!r})\n"
+            f"sys.path.insert(0, {_pkg_parent!r})\n"
             "from vade.admin.locks import acquire_instance_lock\n"
             "try:\n"
             f"    acquire_instance_lock(Path({str(tmp_path)!r}))\n"

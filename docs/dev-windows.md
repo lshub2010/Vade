@@ -62,7 +62,9 @@ D:/HermesWorkspace/Vade/Vade/.venv/Scripts/python.exe tools/check_contracts.py
 D:/HermesWorkspace/Vade/Vade/.venv/Scripts/python.exe docs/check_docs.py
 ```
 
-期望结果：全量测试 `378 passed`，契约检查 `contracts: OK`。
+期望结果：全量测试 `1632 passed, 7 failed, 1 skipped`。那 7 个失败**全部是 Windows 平台限制，不是代码问题**（详见 §4）：6 个是 `0600`/`0700` 权限位断言（Windows 无 POSIX 权限位语义），1 个是 `test_python_m_vade_admin_listener_stops_cleanly_on_sigterm`（Windows 没有真正的 SIGTERM，进程被 `TerminateProcess` 硬杀，返回码非 0）。在 Linux 上这些全部通过。
+
+契约检查应为 `contracts: OK`。
 
 ## 4. 平台差异
 
@@ -79,5 +81,19 @@ Windows 文件系统没有 POSIX 权限位语义：`chmod` 基本是 no-op，`st
 
 - PATH 必须是 MSYS 形式（`/d/Hermes/...`）。`vade-env.sh` 已处理；手工追加路径时用 `/d/...`，不要写 `D:\...`，否则 bash 找不到。
 - 原生程序（git / cargo / python）的参数不做 MSYS 路径转换：给它们传路径时用 `D:/...` 正斜杠形式，别传 `/d/...`。
+- **`--config /d/...` 会被静默忽略**（这条最容易误判成 bug）。`python -m vade --config /d/Hermes/.../c.toml` 里，`/d/...` 会被 Python 当成 `D:\d\Hermes\...` 这个不存在的路径，`load_config` 发现文件不存在就**静默回落到默认值**（8443/8444、`./data`），不报错。症状是「我改了配置但端口/data_dir 没变」。用 `D:/Hermes/...` 就正常。判断方法：`setup_path` 那行会显示实际用的 data 目录。
 - `python` 默认指向 Hermes 自带解释器，请始终显式使用仓库 venv 的可执行文件（见上）。
 - 临时文件写到 `D:/Hermes/cache/scratch`（Hermes 的 scratch 目录）。注意 `$TMPDIR` 在这里是 `/tmp`，实际映射到系统 temp（`C:/Users/<用户名>/AppData/Local/Temp`），并不是 Hermes 的 scratch 目录。
+
+## 6. Windows 上写二进制文件必须显式二进制模式
+
+`os.open()` 在 Windows 上**默认是文本模式**，会把写入数据里的每个 LF 字节（0x0A）自动改写成 CR+LF 两个字节（0x0D 0x0A）。POSIX 没有这个概念，所以这个坑只在 Windows 上出现，且**概率性发作**——只有当随机字节里恰好含 LF 时才坏。
+
+实测（写 32 字节随机 pepper，500 次）：**51 次被写成 33/34/35 字节**，规律是「payload 里有几个 LF 就多几个字节」。后果是 `pairing pepper must be 32 bytes` 报错，core 约 17% 概率启动失败，而且每次失败的用例都不同，看起来像 flaky 测试。
+
+两条规则：
+
+1. **任何写入型 `os.open` 都要带二进制标志**。`os.O_BINARY` 在 POSIX 上不存在，所以用 `getattr(os, "O_BINARY", 0)`（POSIX 上为 0，按位或不改变任何行为）。
+2. **`O_BINARY` 管不住 `os.fdopen(fd, "w")`**。这是第二层：`TextIOWrapper` 有自己的换行翻译，即使 fd 是二进制的，`fdopen(fd, "w")` 仍会把 LF 写成 CR+LF。文本包装必须显式 `newline="\n"`。实测四种组合确认过。
+
+另外，`os.write()` 可能短写（返回值小于 `len(data)`），写入路径应循环写完再返回，不能假设一次写完。

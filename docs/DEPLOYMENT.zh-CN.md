@@ -772,9 +772,8 @@ ssh -N -L 8444:127.0.0.1:8444 ops@vade.example.com
 | 端口 | `ss -ltnp \| grep -E '8443\|8444'` | 配置地址上的两个监听 |
 | 进程 | `systemctl is-active vade-core` | `active` |
 
-`/healthz` 不需要鉴权，也刻意不返回配置、指纹或模块清单。`version` 是编译期
-常量（`CORE_VERSION = "0.1.0"`），不是发布 tag —— 别拿它判断
-`0.0.5-alpha`。
+`/healthz` 不需要鉴权，也刻意不返回配置、指纹或模块清单。`version` 取自
+`vade.__version__`（例如 `0.1.0-beta.1`），与发布版本一致。
 
 `policy_mode` 只有在 `[dev].allow_all = true` 时才是 `allow_all`；生产必须
 保持默认的 `false`。

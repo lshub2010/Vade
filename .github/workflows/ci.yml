@@ -74,3 +74,73 @@ jobs:
           git diff --exit-code -- admin-ui/dist
           test -z "$(git status --porcelain -- admin-ui/dist)"
 
+  # Windows 平台专有回归。Linux 上永远绿不了也永远红不了的坑（`fcntl` 顶层
+  # import、`os.open` 缺 `O_BINARY` 把 LF 写成 CRLF、`fdopen` 的换行翻译）
+  # 只能在这里暴露：它们要么让 core 直接起不来，要么概率性写坏二进制文件。
+  # 没有这个 job，这些 bug 会一直活到用户机器上。
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install Python deps
+        run: pip install -r requirements-dev.txt
+
+      - name: Build protocol core (.dll)
+        run: |
+          cd protocol/core
+          cargo build --features uniffi --lib -j 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item target/debug/vade_protocol.dll python/vade_protocol.dll
+          # 原生绑定能 import 才算构建成功（缺 dll 时约 22 条用例会成批假红）。
+          cd python
+          python -c "import vade_protocol as v; print('protocol', v.protocol_version())"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 7 条断言的是 POSIX 语义，在 Windows 上无法成立，逐条 deselect（不是
+      # 整文件 skip，也不是 `|| true`）：6 条校验 0600/0700 权限位，Windows 的
+      # `st_mode` 不带权限位；1 条校验 SIGTERM 优雅退出，Windows 没有 SIGTERM，
+      # 进程被 TerminateProcess 硬杀。其余 1632 条必须真绿。
+      - name: pytest (Windows-relevant subset)
+        env:
+          PYTHONPATH: core;protocol/core/python
+        run: |
+          $deselect = @(
+            "core/tests/admin/test_admin_hardening.py::test_sessions_file_stores_only_the_digest_and_is_0600",
+            "core/tests/identity/test_pairing_hardening.py::test_a_widened_pepper_mode_is_repaired_on_the_next_start",
+            "core/tests/identity/test_pairing_hardening.py::test_pepper_file_is_created_0600_with_32_bytes",
+            "core/tests/model/test_discovery_rpc.py::test_discovery_survives_a_core_restart",
+            "core/tests/test_admin_listener.py::test_first_start_mints_a_47_char_token_with_private_modes",
+            "core/tests/test_admin_listener.py::test_python_m_vade_admin_listener_stops_cleanly_on_sigterm",
+            "core/tests/transport/test_ui_session_persistence.py::test_the_store_never_contains_a_plaintext_token_or_csrf"
+          )
+          $args = @("-m", "pytest", "core/tests", "-q")
+          foreach ($d in $deselect) { $args += "--deselect"; $args += $d }
+          python @args
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 契约门禁与平台无关，但跑一遍能证明 Windows 上读取/解析路径没有隐藏的
+      # 换行或编码依赖（这些文件是 CRLF 检出的）。
+      - name: Contract gates
+        env:
+          PYTHONPATH: core;protocol/core/python
+        run: |
+          python tools/check_contracts.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python docs/check_docs.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/check_ledger.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+

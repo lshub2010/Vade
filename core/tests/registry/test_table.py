@@ -209,30 +209,29 @@ def test_two_model_modules_can_both_expose_chat():
     assert reg.get("com.example.model-b", "b-1") is not None
 
 
-def test_chat_coexistence_does_not_exempt_a_modules_other_tools():
-    """Only `chat` is namespaced; a model module's other names stay unique."""
+def test_a_model_module_may_not_carry_other_tools():
+    """`chat` is the provider channel; M6 modules declare it alone.
+
+    A model module with extra tools used to register and could then win the
+    provider sort, which is a privilege escalation rather than a naming issue.
+    """
     reg = Registry()
-    reg.register(multi_tool_manifest("com.example.model-a", "a-1", ("chat", "read_file")),
-                 fingerprint="a" * 16, connection_id="c1")
     reg.register(manifest(module="com.example.model-b", instance="b-1", tool="chat",
                           concurrency="pooled", max_concurrency=4),
                  fingerprint="b" * 16, connection_id="c2")
 
     with pytest.raises(VadeError) as excinfo:
-        reg.register(multi_tool_manifest("com.example.model-b", "b-2", ("chat", "read_file"),
-                                         concurrency="pooled", max_concurrency=4),
-                     fingerprint="b" * 16, connection_id="c3")
+        reg.register(multi_tool_manifest("com.example.model-a", "a-1", ("chat", "read_file")),
+                     fingerprint="a" * 16, connection_id="c1")
     err = excinfo.value
-    assert err.code == "TOOL_CONFLICT"
-    assert "/capabilities/tools/1/name" in err.message, "the collision is read_file, not chat"
-    assert "read_file" in err.message
+    assert err.code == "MANIFEST_INVALID"
+    assert "only tool" in err.message
 
-    # The failed registration never half-applied: both model modules stay.
-    read_file = reg.resolve_tool("read_file")
-    assert read_file is not None and read_file.module_id == "com.example.model-a"
-    assert {b.module_id for b in reg.bindings_for("chat")} == {
-        "com.example.model-a", "com.example.model-b"}
-    assert reg.get("com.example.model-b", "b-2") is None
+    # The rejected registration half-applied nothing: no read_file, no model-a.
+    assert reg.resolve_tool("read_file") is None
+    assert reg.get("com.example.model-a", "a-1") is None
+    assert reg.get("com.example.model-b", "b-1") is not None
+    assert {b.module_id for b in reg.bindings_for("chat")} == {"com.example.model-b"}
 
 
 def test_pooled_chat_instances_keep_the_lease_rules():
@@ -255,3 +254,21 @@ def test_pooled_chat_instances_keep_the_lease_rules():
         )
     assert excinfo.value.code == "TOOL_CONFLICT"
     assert "max_concurrency=2" in excinfo.value.message
+
+
+def test_a_module_cannot_bolt_chat_onto_its_other_tools():
+    """Declaring `chat` makes a module a provider; it must be its only tool.
+
+    Regression (post-release review P1-3): a memory-style module that also
+    declared `chat` registered cleanly and, with a higher priority, became the
+    LLM provider — reading every prompt and answering in the model's place.
+    """
+    reg = Registry()
+    with pytest.raises(VadeError) as caught:
+        reg.register(
+            multi_tool_manifest("com.example.memory", "main", ["remember", "chat"]),
+            fingerprint="a" * 16,
+            connection_id="c1",
+        )
+    assert caught.value.code == "MANIFEST_INVALID"
+    assert "only tool" in caught.value.message

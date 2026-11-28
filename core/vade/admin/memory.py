@@ -35,7 +35,9 @@ __all__ = ["build_routes", "MAX_LIMIT"]
 MAX_LIMIT = 200
 LAYERS = ("session", "global")
 STATUSES = ("staging", "active", "archived", "superseded")
-_MAX_TEXT = 300
+#: Must match the module's `reason[:200]`; a longer value here would be audited
+#: at 300 chars while the stored archive row silently kept 200.
+_MAX_TEXT = 200
 
 
 # ------------------------------------------------------------------ helpers
@@ -60,11 +62,17 @@ def _audit(ctx: Any, session: Any, kind: str, **fields: Any) -> None:
     )
 
 
-def _number(value: str | None, name: str) -> float | None:
+def _number(value: str | None, name: str) -> int | None:
+    """Unix seconds as an integer.
+
+    C-08 types `from`/`to` as `number`, but the module's C-16 contract is
+    integer seconds and its dispatcher rejects a float. Sending `1700000000.0`
+    made every time-filtered list a 400, so the boundary converts once, here.
+    """
     if value in (None, ""):
         return None
     try:
-        return float(value)
+        return int(float(value))
     except (TypeError, ValueError):
         raise VadeError("INVALID_ARGUMENT", f"{name} must be a number") from None
 

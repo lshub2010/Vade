@@ -283,6 +283,16 @@ class Registry:
                     effective_risk=self._effective_risk(record.module_id, spec),
                 )
 
+        # A model module is defined by declaring `chat`, and M6 says that is its
+        # ONLY tool. Without this check any installed module (memory, fs, a
+        # bridge) could append `chat`, win the priority sort and silently become
+        # the LLM provider — reading every prompt and forging replies.
+        if any(spec.name == "chat" for spec in manifest.tools) and len(manifest.tools) != 1:
+            raise VadeError(
+                "MANIFEST_INVALID",
+                "/capabilities/tools: a model module must declare 'chat' as its only tool",
+            )
+
         for pos, spec in enumerate(manifest.tools):
             if spec.name not in _NAMESPACE_SCOPED_TOOLS:
                 foreign = {b.module_id for b in index.values() if b.spec.name == spec.name} - {manifest.module_id}

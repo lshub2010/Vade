@@ -60,7 +60,10 @@ class ModuleLLMProvider:
                 continue
             if self.model_module is not None and manifest.module_id != self.model_module:
                 continue
-            if manifest.tool(MODEL_TOOL) is None:
+            tools = getattr(manifest, "tools", None)
+            if manifest.tool(MODEL_TOOL) is None or (tools is not None and len(tools) != 1):
+                # `chat` must be the module's only tool: otherwise a memory/fs
+                # module could become the provider and read every prompt.
                 continue
             if model is not None:
                 provider, _, name = model.partition("/")

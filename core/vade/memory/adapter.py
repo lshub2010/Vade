@@ -14,6 +14,12 @@ both are load-bearing:
   indistinguishable from data loss (22-C3 §四); `NOT_FOUND` would be read as
   "this entry is gone" by the admin UI.
 
+Reads share the router's per-instance circuit breaker: a wedged memory module
+used to be retried on every admin refresh and every turn, so one stuck lock cost
+both the page and the prompt path. `UNSUPPORTED` (501, not installed) and
+`UNAVAILABLE` (503, installed but circuit-open) stay distinct — the admin UI
+words them differently.
+
 Selection uses the module-id convention the canvas already uses
 (`capability_kinds` in `admin/views.py`): a node whose `module_id` contains
 `memory`. The memory module registers with `concurrency="exclusive"`, so at most
@@ -98,6 +104,25 @@ class MemoryAdapter:
 
     def __init__(self, app: Any) -> None:
         self._app = app
+        self._breaker: Any = None
+
+    def _circuit(self) -> Any:
+        """The router's breaker, or None when core runs without a router.
+
+        One breaker for routing and memory is deliberate: the memory node's
+        health is a property of the link, not of the caller, and a second window
+        would let admin reads hammer a module the router already gave up on.
+        """
+        if self._breaker is None:
+            router = getattr(self._app, "router", None)
+            self._breaker = getattr(router, "breaker", None)
+        return self._breaker
+
+    @staticmethod
+    def _counts_as_failure(code: str) -> bool:
+        # A rejected query or a missing id is the caller's fault; counting it
+        # would let one malformed request open the circuit for everyone.
+        return code in {"INTERNAL", "TIMEOUT", "UNAVAILABLE"}
 
     # ------------------------------------------------------------- resolution
     def _registry(self) -> Any:
@@ -136,8 +161,27 @@ class MemoryAdapter:
             connection_id=getattr(record, "connection_id", None),
             tool=method,
         )
-        reply = await self._caller().call(target, method, dict(params), deadline_ms)
-        return _result(reply)
+        breaker = self._circuit()
+        module_id = target.module_id
+        instance_id = target.instance_id
+        if breaker is not None and not breaker.allow(module_id, instance_id):
+            raise VadeError("UNAVAILABLE", "memory module is circuit-open")
+        try:
+            reply = await self._caller().call(target, method, dict(params), deadline_ms)
+            result = _result(reply)
+        except VadeError as exc:
+            if breaker is not None and self._counts_as_failure(str(exc.code)):
+                breaker.record_failure(
+                    module_id, instance_id, timeout=str(exc.code) == "TIMEOUT"
+                )
+            raise
+        except Exception:
+            if breaker is not None:
+                breaker.record_failure(module_id, instance_id)
+            raise
+        if breaker is not None:
+            breaker.record_success(module_id, instance_id)
+        return result
 
     # ----------------------------------------------------------- prompt path
     async def read_session(self, session_id: str, limit: int = 50) -> list[MemoryItem]:

@@ -218,3 +218,84 @@ def test_install_sets_the_optional_app_slots():
     # One object, two names: a test that injects `app.memory` cannot be shadowed
     # by a stale `app.memory_port` (and vice versa).
     assert app.memory is app.memory_port
+
+
+class FakeBreaker:
+    """Records what the adapter reported; `allow` is scripted per instance."""
+
+    def __init__(self, allow=True):
+        self._allow = allow
+        self.allowed: list[tuple[str, str]] = []
+        self.successes: list[tuple[str, str]] = []
+        self.failures: list[tuple[str, str, bool]] = []
+
+    def allow(self, module_id, instance_id):
+        self.allowed.append((module_id, instance_id))
+        return self._allow
+
+    def record_success(self, module_id, instance_id):
+        self.successes.append((module_id, instance_id))
+
+    def record_failure(self, module_id, instance_id, *, timeout=False):
+        self.failures.append((module_id, instance_id, timeout))
+
+
+def _app_with_breaker(breaker, replies=None):
+    app, caller = _app([_record()], replies)
+    app.router = SimpleNamespace(breaker=breaker)
+    return app, caller
+
+
+def test_a_circuit_open_memory_node_is_unavailable_not_an_empty_page():
+    """503, never "0 memories": an open circuit is an outage, not data loss."""
+    breaker = FakeBreaker(allow=False)
+    app, caller = _app_with_breaker(breaker)
+
+    with pytest.raises(VadeError) as caught:
+        asyncio.run(MemoryAdapter(app).admin_list({}))
+    assert caught.value.code == "UNAVAILABLE"
+    assert caller.calls == []  # the module was not even asked
+    assert breaker.allowed == [("vade.memory", "mem-1")]
+
+
+def test_five_transport_failures_open_the_shared_breaker():
+    breaker = FakeBreaker()
+    replies = {"memory/admin_stats": {"ok": False, "error": {"code": "INTERNAL", "message": "boom"}}}
+    app, _caller = _app_with_breaker(breaker, replies)
+    adapter = MemoryAdapter(app)
+
+    for _ in range(5):
+        with pytest.raises(VadeError):
+            asyncio.run(adapter.admin_stats())
+    assert [flag for _m, _i, flag in breaker.failures] == [False] * 5
+    assert breaker.successes == []
+
+
+def test_a_caller_error_does_not_count_against_the_module():
+    """A bad query is the admin's fault; it must not open the circuit."""
+    breaker = FakeBreaker()
+    replies = {"memory/admin_list": {"ok": False, "error": {"code": "INVALID_ARGUMENT", "message": "bad"}}}
+    app, _caller = _app_with_breaker(breaker, replies)
+
+    with pytest.raises(VadeError) as caught:
+        asyncio.run(MemoryAdapter(app).admin_list({"layer": "nope"}))
+    assert caught.value.code == "INVALID_ARGUMENT"
+    assert breaker.failures == []
+
+
+def test_a_timeout_is_recorded_as_a_timeout_and_a_success_closes_the_window():
+    breaker = FakeBreaker()
+    replies = {"memory/admin_stats": {"ok": False, "error": {"code": "TIMEOUT", "message": "slow"}}}
+    app, _caller = _app_with_breaker(breaker, replies)
+    with pytest.raises(VadeError):
+        asyncio.run(MemoryAdapter(app).admin_stats())
+    assert breaker.failures[-1][2] is True
+
+    ok_breaker = FakeBreaker()
+    ok_app, _ = _app_with_breaker(
+        ok_breaker,
+        {"memory/admin_stats": {"global_count": 0, "global_limit": 1, "staging_count": 0,
+                                "archived_count": 0, "oldest_at": None}},
+    )
+    asyncio.run(MemoryAdapter(ok_app).admin_stats())
+    assert ok_breaker.successes == [("vade.memory", "mem-1")]

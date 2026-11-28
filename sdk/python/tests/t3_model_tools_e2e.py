@@ -6,10 +6,11 @@ explicitly:
 
     python sdk/python/tests/t3_model_tools_e2e.py
 
-It needs an exact binding: build ``protocol/core/python/libvade_protocol.so``
-in this checkout, or set ``VADE_PROTOCOL_SO`` (and optionally
-``VADE_PROTOCOL_PY``) to the file you mean to test. It never borrows another
-worktree's build silently.
+It needs an exact binding: build the cdylib
+(``protocol/core/python/libvade_protocol.so`` on POSIX,
+``protocol/core/python/vade_protocol.dll`` on Windows) in this checkout, or
+set ``VADE_PROTOCOL_LIB`` (and optionally ``VADE_PROTOCOL_PY``) to the file you
+mean to test. It never borrows another worktree's build silently.
 
 What it proves, in order:
 
@@ -89,41 +90,86 @@ PORT = _free_port()
 
 
 # --------------------------------------------------------------------- binding
-def _binding_dir(work: Path) -> Path:
-    """Locate `vade_protocol.py` + its `.so`, copying them together if needed.
+def _shared_lib_name() -> str:
+    """The cdylib file name the generated binding looks for beside itself.
 
-    The generated `.py` is committed; the shared library is not. The binding
-    loads `libvade_protocol.so` from the directory of `vade_protocol.py`, so a
-    worktree without a built copy gets a temp dir with both files.
+    `_uniffi_load_indirect()` in `vade_protocol.py` hardcodes the platform's
+    name (``vade_protocol.dll`` on Windows, ``libvade_protocol.so`` on
+    POSIX/ELF, ``libvade_protocol.dylib`` on macOS) and loads it from its own
+    directory — so whatever we copy into a temp dir must use exactly that name.
+    """
+    if sys.platform == "darwin":
+        return "libvade_protocol.dylib"
+    if os.name == "nt":
+        return "vade_protocol.dll"
+    return "libvade_protocol.so"
+
+
+SHARED_LIB = _shared_lib_name()
+
+
+def _check_binding_dir(directory: Path, origin: str) -> Path:
+    """Fail loudly when `directory` cannot serve as an importable binding."""
+    directory = directory.expanduser().resolve()
+    if not (directory / "vade_protocol.py").is_file():
+        raise SystemExit(
+            f"{origin}={directory} has no vade_protocol.py; point it at the "
+            "directory holding both vade_protocol.py and the built "
+            f"{SHARED_LIB}."
+        )
+    if not (directory / SHARED_LIB).is_file():
+        raise SystemExit(
+            f"{origin}={directory} has no {SHARED_LIB}; that is the name the "
+            f"generated binding loads on this platform. Build it (cargo build "
+            "--features uniffi --lib in protocol/core) and copy the cdylib next "
+            "to vade_protocol.py, or set VADE_PROTOCOL_LIB to the exact file."
+        )
+    return directory
+
+
+def _binding_dir(work: Path) -> Path:
+    """Locate `vade_protocol.py` + its cdylib, copying them together if needed.
+
+    The generated `.py` is committed; the shared library is not
+    (`.gitignore` ignores both `*.so` and `*.dll`). The binding loads
+    `SHARED_LIB` from the directory of `vade_protocol.py`, so a worktree
+    without a built copy gets a temp dir with both files under the names the
+    binding expects.
     """
     explicit = os.environ.get("VADE_PROTOCOL_PY")
     if explicit:
-        return Path(explicit)
+        resolved = _check_binding_dir(Path(explicit), "VADE_PROTOCOL_PY")
+        print(f"[info] binding dir (VADE_PROTOCOL_PY): {resolved}", flush=True)
+        return resolved
 
     source = REPO / "protocol" / "core" / "python"
-    if (source / "libvade_protocol.so").is_file():
+    if (source / SHARED_LIB).is_file():
+        print(f"[info] binding lib (in tree): {source / SHARED_LIB}", flush=True)
         return source
 
-    env_so = os.environ.get("VADE_PROTOCOL_SO")
-    if not env_so:
+    env_lib = os.environ.get("VADE_PROTOCOL_LIB") or os.environ.get("VADE_PROTOCOL_SO")
+    if not env_lib:
         raise SystemExit(
-            "no libvade_protocol.so in this worktree. Build it, or set "
-            "VADE_PROTOCOL_SO to the exact .so you mean to test with "
-            "(VADE_PROTOCOL_PY points at a directory holding both files). "
-            "Refusing to borrow a sibling worktree's binding silently."
+            f"no {SHARED_LIB} in this worktree ({source}). Build it "
+            "(cargo build --features uniffi --lib in protocol/core) and copy "
+            f"the cdylib into {source}, or set VADE_PROTOCOL_LIB to the exact "
+            f"{SHARED_LIB} you mean to test (VADE_PROTOCOL_SO is the legacy "
+            "name for the same thing; VADE_PROTOCOL_PY points at a directory "
+            "holding both files). Refusing to borrow a sibling worktree's "
+            "binding silently."
         )
-    candidate = Path(env_so).expanduser().resolve()
+    candidate = Path(env_lib).expanduser().resolve()
     if not candidate.is_file():
-        raise SystemExit(f"VADE_PROTOCOL_SO does not exist: {candidate}")
+        raise SystemExit(f"VADE_PROTOCOL_LIB does not exist: {candidate}")
 
     target = work / "binding"
     target.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source / "vade_protocol.py", target / "vade_protocol.py")
     try:
-        (target / "libvade_protocol.so").symlink_to(candidate)
+        (target / SHARED_LIB).symlink_to(candidate)
     except OSError:
-        shutil.copy2(candidate, target / "libvade_protocol.so")
-    print(f"[info] binding .so: {candidate}", flush=True)
+        shutil.copy2(candidate, target / SHARED_LIB)
+    print(f"[info] binding lib: {candidate} -> {target / SHARED_LIB}", flush=True)
     return target
 
 
@@ -322,6 +368,20 @@ def _json_or_none(text: Any) -> Any:
         return None
 
 
+def _toml_path(path: Path) -> str:
+    """Render `path` as a TOML basic-string *body* (no surrounding quotes).
+
+    On Windows ``str(Path)`` is ``D:\\Hermes\\...`` and a backslash is an escape
+    introducer inside a TOML basic string (``\\H`` reads as a ``\\xHH`` escape
+    and tomllib raises ``Invalid hex value``). ``as_posix()`` yields
+    ``D:/Hermes/...``, which both Python and TOML accept as-is; escaping the
+    two characters that would still break the string keeps it correct even for
+    exotic directory names. On POSIX ``as_posix()`` is exactly ``str(path)``,
+    so this renders the same text as before.
+    """
+    return path.as_posix().replace("\\", "\\\\").replace('"', '\\"')
+
+
 async def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="vade-t3-"))
     if os.environ.get("VADE_KEEP_WORK") != "1":
@@ -338,7 +398,7 @@ async def main() -> int:
             [
                 "[core]",
                 f'listen = "{HOST}:{PORT}"',
-                f'data_dir = "{data}"',
+                f'data_dir = "{_toml_path(data)}"',
                 'log_level = "warning"',
                 "",
                 "[dev]",
@@ -644,8 +704,9 @@ async def main() -> int:
                 for spec in (first.get("tools") or [])
             ]
             check(
-                "first request advertised the four echo tools + model chat",
-                all(name in first_tools for name in expected_names if name) and "model__chat" in first_tools,
+                "first request advertised the four echo tools and hid the provider channel",
+                all(name in first_tools for name in expected_names if name)
+                and "model__chat" not in first_tools,
                 f"tools={first_tools}",
             )
             second_tool_messages = [

@@ -177,3 +177,32 @@ async def test_private_rpc_non_mapping_result_is_an_error():
     await client._handle_request({"id": 3, "method": "memory/list", "params": {}})
     assert errors[-1][0:2] == (3, "INTERNAL")
     assert "object" in errors[-1][2]
+
+
+async def test_private_rpc_that_never_returns_is_a_timeout():
+    """A wedged handler must not leave the caller hanging forever."""
+    import asyncio
+
+    errors = []
+
+    class SlowApp:
+        module_id = "com.example.slow"
+
+        async def dispatch_rpc(self, method, params):
+            await asyncio.sleep(5)
+            return {"items": []}
+
+    client = object.__new__(Client)
+    client.app = SlowApp()
+    client.rpc_timeout = 0.05
+
+    async def reply(request_id, result):  # pragma: no cover - must not run
+        raise AssertionError("timed-out RPC must not reply with a result")
+
+    async def reply_error(request_id, code, message):
+        errors.append((request_id, code, message))
+
+    client._reply = reply
+    client._reply_error = reply_error
+    await client._handle_request({"id": 4, "method": "memory/admin_list", "params": {}})
+    assert errors and errors[-1][1] == "TIMEOUT"

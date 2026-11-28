@@ -370,6 +370,72 @@ def test_second_instance_cannot_take_the_data_directory(tmp_path):
         release_instance_lock(fd)
 
 
+# ------------------------------- 5a) lock semantics hold on every platform
+# POSIX gets flock; Windows gets msvcrt.locking (byte-range, per-handle). The
+# contract under test is platform-independent: one holder per data dir, OSError
+# for everyone else, release hands the dir back.
+def test_second_acquire_of_the_same_data_dir_fails_on_this_platform(tmp_path):
+    fd = acquire_instance_lock(tmp_path)
+    try:
+        with pytest.raises(OSError):
+            acquire_instance_lock(tmp_path)
+    finally:
+        release_instance_lock(fd)
+
+
+def test_release_instance_lock_hands_the_directory_back(tmp_path):
+    fd = acquire_instance_lock(tmp_path)
+    release_instance_lock(fd)
+    release_instance_lock(acquire_instance_lock(tmp_path))  # must not raise
+    release_instance_lock(None)  # documented no-op
+
+
+def test_distinct_data_dirs_lock_independently(tmp_path):
+    from vade.admin import locks
+
+    assert locks.lock_path(tmp_path / "alpha") != locks.lock_path(tmp_path / "beta")
+    first = acquire_instance_lock(tmp_path / "alpha")
+    try:
+        second = acquire_instance_lock(tmp_path / "beta")  # held alpha ⇒ beta still free
+        try:
+            assert (tmp_path / "alpha" / "core.lock").exists()
+            assert (tmp_path / "beta" / "core.lock").exists()
+        finally:
+            release_instance_lock(second)
+    finally:
+        release_instance_lock(first)
+
+
+def test_platform_branch_takes_a_real_os_lock(tmp_path):
+    """The guard picks the platform's mechanism — and that mechanism bites."""
+    from vade.admin import locks
+
+    fd = acquire_instance_lock(tmp_path)
+    try:
+        assert locks._IS_WINDOWS == (os.name == "nt")
+        if os.name == "nt":
+            import msvcrt
+
+            probe = os.open(locks.lock_path(tmp_path), os.O_RDWR | getattr(os, "O_BINARY", 0))
+            try:
+                os.lseek(probe, 0, os.SEEK_SET)
+                with pytest.raises(OSError):
+                    msvcrt.locking(probe, msvcrt.LK_NBLCK, 1)
+            finally:
+                os.close(probe)
+        else:
+            import fcntl
+
+            probe = os.open(locks.lock_path(tmp_path), os.O_RDWR)
+            try:
+                with pytest.raises(OSError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+    finally:
+        release_instance_lock(fd)
+
+
 def test_cli_write_commands_refuse_while_the_lock_is_held(tmp_path):
     from vade.admin import cli
 

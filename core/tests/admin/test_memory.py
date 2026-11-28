@@ -278,3 +278,30 @@ def test_a_browser_cookie_may_read_but_never_write(env):
         assert any(row["code"] == "READ_ONLY_SESSION" for row in rejected)
 
     asyncio.run(scenario())
+
+
+def test_archive_reason_matches_the_contract_limit(env):
+    """C-16 caps `reason` at 300; the handler must not silently keep 200."""
+    ctx, port, app = env
+
+    async def scenario():
+        token = await _device_token(app, ctx)
+        client = client_for(app)
+        too_long = await client.post(
+            "/admin/api/memory/m1/archive",
+            json={"reason": "x" * 301},
+            headers=bearer(token),
+        )
+        assert too_long.status_code == 400, too_long.text
+        assert too_long.json()["code"] == "INVALID_ARGUMENT"
+
+        exact = await client.post(
+            "/admin/api/memory/m1/archive",
+            json={"reason": "y" * 300},
+            headers=bearer(token),
+        )
+        assert exact.status_code == 200, exact.text
+        assert port.writes[-1][0] == "archive"
+        assert len(port.writes[-1][2]) == 300
+
+    asyncio.run(scenario())

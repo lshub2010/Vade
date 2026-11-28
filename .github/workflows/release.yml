@@ -11,10 +11,11 @@ on:
   push:
     tags:
       - "v0.1.0-beta"
+      - "v0.1.0-beta.*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "existing tag, e.g. v0.1.0-beta"
+        description: "existing tag, e.g. v0.1.0-beta.1"
         required: true
         type: string
 
@@ -165,9 +166,9 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: Vade 0.1.0-beta
+          name: Vade ${{ env.RELEASE_TAG }}
           prerelease: true
-          body_path: docs/release/0.1.0-beta-notes.md
+          body_path: docs/release/${{ env.RELEASE_TAG }}.md
           generate_release_notes: false
           fail_on_unmatched_files: true
           files: dist/*

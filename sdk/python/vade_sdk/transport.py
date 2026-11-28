@@ -503,13 +503,20 @@ class Client:
         try:
             result = await self.app.dispatch_rpc(method, params)
         except Exception as exc:
-            code = str(getattr(exc, "code", "NOT_FOUND"))
+            # A handler bug is INTERNAL, not NOT_FOUND: conflating them made a
+            # crashed memory query look like "this method does not exist".
+            code = str(getattr(exc, "code", "INTERNAL"))
             detail = str(getattr(exc, "message", str(exc)))[:300]
             if request_id is not None:
                 await self._reply_error(request_id, code, detail)
             return
         if request_id is not None:
-            await self._reply(request_id, result if isinstance(result, Mapping) else {"result": result})
+            if result is None:
+                # A handler that forgot to return must not look like an empty
+                # page: core would render "0 items" and hide the bug.
+                await self._reply_error(request_id, "INTERNAL", "private RPC returned no result")
+            else:
+                await self._reply(request_id, result if isinstance(result, Mapping) else {"result": result})
 
     async def _drain_and_stop(self, grace_ms: int) -> None:
         deadline = time.monotonic() + max(0, grace_ms) / 1000.0

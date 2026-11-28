@@ -86,7 +86,9 @@ async def test_transport_passes_ctx_and_dispatches_private_rpc():
         async def dispatch_rpc(self, method, params):
             if method == "memory/admin_stats":
                 return {"global_count": 0}
-            raise RuntimeError("missing code")
+            from vade_sdk import ToolError
+
+            raise ToolError("NOT_FOUND", "no such private RPC")
 
     client = object.__new__(Client)
     client.app = FakeApp()
@@ -114,3 +116,38 @@ async def test_transport_passes_ctx_and_dispatches_private_rpc():
 
     await client._handle_request({"id": 3, "method": "memory/unknown", "params": {}})
     assert errors[-1][0:2] == (3, "NOT_FOUND")
+
+
+async def test_private_rpc_handler_bug_is_internal_and_never_a_fake_success():
+    """A handler exception is INTERNAL; a None return is an error, not an empty page."""
+    replies = []
+    errors = []
+
+    class FakeApp:
+        module_id = "com.example.bug"
+
+        async def dispatch_rpc(self, method, params):
+            if method == "memory/raises":
+                raise KeyError("db")
+            return None
+
+    client = object.__new__(Client)
+    client.app = FakeApp()
+
+    async def reply(request_id, result):
+        replies.append((request_id, result))
+
+    async def reply_error(request_id, code, message):
+        errors.append((request_id, code, message))
+
+    client._reply = reply
+    client._reply_error = reply_error
+
+    await client._handle_request({"id": 1, "method": "memory/raises", "params": {}})
+    assert errors[-1][0:2] == (1, "INTERNAL")
+    assert replies == []
+
+    await client._handle_request({"id": 2, "method": "memory/empty", "params": {}})
+    assert errors[-1][0:2] == (2, "INTERNAL")
+    assert "no result" in errors[-1][2]
+    assert replies == []

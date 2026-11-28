@@ -211,6 +211,10 @@ def _module_entries(record: Any, module_id: str) -> list[ModelEntry]:
     manifest = getattr(record, "manifest", None)
     if manifest is None or getattr(manifest, "tool", None) is None or manifest.tool(MODEL_TOOL) is None:
         return []
+    if len(getattr(manifest, "tools", ()) or ()) != 1:
+        # Only `chat` makes a model module (M6). A module that also ships other
+        # tools is not a provider, whatever its priority says.
+        return []
     priority = int(getattr(manifest, "priority", 0) or 0)
     available = _online(record)
     frame = float(getattr(record, "last_frame_at", 0.0) or 0.0)

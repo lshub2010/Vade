@@ -104,10 +104,13 @@ class MemoryAdapter:
     def _record(self) -> Any:
         registry = self._registry()
         if registry is None:
-            raise VadeError("NOT_FOUND", "memory module is not installed")
+            raise VadeError("UNSUPPORTED", "memory module is not installed")
         candidates = [record for record in registry.snapshot() if _is_memory_node(record)]
         if not candidates:
-            raise VadeError("NOT_FOUND", "memory module is not installed")
+            # C-08 declares 501 for "no memory backend in this build". NOT_FOUND
+            # would be read as "this entry is gone" by the admin UI, which is
+            # exactly the data-loss ambiguity the adapter exists to prevent.
+            raise VadeError("UNSUPPORTED", "memory module is not installed")
         # `exclusive` means one instance; sorting makes a misconfigured second
         # instance deterministic instead of "whichever the table iterated first".
         candidates.sort(key=lambda record: str(getattr(record, "node_id", "")))

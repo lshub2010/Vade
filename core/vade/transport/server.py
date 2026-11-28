@@ -50,6 +50,7 @@ import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
+from .. import __version__
 from ..errors import VadeError, http_status
 from ..logging import get_logger
 from .connection import Connection
@@ -67,7 +68,7 @@ __all__ = [
 log = get_logger("vade.transport.server")
 
 
-CORE_VERSION = "0.1.0"
+CORE_VERSION = __version__
 
 #: A pair-code POST is a tiny JSON body; anything bigger is abuse.
 MAX_UI_SESSION_BODY = 64 * 1024

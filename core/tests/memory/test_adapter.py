@@ -81,11 +81,16 @@ def test_read_session_calls_the_private_rpc_and_wraps_items():
     assert deadline_ms > 0
 
 
-def test_no_memory_node_is_not_found_not_an_empty_list():
+def test_no_memory_node_is_unsupported_not_an_empty_list():
+    """C-08: a build without a memory backend answers 501, not "entry missing".
+
+    `NOT_FOUND` made the admin page say "this entry is gone" when the module was
+    simply not installed — the exact data-loss ambiguity the adapter forbids.
+    """
     app, _caller = _app([])
     with pytest.raises(VadeError) as caught:
         asyncio.run(MemoryAdapter(app).read_session("01J0000000000000000000000S"))
-    assert caught.value.code == "NOT_FOUND"
+    assert caught.value.code == "UNSUPPORTED"
 
 
 def test_offline_and_disabled_nodes_are_skipped():
@@ -96,7 +101,8 @@ def test_offline_and_disabled_nodes_are_skipped():
     )
     with pytest.raises(VadeError) as caught:
         asyncio.run(MemoryAdapter(app).admin_stats())
-    assert caught.value.code == "NOT_FOUND"
+    # No eligible node is "no backend installed" (501), not "stats missing".
+    assert caught.value.code == "UNSUPPORTED"
     assert caller.calls == []
 
 

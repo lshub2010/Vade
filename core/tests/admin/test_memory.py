@@ -111,7 +111,7 @@ def test_list_forwards_the_query_and_returns_a_page(env):
         client = client_for(app)
         response = await client.get(
             "/admin/api/memory?layer=global&namespace=user:default&status=active"
-            "&from=10&to=20&q=pref&limit=25",
+            "&from=10.5&to=20.9&q=pref&limit=25",
             headers=bearer(token),
         )
         assert response.status_code == 200, response.text
@@ -122,7 +122,10 @@ def test_list_forwards_the_query_and_returns_a_page(env):
         assert body["next_cursor"] is None
         assert port.list_queries == [{
             "layer": "global", "namespace": "user:default", "status": "active",
-            "from": 10.0, "to": 20.0, "q": "pref", "limit": 25, "cursor": None,
+            # C-08 says `number`, C-16 says integer seconds: the handler is the
+            # boundary that converts once (10.5 -> 10), so the module never sees
+            # a float it would reject.
+            "from": 10, "to": 20, "q": "pref", "limit": 25, "cursor": None,
         }]
 
     asyncio.run(scenario())

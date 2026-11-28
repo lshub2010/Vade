@@ -19,7 +19,6 @@ mechanism.
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 __all__ = ["acquire_instance_lock", "release_instance_lock", "lock_path"]

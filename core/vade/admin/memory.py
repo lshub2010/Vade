@@ -35,8 +35,7 @@ __all__ = ["build_routes", "MAX_LIMIT"]
 MAX_LIMIT = 200
 LAYERS = ("session", "global")
 STATUSES = ("staging", "active", "archived", "superseded")
-#: Must match the module's `reason[:200]`; a longer value here would be audited
-#: at 300 chars while the stored archive row silently kept 200.
+#: C-16 `reason` maxLength; the module stores the same 300 characters.
 _MAX_TEXT = 300
 
 
@@ -79,6 +78,10 @@ def _number(value: str | None, name: str) -> int | None:
         # `?from=inf` / `1e400` survive float() and blow up as OverflowError in
         # int(); that used to surface as a 500 instead of the contract's 400.
         raise VadeError("INVALID_ARGUMENT", f"{name} must be a finite number")
+    if not -(2**63) <= number < 2**63:
+        # SQLite INTEGER is signed 64-bit; a larger "finite" number reached the
+        # module and blew up as OverflowError/INTERNAL (HTTP 500) instead of 400.
+        raise VadeError("INVALID_ARGUMENT", f"{name} is out of range")
     try:
         return int(number)
     except (OverflowError, ValueError):

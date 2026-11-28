@@ -9,15 +9,21 @@ held for the life of the process (the open file description keeps it).
 `flock` locks are advisory and per open-file-description, so the CLI can share
 this helper to answer "is a core running against this data dir?" with the same
 truth the core itself uses — rather than a PID file nobody updates.
+
+Windows has no `fcntl`; `msvcrt.locking` provides the same exclusion (non
+blocking, held by the OS for the life of the handle, visible across processes).
+Same rule, same failure mode (`OSError` when busy), platform-appropriate
+mechanism.
 """
 
 from __future__ import annotations
 
-import fcntl
 import os
 from pathlib import Path
 
 __all__ = ["acquire_instance_lock", "release_instance_lock", "lock_path"]
+
+_IS_WINDOWS = os.name == "nt"  # matches the convention in the test suite
 
 
 def lock_path(data_dir: Path) -> Path:
@@ -33,9 +39,21 @@ def acquire_instance_lock(data_dir: Path) -> int:
     """
     directory = Path(data_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path(directory), os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(lock_path(directory), os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if _IS_WINDOWS:
+            import msvcrt
+
+            # msvcrt.locking needs at least one byte in the file to lock.
+            os.lseek(fd, 0, os.SEEK_SET)
+            if os.fstat(fd).st_size < 1:
+                os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         os.close(fd)
         raise
@@ -54,6 +72,14 @@ def release_instance_lock(fd: int | None) -> None:
     if fd is None:
         return
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        if _IS_WINDOWS:
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)

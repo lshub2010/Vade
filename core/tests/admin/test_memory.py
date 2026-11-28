@@ -305,3 +305,20 @@ def test_archive_reason_matches_the_contract_limit(env):
         assert len(port.writes[-1][2]) == 300
 
     asyncio.run(scenario())
+
+
+def test_time_filters_reject_non_finite_and_out_of_range_values(env):
+    """`inf`/`nan`/`2**63` must be 400, not a 500 from int()/SQLite."""
+    ctx, _port, app = env
+
+    async def scenario():
+        token = await _device_token(app, ctx)
+        client = client_for(app)
+        for raw in ("inf", "-inf", "nan", "1e400", str(2**63)):
+            response = await client.get(
+                f"/admin/api/memory?from={raw}", headers=bearer(token)
+            )
+            assert response.status_code == 400, (raw, response.status_code, response.text)
+            assert response.json()["code"] == "INVALID_ARGUMENT", raw
+
+    asyncio.run(scenario())

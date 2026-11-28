@@ -811,8 +811,8 @@ build.
 | process | `systemctl is-active vade-core` | `active` |
 
 `/healthz` is unauthenticated and deliberately returns no config, fingerprints
-or module list. `version` is the build constant (`CORE_VERSION = "0.1.0"`), not
-the release tag — do not use it to detect `0.0.5-alpha`.
+or module list. `version` is `vade.__version__` (for example `0.1.0-beta.1`),
+so it tracks the release.
 
 `policy_mode` is `allow_all` only when `[dev].allow_all = true`; production
 must leave it `false` (the default).

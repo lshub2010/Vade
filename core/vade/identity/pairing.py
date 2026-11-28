@@ -66,6 +66,22 @@ __all__ = [
     "MAX_ACTIVE_CODES",
 ]
 
+# Windows fds default to text mode and would translate every LF byte into CRLF,
+# corrupting the 32 random pepper bytes (random bytes contain LFs ~12% of the
+# time; the translated file then fails the strict 32-byte length check).
+# POSIX has no O_BINARY; OR-ing 0 is a no-op there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """`os.write()` until every byte is out; a short write must not truncate."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:  # pragma: no cover - regular files never do this
+            raise OSError(f"write on fd {fd} made no progress, {len(view)} byte(s) left")
+        view = view[written:]
+
 BASE32 = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 SEPARATORS = {"-", " ", "\u3000", "\t", "\u00b7", "\u30fb"}
 CODE_LEN = 8
@@ -168,7 +184,7 @@ def _load_pepper(path: Path) -> bytes:
     except FileNotFoundError:
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
         except FileExistsError:
             try:
                 raw = path.read_bytes()
@@ -176,7 +192,7 @@ def _load_pepper(path: Path) -> bytes:
                 raise VadeError("INTERNAL", f"pairing pepper {path.name} is unreadable: {exc}") from None
         else:
             try:
-                os.write(fd, secrets.token_bytes(PEPPER_BYTES))
+                _write_all(fd, secrets.token_bytes(PEPPER_BYTES))
             finally:
                 os.close(fd)
             try:

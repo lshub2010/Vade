@@ -146,10 +146,15 @@ def _bad_name(name: Any, reserved: frozenset[str] | set[str] = frozenset()) -> s
     return ""
 
 
+# Windows fds default to text mode and would translate every LF byte into CRLF,
+# corrupting binary payloads. POSIX has no O_BINARY; OR-ing 0 is a no-op there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
 def _atomic_write(path: Path, data: bytes, *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f".{path.name}.tmp-{secrets.token_hex(4)}")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, mode)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)

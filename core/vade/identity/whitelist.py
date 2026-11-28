@@ -39,6 +39,10 @@ __all__ = ["Whitelist", "Entry", "WHITELIST_FILENAME", "fp8_hex"]
 WHITELIST_FILENAME = "whitelist.json"
 PUBLIC_KEY_LEN = 32
 
+# Windows fds default to text mode and would translate every LF byte into CRLF,
+# corrupting binary payloads. POSIX has no O_BINARY; OR-ing 0 is a no-op there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 
 @dataclass(frozen=True, slots=True)
 class Entry:
@@ -139,9 +143,9 @@ class Whitelist:
         tmp = self._path.with_suffix(".tmp")
         # Create 0600 from the first byte: write_text() would leave a window
         # where the umask (usually 0644) applies.
-        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | _O_BINARY, 0o600)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
         finally:
             try:

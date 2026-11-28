@@ -25,6 +25,20 @@ from ..errors import VadeError
 from . import setup_token
 from .auth import PasswordPolicyError, hash_password, validate_password
 
+# Windows fds default to text mode and would translate every LF byte into CRLF,
+# corrupting binary payloads. POSIX has no O_BINARY; OR-ing 0 is a no-op there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """`os.write()` until every byte is out; a short write must not truncate."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:  # pragma: no cover - regular files never do this
+            raise OSError(f"write on fd {fd} made no progress, {len(view)} byte(s) left")
+        view = view[written:]
+
 __all__ = ["SetupService", "InitializeSnapshot", "TICKET_ALPHABET", "TICKET_LEN", "TICKET_TTL_S"]
 
 TICKET_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -180,9 +194,9 @@ class SetupService:
         path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(path.parent, 0o700)
         tmp = path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BINARY, 0o600)
         try:
-            os.write(fd, raw)
+            _write_all(fd, raw)
         finally:
             os.close(fd)
         os.replace(tmp, path)

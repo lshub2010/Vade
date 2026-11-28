@@ -23,6 +23,20 @@ __all__ = ["CoreIdentity", "load_or_create", "HELLO_PREFIX"]
 
 HELLO_PREFIX = "vade-bind-hello-v1"
 
+# Windows fds default to text mode and would translate every LF byte into CRLF,
+# corrupting binary payloads. POSIX has no O_BINARY; OR-ing 0 is a no-op there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """`os.write()` until every byte is out; a short write must not truncate."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:  # pragma: no cover - regular files never do this
+            raise OSError(f"write on fd {fd} made no progress, {len(view)} byte(s) left")
+        view = view[written:]
+
 
 @dataclass(frozen=True, slots=True)
 class CoreIdentity:
@@ -63,9 +77,9 @@ def load_or_create(data_dir: Path | str) -> CoreIdentity:
     )
     # O_EXCL + 0600: another process must not win the race and leave us with a
     # key we do not actually own.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
     try:
-        os.write(fd, raw)
+        _write_all(fd, raw)
     finally:
         os.close(fd)
     os.chmod(path, 0o600)

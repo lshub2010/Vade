@@ -34,6 +34,10 @@ HEADER = struct.Struct(">BBBBIIQ")
 HEADER_LEN = 20
 MAX_PLAINTEXT = 65519
 
+# Windows fds default to text mode and would translate every LF byte into CRLF,
+# corrupting binary payloads. POSIX has no O_BINARY; OR-ing 0 is a no-op there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 FT_HANDSHAKE = 0x01
 FT_RPC = 0x02
 FT_EVENT = 0x03
@@ -106,8 +110,8 @@ def load_or_create_key(path: Path | str | None = None) -> tuple[str, bytes]:
         return raw.lower(), _x25519_public(seed)
 
     seed = os.urandom(32).hex()
-    fd = os.open(target, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    fd = os.open(target, os.O_CREAT | os.O_WRONLY | os.O_EXCL | _O_BINARY, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(seed + "\n")
     return seed, _x25519_public(bytes.fromhex(seed))
 
@@ -147,8 +151,8 @@ def save_core_pin(app, public_key: bytes, *, tls_fingerprint: str | None = None)
         "tls_fingerprint": tls_fingerprint,
         "pinned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | _O_BINARY, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(payload, indent=2) + "\n")
 
 

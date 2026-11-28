@@ -22,6 +22,10 @@ __all__ = ["Identity", "load_or_create", "KEY_FILENAME"]
 
 KEY_FILENAME = "core.key"
 
+# Windows fds default to text mode and would translate every LF byte into CRLF,
+# corrupting binary payloads. POSIX has no O_BINARY; OR-ing 0 is a no-op there.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 
 class Identity:
     """Opaque wrapper; only the safe accessors are public."""
@@ -97,8 +101,8 @@ def load_or_create(data_dir: Path | str, *, protocol_module: Any | None = None) 
     secret = str(ffi.to_secret_hex())
     # Create 0600 from the first byte; write_text() would briefly apply the
     # umask (usually 0644) to a private key.
-    fd = os.open(key_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    fd = os.open(key_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | _O_BINARY, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(secret + "\n")
     _protect(key_path)
     return Identity(ffi, secret)
